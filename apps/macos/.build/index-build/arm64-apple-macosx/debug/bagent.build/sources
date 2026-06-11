@@ -1,0 +1,13 @@
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/AppDelegate.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/ChatView.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/ChatViewModel.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/DaemonClient.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/DaemonLauncher.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/GlobalHotkey.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/MessageContentView.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/NotchWindowController.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/NotchWrapShape.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/PermissionsManager.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/SettingsView.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/StatusBarController.swift
+/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/main.swift

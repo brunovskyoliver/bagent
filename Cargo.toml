@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/daemon",
+    "crates/agent",
+    "crates/memory",
+    "crates/rules",
+    "crates/connectors/ollama",
+    "crates/connectors/apple_mail",
+    "crates/connectors/apple_notes",
+]
+resolver = "2"

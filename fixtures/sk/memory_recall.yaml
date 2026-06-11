@@ -1,0 +1,105 @@
+# Test fixtures: semantic memory recall.
+# Tests that hybrid BM25+cosine retrieval returns the right memory item
+# for a semantically related (not necessarily lexically matching) query.
+# Run these against POST /memory (insert) then GET /memory/search?q=...
+
+recall_tests:
+  - id: recall_payment_01
+    insert:
+      namespace: global
+      kind: fact
+      language: sk
+      text: "Faktúru č. 2024/0042 som zaplatil 5. júna 2024"
+    query: "kedy som platil faktúru"
+    min_score: 0.3
+    expected_id_in_hits: true
+
+  - id: recall_contact_01
+    insert:
+      namespace: global
+      kind: fact
+      language: sk
+      text: "Peter Novák je môj hlavný dodávateľ stavebného materiálu"
+    query: "kto mi dodáva material"
+    min_score: 0.3
+    expected_id_in_hits: true
+
+  - id: recall_pref_tykanie_01
+    insert:
+      namespace: user_pref
+      kind: preference
+      language: sk
+      text: "Používateľ preferuje tykanie (Ty-forma) pri všetkých odpovediach"
+    query: "ako oslovovať používateľa"
+    min_score: 0.3
+    expected_id_in_hits: true
+
+  - id: recall_glossary_dph_01
+    insert:
+      namespace: sk_glossary
+      kind: sk_glossary
+      language: sk
+      text: "Oprava: VAT → DPH. Nepoužívaj anglický termín VAT v slovenčine."
+    query: "daň z pridanej hodnoty"
+    min_score: 0.2
+    expected_id_in_hits: true
+
+  - id: recall_meeting_01
+    insert:
+      namespace: global
+      kind: fact
+      language: sk
+      text: "Stretnutie s klientom ABC s.r.o. je naplánované na 20. júna o 10:00"
+    query: "kedy mám stretnutie s ABC"
+    min_score: 0.3
+    expected_id_in_hits: true
+
+  - id: recall_brevity_pref_01
+    insert:
+      namespace: user_pref
+      kind: preference
+      language: sk
+      text: "Používateľ chce krátke, stručné odpovede bez zbytočných dlhých výpisov"
+    query: "dĺžka odpovedí"
+    min_score: 0.2
+    expected_id_in_hits: true
+
+  - id: recall_supplier_email_01
+    insert:
+      namespace: global
+      kind: fact
+      language: sk
+      text: "Email dodávateľa Novák Stav: peter.novak@novakstav.sk"
+    query: "kontakt na Nováka"
+    min_score: 0.3
+    expected_id_in_hits: true
+
+  - id: recall_correction_greet_01
+    insert:
+      namespace: correction
+      kind: correction
+      language: sk
+      text: "Oprava: nezačínaj emaily prázdnym riadkom po Dobrý deň"
+    query: "formát obchodného emailu"
+    min_score: 0.2
+    expected_id_in_hits: true
+
+  - id: recall_irrelevant_01
+    insert:
+      namespace: global
+      kind: fact
+      language: sk
+      text: "Heslo k WiFi v kancelárii je bagent2024"
+    query: "faktúra za elektrinu"
+    min_score: 0.0
+    expected_id_in_hits: false  # Should NOT appear as a top hit for unrelated query
+
+  - id: recall_odoo_workflow_01
+    insert:
+      namespace: global
+      kind: instruction
+      language: sk
+      text: "Odoo: otvorenie faktúry → Účtovníctvo → Faktúry zákazníkov → vyhľadať podľa čísla"
+    query: "kde nájdem faktúry v Odoo"
+    min_score: 0.3
+    expected_id_in_hits: true

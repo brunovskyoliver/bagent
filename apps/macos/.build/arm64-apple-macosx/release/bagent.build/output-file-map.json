@@ -1,0 +1,49 @@
+{
+  "": {
+    "dependencies": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/bagent.d",
+    "object": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/bagent.o",
+    "swift-dependencies": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/primary.swiftdeps"
+  },
+  "/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/AppDelegate.swift": {
+    "object": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/AppDelegate.swift.o",
+    "swiftmodule": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/AppDelegate~partial.swiftmodule",
+    "swift-dependencies": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/AppDelegate.swiftdeps",
+    "diagnostics": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/AppDelegate.dia"
+  },
+  "/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/ChatView.swift": {
+    "object": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/ChatView.swift.o",
+    "swiftmodule": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/ChatView~partial.swiftmodule",
+    "swift-dependencies": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/ChatView.swiftdeps",
+    "diagnostics": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/ChatView.dia"
+  },
+  "/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/ChatViewModel.swift": {
+    "object": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/ChatViewModel.swift.o",
+    "swiftmodule": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/ChatViewModel~partial.swiftmodule",
+    "swift-dependencies": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/ChatViewModel.swiftdeps",
+    "diagnostics": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/ChatViewModel.dia"
+  },
+  "/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/GlobalHotkey.swift": {
+    "object": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/GlobalHotkey.swift.o",
+    "swiftmodule": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/GlobalHotkey~partial.swiftmodule",
+    "swift-dependencies": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/GlobalHotkey.swiftdeps",
+    "diagnostics": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/GlobalHotkey.dia"
+  },
+  "/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/NotchWindowController.swift": {
+    "object": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/NotchWindowController.swift.o",
+    "swiftmodule": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/NotchWindowController~partial.swiftmodule",
+    "swift-dependencies": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/NotchWindowController.swiftdeps",
+    "diagnostics": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/NotchWindowController.dia"
+  },
+  "/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/StatusBarController.swift": {
+    "object": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/StatusBarController.swift.o",
+    "swiftmodule": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/StatusBarController~partial.swiftmodule",
+    "swift-dependencies": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/StatusBarController.swiftdeps",
+    "diagnostics": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/StatusBarController.dia"
+  },
+  "/Users/oliver/Programming/bagent/apps/macos/Sources/bagent/main.swift": {
+    "object": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/main.swift.o",
+    "swiftmodule": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/main~partial.swiftmodule",
+    "swift-dependencies": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/main.swiftdeps",
+    "diagnostics": "/Users/oliver/Programming/bagent/apps/macos/.build/arm64-apple-macosx/release/bagent.build/main.dia"
+  }
+}

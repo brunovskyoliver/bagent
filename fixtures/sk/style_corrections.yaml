@@ -1,0 +1,66 @@
+# Test fixtures: style corrections the assistant should learn from.
+# Format: user_correction (what the user said after a wrong response)
+# Expected outcome: assertion that the correction gets captured and applied.
+
+corrections:
+  - id: tykanie_01
+    trigger: "od teraz mi tykaj"
+    expected_directive: "Používaj tykanie (Ty-forma) pri odpovediach"
+    expected_kind: preference
+    expected_namespace: user_pref
+    verify_next_turn: "ako sa máš"
+    verify_response_contains: "máš"   # Ty-forma instead of "máte"
+
+  - id: tykanie_02
+    trigger: "prosím tykaj mi, nechcem Vy-formu"
+    expected_directive: "Použi Ty-formu namiesto Vy-formy"
+    expected_kind: preference
+    expected_namespace: user_pref
+
+  - id: brevity_01
+    trigger: "odpovedaj kratšie, nepotrebujem dlhé výpisy"
+    expected_directive: "Stručné odpovede, bez dlhých vysvetlení"
+    expected_kind: preference
+    expected_namespace: user_pref
+
+  - id: dph_correction_01
+    prev_assistant: "The VAT rate is 20%."
+    user_correction: "nehovor VAT, správne je DPH"
+    expected_kind: sk_glossary
+    expected_namespace: sk_glossary
+    expected_correction_text_contains: "VAT → DPH"
+
+  - id: faktura_correction_01
+    prev_assistant: "Your invoice total is €1200."
+    user_correction: "nehovor invoice, je to faktúra"
+    expected_kind: sk_glossary
+    expected_namespace: sk_glossary
+
+  - id: splatnost_correction_01
+    prev_assistant: "The due date is June 30."
+    user_correction: "due date je po slovensky splatnosť"
+    expected_kind: sk_glossary
+    expected_namespace: sk_glossary
+
+  - id: format_correction_01
+    prev_assistant: "Dobrý deň,\n\nTu je zhrnutie..."
+    user_correction: "nepridávaj prázdny riadok po Dobrý deň"
+    expected_kind: correction
+    expected_namespace: correction
+
+  - id: remember_contact_01
+    trigger: "pamätaj si že Peter Novák je môj hlavný dodávateľ"
+    expected_kind: fact
+    expected_namespace: global
+    expected_directive_contains: "Peter Novák"
+
+  - id: remember_pref_01
+    trigger: "vždy odpovedaj po slovensky, aj keď ti píšem po anglicky"
+    expected_kind: preference
+    expected_namespace: user_pref
+
+  - id: never_translate_01
+    trigger: "už nikdy neprekladaj slovo odberateľ"
+    expected_kind: sk_glossary
+    expected_namespace: sk_glossary
+    expected_directive_contains: "odberateľ"
