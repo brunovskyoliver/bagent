@@ -1,6 +1,10 @@
 import SwiftUI
 import WebKit
 
+extension Notification.Name {
+    static let bagentCodeCopied = Notification.Name("bagentCodeCopied")
+}
+
 // MARK: - Decides between plain Text and rich WebView
 
 struct MessageContentView: View {
@@ -65,7 +69,31 @@ struct WebMessageView: View {
         pre code{background:none;padding:0;font-size:12px}
         strong{font-weight:600}
         .katex-display{overflow-x:auto;overflow-y:hidden;padding:4px 0}
+        .codewrap{margin:6px 0}
+        .codeheader{display:flex;justify-content:flex-end;padding:0 2px 2px 0}
+        .copybtn{border:none;background:none;color:CanvasText;font-size:10px;font-family:-apple-system,BlinkMacSystemFont;cursor:pointer;padding:0;opacity:.3;transition:opacity .12s}
+        .copybtn:hover{opacity:.85}
+        .copybtn.copied{color:#30d158;opacity:1}
         </style>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.querySelectorAll('pre').forEach(function(pre){
+            var w=document.createElement('div');w.className='codewrap';
+            pre.parentNode.insertBefore(w,pre);
+            var hdr=document.createElement('div');hdr.className='codeheader';
+            var b=document.createElement('button');b.className='copybtn';b.textContent='⧉ Kopírovať';b.title='Kopírovať kód';
+            b.onclick=function(){
+              var t=(pre.querySelector('code')||pre).innerText;
+              try{window.webkit.messageHandlers.copyBridge.postMessage(t);}catch(e){}
+              b.textContent='✓ Skopírované';b.classList.add('copied');
+              setTimeout(function(){b.textContent='⧉ Kopírovať';b.classList.remove('copied');},1400);
+            };
+            hdr.appendChild(b);
+            w.appendChild(hdr);
+            w.appendChild(pre);
+          });
+        });
+        </script>
         </head>
         <body>\(body)</body>
         </html>
@@ -111,12 +139,20 @@ struct WebMessageView: View {
 
 // MARK: - NSViewRepresentable
 
+private final class NonScrollingWebView: WKWebView {
+    override func scrollWheel(with event: NSEvent) {
+        nextResponder?.scrollWheel(with: event)
+    }
+}
+
 private struct _WebViewRepresentable: NSViewRepresentable {
     let html: String
     @Binding var height: CGFloat
 
     func makeNSView(context: Context) -> WKWebView {
-        let wv = WKWebView()
+        let config = WKWebViewConfiguration()
+        config.userContentController.add(context.coordinator, name: "copyBridge")
+        let wv = NonScrollingWebView(frame: .zero, configuration: config)
         wv.navigationDelegate = context.coordinator
         wv.setValue(false, forKey: "drawsBackground")
         return wv
@@ -132,7 +168,7 @@ private struct _WebViewRepresentable: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     @MainActor
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var lastHTML: String = ""
         var heightBinding: Binding<CGFloat>?
 
@@ -153,6 +189,18 @@ private struct _WebViewRepresentable: NSViewRepresentable {
             decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
         ) {
             decisionHandler(navigationAction.navigationType == .other ? .allow : .cancel)
+        }
+
+        nonisolated func userContentController(
+            _ userContentController: WKUserContentController,
+            didReceive message: WKScriptMessage
+        ) {
+            Task { @MainActor in
+                guard message.name == "copyBridge", let text = message.body as? String else { return }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                NotificationCenter.default.post(name: .bagentCodeCopied, object: nil)
+            }
         }
     }
 }

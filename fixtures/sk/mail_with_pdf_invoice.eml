@@ -1,0 +1,44 @@
+From: Jan Novak <jan.novak@firma.sk>
+To: peter.kollar@odberatel.sk
+Subject: Faktúra č. 2024-0142 — dodávka tovaru
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="boundary-invoice-fixture-001"
+Date: Mon, 11 Nov 2024 09:15:00 +0100
+Message-ID: <fixture-invoice-001@firma.sk>
+
+--boundary-invoice-fixture-001
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: quoted-printable
+
+Dobrý deň,
+
+v prílohe zasielame faktúru č. 2024-0142 za dodávku tovaru zo dňa 5. novembra 2024.
+
+Fakturovaná suma: 2 400,00 EUR (DPH 20 % = 400,00 EUR)
+Splatnosť: 25. novembra 2024
+IBAN: SK89 0900 0000 0051 2312 3456
+
+Prosíme o úhradu v uvedenej lehote splatnosti.
+
+S pozdravom,
+Ján Novák
+FIRMA, s.r.o.
+
+--boundary-invoice-fixture-001
+Content-Type: application/pdf; name="faktura-2024-0142.pdf"
+Content-Disposition: attachment; filename="faktura-2024-0142.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQKJeLjz9MKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5k
+b2JqCjIgMCBvYmo8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagoz
+IDAgb2JqPDwvVHlwZS9QYWdlL1BhcmVudCAyIDAgUi9NZWRpYUJveFswIDAgNjEyIDc5Ml0v
+Q29udGVudHMgNCAwIFIvUmVzb3VyY2VzPDwvRm9udDw8L0YxIDUgMCBSPj4+Pj4+ZW5kb2Jq
+CjQgMCBvYmo8PC9MZW5ndGggNDQ+PgpzdHJlYW0KQlQKL0YxIDEyIFRmCjcyIDcyMCBUZAoo
+RmFrdHVyYSAtIERQSCkgVGoKRVQKZW5kc3RyZWFtCmVuZG9iagoxIDAgb2JqPDwvVHlwZS9G
+b250L1N1YnR5cGUvVHlwZTEvQmFzZUZvbnQvSGVsdmV0aWNhPj5lbmRvYmoKeHJlZgowIDYK
+MDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDk5IDAwMDAwIG4gCjAwMDAwMDAxNTIgMDAw
+MDAgbiAKMDAwMDAwMDIwOSAwMDAwMCBuIAowMDAwMDAwMzUwIDAwMDAwIG4gCjAwMDAwMDA0
+NDYgMDAwMDAgbiAKdHJhaWxlcjw8L1NpemUgNi9Sb290IDEgMCBSPj4Kc3RhcnR4cmVmCjUy
+MAolJUVPRgo=
+
+--boundary-invoice-fixture-001--

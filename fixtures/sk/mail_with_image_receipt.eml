@@ -1,0 +1,36 @@
+From: pokladna@obchod.sk
+To: marian.hruska@gmail.com
+Subject: Potvrdenie platby — pokladničný doklad
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="boundary-receipt-fixture-002"
+Date: Tue, 12 Nov 2024 14:30:00 +0100
+Message-ID: <fixture-receipt-002@obchod.sk>
+
+--boundary-receipt-fixture-002
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: quoted-printable
+
+Dobrý deň,
+
+ďakujeme za Váš nákup. V prílohe nájdete pokladničný doklad (účtenka).
+
+Celková suma: 48,90 EUR
+DPH (20%): 8,15 EUR
+Dátum: 12.11.2024
+
+S pozdravom,
+Obchod, s.r.o.
+
+--boundary-receipt-fixture-002
+Content-Type: image/jpeg; name="uctenka-2024-1112.jpg"
+Content-Disposition: attachment; filename="uctenka-2024-1112.jpg"
+Content-Transfer-Encoding: base64
+
+/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRof
+Hh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwh
+MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAAR
+CAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAA
+AP/EABQBAQAAAAAAAAAAAAAAAAAAAAD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEA
+PQBKAA==
+
+--boundary-receipt-fixture-002--

@@ -1,0 +1,12 @@
+[package]
+name = "bagent-attachments"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bagent_attachments"
+
+[dependencies]
+anyhow  = "1"
+serde   = { version = "1", features = ["derive"] }
+sha2    = "0.10"

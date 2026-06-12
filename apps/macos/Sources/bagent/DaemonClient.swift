@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 // MARK: - Health
 
@@ -6,6 +7,7 @@ struct DaemonHealth: Sendable {
     let daemonUp: Bool
     let ollamaUp: Bool
     let model: String
+    let classifierModel: String
     let mailConnector: Bool
     let notesConnector: Bool
 }
@@ -74,11 +76,13 @@ struct DaemonClient: Sendable {
             req.timeoutInterval = 3
             let (data, response) = try await URLSession.shared.data(for: req)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—", mailConnector: false, notesConnector: false)
+                return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—",
+                                    classifierModel: "—", mailConnector: false, notesConnector: false)
             }
             struct ConnectorResp: Decodable { let mail: Bool; let notes: Bool }
             struct HealthResp: Decodable {
                 let status: String; let ollama: Bool; let model: String
+                let classifier_model: String?
                 let connectors: ConnectorResp?
             }
             let h = try JSONDecoder().decode(HealthResp.self, from: data)
@@ -86,11 +90,13 @@ struct DaemonClient: Sendable {
                 daemonUp: h.status == "ok",
                 ollamaUp: h.ollama,
                 model: h.model,
+                classifierModel: h.classifier_model ?? "qwen2.5:0.5b",
                 mailConnector:  h.connectors?.mail  ?? false,
                 notesConnector: h.connectors?.notes ?? false
             )
         } catch {
-            return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—", mailConnector: false, notesConnector: false)
+            return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—",
+                                classifierModel: "—", mailConnector: false, notesConnector: false)
         }
     }
 
@@ -119,18 +125,115 @@ struct DaemonClient: Sendable {
 
     // MARK: Chat (SSE streaming)
 
+    struct MailAttachmentRef: Decodable, Sendable {
+        let filename: String
+        let path: String
+        let size: Int
+    }
+
+    /// Stable reference to a specific mail message found by the assistant.
+    /// Used to populate the "Otvoriť mail" button in the UI.
+    struct MailRef: Decodable, Sendable {
+        let rowid: Int
+        let message_id: String?
+        let subject: String
+        let sender: String
+        /// When true the client auto-opens Mail.app after the first sentence streams in.
+        let auto_open: Bool
+    }
+
     enum ChatEvent: Sendable {
         case token(String)
         case memorySaved(id: String)
         case approvalRequested(id: String, tool: String, description: String?)
         case toolBlocked(tool: String)
+        case mailAttachments([MailAttachmentRef])
+        case mailFound(MailRef)
         case done(sessionId: String?)
+    }
+
+    /// Upload a local file to `POST /attachments` and return a `ChatAttachment`.
+    func uploadAttachment(url: URL) async throws -> ChatAttachment {
+        let c = try await loadCreds()
+        var req = authedRequest("/attachments", creds: c)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 60
+
+        let filename = url.lastPathComponent
+        let mime = mimeType(for: url)
+        let boundary = UUID().uuidString
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+        let fileData = try Data(contentsOf: url)
+        var body = Data()
+        let crlf = "\r\n"
+        func s(_ str: String) { body.append(str.data(using: .utf8)!) }
+        s("--\(boundary)\(crlf)")
+        s("Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\(crlf)")
+        s("Content-Type: \(mime)\(crlf)")
+        s(crlf)
+        body.append(fileData)
+        s(crlf)
+        s("--\(boundary)--\(crlf)")
+        req.httpBody = body
+
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.badStatus
+        }
+        struct Resp: Decodable {
+            let attachment_id: String
+            let filename: String
+            let mime: String
+            let kind: String
+            let size: Int
+        }
+        let resp = try JSONDecoder().decode(Resp.self, from: data)
+        let kind: ChatAttachmentKind = {
+            switch resp.kind {
+            case "image": return .image
+            case "pdf":   return .pdf
+            case "text":  return .text
+            default:      return .other
+            }
+        }()
+        // Generate a thumbnail for images
+        var thumbnail: NSImage? = nil
+        if kind == .image { thumbnail = NSImage(contentsOf: url) }
+        return ChatAttachment(
+            id: resp.attachment_id,
+            filename: resp.filename,
+            mime: resp.mime,
+            kind: kind,
+            localURL: url,
+            sizeBytes: resp.size,
+            thumbnail: thumbnail
+        )
+    }
+
+    private func mimeType(for url: URL) -> String {
+        let ext = url.pathExtension.lowercased()
+        switch ext {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png":         return "image/png"
+        case "gif":         return "image/gif"
+        case "webp":        return "image/webp"
+        case "heic", "heif": return "image/heic"
+        case "pdf":         return "application/pdf"
+        case "txt":         return "text/plain"
+        case "md":          return "text/markdown"
+        case "html":        return "text/html"
+        case "csv":         return "text/csv"
+        case "json":        return "application/json"
+        default:            return "application/octet-stream"
+        }
     }
 
     func chatStream(
         text: String,
         sessionId: String?,
-        model: String
+        model: String,
+        attachmentIds: [String] = []
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -145,11 +248,13 @@ struct DaemonClient: Sendable {
                         let message: String
                         let model: String
                         let session_id: String?
+                        let attachment_ids: [String]
                     }
                     req.httpBody = try JSONEncoder().encode(Body(
                         message: text,
                         model: model,
-                        session_id: sessionId
+                        session_id: sessionId,
+                        attachment_ids: attachmentIds
                     ))
 
                     let (bytes, response) = try await URLSession.shared.bytes(for: req)
@@ -182,6 +287,23 @@ struct DaemonClient: Sendable {
                         case "tool_blocked":
                             if let tool = event.tool {
                                 continuation.yield(.toolBlocked(tool: tool))
+                            }
+                        case "mail_attachments":
+                            if let atts = event.attachments, !atts.isEmpty {
+                                continuation.yield(.mailAttachments(atts))
+                            }
+                        case "mail_found":
+                            if let rowid = event.rowid,
+                               let subject = event.subject,
+                               let sender = event.sender {
+                                let ref_ = MailRef(
+                                    rowid: rowid,
+                                    message_id: event.message_id,
+                                    subject: subject,
+                                    sender: sender,
+                                    auto_open: event.auto_open ?? false
+                                )
+                                continuation.yield(.mailFound(ref_))
                             }
                         case "done":
                             continuation.yield(.done(sessionId: event.session_id))
@@ -283,6 +405,63 @@ struct DaemonClient: Sendable {
             throw DaemonError.badStatus
         }
     }
+
+    // MARK: - Mail open (Phase 5E)
+
+    /// Ask the daemon to open a specific email in Apple Mail.app.
+    func openMail(rowid: Int?, messageId: String?, subject: String, sender: String) async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/mail/open", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable {
+            let rowid: Int?
+            let message_id: String?
+            let subject: String
+            let sender: String
+        }
+        req.httpBody = try JSONEncoder().encode(
+            Body(rowid: rowid, message_id: messageId, subject: subject, sender: sender)
+        )
+        _ = try await URLSession.shared.data(for: req)
+    }
+
+    // MARK: - Disk usage (Phase 4G)
+
+    struct UsageStats: Decodable, Sendable {
+        let db_bytes: Int
+        let attachments_bytes: Int
+        let memory_items_count: Int
+        let chat_turns_count: Int
+        let mail_cache_count: Int
+        let embeddings_count: Int
+        let total_bytes: Int
+
+        var totalFormatted: String { formatBytes(total_bytes) }
+        var dbFormatted: String { formatBytes(db_bytes) }
+        var attachmentsFormatted: String { formatBytes(attachments_bytes) }
+
+        private func formatBytes(_ n: Int) -> String {
+            let d = Double(n)
+            if n < 1024 { return "\(n) B" }
+            if n < 1024 * 1024 { return String(format: "%.1f KB", d / 1024) }
+            if n < 1024 * 1024 * 1024 { return String(format: "%.1f MB", d / (1024 * 1024)) }
+            return String(format: "%.2f GB", d / (1024 * 1024 * 1024))
+        }
+    }
+
+    func usage() async throws -> UsageStats {
+        let c = try await loadCreds()
+        let (data, _) = try await URLSession.shared.data(for: authedRequest("/usage", creds: c))
+        return try JSONDecoder().decode(UsageStats.self, from: data)
+    }
+
+    func clearMailCache() async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/mail/cache/clear", creds: c)
+        req.httpMethod = "POST"
+        _ = try await URLSession.shared.data(for: req)
+    }
 }
 
 // MARK: - Types
@@ -324,5 +503,12 @@ private struct SSEEvent: Decodable {
     let session_id: String?
     let tool: String?
     let description: String?
+    let attachments: [DaemonClient.MailAttachmentRef]?
+    // mail_found event fields
+    let rowid: Int?
+    let message_id: String?
+    let subject: String?
+    let sender: String?
+    let auto_open: Bool?
 }
 

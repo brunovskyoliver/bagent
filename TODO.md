@@ -82,17 +82,17 @@ Check off items as they are completed.
 
 Built-in display only (notch present). External / non-notch path unchanged. See `docs/UI_DESIGN.md` for anatomy + animation vocabulary.
 
-- [ ] `NotchWrapShape.swift` — SwiftUI `Shape` with animatable `wingWidth` + `bridgeHeight`
-- [ ] Geometry: compute left/right wing rects from `auxiliaryTopLeft/RightArea`; `pillFrame` becomes union rect spanning both wings + notch gap + bridge room
-- [ ] Replace `PillView` notch branch (`ChatView.swift`) with `NotchWrapView` — sparkles icon left, chevron icon right, no title text
-- [ ] Hover state: wings expand 32 pt → 96 pt, bridge fades in, subtle white stroke on shape
-- [ ] `hoverChanged(isHovered:)` callback from SwiftUI → `NotchWindowController` to drive `setFrame` in sync with SwiftUI layout
-- [ ] Click / `⌥Space`: redesigned 3-phase expand animation (Phase A wings spread → Phase B bridge drops → Phase C content fades in)
-- [ ] Collapse: reverse animation, anchored at notch top-center
-- [ ] Hit-test via `.contentShape(NotchWrapShape(...))` — notch cutout stays click-through
-- [ ] Visual QA on M1/M2/M3/M4/M5 notch geometries (inner corner radius match)
-- [ ] Update `docs/spikes/notch_geometry.md` with per-model notch corner radii
-- [ ] `docs/UI_DESIGN.md` — notch wrap anatomy, animation language, iconography slots, reduced-motion fallback
+- [x] `NotchWrapShape.swift` — SwiftUI `Shape` with animatable `wingWidth` + `bridgeHeight`
+- [x] Geometry: compute left/right wing rects from `auxiliaryTopLeft/RightArea`; `pillFrame` becomes union rect spanning both wings + notch gap + bridge room
+- [x] Replace `PillView` notch branch (`ChatView.swift`) with `NotchWrapView` — sparkles icon left, chevron icon right, no title text
+- [x] Hover state: wings expand 32 pt → 96 pt, bridge fades in, subtle white stroke on shape
+- [x] `hoverChanged(isHovered:)` callback from SwiftUI → `NotchWindowController` to drive `setFrame` in sync with SwiftUI layout
+- [x] Click / `⌥Space`: redesigned 3-phase expand animation (Phase A wings spread → Phase B bridge drops → Phase C content fades in)
+- [x] Collapse: reverse animation, anchored at notch top-center
+- [x] Hit-test via `.contentShape(NotchWrapShape(...))` — notch cutout stays click-through
+- [x] Visual QA on M1/M2/M3/M4/M5 notch geometries (inner corner radius match)
+- [x] Update `docs/spikes/notch_geometry.md` with per-model notch corner radii
+- [x] `docs/UI_DESIGN.md` — notch wrap anatomy, animation language, iconography slots, reduced-motion fallback
 
 ---
 
@@ -239,6 +239,181 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
 - [x] Audit entries for every approval decision (`approval_decide`, `approval_timeout`)
 - [x] `GET /rules` + `POST /rules` — load/save/hot-validate YAML
 - [x] Settings → Pravidlá section: TextEditor + Save button with validation
+
+---
+
+## Phase 5B — Chat Attachments ✅ COMPLETE
+
+- [x] `ChatView.swift` input bar: `plus.circle` button opens `NSOpenPanel` (images, PDF, text/source)
+- [x] `ChatViewModel.swift`:
+  - [x] `ChatAttachmentKind` enum (`image`, `pdf`, `text`, `other`)
+  - [x] `ChatAttachment` struct: `id, filename, mime, kind, localURL, sizeBytes, thumbnail?`
+  - [x] `@Published var pendingAttachments: [ChatAttachment] = []`
+  - [x] Extend `ChatMessage` with `attachments: [ChatAttachment] = []`
+  - [x] Upload flow: `POST /attachments` (multipart), store returned id
+  - [x] Pass `attachment_ids: [String]` in `/chat` request
+- [x] Render attachment chips above input bar (filename + remove ×); limit 5 per turn
+- [x] Render image thumbnails + paperclip chips in message bubbles
+- [x] Drag-and-drop files into open conversation (`onDrop` on `ExpandedChatView`)
+- [x] Drag-and-drop onto collapsed notch pill → expand + attach
+- [x] Daemon — `POST /attachments` (multipart, axum):
+  - [x] Content-addressed storage `~/Library/Application Support/bagent/attachments/{sha256}.{ext}`
+  - [x] Dedup by sha256; returns `{attachment_id, mime, size, sha256, kind}`
+  - [x] `ChatRequest` extended with `attachment_ids: Vec<String>`
+- [x] `crates/attachments/`: extraction pipeline
+  - [x] `text/*`, `*.md`, source files → UTF-8 read (truncated to 8 000 chars)
+  - [x] `application/pdf` → `pdftotext` / `textutil` fallback
+  - [x] `image/*` → store path, flag `requires_vision: true`
+- [x] `PromptBuilder::build` gains `attachments_ctx: Option<String>` — Layer 6.5 between tool data and session summary
+- [x] Ollama `Message` extended with `images: Vec<String>` (base64, skip_serializing_if empty)
+- [x] Auto-route to `qwen2.5vl:7b` when any attachment `kind=image` and no explicit model override; audit `model_swap`
+- [x] Migration V8: `attachments` + `chat_turn_attachments` link table
+- [x] Settings → Ollama: vision model status indicator + pull hint
+- [x] Privacy: `pii: true` on attachment-derived context; max 20 MB per file
+- [x] Onboarding: first image attachment triggers one-time alert if vision model not installed
+- [x] Resize glitch fixed: removed `Task { @MainActor }` hop in `NotchWindowController.swift`; `.regularMaterial` swapped for solid color during active drag; `layerContentsRedrawPolicy = .onSetNeedsDisplay` on chat hosting view
+- [ ] `ollama pull qwen2.5vl:7b` — in progress (large model ~6GB)
+
+---
+
+## Phase 5C — Apple Mail Attachments + Vision Routing ✅ COMPLETE
+
+- [x] `crates/connectors/apple_mail/src/lib.rs`:
+  - [x] `MailAttachment { filename, mimetype, size, part_index, content_id }`
+  - [x] `extract_attachments_from_parsed()` — walks MIME tree, detects non-body parts
+  - [x] `MailMessage` extended with `attachments: Vec<MailAttachment>`
+  - [x] `get_message` populates attachments alongside body
+  - [x] `get_message_attachment(rowid, idx)` → raw bytes; `_base64` variant for JSON
+- [x] New daemon routes:
+  - [x] `GET /mail/message/:rowid/attachments` → list metadata
+  - [x] `GET /mail/message/:rowid/attachments/:idx` → base64-encoded bytes + metadata
+- [x] Migration V9: `mail_attachments(message_rowid, idx, filename, mime, size)`
+- [x] `mail_message` response includes `attachments` field in JSON
+- [x] Vision route: image mail attachment → auto-route to vision model (same logic as 5B)
+- [x] Mail attachment chips rendered identically to chat attachments (`AttachmentStrip`)
+- [x] Test fixtures:
+  - [x] `fixtures/sk/mail_with_pdf_invoice.eml` — Slovak invoice PDF; test asserts DPH/IBAN in body
+  - [x] `fixtures/sk/mail_with_image_receipt.eml` — JPEG receipt; test asserts vision-route triggers
+  - [x] 4 new unit tests in `crates/connectors/apple_mail/src/lib.rs` (all pass)
+
+---
+
+## Phase 5D — LLM-Driven Mail Search (supersedes 5C heuristics)
+
+- [x] `crates/agent/src/mail_intent.rs` — `MailIntent` struct + `MailIntentClassifier`
+  - [x] `action`: "list_recent" | "search" | "read_attachment" | "none"
+  - [x] Structured fields: `sender`, `subject`, `date` (ISO), `keywords`, `wants_attachment`
+  - [x] LLM prompt includes today's date; normalizes Slovak "DD.MM.YYYY" → ISO
+  - [x] `unwrap_or_default()` fallback to `action:"none"` on parse failure
+- [x] `crates/connectors/apple_mail/src/lib.rs` — `MailSearchFilter` + `search_messages()`
+  - [x] Dynamic SQL WHERE over Envelope Index (sender LIKE, subject LIKE, date range)
+  - [x] `ORDER BY date_received DESC LIMIT n`
+- [x] `crates/daemon/src/main.rs` — rewrite mail branch of `fetch_tool_context`
+  - [x] `parse_date_to_range("YYYY-MM-DD")` → day-boundary unix epoch `(start, end)`
+  - [x] Classifier-driven dispatch: none / list_recent / search / read_attachment
+  - [x] `search`: `MailSearchFilter` from intent; best-effort keyword filter on cached bodies
+  - [x] `read_attachment`: search → `get_message_attachment` → PDF text extraction
+  - [x] Removed `extract_subject_hint` heuristic
+  - [x] Injected context header tells LLM to state plainly when mail not found
+- [x] `crates/agent/src/prompt.rs` — persona reinforced: never invent mail contents
+- [ ] Unit tests:
+  - [ ] `parse_date_to_range("2026-06-10")` → correct `[start, end)` bounds
+  - [ ] `MailIntent` deserializes documented JSON shapes incl. `action:"none"` and `action:"open"`
+  - [ ] `search_messages` filter combos (sender-only, subject+date, empty)
+  - [ ] Classifier round-trip (`#[ignore]`, needs live Ollama)
+  - [ ] `MailMessage.message_id` extracted from fixture emlx file
+
+---
+
+## Phase 5E — Mail-Open + AeroSpace Window Control
+
+### Mail identity + open
+- [x] `MailMessage.message_id: Option<String>` — extract from emlx top-level headers in `parse_emlx_body_and_attachments` (`crates/connectors/apple_mail/src/lib.rs`)
+- [x] `apple_mail_connector::open_message(message_id, subject, sender)` — AppleScript; primary path `whose message id is`, fallback subject+sender search across all mailboxes
+- [x] `MailIntent` gains `action="open"` — LLM classifier prompt updated (`crates/agent/src/mail_intent.rs`)
+- [x] `MailRef { rowid, message_id, subject, sender }` struct in daemon; `fetch_tool_context` returns `(ctx, pdf_paths, Option<MailRef>)` (`crates/daemon/src/main.rs`)
+- [x] `"open"` dispatch in `fetch_tool_context`: search → enrich → call `open_message()` in background task; set `found_mail_ref`
+- [x] SSE event `{"type":"mail_found", rowid, message_id, subject, sender}` — emitted early (before tokens) when a mail was found (`crates/daemon/src/main.rs`)
+- [x] `POST /mail/open` endpoint — resolves message_id from rowid via emlx if needed, then calls `open_message()` (`crates/daemon/src/main.rs`)
+- [x] `DaemonClient.MailRef`, `ChatEvent.mailFound`, SSE decode, `openMail()` function (`apps/macos/Sources/bagent/DaemonClient.swift`)
+- [x] `ChatMessage.mailRef: MailRef?` — set on `.mailFound` event (`apps/macos/Sources/bagent/ChatViewModel.swift`)
+- [x] `ChatViewModel.openMail(_ ref:)` — calls `DaemonClient.openMail`
+- [x] `MailOpenButton` — 28 pt circle → hover spring-morphs to 150 pt rounded rect; envelope icon slides left; "Otvoriť mail" text fades+slides in (`apps/macos/Sources/bagent/ChatView.swift`)
+- [x] `MailOpenButton` shown above `MessageContentView` in `MessageBubble` when `message.mailRef != nil`
+- [ ] Test: ask "nájdi email od X a otvor ho" → Mail.app opens the message; button appears above answer
+
+### AeroSpace window management
+- [x] `WindowIntent { action, workspace, app }` + `WindowIntentClassifier` — new file `crates/agent/src/window_intent.rs`; exported from `crates/agent/src/lib.rs`
+- [x] `find_aerospace_binary()` — resolves via `which` then `/Applications/AeroSpace.app` fallback
+- [x] `run_aerospace(args)` — `tokio::process::Command`, silent degrade on error
+- [x] `run_aerospace_intent(intent)` — maps actions: `focus_workspace`, `open_app` (open + poll + move), `move_app`, `focus_app`; `app_to_bundle_id()` helper
+- [x] Keyword gate in `fetch_tool_context` ("plochu", "prepni", "presuň", "zameraj"); runs `WindowIntentClassifier` → `run_aerospace_intent`; appends SK confirmation to context parts
+- [ ] Test: "prepni na plochu 3" → workspace focuses; "otvor mail na ploche 1" → Mail opens on ws 1; silent degrade when AeroSpace not running
+
+---
+
+## Phase 5F — Conversational Entity & Coreference Resolution ✅ COMPLETE
+
+Classifiers previously saw only the current user turn. Pronoun references across turns (SK "od nej" → "Katarína Horváthová" from a prior turn) were silently lost, causing searches to return wrong or empty results.
+
+- [x] `format_history_snippet(history, max_turns)` — last 4 turns, 200 chars/turn cap; `[User]`/`[Assistant]` labels (`crates/daemon/src/main.rs`)
+- [x] `fetch_tool_context` receives `history: &[Message]`; builds snippet before classifiers run
+- [x] `MailIntentClassifier::classify(user_turn, context)` — prepends context block + coreference instruction to LLM prompt (`crates/agent/src/mail_intent.rs`)
+- [x] `WindowIntentClassifier::classify(user_turn, context)` — same treatment (`crates/agent/src/window_intent.rs`)
+- [ ] Unit tests: SK pronoun-resolution fixtures ("od nej" → resolved sender from prior turn)
+
+---
+
+## Phase 1B — Chat Scroll UX (✅ COMPLETE — test pending)
+
+- [x] Smart sticky-scroll: `userScrolledUp: Bool @State` in `ExpandedChatView`; `ScrollOffsetKey` `PreferenceKey` detects offset via content `GeometryReader` background; auto-scroll `.onChange(streamingChunk)` / `.onChange(messages.count)` gated on `!userScrolledUp`; new user-message send resets flag to false (`apps/macos/Sources/bagent/ChatView.swift`)
+- [x] Viewport persistence: `savedScrollAnchorId: UUID?` + `savedScrollWasAtBottom: Bool` on `ChatViewModel` (survive collapse — ViewModel is long-lived); saved on `onDisappear`, restored on `onAppear` inside `ScrollViewReader`; reset on `clear()` (`apps/macos/Sources/bagent/ChatViewModel.swift`, `ChatView.swift`)
+- [ ] Test: scroll up during streaming → content stays put; send new message → snaps to bottom; collapse + reopen → same scroll position
+
+---
+
+## Phase 1C — Memory Panel UI
+
+- [ ] `MemoryPanelView.swift` — search box + kind filter chips (Preferencie / Opravy / Glosár SK / Všetko) + scrollable item list with delete
+- [ ] Brain icon button in `ExpandedChatView` header (next to gear); toggles `showMemory`; mutually exclusive with `showSettings`
+- [ ] `@Published var showMemory: Bool` + `searchMemory(query:)` debounced 300 ms in `ChatViewModel`
+- [ ] Remove Pamäť section from `SettingsView` (content moved to panel)
+- [ ] `DaemonClient.memorySearch` already exists — reuse for live search
+
+---
+
+## Phase 4E — Passive Memory + Cross-Session Recall
+
+### Passive extraction (background, no LLM latency)
+- [ ] `crates/agent/src/memory_extractor.rs` — `MemoryExtractor` struct; single Ollama call classifies `{user_turn, assistant_reply}` → `[{ kind, text, importance, namespace }]`; discard `importance < 0.6`; call `MemoryStore::insert` for remainder
+- [ ] Export `MemoryExtractor` from `crates/agent/src/lib.rs`
+- [ ] `crates/daemon/src/main.rs` — inside existing post-turn `tokio::spawn` (~line 697): spawn `MemoryExtractor::run()` alongside correction classifier
+- [ ] Session summarizer: after every 10 turns, spawn task that calls `ollama.summarize()` and upserts `sessions.summary`
+
+### Cross-session conversation recall
+- [ ] `V10__chat_turns_fts_embeddings.sql` migration — `chat_turns_fts` FTS5 table + triggers + `source` column on `embeddings` ✅
+- [ ] `crates/memory/src/lib.rs` — `retrieve_turns(query, k=3)` — hybrid BM25+cosine over `chat_turns_fts`; returns `Vec<(role, content)>`; cap 3 turns × 300 chars
+- [ ] `crates/agent/src/prompt.rs` — Layer 7.5: call `retrieve_turns`, inject as "Relevantné minulé rozhovory:" system message
+- [ ] Startup backfill: `tokio::spawn` on daemon init embeds existing `chat_turns` missing from `embeddings` (batched, 50/tick)
+
+---
+
+## Phase 4F — Automated Mail Sync
+
+- [ ] Extract `mail_sync_inner()` from `mail_sync` handler in `crates/daemon/src/main.rs`
+- [ ] Startup `tokio::spawn`: 60 s interval loop calls `mail_sync_inner()`
+- [ ] `notify` crate FSEvents watcher on `~/Library/Mail/V10/MailData/Envelope Index-wal` → immediate `mail_sync_inner()` on change
+- [ ] First-sync deeper history: if `last_sync_at IS NULL`, fetch 5 000 messages; incremental: 500
+- [ ] Post-sync embedding: `tokio::spawn` embeds new `mail_cache` rows into `embeddings` (source=`mail_cache`)
+- [ ] `SettingsView` Konektory section: show `last_sync_at` timestamp alongside sync button
+
+---
+
+## Phase 4G — Disk Usage Panel
+
+- [ ] `GET /usage` endpoint in daemon: returns `db_bytes`, `attachments_bytes`, `memory_items_count`, `chat_turns_count`, `mail_cache_count`, `embeddings_count`, `total_bytes`
+- [ ] `UsageStats` struct + `usage()` in `DaemonClient.swift`
+- [ ] Settings → "Využitie disku" section: formatted size rows + "Vyčistiť vyrovnávaciu pamäť" button (clears `mail_cache` rows > 30 days)
 
 ---
 

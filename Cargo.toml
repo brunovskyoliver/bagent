@@ -4,6 +4,7 @@ members = [
     "crates/agent",
     "crates/memory",
     "crates/rules",
+    "crates/attachments",
     "crates/connectors/ollama",
     "crates/connectors/apple_mail",
     "crates/connectors/apple_notes",

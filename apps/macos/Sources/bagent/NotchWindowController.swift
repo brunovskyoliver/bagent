@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 // Borderless NSPanel by default returns canBecomeKey = false, which silently
@@ -26,6 +27,8 @@ final class NotchWindowController: NSObject {
     private var chatFrame: NSRect = .zero
     private var notchWidth: CGFloat = 0
     private var notchHeight: CGFloat = 0
+    private var sizeCancellable: AnyCancellable?
+    private var previousApp: NSRunningApplication?
 
     init(chatViewModel: ChatViewModel) {
         self.chatViewModel = chatViewModel
@@ -39,6 +42,18 @@ final class NotchWindowController: NSObject {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
+
+        sizeCancellable = Publishers.CombineLatest(
+            chatViewModel.$chatWindowW,
+            chatViewModel.$chatWindowH
+        )
+        .dropFirst()
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] (w, h) in
+            // Call synchronously — no async hop so AppKit frame update is
+            // in the same runloop pass as the SwiftUI layout change.
+            self?.updateChatSize(w: w, h: h)
+        }
     }
 
     // MARK: - Geometry
@@ -90,15 +105,29 @@ final class NotchWindowController: NSObject {
             )
         }
 
-        // Chat panel starts immediately below the pill — no overlap with the status bar.
-        let chatW: CGFloat = 400
-        let chatH: CGFloat = 520
+        // Chat panel sits below the pill with a small visual gap.
+        let chatW = chatViewModel.chatWindowW
+        let chatH = chatViewModel.chatWindowH
+        let chatGap: CGFloat = 8
         chatFrame = NSRect(
             x: notchCenterX - chatW / 2,
-            y: pillFrame.minY - chatH,
+            y: pillFrame.minY - chatH - chatGap,
             width: chatW,
             height: chatH
         )
+    }
+
+    private func updateChatSize(w: CGFloat, h: CGFloat) {
+        let notchCenterX = pillFrame.midX
+        chatFrame = NSRect(
+            x: notchCenterX - w / 2,
+            y: pillFrame.minY - h - 8,
+            width: w,
+            height: h
+        )
+        if isExpanded {
+            chatPanel.setFrame(chatFrame, display: true, animate: false)
+        }
     }
 
     // MARK: - Panels
@@ -125,6 +154,7 @@ final class NotchWindowController: NSObject {
             isOnNotch: hasNotch,
             notchWidth: notchWidth,
             notchHeight: notchHeight,
+            viewModel: chatViewModel,
             onTap: { [weak self] in self?.toggle() },
             onHoverChanged: { [weak self] hovering in self?.hoverChanged(isHovered: hovering) }
         )
@@ -135,9 +165,9 @@ final class NotchWindowController: NSObject {
 
     private func hoverChanged(isHovered: Bool) {
         guard hasNotch else { return }
-        // Expand the status panel frame to show the bridge on hover, shrink on idle.
+        // Keep the bridge open while the chat panel is expanded.
         let screen = NSScreen.main
-        let newBridge = isHovered ? NotchWrapMetrics.hoverBridgeHeight : NotchWrapMetrics.idleBridgeHeight
+        let newBridge = (isHovered || isExpanded) ? NotchWrapMetrics.hoverBridgeHeight : NotchWrapMetrics.idleBridgeHeight
         let totalW = 2 * NotchWrapMetrics.hoverWingWidth + notchWidth
         let totalH = notchHeight + newBridge
         let newFrame = NSRect(
@@ -159,7 +189,11 @@ final class NotchWindowController: NSObject {
             viewModel: chatViewModel,
             onCollapse: { [weak self] in self?.collapse() }
         )
-        panel.contentView = NSHostingView(rootView: content)
+        let hostingView = NSHostingView(rootView: content)
+        // Prevent mid-resize re-rasterization which causes text shake during drag.
+        hostingView.wantsLayer = true
+        hostingView.layerContentsRedrawPolicy = .onSetNeedsDisplay
+        panel.contentView = hostingView
         // Stays hidden until expand() is called.
         self.chatPanel = panel
     }
@@ -174,15 +208,26 @@ final class NotchWindowController: NSObject {
         guard !isExpanded else { return }
         isExpanded = true
 
+        // Save the app that was active before bagent takes focus
+        previousApp = NSWorkspace.shared.frontmostApplication
+
+        // Step 1 — animate notch to hover state so it "charges up" before the panel appears.
+        chatViewModel.pillHovered = true
+        if hasNotch { hoverChanged(isHovered: true) }
+
+        // Step 2 — after hover spring mostly settles, pop the chat panel from the notch.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.isExpanded else { return }
+            self.showChatPanel()
+        }
+    }
+
+    private func showChatPanel() {
         chatPanel.styleMask = [.borderless]
         chatPanel.hasShadow = true
-        // Frame is already correct; show panel with deferred redraw so SwiftUI
-        // has the full chatFrame to work with on the first render pass.
         chatPanel.setFrame(chatFrame, display: false)
         chatPanel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-
-        // Triggers the spring pop animation in ChatPanelContent.
         chatViewModel.isExpanded = true
 
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
@@ -227,12 +272,22 @@ final class NotchWindowController: NSObject {
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
         chatPanel.styleMask = [.borderless, .nonactivatingPanel]
 
-        // Hide the chat panel after the spring settles (~0.35 s).
+        // Hide chat panel after spring settles (~0.35 s), then contract notch back to idle.
+        let appToRestore = previousApp
+        previousApp = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self else { return }
             self.chatPanel.hasShadow = false
             self.chatPanel.orderOut(nil)
             self.chatPanel.resignKey()
+            // Restore focus to the app that was active before bagent opened
+            appToRestore?.activate(options: [])
+            // Contract notch back to idle only if mouse is no longer over the pill.
+            let loc = NSEvent.mouseLocation
+            if !self.statusPanel.frame.contains(loc) {
+                self.chatViewModel.pillHovered = false
+                if self.hasNotch { self.hoverChanged(isHovered: false) }
+            }
         }
     }
 
@@ -240,6 +295,9 @@ final class NotchWindowController: NSObject {
 
     @objc private func screensChanged() {
         computeGeometry()
+        // Rebuild status panel so SwiftUI picks up new notchWidth/notchHeight.
+        statusPanel.orderOut(nil)
+        buildStatusPanel()
         statusPanel.setFrame(pillFrame, display: true)
         if isExpanded {
             chatPanel.setFrame(chatFrame, display: true)

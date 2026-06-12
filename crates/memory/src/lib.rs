@@ -255,6 +255,115 @@ impl MemoryStore {
         Ok(final_hits)
     }
 
+    /// Retrieve relevant past chat turns via hybrid BM25+cosine over chat_turns_fts.
+    /// Returns up to k turns (role, content truncated to 300 chars, created_at).
+    /// Used for cross-session conversation injection.
+    pub async fn retrieve_turns(
+        &self,
+        query: &str,
+        exclude_session_id: Option<&str>,
+        k: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let query_embedding = self.ollama.embed(&self.embed_model, query).await.ok();
+        let db = self.db.lock().unwrap();
+
+        let exclude = exclude_session_id.unwrap_or("");
+
+        // BM25 via FTS5
+        let fts_sql = "SELECT ct.id, ct.role, ct.content, ct.created_at, bm25(chat_turns_fts) as score \
+                       FROM chat_turns_fts \
+                       JOIN chat_turns ct ON chat_turns_fts.id = ct.id \
+                       WHERE chat_turns_fts MATCH ?1 \
+                         AND ct.role IN ('user','assistant') \
+                         AND (?2 = '' OR ct.session_id != ?2) \
+                       ORDER BY score \
+                       LIMIT ?3";
+
+        let limit = (k * 3) as i64;
+        let mut results: Vec<(String, String, String, String, f32)> = Vec::new();
+
+        if let Ok(mut stmt) = db.prepare(fts_sql) {
+            if let Ok(mut rows) = stmt.query(rusqlite::params![format!("{query}*"), exclude, limit]) {
+                while let Ok(Some(row)) = rows.next() {
+                    let id: String = row.get(0).unwrap_or_default();
+                    let role: String = row.get(1).unwrap_or_default();
+                    let content: String = row.get(2).unwrap_or_default();
+                    let created_at: String = row.get(3).unwrap_or_default();
+                    let score: f64 = row.get(4).unwrap_or(0.0);
+                    results.push((id, role, content, created_at, (score.abs() as f32).min(10.0) / 10.0 * 0.4));
+                }
+            }
+        }
+
+        // Cosine boost
+        if let Some(ref qe) = query_embedding {
+            let cos_sql = "SELECT item_id, vector FROM embeddings WHERE source = 'chat_turn'";
+            if let Ok(mut cos_stmt) = db.prepare(cos_sql) {
+                if let Ok(mut cos_rows) = cos_stmt.query([]) {
+                    while let Ok(Some(row)) = cos_rows.next() {
+                        let item_id: String = row.get(0).unwrap_or_default();
+                        let blob: Vec<u8> = row.get(1).unwrap_or_default();
+                        let stored = blob_to_f32(&blob);
+                        let cos = cosine_similarity(qe, &stored) * 0.6;
+                        if let Some(r) = results.iter_mut().find(|r| r.0 == item_id) {
+                            r.4 += cos;
+                        } else if cos > 0.15 {
+                            // Semantic-only hit
+                            if let Ok(mut s) = db.prepare(
+                                "SELECT id, role, content, created_at FROM chat_turns WHERE id = ?1"
+                            ) {
+                                if let Ok(mut rows2) = s.query(rusqlite::params![item_id]) {
+                                    if let Ok(Some(r2)) = rows2.next() {
+                                        let id2: String = r2.get(0).unwrap_or_default();
+                                        let role2: String = r2.get(1).unwrap_or_default();
+                                        let content2: String = r2.get(2).unwrap_or_default();
+                                        let at2: String = r2.get(3).unwrap_or_default();
+                                        results.push((id2, role2, content2, at2, cos));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        results.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(results
+            .into_iter()
+            .take(k)
+            .map(|(_, role, content, created_at, _)| {
+                let truncated = if content.len() > 300 {
+                    let end = content.floor_char_boundary(300);
+                    format!("{}…", &content[..end])
+                } else {
+                    content
+                };
+                (role, truncated, created_at)
+            })
+            .collect())
+    }
+
+    /// Embed a chat turn and store it in embeddings with source='chat_turn'.
+    pub async fn embed_chat_turn(&self, turn_id: &str, content: &str) -> Result<()> {
+        let embedding = self.ollama.embed(&self.embed_model, content).await?;
+        let db = self.db.lock().unwrap();
+        let blob = f32_to_blob(&embedding);
+        let now = Utc::now().to_rfc3339();
+        db.execute(
+            "INSERT OR REPLACE INTO embeddings \
+             (item_id, namespace, model, dim, vector, created_at, source) \
+             VALUES (?1, 'chat_turn', ?2, ?3, ?4, ?5, 'chat_turn')",
+            rusqlite::params![turn_id, self.embed_model, embedding.len() as i64, blob, now],
+        )?;
+        Ok(())
+    }
+
     pub fn delete(&self, id: &str) -> Result<bool> {
         let db = self.db.lock().unwrap();
         let n = db.execute("DELETE FROM memory_items WHERE id = ?1", rusqlite::params![id])?;

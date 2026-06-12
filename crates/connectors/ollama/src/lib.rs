@@ -11,17 +11,25 @@ pub const DEFAULT_EMBED_MODEL: &str = "bge-m3";
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// Base64-encoded image bytes for vision models (no data: URI prefix).
+    /// Serialised only when non-empty so text-only models aren't affected.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub images: Vec<String>,
 }
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self { role: "user".into(), content: content.into(), images: vec![] }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self { role: "assistant".into(), content: content.into(), images: vec![] }
     }
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self { role: "system".into(), content: content.into(), images: vec![] }
+    }
+    /// User message with base64-encoded images attached (for vision models).
+    pub fn user_with_images(content: impl Into<String>, images: Vec<String>) -> Self {
+        Self { role: "user".into(), content: content.into(), images }
     }
 }
 
@@ -89,7 +97,8 @@ impl OllamaClient {
                 .json(&serde_json::json!({
                     "model": model,
                     "messages": messages,
-                    "stream": true
+                    "stream": true,
+                    "keep_alive": -1
                 }))
                 .send()
                 .await
@@ -126,7 +135,7 @@ impl OllamaClient {
     pub async fn embed(&self, model: &str, text: &str) -> Result<Vec<f32>> {
         let resp: serde_json::Value = self.http
             .post(format!("{}/api/embeddings", self.base_url))
-            .json(&serde_json::json!({ "model": model, "prompt": text }))
+            .json(&serde_json::json!({ "model": model, "prompt": text, "keep_alive": -1 }))
             .send()
             .await
             .context("POST /api/embeddings")?
@@ -151,6 +160,7 @@ impl OllamaClient {
                 "model": model,
                 "messages": [{ "role": "user", "content": prompt }],
                 "stream": false,
+                "keep_alive": -1,
                 "options": { "temperature": temperature }
             }))
             .send()
@@ -185,7 +195,8 @@ impl OllamaClient {
             .json(&serde_json::json!({
                 "model": model,
                 "messages": [{ "role": "user", "content": prompt }],
-                "stream": false
+                "stream": false,
+                "keep_alive": -1
             }))
             .send()
             .await

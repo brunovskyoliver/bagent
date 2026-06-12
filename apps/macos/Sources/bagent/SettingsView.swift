@@ -16,16 +16,16 @@ struct SettingsView: View {
                 permissionsSection
                 connectorsSection
                 ollamaSection
-                memorySection
                 rulesSection
                 shortcutsSection
+                usageSection
             }
             .padding(16)
         }
         .task {
             await viewModel.loadModels()
             await viewModel.refreshHealth()
-            await viewModel.loadMemoryItems()
+            await viewModel.loadUsage()
         }
     }
 
@@ -120,9 +120,16 @@ struct SettingsView: View {
                 StatusRow(label: "Ollama", up: viewModel.daemonHealth?.ollamaUp)
                 if let model = viewModel.daemonHealth?.model, model != "—" {
                     HStack {
-                        Text("Model daemon").font(.system(size: 12)).foregroundStyle(.secondary)
+                        Text("Model chat").font(.system(size: 12)).foregroundStyle(.secondary)
                         Spacer()
                         Text(model).font(.system(size: 11)).foregroundStyle(.tertiary)
+                    }
+                }
+                if let cm = viewModel.daemonHealth?.classifierModel, cm != "—" {
+                    HStack {
+                        Text("Model klasifikátor").font(.system(size: 12)).foregroundStyle(.secondary)
+                        Spacer()
+                        Text(cm).font(.system(size: 11)).foregroundStyle(.tertiary)
                     }
                 }
             }
@@ -145,91 +152,28 @@ struct SettingsView: View {
                 Text("Odporúčaný pre SK/EN: qwen2.5:7b")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
-            }
-        }
-    }
 
-    // MARK: - Memory
+                Divider()
 
-    private var memorySection: some View {
-        SettingsSection(title: "Pamäť / Naučené preferencie") {
-            VStack(alignment: .leading, spacing: 6) {
-                if viewModel.isLoadingMemory {
-                    HStack {
-                        ProgressView().scaleEffect(0.65)
-                        Text("Načítavam…").font(.system(size: 11)).foregroundStyle(.secondary)
-                    }
-                } else if viewModel.memoryItems.isEmpty {
-                    Text("Žiadne uložené preferencie.")
+                // Vision model status
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(viewModel.visionModelAvailable ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                    Text("Vision model (qwen2.5vl:7b)")
+                        .font(.system(size: 12))
+                    Spacer()
+                    Text(viewModel.visionModelAvailable ? "nainštalovaný" : "chýba")
                         .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                if !viewModel.visionModelAvailable {
+                    Text("Pre prikladanie obrázkov spusti: ollama pull qwen2.5vl:7b")
+                        .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
-                } else {
-                    ForEach(viewModel.memoryItems) { item in
-                        HStack(alignment: .top, spacing: 6) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(item.text)
-                                    .font(.system(size: 11))
-                                    .lineLimit(2)
-                                HStack(spacing: 4) {
-                                    Text(memoryKindLabel(item.kind))
-                                        .font(.system(size: 9))
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 1)
-                                        .background(memoryKindColor(item.kind).opacity(0.15))
-                                        .foregroundStyle(memoryKindColor(item.kind))
-                                        .clipShape(RoundedRectangle(cornerRadius: 3))
-                                    Text(item.namespace)
-                                        .font(.system(size: 9))
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
-                            Spacer()
-                            Button {
-                                Task { await viewModel.deleteMemoryItem(id: item.id) }
-                            } label: {
-                                Image(systemName: "trash")
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding(.vertical, 3)
-                        Divider()
-                    }
+                        .textSelection(.enabled)
                 }
-                Button {
-                    Task { await viewModel.loadMemoryItems() }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrow.clockwise").font(.system(size: 10))
-                        Text("Obnoviť").font(.system(size: 11))
-                    }
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(Color.accentColor)
-                .padding(.top, 4)
             }
-        }
-    }
-
-    private func memoryKindLabel(_ kind: String) -> String {
-        switch kind {
-        case "preference":    return "preferencia"
-        case "correction":    return "oprava"
-        case "sk_glossary":   return "glosár SK"
-        case "style_profile": return "štýl"
-        case "fact":          return "fakt"
-        default:              return kind
-        }
-    }
-
-    private func memoryKindColor(_ kind: String) -> Color {
-        switch kind {
-        case "preference":    return .blue
-        case "correction":    return .orange
-        case "sk_glossary":   return .purple
-        case "style_profile": return .green
-        default:              return .gray
         }
     }
 
@@ -314,9 +258,91 @@ struct SettingsView: View {
             }
         }
     }
+
+    // MARK: - Disk Usage
+
+    private var usageSection: some View {
+        SettingsSection(title: "Využitie disku") {
+            VStack(alignment: .leading, spacing: 6) {
+                if viewModel.isLoadingUsage {
+                    HStack {
+                        ProgressView().scaleEffect(0.65)
+                        Text("Načítavam…").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                } else if let stats = viewModel.usageStats {
+                    UsageRow(label: "Databáza",         value: stats.dbFormatted)
+                    UsageRow(label: "Prílohy",          value: stats.attachmentsFormatted)
+                    UsageRow(label: "Položky pamäti",   value: "\(stats.memory_items_count)")
+                    UsageRow(label: "Správy konverzácií", value: "\(stats.chat_turns_count)")
+                    UsageRow(label: "Emaily v cache",   value: "\(stats.mail_cache_count)")
+                    UsageRow(label: "Embeddingy",       value: "\(stats.embeddings_count)")
+                    Divider()
+                    HStack {
+                        Text("Celkovo")
+                            .font(.system(size: 11, weight: .semibold))
+                        Spacer()
+                        Text(stats.totalFormatted)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.primary)
+                    }
+                } else {
+                    Text("Nedostupné")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        Task { await viewModel.loadUsage() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.clockwise").font(.system(size: 10))
+                            Text("Obnoviť").font(.system(size: 11))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
+
+                    Button {
+                        Task { await viewModel.clearMailCache() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            if viewModel.isClearingCache {
+                                ProgressView().scaleEffect(0.55)
+                            } else {
+                                Image(systemName: "trash").font(.system(size: 10))
+                            }
+                            Text("Vymazať starú mail cache").font(.system(size: 11))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .disabled(viewModel.isClearingCache)
+                }
+                .padding(.top, 4)
+            }
+        }
+    }
 }
 
 // MARK: - Helpers
+
+private struct UsageRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.primary)
+        }
+    }
+}
 
 private struct SettingsSection<Content: View>: View {
     let title: String
