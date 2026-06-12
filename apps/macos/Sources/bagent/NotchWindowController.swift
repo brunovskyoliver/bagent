@@ -13,7 +13,9 @@ private final class BagentPanel: NSPanel {
 @MainActor
 final class NotchWindowController: NSObject {
 
-    /// Always-visible pill that shows the label/status — never moves.
+    /// Always-visible pill that shows the label/status.
+    /// On notch displays the window frame stays at max hover size; SwiftUI
+    /// animates the visible shape inside it to avoid AppKit resize clipping.
     private var statusPanel: BagentPanel!
     /// The expandable chat sheet — appears below the pill, hidden when collapsed.
     private var chatPanel: BagentPanel!
@@ -165,22 +167,9 @@ final class NotchWindowController: NSObject {
 
     private func hoverChanged(isHovered: Bool) {
         guard hasNotch else { return }
-        // Keep the bridge open while the chat panel is expanded.
-        let screen = NSScreen.main
-        let newBridge = (isHovered || isExpanded) ? NotchWrapMetrics.hoverBridgeHeight : NotchWrapMetrics.idleBridgeHeight
-        let totalW = 2 * NotchWrapMetrics.hoverWingWidth + notchWidth
-        let totalH = notchHeight + newBridge
-        let newFrame = NSRect(
-            x: pillFrame.midX - totalW / 2,
-            y: (screen?.frame.maxY ?? pillFrame.maxY + notchHeight) - notchHeight - newBridge,
-            width: totalW,
-            height: totalH
-        )
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.28
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            statusPanel.animator().setFrame(newFrame, display: true)
-        }
+        // Keep the AppKit window stable. Resizing this panel while SwiftUI also
+        // animates the notch path can clip the bottom arcs into sharp corners.
+        statusPanel.setFrame(pillFrame, display: true, animate: false)
     }
 
     private func buildChatPanel() {

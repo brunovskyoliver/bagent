@@ -385,16 +385,16 @@ Classifiers previously saw only the current user turn. Pronoun references across
 ## Phase 4E — Passive Memory + Cross-Session Recall
 
 ### Passive extraction (background, no LLM latency)
-- [ ] `crates/agent/src/memory_extractor.rs` — `MemoryExtractor` struct; single Ollama call classifies `{user_turn, assistant_reply}` → `[{ kind, text, importance, namespace }]`; discard `importance < 0.6`; call `MemoryStore::insert` for remainder
-- [ ] Export `MemoryExtractor` from `crates/agent/src/lib.rs`
-- [ ] `crates/daemon/src/main.rs` — inside existing post-turn `tokio::spawn` (~line 697): spawn `MemoryExtractor::run()` alongside correction classifier
-- [ ] Session summarizer: after every 10 turns, spawn task that calls `ollama.summarize()` and upserts `sessions.summary`
+- [x] `crates/agent/src/memory_extractor.rs` — `MemoryExtractor` struct; single Ollama call classifies `{user_turn, assistant_reply}` → `[{ kind, text, importance, namespace }]`; discard `importance < 0.6`; call `MemoryStore::insert` for remainder
+- [x] Export `MemoryExtractor` from `crates/agent/src/lib.rs`
+- [x] `crates/daemon/src/main.rs` — inside existing post-turn `tokio::spawn`: spawn `MemoryExtractor::run()` alongside correction classifier
+- [x] Session summarizer: after every 10 turns, spawn task that calls `ollama.summarize()` and upserts `sessions.summary`
 
 ### Cross-session conversation recall
 - [ ] `V10__chat_turns_fts_embeddings.sql` migration — `chat_turns_fts` FTS5 table + triggers + `source` column on `embeddings` ✅
-- [ ] `crates/memory/src/lib.rs` — `retrieve_turns(query, k=3)` — hybrid BM25+cosine over `chat_turns_fts`; returns `Vec<(role, content)>`; cap 3 turns × 300 chars
-- [ ] `crates/agent/src/prompt.rs` — Layer 7.5: call `retrieve_turns`, inject as "Relevantné minulé rozhovory:" system message
-- [ ] Startup backfill: `tokio::spawn` on daemon init embeds existing `chat_turns` missing from `embeddings` (batched, 50/tick)
+- [x] `crates/memory/src/lib.rs` — `retrieve_turns(query, k=3)` — hybrid BM25+cosine over `chat_turns_fts`; returns `Vec<(role, content)>`; cap 3 turns × 300 chars
+- [x] `crates/agent/src/prompt.rs` — cross-session recall is diagnostic-only by default; candidates are traced but not injected into model prompts
+- [x] Startup backfill: `tokio::spawn` on daemon init embeds existing `chat_turns` missing from `embeddings`
 
 ---
 
@@ -414,6 +414,24 @@ Classifiers previously saw only the current user turn. Pronoun references across
 - [ ] `GET /usage` endpoint in daemon: returns `db_bytes`, `attachments_bytes`, `memory_items_count`, `chat_turns_count`, `mail_cache_count`, `embeddings_count`, `total_bytes`
 - [ ] `UsageStats` struct + `usage()` in `DaemonClient.swift`
 - [ ] Settings → "Využitie disku" section: formatted size rows + "Vyčistiť vyrovnávaciu pamäť" button (clears `mail_cache` rows > 30 days)
+
+## Phase 4H — Prompt Trace Logging + Debug Panel
+
+- [x] Per-turn `prompt_trace_id` generated in daemon and emitted over SSE before response tokens
+- [x] Local rolling JSONL log at `~/Library/Application Support/bagent/debug/prompt-traces.jsonl`
+- [x] `GET /debug/traces/:id` returns a single prompt trace by ID
+- [x] `GET /debug/conversations/:id` returns conversation turns, stats, and matching traces
+- [x] Header bug icon opens current conversation debug panel
+- [x] Copy buttons for conversation ID, trace ID, expanded trace, and full debug payload
+- [x] `docs/PROMPT_DEBUG_LOGS.md` documents lookup flow for Codex / Claude Code
+
+## Phase 4I — Cross-Session Recall Gating + Simulation Tests
+
+- [x] Disable automatic cross-session chat recall injection by default
+- [x] Keep past chat retrieval visible as non-injected debug candidates
+- [x] Regression test: seeded prior TENENET/Katka chat is not included in fresh prompt messages
+- [ ] Add broader simulation fixture set: Ryanair, unread summaries, unrelated business queries, attachment follow-ups
+- [ ] Add UI screenshot test for collapsed/expanded trace rows and Debug panel copy actions
 
 ---
 

@@ -67,6 +67,12 @@ struct NotchWrapView: View {
         reduceMotion ? .easeInOut(duration: 0.18) : .spring(response: 0.28, dampingFraction: 0.78)
     }
     private var status: AgentStatus { viewModel.agentStatus }
+    private var maxSize: CGSize {
+        CGSize(
+            width: 2 * NotchWrapMetrics.hoverWingWidth + notchWidth,
+            height: notchHeight + NotchWrapMetrics.hoverBridgeHeight
+        )
+    }
 
     private func setExpansion(expanded: Bool) {
         withAnimation(spring) {
@@ -133,6 +139,7 @@ struct NotchWrapView: View {
             StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
                 .position(rightIconPos)
         }
+        .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
         .contentShape(
             NotchWrapShape(
                 wingWidth: wingWidth,
@@ -357,6 +364,8 @@ struct ExpandedChatView: View {
                     SettingsView(viewModel: viewModel)
                 } else if viewModel.showMemory {
                     MemoryPanelView(viewModel: viewModel)
+                } else if viewModel.showDebug {
+                    DebugPanelView(viewModel: viewModel)
                 } else {
                     messageList
                     Divider()
@@ -526,6 +535,13 @@ struct ExpandedChatView: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.8)))
             }
             Spacer()
+            Button { viewModel.toggleDebugPanel() } label: {
+                Image(systemName: viewModel.showDebug ? "ladybug.fill" : "ladybug")
+                    .font(.system(size: 14))
+                    .foregroundStyle(viewModel.showDebug ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
+            }
+            .buttonStyle(.plain)
+            .help("Debug")
             Button { viewModel.toggleMemoryPanel() } label: {
                 Image(systemName: viewModel.showMemory ? "brain.fill" : "brain")
                     .font(.system(size: 14))
@@ -721,6 +737,161 @@ struct ExpandedChatView: View {
 
 // MARK: - Message bubble
 
+private func copyToPasteboard(_ text: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+    NotificationCenter.default.post(name: .bagentCodeCopied, object: nil)
+}
+
+struct DebugPanelView: View {
+    @ObservedObject var viewModel: ChatViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Label("Debug", systemImage: "ladybug")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if let id = viewModel.currentSessionId {
+                    Button {
+                        copyToPasteboard(id)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 12))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Kopírovať ID konverzácie")
+                }
+                Button {
+                    if let payload = viewModel.debugConversationPayload {
+                        copyToPasteboard(payload)
+                    }
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.plain)
+                .help("Kopírovať debug payload")
+            }
+
+            if let id = viewModel.currentSessionId {
+                HStack(spacing: 6) {
+                    Text("Conversation ID")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(id)
+                        .font(.system(size: 10, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+            }
+
+            if viewModel.isLoadingDebug {
+                ProgressView()
+                    .scaleEffect(0.8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    Text(viewModel.debugConversationPayload ?? "Žiadne debug dáta.")
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(Color.black.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+        }
+        .padding(12)
+        .task { await viewModel.loadDebugConversation() }
+    }
+}
+
+struct PromptTraceDisclosure: View {
+    let message: ChatMessage
+    @ObservedObject var viewModel: ChatViewModel
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Button {
+                    expanded.toggle()
+                    if expanded {
+                        Task { await viewModel.loadDebugTrace(for: message.id) }
+                    }
+                } label: {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .bold))
+                    Text(previewText)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 8)
+                if let id = message.debugTraceId {
+                    Button {
+                        copyToPasteboard(id)
+                    } label: {
+                        Image(systemName: "number")
+                            .font(.system(size: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Kopírovať trace ID")
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(Color.gray.opacity(0.13))
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text(message.debugTraceId ?? "")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button {
+                            copyToPasteboard(message.debugPayload ?? "")
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Kopírovať prompt/debug trace")
+                    }
+                    ScrollView {
+                        Text(message.debugPayload ?? "Načítavam trace…")
+                            .font(.system(size: 10, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(maxHeight: 220)
+                    .background(Color.black.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .padding(8)
+                .background(Color.gray.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+
+    private var previewText: String {
+        let base = message.debugPreview?.isEmpty == false ? message.debugPreview! : "Prompt trace"
+        var parts = [base]
+        if let count = message.debugMessageCount { parts.append("\(count) msgs") }
+        if let tokens = message.debugTokenEstimate { parts.append("~\(tokens) tok") }
+        return parts.joined(separator: " · ")
+    }
+}
+
 struct MessageBubble: View {
     let message: ChatMessage
     let isStreaming: Bool
@@ -748,6 +919,9 @@ struct MessageBubble: View {
                 }
             } else {
                 VStack(alignment: .leading, spacing: 4) {
+                    if message.debugTraceId != nil {
+                        PromptTraceDisclosure(message: message, viewModel: viewModel)
+                    }
                     MessageContentView(text: message.content, isStreaming: isStreaming)
                         .padding(.horizontal, 10)
                         // Extra top padding when the button is present so text doesn't overlap it.

@@ -1,5 +1,8 @@
+use anyhow::Result;
+use apple_mail_connector::MailSearchFilter;
+use apple_mail_connector::{self, MailConnector};
+use apple_notes_connector::NotesConnector;
 use axum::{
-    Router,
     extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware,
@@ -8,30 +11,25 @@ use axum::{
         IntoResponse,
     },
     routing::{delete, get, post},
-    Json,
+    Json, Router,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use sha2::{Digest, Sha256};
 use bagent_agent::{
-    CorrectionClassifier, DirectiveExtractor, MailIntentClassifier, MemoryExtractor,
-    PromptBuilder, WindowIntentClassifier,
-    has_explicit_trigger,
+    has_explicit_trigger, CorrectionClassifier, DirectiveExtractor, MailIntentClassifier,
+    MemoryExtractor, PromptBuilder, PromptTrace, WindowIntentClassifier,
 };
-use apple_mail_connector::MailSearchFilter;
 use bagent_attachments::extract as extract_attachment;
 use bagent_memory::MemoryStore;
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::StreamExt;
 use ollama_connector::{Message, OllamaClient, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL};
-use apple_mail_connector::{self, MailConnector};
-use apple_notes_connector::NotesConnector;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use sha2::{Digest, Sha256};
+use std::{collections::HashMap, convert::Infallible, io::Write, path::PathBuf, sync::Arc};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
-use anyhow::Result;
 
 mod embedded {
     refinery::embed_migrations!("migrations");
@@ -47,6 +45,7 @@ struct AppState {
     db_path: PathBuf,
     token: String,
     default_model: String,
+    debug_dir: PathBuf,
     /// Small fast model for intent/correction classifiers — never blocks chat TTFT.
     classifier_model: String,
     vision_model: String,
@@ -74,6 +73,31 @@ struct ChatRequest {
     attachment_ids: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct PromptDebugRecord {
+    prompt_trace_id: String,
+    session_id: String,
+    created_at: String,
+    user_message: String,
+    model: String,
+    language: String,
+    prompt_chars: usize,
+    prompt_token_estimate: usize,
+    message_count: usize,
+    prompt_messages: Vec<PromptDebugMessage>,
+    trace: PromptTrace,
+    response_preview: String,
+    response_chars: usize,
+    elapsed_ms: u128,
+}
+
+#[derive(Serialize)]
+struct PromptDebugMessage {
+    role: String,
+    content: String,
+    images_count: usize,
+}
+
 #[derive(Deserialize)]
 struct ApprovalDecideRequest {
     allow: bool,
@@ -96,7 +120,9 @@ struct MemoryInsertRequest {
     expires_at: Option<String>,
 }
 
-fn default_und() -> String { "und".to_string() }
+fn default_und() -> String {
+    "und".to_string()
+}
 
 #[derive(Deserialize)]
 struct MemorySearchQuery {
@@ -129,7 +155,9 @@ struct SearchQuery {
     limit: usize,
 }
 
-fn default_limit() -> usize { 20 }
+fn default_limit() -> usize {
+    20
+}
 
 /// Stable reference to a found mail message — surfaced to the frontend so
 /// it can render an "Otvoriť mail" button without re-running a search.
@@ -176,6 +204,8 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let attachments_dir = data_dir.join("attachments");
     std::fs::create_dir_all(&attachments_dir)?;
+    let debug_dir = data_dir.join("debug");
+    std::fs::create_dir_all(&debug_dir)?;
 
     let mut conn = Connection::open(data_dir.join("bagent.db"))?;
     embedded::migrations::runner()
@@ -195,10 +225,16 @@ async fn main() -> Result<()> {
     let mail = MailConnector::new().ok().filter(|c| c.is_accessible());
     let notes = NotesConnector::new().ok().filter(|c| c.is_accessible());
 
-    if mail.is_some()  { tracing::info!("Mail connector: accessible"); }
-    else               { tracing::warn!("Mail connector: no Full Disk Access"); }
-    if notes.is_some() { tracing::info!("Notes connector: accessible"); }
-    else               { tracing::warn!("Notes connector: no Full Disk Access"); }
+    if mail.is_some() {
+        tracing::info!("Mail connector: accessible");
+    } else {
+        tracing::warn!("Mail connector: no Full Disk Access");
+    }
+    if notes.is_some() {
+        tracing::info!("Notes connector: accessible");
+    } else {
+        tracing::warn!("Notes connector: no Full Disk Access");
+    }
 
     let ollama = OllamaClient::new(DEFAULT_BASE_URL);
 
@@ -225,8 +261,12 @@ async fn main() -> Result<()> {
                 ollama_chat.generate_raw(&warmup_chat_model, ".", 0.0),
                 ollama_embed.embed(&warmup_embed_model, "warmup"),
             );
-            if r_chat.is_ok()  { tracing::info!("warmup: chat model loaded"); }
-            if r_embed.is_ok() { tracing::info!("warmup: embed model loaded"); }
+            if r_chat.is_ok() {
+                tracing::info!("warmup: chat model loaded");
+            }
+            if r_embed.is_ok() {
+                tracing::info!("warmup: embed model loaded");
+            }
         });
     }
 
@@ -239,19 +279,22 @@ async fn main() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let conn = match rusqlite::Connection::open(&backfill_db_path) {
                 Ok(c) => c,
-                Err(e) => { tracing::warn!("backfill: failed to open db: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("backfill: failed to open db: {e}");
+                    return;
+                }
             };
             let ids: Vec<(String, String)> = {
                 let mut stmt = match conn.prepare(
                     "SELECT id, content FROM chat_turns \
                      WHERE id NOT IN (SELECT item_id FROM embeddings WHERE source='chat_turn') \
                      AND role IN ('user','assistant') \
-                     LIMIT 200"
+                     LIMIT 200",
                 ) {
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
                     .ok()
                     .map(|rows| rows.flatten().collect())
                     .unwrap_or_default()
@@ -277,7 +320,9 @@ async fn main() -> Result<()> {
             // Initial sync on startup only when on AC (slight delay)
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             if is_on_ac_power() {
-                match mail_sync_inner(db_poll.clone(), mail_for_poll.clone(), memory_poll.clone()).await {
+                match mail_sync_inner(db_poll.clone(), mail_for_poll.clone(), memory_poll.clone())
+                    .await
+                {
                     Ok((n, _)) => tracing::info!("mail auto-sync startup: {n} messages"),
                     Err(e) => tracing::warn!("mail auto-sync startup error: {e}"),
                 }
@@ -290,7 +335,9 @@ async fn main() -> Result<()> {
                     tracing::debug!("mail auto-sync skipped: on battery");
                     continue;
                 }
-                match mail_sync_inner(db_poll.clone(), mail_for_poll.clone(), memory_poll.clone()).await {
+                match mail_sync_inner(db_poll.clone(), mail_for_poll.clone(), memory_poll.clone())
+                    .await
+                {
                     Ok((n, _)) if n > 0 => tracing::info!("mail auto-sync: {n} new messages"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!("mail auto-sync error: {e}"),
@@ -319,24 +366,39 @@ async fn main() -> Result<()> {
             );
             match watcher_result {
                 Ok(mut watcher) => {
-                    if watcher.watch(&mail_wal, RecursiveMode::NonRecursive).is_ok() {
+                    if watcher
+                        .watch(&mail_wal, RecursiveMode::NonRecursive)
+                        .is_ok()
+                    {
                         tokio::spawn(async move {
                             let _watcher = watcher; // keep alive
                             loop {
-                                if tok_rx.recv().await.is_none() { break; }
+                                if tok_rx.recv().await.is_none() {
+                                    break;
+                                }
                                 // Debounce: drain any burst events
                                 while tok_rx.try_recv().is_ok() {}
                                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                                 while tok_rx.try_recv().is_ok() {}
                                 if is_on_ac_power() {
                                     tracing::info!("mail FSEvents: WAL changed, syncing");
-                                    match mail_sync_inner(db_fs.clone(), mail_for_fs.clone(), memory_fs.clone()).await {
-                                        Ok((n, _)) if n > 0 => tracing::info!("mail FSEvents sync: {n} new"),
+                                    match mail_sync_inner(
+                                        db_fs.clone(),
+                                        mail_for_fs.clone(),
+                                        memory_fs.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok((n, _)) if n > 0 => {
+                                            tracing::info!("mail FSEvents sync: {n} new")
+                                        }
                                         Ok(_) => {}
                                         Err(e) => tracing::warn!("mail FSEvents sync error: {e}"),
                                     }
                                 } else {
-                                    tracing::debug!("mail FSEvents: WAL changed, skipped (battery)");
+                                    tracing::debug!(
+                                        "mail FSEvents: WAL changed, skipped (battery)"
+                                    );
                                 }
                             }
                         });
@@ -358,13 +420,21 @@ async fn main() -> Result<()> {
     let pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+    let default_model =
+        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
+    let classifier_model =
+        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| "qwen2.5:0.5b".to_string());
+    let vision_model =
+        std::env::var("BAGENT_VISION_MODEL").unwrap_or_else(|_| "qwen2.5vl:7b".to_string());
+
     let state = AppState {
         db,
         db_path: data_dir.join("bagent.db"),
         token,
-        default_model: "qwen2.5:7b".to_string(),
-        classifier_model: "qwen2.5:0.5b".to_string(),
-        vision_model: "qwen2.5vl:7b".to_string(),
+        default_model,
+        debug_dir,
+        classifier_model,
+        vision_model,
         attachments_dir,
         ollama,
         mail,
@@ -376,40 +446,49 @@ async fn main() -> Result<()> {
     };
 
     let app = Router::new()
-        .route("/health",                 get(health))
-        .route("/models",                 get(models))
-        .route("/chat",                   post(chat))
-        .route("/embeddings",             post(embeddings))
-        .route("/approvals/pending",      get(approvals_pending))
-        .route("/approvals/:id/decide",   post(approval_decide))
-        .route("/rules",                  get(rules_get).post(rules_save))
+        .route("/health", get(health))
+        .route("/models", get(models))
+        .route("/chat", post(chat))
+        .route("/embeddings", post(embeddings))
+        .route("/approvals/pending", get(approvals_pending))
+        .route("/approvals/:id/decide", post(approval_decide))
+        .route("/rules", get(rules_get).post(rules_save))
         // Phase 4B — Sessions
-        .route("/sessions",               post(session_create).get(sessions_list))
-        .route("/sessions/:id/turns",     get(session_turns))
-        .route("/sessions/:id",           delete(session_delete))
+        .route("/sessions", post(session_create).get(sessions_list))
+        .route("/sessions/:id/turns", get(session_turns))
+        .route("/sessions/:id", delete(session_delete))
         // Phase 4B — Memory
-        .route("/memory",                 post(memory_insert).get(memory_list))
-        .route("/memory/search",          get(memory_search))
-        .route("/memory/:id",             delete(memory_delete))
+        .route("/memory", post(memory_insert).get(memory_list))
+        .route("/memory/search", get(memory_search))
+        .route("/memory/:id", delete(memory_delete))
         // Phase 5B — Attachments
-        .route("/attachments",            post(upload_attachment))
-        .route("/attachments/:id",        get(get_attachment))
+        .route("/attachments", post(upload_attachment))
+        .route("/attachments/:id", get(get_attachment))
         // Phase 4 — Mail
-        .route("/mail/inbox",             get(mail_inbox))
-        .route("/mail/message/:rowid",    get(mail_message))
-        .route("/mail/sync",              post(mail_sync))
+        .route("/mail/inbox", get(mail_inbox))
+        .route("/mail/message/:rowid", get(mail_message))
+        .route("/mail/sync", post(mail_sync))
         // Phase 5C — Mail attachments
-        .route("/mail/message/:rowid/attachments",      get(mail_message_attachments))
-        .route("/mail/message/:rowid/attachments/:idx", get(mail_message_attachment_bytes))
+        .route(
+            "/mail/message/:rowid/attachments",
+            get(mail_message_attachments),
+        )
+        .route(
+            "/mail/message/:rowid/attachments/:idx",
+            get(mail_message_attachment_bytes),
+        )
         // Phase 5E — Open mail in Mail.app
         .route("/mail/open", post(mail_open))
         // Phase 4 — Notes
-        .route("/notes/list",             get(notes_list))
-        .route("/notes/search",           get(notes_search))
-        .route("/notes/:pk",              get(notes_get))
+        .route("/notes/list", get(notes_list))
+        .route("/notes/search", get(notes_search))
+        .route("/notes/:pk", get(notes_get))
         // Phase 4G — Disk usage
-        .route("/usage",                  get(disk_usage))
-        .route("/mail/cache/clear",       post(mail_cache_clear))
+        .route("/usage", get(disk_usage))
+        .route("/mail/cache/clear", post(mail_cache_clear))
+        // Phase 4H — Prompt trace debug
+        .route("/debug/conversations/:id", get(debug_conversation))
+        .route("/debug/traces/:id", get(debug_trace))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
@@ -437,35 +516,255 @@ async fn disk_usage(State(state): State<AppState>) -> impl IntoResponse {
 
     let attachments_bytes = dir_size(&state.attachments_dir);
 
-    let (memory_items_count, chat_turns_count, mail_cache_count, embeddings_count): (i64, i64, i64, i64) = {
+    let (memory_items_count, chat_turns_count, mail_cache_count, embeddings_count): (
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = {
         let db = state.db.lock().await;
-        let mc: i64 = db.query_row("SELECT COUNT(*) FROM memory_items", [], |r| r.get(0)).unwrap_or(0);
-        let ct: i64 = db.query_row("SELECT COUNT(*) FROM chat_turns", [], |r| r.get(0)).unwrap_or(0);
-        let mail: i64 = db.query_row("SELECT COUNT(*) FROM mail_cache", [], |r| r.get(0)).unwrap_or(0);
-        let emb: i64 = db.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0)).unwrap_or(0);
+        let mc: i64 = db
+            .query_row("SELECT COUNT(*) FROM memory_items", [], |r| r.get(0))
+            .unwrap_or(0);
+        let ct: i64 = db
+            .query_row("SELECT COUNT(*) FROM chat_turns", [], |r| r.get(0))
+            .unwrap_or(0);
+        let mail: i64 = db
+            .query_row("SELECT COUNT(*) FROM mail_cache", [], |r| r.get(0))
+            .unwrap_or(0);
+        let emb: i64 = db
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
+            .unwrap_or(0);
         (mc, ct, mail, emb)
     };
 
     let total_bytes = db_bytes + attachments_bytes;
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "db_bytes": db_bytes,
-        "attachments_bytes": attachments_bytes,
-        "memory_items_count": memory_items_count,
-        "chat_turns_count": chat_turns_count,
-        "mail_cache_count": mail_cache_count,
-        "embeddings_count": embeddings_count,
-        "total_bytes": total_bytes
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "db_bytes": db_bytes,
+            "attachments_bytes": attachments_bytes,
+            "memory_items_count": memory_items_count,
+            "chat_turns_count": chat_turns_count,
+            "mail_cache_count": mail_cache_count,
+            "embeddings_count": embeddings_count,
+            "total_bytes": total_bytes
+        })),
+    )
 }
 
 async fn mail_cache_clear(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.lock().await;
-    let n = db.execute(
-        "DELETE FROM mail_cache WHERE synced_at < strftime('%s', datetime('now', '-30 days'))",
-        [],
-    ).unwrap_or(0);
+    let n = db
+        .execute(
+            "DELETE FROM mail_cache WHERE synced_at < strftime('%s', datetime('now', '-30 days'))",
+            [],
+        )
+        .unwrap_or(0);
     (StatusCode::OK, Json(serde_json::json!({ "deleted": n })))
+}
+
+async fn debug_trace(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    match find_prompt_debug_record(&state.debug_dir, |v| {
+        v.get("prompt_trace_id").and_then(|x| x.as_str()) == Some(id.as_str())
+    }) {
+        Ok(Some(record)) => (StatusCode::OK, Json(record)),
+        Ok(None) => {
+            let matching_session_traces = read_prompt_debug_records(&state.debug_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| v.get("session_id").and_then(|x| x.as_str()) == Some(id.as_str()))
+                .map(|v| {
+                    serde_json::json!({
+                        "prompt_trace_id": v.get("prompt_trace_id").cloned().unwrap_or_default(),
+                        "created_at": v.get("created_at").cloned().unwrap_or_default(),
+                        "user_message": v.get("user_message").cloned().unwrap_or_default(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "trace not found",
+                    "hint": "This may be a conversation/session id. Use /debug/conversations/:id, or one of matching_prompt_traces with /debug/traces/:prompt_trace_id.",
+                    "matching_prompt_traces": matching_session_traces,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn debug_conversation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let (session, turns, stats) = {
+        let db = state.db.lock().await;
+        let session: Option<serde_json::Value> = db
+            .query_row(
+                "SELECT id, started_at, ended_at, language, summary, metadata_json \
+                 FROM sessions WHERE id = ?1",
+                rusqlite::params![id],
+                |r| {
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "started_at": r.get::<_, String>(1)?,
+                        "ended_at": r.get::<_, Option<String>>(2)?,
+                        "language": r.get::<_, Option<String>>(3)?,
+                        "summary": r.get::<_, Option<String>>(4)?,
+                        "metadata_json": r.get::<_, Option<String>>(5)?,
+                    }))
+                },
+            )
+            .ok();
+
+        let turns: Vec<serde_json::Value> = db
+            .prepare(
+                "SELECT id, role, content, language, model, created_at FROM chat_turns \
+                 WHERE session_id = ?1 ORDER BY created_at",
+            )
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_map(rusqlite::params![id], |r| {
+                    let content: String = r.get(2)?;
+                    Ok(serde_json::json!({
+                        "id": r.get::<_, String>(0)?,
+                        "role": r.get::<_, String>(1)?,
+                        "content_preview": preview_text(&content, 500),
+                        "chars": content.len(),
+                        "language": r.get::<_, String>(3)?,
+                        "model": r.get::<_, Option<String>>(4)?,
+                        "created_at": r.get::<_, String>(5)?,
+                    }))
+                })
+                .ok()
+                .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default();
+
+        let stats = serde_json::json!({
+            "memory_items_count": db.query_row("SELECT COUNT(*) FROM memory_items", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
+            "chat_turns_count": db.query_row("SELECT COUNT(*) FROM chat_turns WHERE session_id = ?1", rusqlite::params![id], |r| r.get::<_, i64>(0)).unwrap_or(0),
+            "embeddings_count": db.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
+            "mail_cache_count": db.query_row("SELECT COUNT(*) FROM mail_cache", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
+        });
+        (session, turns, stats)
+    };
+
+    let traces = read_prompt_debug_records(&state.debug_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| v.get("session_id").and_then(|x| x.as_str()) == Some(id.as_str()))
+        .collect::<Vec<_>>();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "conversation_id": id,
+            "session": session,
+            "stats": stats,
+            "turns": turns,
+            "traces": traces,
+        })),
+    )
+}
+
+fn append_prompt_debug_record(
+    debug_dir: &std::path::Path,
+    record: &PromptDebugRecord,
+) -> Result<()> {
+    std::fs::create_dir_all(debug_dir)?;
+    let path = debug_dir.join("prompt-traces.jsonl");
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 5 * 1024 * 1024 {
+        let rotated = debug_dir.join("prompt-traces.1.jsonl");
+        let _ = std::fs::remove_file(&rotated);
+        let _ = std::fs::rename(&path, rotated);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let line = serde_json::to_string(record)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+fn read_prompt_debug_records(debug_dir: &std::path::Path) -> Result<Vec<serde_json::Value>> {
+    let path = debug_dir.join("prompt-traces.jsonl");
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect())
+}
+
+fn find_prompt_debug_record<F>(
+    debug_dir: &std::path::Path,
+    pred: F,
+) -> Result<Option<serde_json::Value>>
+where
+    F: Fn(&serde_json::Value) -> bool,
+{
+    Ok(read_prompt_debug_records(debug_dir)?
+        .into_iter()
+        .rev()
+        .find(pred))
+}
+
+fn debug_trace_preview(trace: &PromptTrace) -> String {
+    let layers = trace
+        .layers
+        .iter()
+        .filter(|l| l.included)
+        .map(|l| l.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let recall = if trace.past_turn_candidates.is_empty() {
+        "no past-chat candidates".to_string()
+    } else {
+        format!(
+            "{} past-chat candidates not injected",
+            trace.past_turn_candidates.len()
+        )
+    };
+    preview_text(&format!("{layers}; {recall}"), 180)
+}
+
+fn preview_text(s: &str, max: usize) -> String {
+    let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.len() <= max {
+        compact
+    } else {
+        let end = compact.floor_char_boundary(max);
+        format!("{}…", &compact[..end])
+    }
+}
+
+fn redact_debug_text(s: &str) -> String {
+    s.split_whitespace()
+        .map(|part| {
+            let lower = part.to_ascii_lowercase();
+            if lower.starts_with("bearer")
+                || lower.starts_with("sk-")
+                || lower.contains("api_key")
+                || lower.contains("authorization:")
+            {
+                "[REDACTED]"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Returns true when the Mac is connected to AC power (not running on battery).
@@ -475,15 +774,21 @@ fn is_on_ac_power() -> bool {
     let Ok(out) = std::process::Command::new("pmset")
         .args(["-g", "batt"])
         .output()
-    else { return true; };
+    else {
+        return true;
+    };
     let s = String::from_utf8_lossy(&out.stdout);
     // "Now drawing from 'AC Power'" or "'Battery Power'"
     s.contains("AC Power")
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {
-    if !path.exists() { return 0; }
-    let Ok(entries) = std::fs::read_dir(path) else { return 0; };
+    if !path.exists() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
     entries.flatten().fold(0u64, |acc, entry| {
         let meta = entry.metadata().ok();
         if let Some(m) = meta {
@@ -511,7 +816,9 @@ async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .map(|v| v == format!("Bearer {}", state.token))
         .unwrap_or(false);
-    if !ok { return Err(StatusCode::UNAUTHORIZED); }
+    if !ok {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     Ok(next.run(req).await)
 }
 
@@ -524,7 +831,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         model: state.default_model,
         classifier_model: state.classifier_model,
         connectors: ConnectorStatus {
-            mail:  state.mail.is_some(),
+            mail: state.mail.is_some(),
             notes: state.notes.is_some(),
         },
     })
@@ -533,7 +840,10 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
     match state.ollama.models().await {
         Ok(names) => (StatusCode::OK, Json(serde_json::json!({ "models": names }))),
-        Err(e)    => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -586,7 +896,10 @@ async fn approval_decide(
         }
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "approval not found or already decided" })))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "approval not found or already decided" })),
+        )
     }
 }
 
@@ -594,7 +907,10 @@ async fn rules_get(State(state): State<AppState>) -> impl IntoResponse {
     let yaml = state.rules.rules_yaml();
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         yaml,
     )
 }
@@ -605,7 +921,10 @@ async fn rules_save(
 ) -> impl IntoResponse {
     match state.rules.save_yaml(&req.yaml) {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -615,8 +934,14 @@ async fn embeddings(
 ) -> impl IntoResponse {
     let model = req.model.as_deref().unwrap_or(DEFAULT_EMBED_MODEL);
     match state.ollama.embed(model, &req.input).await {
-        Ok(vec)  => (StatusCode::OK, Json(serde_json::json!({ "embedding": vec, "model": model }))),
-        Err(e)   => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(vec) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "embedding": vec, "model": model })),
+        ),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -627,15 +952,17 @@ async fn chat(
     let (tx, rx) = mpsc::channel(64);
     let model = req.model.clone().unwrap_or(state.default_model.clone());
     let classifier_model = state.classifier_model.clone();
+    let intent_model = state.classifier_model.clone();
     let db = state.db.clone();
     let ollama = state.ollama.clone();
     let user_message = req.message.clone();
-    let mail  = state.mail.clone();
+    let mail = state.mail.clone();
     let notes = state.notes.clone();
     let ctx_db = state.db.clone();
     let memory = state.memory.clone();
     let prompt_builder = state.prompt_builder.clone();
     let rules = state.rules.clone();
+    let debug_dir = state.debug_dir.clone();
     let pending_approvals = state.pending_approvals.clone();
     let vision_model = state.vision_model.clone();
     let attachment_ids = req.attachment_ids.clone();
@@ -661,23 +988,31 @@ async fn chat(
         // Check for explicit memory directive before answering
         let directive_extractor = DirectiveExtractor::new(ollama.clone(), classifier_model.clone());
         if has_explicit_trigger(&user_message) {
-            if let Ok(Some(directive)) = directive_extractor.detect_and_extract(&user_message).await {
-                if let Ok(Some(mem_id)) = memory.insert(
-                    &directive.namespace,
-                    &directive.kind,
-                    &directive.language,
-                    &directive.directive,
-                    None, None, None,
-                ).await {
-                    let ev = Event::default().data(
-                        serde_json::json!({"type":"memory_saved","id": mem_id}).to_string()
-                    );
+            if let Ok(Some(directive)) = directive_extractor.detect_and_extract(&user_message).await
+            {
+                if let Ok(Some(mem_id)) = memory
+                    .insert(
+                        &directive.namespace,
+                        &directive.kind,
+                        &directive.language,
+                        &directive.directive,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    let ev = Event::default()
+                        .data(serde_json::json!({"type":"memory_saved","id": mem_id}).to_string());
                     let _ = tx.send(Ok(ev)).await;
                 }
             }
         }
 
-        tracing::info!("chat timing: directive check {}ms", t0.elapsed().as_millis());
+        tracing::info!(
+            "chat timing: directive check {}ms",
+            t0.elapsed().as_millis()
+        );
         // Load server-side history + session summary + last mail ref in parallel
         let (history, session_summary, last_mail_ref) = tokio::join!(
             async {
@@ -701,33 +1036,62 @@ async fn chat(
 
         // Determine which tools are needed and gate via rules engine
         let low = user_message.to_lowercase();
-        let needs_mail  = ["email", "mail", "správ", "inbox", "schránk", "doručen",
-                           "posledn", "prečítaj", "read", "sender", "odosielate",
-                           "nazvom", "názvom", "mailbox", "prilohu", "prílohu"]
-            .iter().any(|kw| low.contains(kw));
+        let needs_mail = [
+            "email",
+            "mail",
+            "správ",
+            "inbox",
+            "schránk",
+            "doručen",
+            "posledn",
+            "prečítaj",
+            "read",
+            "sender",
+            "odosielate",
+            "nazvom",
+            "názvom",
+            "mailbox",
+            "prilohu",
+            "prílohu",
+        ]
+        .iter()
+        .any(|kw| low.contains(kw));
         let needs_notes = ["poznámk", "note", "zápis", "zapisal", "napísal"]
-            .iter().any(|kw| low.contains(kw));
+            .iter()
+            .any(|kw| low.contains(kw));
 
-        let mut allowed_tools: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut allowed_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (needed, tool_name, description) in [
-            (needs_mail,  "mail_inbox",  "Čítanie poštovej schránky (Apple Mail)"),
-            (needs_notes, "notes_list",  "Čítanie poznámok (Apple Notes)"),
+            (
+                needs_mail,
+                "mail_inbox",
+                "Čítanie poštovej schránky (Apple Mail)",
+            ),
+            (needs_notes, "notes_list", "Čítanie poznámok (Apple Notes)"),
         ] {
-            if !needed { continue; }
+            if !needed {
+                continue;
+            }
             match rules.check(tool_name, "{}") {
-                ApprovalLevel::Auto => { allowed_tools.insert(tool_name.to_string()); }
-                ApprovalLevel::Ask  => {
-                    let approved = request_tool_approval(
-                        &db, &pending_approvals, &tx, tool_name, description,
-                    ).await;
-                    if approved { allowed_tools.insert(tool_name.to_string()); }
+                ApprovalLevel::Auto => {
+                    allowed_tools.insert(tool_name.to_string());
+                }
+                ApprovalLevel::Ask => {
+                    let approved =
+                        request_tool_approval(&db, &pending_approvals, &tx, tool_name, description)
+                            .await;
+                    if approved {
+                        allowed_tools.insert(tool_name.to_string());
+                    }
                 }
                 ApprovalLevel::Forbidden => {
-                    let _ = tx.send(Ok(Event::default().data(
-                        serde_json::json!({"type":"tool_blocked","tool": tool_name}).to_string(),
-                    ))).await;
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({"type":"tool_blocked","tool": tool_name})
+                                .to_string(),
+                        )))
+                        .await;
                 }
             }
         }
@@ -735,23 +1099,35 @@ async fn chat(
         tracing::info!("chat timing: rules checked {}ms", t0.elapsed().as_millis());
         // Fetch live tool context (mail/notes) only for approved tools
         let (tool_ctx, mail_pdf_paths, mail_ref_opt) = fetch_tool_context(
-            &user_message, &history, last_mail_ref.as_ref(), &allowed_tools,
-            ctx_db, mail, notes, ollama.clone(), classifier_model.clone(), memory.clone(),
-        ).await;
+            &user_message,
+            &history,
+            last_mail_ref.as_ref(),
+            &allowed_tools,
+            ctx_db,
+            mail,
+            notes,
+            ollama.clone(),
+            intent_model.clone(),
+            memory.clone(),
+        )
+        .await;
 
         // Emit mail_found before tokens so the MailRef is in place when the client
         // starts watching for the auto-open trigger.
         if let Some(ref mail_ref) = mail_ref_opt {
-            let _ = tx.send(Ok(Event::default().data(
-                serde_json::json!({
-                    "type": "mail_found",
-                    "rowid": mail_ref.rowid,
-                    "message_id": mail_ref.message_id,
-                    "subject": mail_ref.subject,
-                    "sender": mail_ref.sender,
-                    "auto_open": mail_ref.auto_open,
-                }).to_string()
-            ))).await;
+            let _ = tx
+                .send(Ok(Event::default().data(
+                    serde_json::json!({
+                        "type": "mail_found",
+                        "rowid": mail_ref.rowid,
+                        "message_id": mail_ref.message_id,
+                        "subject": mail_ref.subject,
+                        "sender": mail_ref.sender,
+                        "auto_open": mail_ref.auto_open,
+                    })
+                    .to_string(),
+                )))
+                .await;
             // Persist for cross-turn reference ("tento mail", "má prílohy?")
             save_last_mail_ref(&db, &session_id, mail_ref).await;
         }
@@ -790,9 +1166,13 @@ async fn chat(
                                 if let Ok(bytes) = std::fs::read(&bytes_path) {
                                     images_b64.push(B64.encode(&bytes));
                                 }
-                                ctx_parts.push(format!("### {} (obrázok — spracované modelom pre videnie)", filename));
+                                ctx_parts.push(format!(
+                                    "### {} (obrázok — spracované modelom pre videnie)",
+                                    filename
+                                ));
                             } else {
-                                let text = extracted_text.unwrap_or_else(|| "[obsah nedostupný]".to_string());
+                                let text = extracted_text
+                                    .unwrap_or_else(|| "[obsah nedostupný]".to_string());
                                 ctx_parts.push(format!("### {filename}\n{text}"));
                             }
                         }
@@ -806,8 +1186,9 @@ async fn chat(
                 Some(format!("Pripojené súbory:\n\n{}", ctx_parts.join("\n\n")))
             };
 
-            let model_override = if has_image && req.model.is_none() {
-                // Auto-route to vision model; log the swap
+            let model_override = if has_image {
+                // Auto-route image turns to the vision model even when the client
+                // sends the selected chat model from Settings.
                 if let Ok(db_guard) = db.try_lock() {
                     let _ = db_guard.execute(
                         "INSERT INTO audit_entries (action, payload, model) VALUES ('model_swap', ?1, ?2)",
@@ -822,30 +1203,77 @@ async fn chat(
                 None
             };
 
-            AttachmentData { images_b64, ctx, model_override, turn_ids }
+            AttachmentData {
+                images_b64,
+                ctx,
+                model_override,
+                turn_ids,
+            }
         };
 
         let effective_model = att_data.model_override.clone().unwrap_or(model.clone());
 
-        tracing::info!("chat timing: tool_ctx fetched {}ms", t0.elapsed().as_millis());
+        tracing::info!(
+            "chat timing: tool_ctx fetched {}ms",
+            t0.elapsed().as_millis()
+        );
         // Build layered prompt
+        let prompt_trace_id = Uuid::new_v4().to_string();
+        let mut prompt_trace: Option<PromptTrace> = None;
         let messages = match prompt_builder
-            .build(Some(&session_id), &user_message, lang, tool_ctx, att_data.ctx, history, session_summary)
+            .build(
+                Some(&session_id),
+                &user_message,
+                lang,
+                tool_ctx,
+                att_data.ctx,
+                history,
+                session_summary,
+            )
             .await
         {
-            Ok(mut msgs) => {
+            Ok(mut built) => {
                 if att_data.images_b64.is_empty() {
-                    msgs.push(Message::user(&user_message));
+                    built.messages.push(Message::user(&user_message));
                 } else {
-                    msgs.push(Message::user_with_images(&user_message, att_data.images_b64.clone()));
+                    built.messages.push(Message::user_with_images(
+                        &user_message,
+                        att_data.images_b64.clone(),
+                    ));
                 }
-                msgs
+                built.trace.layers.push(bagent_agent::PromptLayerTrace {
+                    name: "current_user_turn".to_string(),
+                    role: "user".to_string(),
+                    included: true,
+                    chars: user_message.len(),
+                    preview: preview_text(&user_message, 240),
+                });
+                let prompt_chars: usize = built.messages.iter().map(|m| m.content.len()).sum();
+                let _ = tx
+                    .send(Ok(Event::default().data(
+                        serde_json::json!({
+                            "type": "debug_trace",
+                            "prompt_trace_id": &prompt_trace_id,
+                            "session_id": &session_id,
+                            "preview": debug_trace_preview(&built.trace),
+                            "prompt_chars": prompt_chars,
+                            "prompt_token_estimate": prompt_chars / 4,
+                            "message_count": built.messages.len(),
+                        })
+                        .to_string(),
+                    )))
+                    .await;
+                prompt_trace = Some(built.trace);
+                built.messages
             }
             Err(_) => {
                 if att_data.images_b64.is_empty() {
                     vec![Message::user(&user_message)]
                 } else {
-                    vec![Message::user_with_images(&user_message, att_data.images_b64.clone())]
+                    vec![Message::user_with_images(
+                        &user_message,
+                        att_data.images_b64.clone(),
+                    )]
                 }
             }
         };
@@ -872,8 +1300,12 @@ async fn chat(
         let prompt_chars: usize = messages.iter().map(|m| m.content.len()).sum();
         tracing::info!(
             "chat timing: prompt built {}ms — {} msgs ~{} chars ~{} tokens",
-            t0.elapsed().as_millis(), messages.len(), prompt_chars, prompt_chars / 4
+            t0.elapsed().as_millis(),
+            messages.len(),
+            prompt_chars,
+            prompt_chars / 4
         );
+        let prompt_messages_for_log = messages.clone();
         // Stream response
         let token_stream = ollama.chat_stream(effective_model.clone(), messages);
         tokio::pin!(token_stream);
@@ -885,7 +1317,9 @@ async fn chat(
                     full_response.push_str(&token);
                     let ev = Event::default()
                         .data(serde_json::json!({"type":"token","content":token}).to_string());
-                    if tx.send(Ok(ev)).await.is_err() { return; }
+                    if tx.send(Ok(ev)).await.is_err() {
+                        return;
+                    }
                 }
                 Err(e) => {
                     let _ = tx.send(Ok(err_event(&e.to_string()))).await;
@@ -896,21 +1330,22 @@ async fn chat(
 
         // Emit mail attachment chips before done so the UI can show them
         if !mail_pdf_paths.is_empty() {
-            let atts: Vec<serde_json::Value> = mail_pdf_paths.iter().map(|(fname, path)| {
-                serde_json::json!({
-                    "filename": fname,
-                    "path": path.to_string_lossy(),
-                    "size": std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+            let atts: Vec<serde_json::Value> = mail_pdf_paths
+                .iter()
+                .map(|(fname, path)| {
+                    serde_json::json!({
+                        "filename": fname,
+                        "path": path.to_string_lossy(),
+                        "size": std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+                    })
                 })
-            }).collect();
-            let _ = tx.send(Ok(Event::default().data(
-                serde_json::json!({"type":"mail_attachments","attachments": atts}).to_string()
-            ))).await;
+                .collect();
+            let _ = tx
+                .send(Ok(Event::default().data(
+                    serde_json::json!({"type":"mail_attachments","attachments": atts}).to_string(),
+                )))
+                .await;
         }
-
-        let _ = tx.send(Ok(Event::default().data(
-            serde_json::json!({"type":"done","session_id": session_id}).to_string()
-        ))).await;
 
         // Persist assistant turn
         let response_for_audit = full_response.clone();
@@ -928,8 +1363,44 @@ async fn chat(
             );
         }
 
+        if let Some(trace) = prompt_trace {
+            let record = PromptDebugRecord {
+                prompt_trace_id: prompt_trace_id.clone(),
+                session_id: session_id.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                user_message: redact_debug_text(&user_message),
+                model: effective_model.clone(),
+                language: lang.to_string(),
+                prompt_chars,
+                prompt_token_estimate: prompt_chars / 4,
+                message_count: prompt_messages_for_log.len(),
+                prompt_messages: prompt_messages_for_log
+                    .iter()
+                    .map(|m| PromptDebugMessage {
+                        role: m.role.clone(),
+                        content: redact_debug_text(&m.content),
+                        images_count: m.images.len(),
+                    })
+                    .collect(),
+                trace,
+                response_preview: redact_debug_text(&preview_text(&response_for_audit, 600)),
+                response_chars: response_for_audit.len(),
+                elapsed_ms: t0.elapsed().as_millis(),
+            };
+            if let Err(e) = append_prompt_debug_record(&debug_dir, &record) {
+                tracing::warn!("prompt debug log write failed: {e}");
+            }
+        }
+
+        let _ = tx
+            .send(Ok(Event::default().data(
+                serde_json::json!({"type":"done","session_id": session_id}).to_string(),
+            )))
+            .await;
+
         // Background: correction classifier + passive memory extraction + session summarizer + turn embedding
-        let correction_classifier = CorrectionClassifier::new(ollama.clone(), classifier_model.clone());
+        let correction_classifier =
+            CorrectionClassifier::new(ollama.clone(), classifier_model.clone());
         let memory_extractor = MemoryExtractor::new(ollama.clone(), classifier_model.clone());
         let memory_bg = memory.clone();
         let ollama_bg = ollama.clone();
@@ -957,38 +1428,59 @@ async fn chat(
                                 result.what_was_wrong.as_deref().unwrap_or("?"),
                                 result.correct_behavior.as_deref().unwrap_or("?")
                             );
-                            let namespace = if result.scope == "sk_lang" { "sk_glossary" } else { "correction" };
-                            let _ = mem.insert(namespace, "correction", "und", &text, None, None, None).await;
+                            let namespace = if result.scope == "sk_lang" {
+                                "sk_glossary"
+                            } else {
+                                "correction"
+                            };
+                            let _ = mem
+                                .insert(namespace, "correction", "und", &text, None, None, None)
+                                .await;
                         }
                     }
                 }
             };
 
-            let extract_fut = memory_extractor.run(&user_msg_bg, &reply_bg, memory_bg.clone(), &lang_bg);
+            let extract_fut =
+                memory_extractor.run(&user_msg_bg, &reply_bg, memory_bg.clone(), &lang_bg);
 
-            tokio::join!(embed_fut, correction_fut, extract_fut);
+            let (embed_result, _, _) = tokio::join!(embed_fut, correction_fut, extract_fut);
+            if let Err(e) = embed_result {
+                tracing::debug!("chat turn embed error: {e}");
+            }
 
             // Session summarizer: every 10 turns, regenerate sessions.summary
-            let turn_count: i64 = db_bg.try_lock().ok().and_then(|db| {
-                db.query_row(
-                    "SELECT COUNT(*) FROM chat_turns WHERE session_id = ?1",
-                    rusqlite::params![session_bg],
-                    |r| r.get(0),
-                ).ok()
-            }).unwrap_or(0);
+            let turn_count: i64 = db_bg
+                .try_lock()
+                .ok()
+                .and_then(|db| {
+                    db.query_row(
+                        "SELECT COUNT(*) FROM chat_turns WHERE session_id = ?1",
+                        rusqlite::params![session_bg],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or(0);
 
             if turn_count > 0 && turn_count % 10 == 0 {
                 // Fetch last 20 turns for summary
                 let turns_text: Option<String> = db_bg.try_lock().ok().and_then(|db| {
-                    let mut stmt = db.prepare(
-                        "SELECT role, content FROM chat_turns WHERE session_id = ?1 \
-                         ORDER BY created_at DESC LIMIT 20"
-                    ).ok()?;
-                    let rows: Vec<String> = stmt.query_map(rusqlite::params![session_bg], |r| {
-                        let role: String = r.get(0)?;
-                        let content: String = r.get(1)?;
-                        Ok(format!("[{role}]: {content}"))
-                    }).ok()?.flatten().collect();
+                    let mut stmt = db
+                        .prepare(
+                            "SELECT role, content FROM chat_turns WHERE session_id = ?1 \
+                         ORDER BY created_at DESC LIMIT 20",
+                        )
+                        .ok()?;
+                    let rows: Vec<String> = stmt
+                        .query_map(rusqlite::params![session_bg], |r| {
+                            let role: String = r.get(0)?;
+                            let content: String = r.get(1)?;
+                            Ok(format!("[{role}]: {content}"))
+                        })
+                        .ok()?
+                        .flatten()
+                        .collect();
                     Some(rows.into_iter().rev().collect::<Vec<_>>().join("\n"))
                 });
 
@@ -996,7 +1488,10 @@ async fn chat(
                     let prompt = format!(
                         "Summarize this conversation concisely in 2-3 sentences, preserving key facts and decisions:\n{text}"
                     );
-                    if let Ok(summary) = ollama_bg.summarize(&model_bg, &[Message::user(prompt)]).await {
+                    if let Ok(summary) = ollama_bg
+                        .summarize(&model_bg, &[Message::user(prompt)])
+                        .await
+                    {
                         if let Ok(db) = db_bg.try_lock() {
                             let _ = db.execute(
                                 "UPDATE sessions SET summary = ?1 WHERE id = ?2",
@@ -1022,8 +1517,14 @@ async fn session_create(State(state): State<AppState>) -> impl IntoResponse {
         "INSERT INTO sessions (id, started_at) VALUES (?1, ?2)",
         rusqlite::params![id, now],
     ) {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "session_id": id }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "session_id": id })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -1048,20 +1549,25 @@ async fn sessions_list(State(state): State<AppState>) -> impl IntoResponse {
         .ok()
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default();
-    (StatusCode::OK, Json(serde_json::json!({ "sessions": sessions })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "sessions": sessions })),
+    )
 }
 
-async fn session_turns(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn session_turns(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let db = state.db.lock().await;
     let mut stmt = match db.prepare(
         "SELECT id, role, content, language, model, created_at FROM chat_turns \
-         WHERE session_id = ?1 ORDER BY created_at"
+         WHERE session_id = ?1 ORDER BY created_at",
     ) {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
     };
     let turns: Vec<serde_json::Value> = stmt
         .query_map(rusqlite::params![id], |row| {
@@ -1087,8 +1593,14 @@ async fn session_delete(
     let db = state.db.lock().await;
     match db.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id]) {
         Ok(n) if n > 0 => (StatusCode::OK, Json(serde_json::json!({ "deleted": true }))),
-        Ok(_) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "session not found" }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "session not found" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -1098,25 +1610,41 @@ async fn memory_insert(
     State(state): State<AppState>,
     Json(req): Json<MemoryInsertRequest>,
 ) -> impl IntoResponse {
-    match state.memory.insert(
-        &req.namespace,
-        &req.kind,
-        &req.language,
-        &req.text,
-        req.source_ref.as_deref(),
-        req.metadata_json.as_deref(),
-        req.expires_at.as_deref(),
-    ).await {
+    match state
+        .memory
+        .insert(
+            &req.namespace,
+            &req.kind,
+            &req.language,
+            &req.text,
+            req.source_ref.as_deref(),
+            req.metadata_json.as_deref(),
+            req.expires_at.as_deref(),
+        )
+        .await
+    {
         Ok(Some(id)) => {
             let db = state.db.lock().await;
             let _ = db.execute(
                 "INSERT INTO audit_entries (action, payload, model) VALUES ('memory_save', ?1, '')",
-                rusqlite::params![serde_json::json!({"id": id, "kind": req.kind, "namespace": req.namespace}).to_string()],
+                rusqlite::params![
+                    serde_json::json!({"id": id, "kind": req.kind, "namespace": req.namespace})
+                        .to_string()
+                ],
             );
-            (StatusCode::OK, Json(serde_json::json!({ "id": id, "saved": true })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "id": id, "saved": true })),
+            )
         }
-        Ok(None)     => (StatusCode::OK, Json(serde_json::json!({ "saved": false, "reason": "duplicate" }))),
-        Err(e)       => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "saved": false, "reason": "duplicate" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -1127,10 +1655,12 @@ async fn memory_list(
     let db = state.db.lock().await;
     let sql = if q.namespace.is_empty() {
         "SELECT id, namespace, kind, language, text, source_ref, created_at, use_count \
-         FROM memory_items ORDER BY updated_at DESC LIMIT ?1".to_string()
+         FROM memory_items ORDER BY updated_at DESC LIMIT ?1"
+            .to_string()
     } else {
         "SELECT id, namespace, kind, language, text, source_ref, created_at, use_count \
-         FROM memory_items WHERE namespace = ?2 ORDER BY updated_at DESC LIMIT ?1".to_string()
+         FROM memory_items WHERE namespace = ?2 ORDER BY updated_at DESC LIMIT ?1"
+            .to_string()
     };
 
     let query_fn = |row: &rusqlite::Row<'_>| {
@@ -1147,14 +1677,22 @@ async fn memory_list(
     };
 
     let items: Vec<serde_json::Value> = if q.namespace.is_empty() {
-        db.prepare(&sql).ok()
-            .and_then(|mut s| s.query_map(rusqlite::params![q.limit as i64], query_fn).ok()
-                .map(|rows| rows.flatten().collect()))
+        db.prepare(&sql)
+            .ok()
+            .and_then(|mut s| {
+                s.query_map(rusqlite::params![q.limit as i64], query_fn)
+                    .ok()
+                    .map(|rows| rows.flatten().collect())
+            })
             .unwrap_or_default()
     } else {
-        db.prepare(&sql).ok()
-            .and_then(|mut s| s.query_map(rusqlite::params![q.limit as i64, q.namespace], query_fn).ok()
-                .map(|rows| rows.flatten().collect()))
+        db.prepare(&sql)
+            .ok()
+            .and_then(|mut s| {
+                s.query_map(rusqlite::params![q.limit as i64, q.namespace], query_fn)
+                    .ok()
+                    .map(|rows| rows.flatten().collect())
+            })
             .unwrap_or_default()
     };
 
@@ -1175,26 +1713,28 @@ async fn memory_search(
         Ok(hits) => {
             let items: Vec<serde_json::Value> = hits
                 .into_iter()
-                .map(|h| serde_json::json!({
-                    "id": h.item.id,
-                    "namespace": h.item.namespace,
-                    "kind": h.item.kind,
-                    "text": h.item.text,
-                    "score": h.score,
-                }))
+                .map(|h| {
+                    serde_json::json!({
+                        "id": h.item.id,
+                        "namespace": h.item.namespace,
+                        "kind": h.item.kind,
+                        "text": h.item.text,
+                        "score": h.score,
+                    })
+                })
                 .collect();
             (StatusCode::OK, Json(serde_json::json!({ "hits": items })))
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
-async fn memory_delete(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn memory_delete(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match state.memory.delete(&id) {
-        Ok(true)  => {
+        Ok(true) => {
             let db = state.db.lock().await;
             let _ = db.execute(
                 "INSERT INTO audit_entries (action, payload, model) VALUES ('memory_forget', ?1, '')",
@@ -1202,8 +1742,14 @@ async fn memory_delete(
             );
             (StatusCode::OK, Json(serde_json::json!({ "deleted": true })))
         }
-        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" }))),
-        Err(e)    => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not found" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -1216,21 +1762,29 @@ async fn mail_inbox(
     let Some(mail) = state.mail else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "Mail connector not accessible. Grant Full Disk Access in System Settings → Privacy & Security." })),
+            Json(
+                serde_json::json!({ "error": "Mail connector not accessible. Grant Full Disk Access in System Settings → Privacy & Security." }),
+            ),
         );
     };
 
     match tokio::task::spawn_blocking(move || mail.list_inbox(q.limit, q.unread)).await {
-        Ok(Ok(msgs)) => (StatusCode::OK, Json(serde_json::json!({ "messages": msgs }))),
-        Ok(Err(e))   => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
-        Err(e)       => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(Ok(msgs)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "messages": msgs })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
-async fn mail_message(
-    State(state): State<AppState>,
-    Path(rowid): Path<i64>,
-) -> impl IntoResponse {
+async fn mail_message(State(state): State<AppState>, Path(rowid): Path<i64>) -> impl IntoResponse {
     let Some(mail) = state.mail else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1240,9 +1794,24 @@ async fn mail_message(
 
     let mut msg = match tokio::task::spawn_blocking(move || mail.get_message(rowid)).await {
         Ok(Ok(Some(m))) => m,
-        Ok(Ok(None))    => return (StatusCode::NOT_FOUND,            Json(serde_json::json!({ "error": "message not found" }))),
-        Ok(Err(e))      => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
-        Err(e)          => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "message not found" })),
+            )
+        }
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
     };
 
     // emlx not locally cached → try AppleScript fallback (needs Automation → Mail)
@@ -1254,7 +1823,10 @@ async fn mail_message(
         }
     }
 
-    (StatusCode::OK, Json(serde_json::json!({ "message": msg, "pii": true })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "message": msg, "pii": true })),
+    )
 }
 
 // ── Phase 5E — Open mail in Mail.app ─────────────────────────────────────────
@@ -1269,7 +1841,8 @@ async fn mail_open(
     } else if let (Some(rowid), Some(ref mc)) = (req.rowid, &state.mail) {
         let mc2 = mc.clone();
         tokio::task::spawn_blocking(move || mc2.get_message(rowid))
-            .await.ok()
+            .await
+            .ok()
             .and_then(|r| r.ok())
             .flatten()
             .and_then(|m| m.message_id)
@@ -1277,13 +1850,13 @@ async fn mail_open(
         None
     };
 
-    match apple_mail_connector::open_message(
-        message_id.as_deref(),
-        &req.subject,
-        &req.sender,
-    ).await {
+    match apple_mail_connector::open_message(message_id.as_deref(), &req.subject, &req.sender).await
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "opened": true }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -1300,10 +1873,22 @@ async fn mail_message_attachments(
         );
     };
     match tokio::task::spawn_blocking(move || mail.get_message(rowid)).await {
-        Ok(Ok(Some(msg))) => (StatusCode::OK, Json(serde_json::json!({ "attachments": msg.attachments }))),
-        Ok(Ok(None))      => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "message not found" }))),
-        Ok(Err(e))        => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
-        Err(e)            => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(Ok(Some(msg))) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "attachments": msg.attachments })),
+        ),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "message not found" })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -1317,7 +1902,8 @@ async fn mail_message_attachment_bytes(
             Json(serde_json::json!({ "error": "Mail connector not accessible." })),
         );
     };
-    match tokio::task::spawn_blocking(move || mail.get_message_attachment_base64(rowid, idx)).await {
+    match tokio::task::spawn_blocking(move || mail.get_message_attachment_base64(rowid, idx)).await
+    {
         Ok(Ok((meta, b64))) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1328,8 +1914,14 @@ async fn mail_message_attachment_bytes(
                 "pii": true,
             })),
         ),
-        Ok(Err(e)) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() }))),
-        Err(e)     => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(Err(e)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -1348,10 +1940,16 @@ async fn upload_attachment(
 
     while let Ok(Some(field)) = multipart.next_field().await {
         if let Some(name) = field.name() {
-            if name != "file" { continue; }
+            if name != "file" {
+                continue;
+            }
         }
-        if let Some(fn_) = field.file_name() { filename = fn_.to_string(); }
-        if let Some(ct) = field.content_type() { mime = ct.to_string(); }
+        if let Some(fn_) = field.file_name() {
+            filename = fn_.to_string();
+        }
+        if let Some(ct) = field.content_type() {
+            mime = ct.to_string();
+        }
 
         match field.bytes().await {
             Ok(b) if b.len() <= MAX_ATTACHMENT_BYTES => {
@@ -1374,7 +1972,10 @@ async fn upload_attachment(
     }
 
     if file_bytes.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "no file field in multipart" })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "no file field in multipart" })),
+        );
     }
 
     // Compute SHA-256 for content-addressed storage
@@ -1385,7 +1986,9 @@ async fn upload_attachment(
     };
 
     // Derive file extension from filename / MIME
-    let ext = filename.rsplit('.').next()
+    let ext = filename
+        .rsplit('.')
+        .next()
         .filter(|e| e.len() <= 6 && e.chars().all(|c| c.is_alphanumeric()))
         .unwrap_or("bin");
     let stored_name = format!("{sha256}.{ext}");
@@ -1394,7 +1997,10 @@ async fn upload_attachment(
     // Write file (idempotent — same sha → same path, no overwrite needed)
     if !bytes_path.exists() {
         if let Err(e) = std::fs::write(&bytes_path, &file_bytes) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
         }
     }
 
@@ -1411,11 +2017,13 @@ async fn upload_attachment(
 
     let db = state.db.lock().await;
     // Dedup by sha256: reuse existing attachment id if already stored
-    let existing_id: Option<String> = db.query_row(
-        "SELECT id FROM attachments WHERE sha256 = ?1",
-        rusqlite::params![sha256],
-        |r| r.get(0),
-    ).ok();
+    let existing_id: Option<String> = db
+        .query_row(
+            "SELECT id FROM attachments WHERE sha256 = ?1",
+            rusqlite::params![sha256],
+            |r| r.get(0),
+        )
+        .ok();
 
     let att_id = if let Some(eid) = existing_id {
         eid
@@ -1434,14 +2042,17 @@ async fn upload_attachment(
         id
     };
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "attachment_id": att_id,
-        "filename": filename,
-        "mime": mime,
-        "kind": kind,
-        "size": size_bytes,
-        "sha256": sha256,
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "attachment_id": att_id,
+            "filename": filename,
+            "mime": mime,
+            "kind": kind,
+            "size": size_bytes,
+            "sha256": sha256,
+        })),
+    )
 }
 
 async fn get_attachment(
@@ -1465,24 +2076,33 @@ async fn get_attachment(
             // Return base64-encoded bytes for images; metadata + text for others
             if mime.starts_with("image/") {
                 if let Ok(bytes) = std::fs::read(&bytes_path) {
-                    return (StatusCode::OK, Json(serde_json::json!({
-                        "id": id,
-                        "filename": filename,
-                        "mime": mime,
-                        "size": size,
-                        "data_base64": B64.encode(&bytes),
-                    })));
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "id": id,
+                            "filename": filename,
+                            "mime": mime,
+                            "size": size,
+                            "data_base64": B64.encode(&bytes),
+                        })),
+                    );
                 }
             }
-            (StatusCode::OK, Json(serde_json::json!({
-                "id": id,
-                "filename": filename,
-                "mime": mime,
-                "size": size,
-                "extracted_text": extracted_text,
-            })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": id,
+                    "filename": filename,
+                    "mime": mime,
+                    "size": size,
+                    "extracted_text": extracted_text,
+                })),
+            )
         }
-        Err(_) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "attachment not found" }))),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "attachment not found" })),
+        ),
     }
 }
 
@@ -1495,14 +2115,22 @@ async fn notes_list(
     let Some(notes) = state.notes else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "Notes connector not accessible. Grant Full Disk Access in System Settings → Privacy & Security." })),
+            Json(
+                serde_json::json!({ "error": "Notes connector not accessible. Grant Full Disk Access in System Settings → Privacy & Security." }),
+            ),
         );
     };
 
     match tokio::task::spawn_blocking(move || notes.list_notes(q.limit)).await {
         Ok(Ok(items)) => (StatusCode::OK, Json(serde_json::json!({ "notes": items }))),
-        Ok(Err(e))    => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
-        Err(e)        => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -1519,15 +2147,18 @@ async fn notes_search(
 
     match tokio::task::spawn_blocking(move || notes.search_notes(&q.q, q.limit)).await {
         Ok(Ok(items)) => (StatusCode::OK, Json(serde_json::json!({ "notes": items }))),
-        Ok(Err(e))    => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
-        Err(e)        => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
-async fn notes_get(
-    State(state): State<AppState>,
-    Path(pk): Path<i64>,
-) -> impl IntoResponse {
+async fn notes_get(State(state): State<AppState>, Path(pk): Path<i64>) -> impl IntoResponse {
     let Some(notes) = state.notes.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1539,27 +2170,52 @@ async fn notes_get(
     let meta = match tokio::task::spawn_blocking({
         let notes = notes.clone();
         move || notes.get_note_metadata(pk)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(Some(n))) => n,
-        Ok(Ok(None))    => return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "note not found" }))),
-        Ok(Err(e))      => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
-        Err(e)          => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "note not found" })),
+            )
+        }
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
     };
 
     if meta.is_locked {
-        return (StatusCode::OK, Json(serde_json::json!({ "note": meta, "pii": true })));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "note": meta, "pii": true })),
+        );
     }
 
     // Fetch body via JXA
     let coredata_id = meta.coredata_id.clone();
     let body = notes.get_note_body(&coredata_id).await.ok().flatten();
-    let lang = body.as_deref().and_then(apple_notes_connector::detect_language);
+    let lang = body
+        .as_deref()
+        .and_then(apple_notes_connector::detect_language);
 
     let mut note = meta;
     note.body = body;
     note.language = lang;
 
-    (StatusCode::OK, Json(serde_json::json!({ "note": note, "pii": true })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "note": note, "pii": true })),
+    )
 }
 
 // ── Approval helper ──────────────────────────────────────────────────────────
@@ -1653,7 +2309,8 @@ async fn mail_sync_inner(
         let db_lock = db.lock().await;
         let result: rusqlite::Result<i64> = db_lock.query_row(
             "SELECT last_sync_at FROM connectors WHERE kind = 'apple_mail'",
-            [], |r| r.get(0),
+            [],
+            |r| r.get(0),
         );
         match result {
             Ok(ts) => (ts, false),
@@ -1690,12 +2347,14 @@ async fn mail_sync_inner(
                 ],
             ).ok();
         }
-        db_lock.execute(
-            "INSERT INTO connectors (kind, config_json, enabled, last_sync_at)
+        db_lock
+            .execute(
+                "INSERT INTO connectors (kind, config_json, enabled, last_sync_at)
              VALUES ('apple_mail','{}',1,?1)
              ON CONFLICT(kind) DO UPDATE SET last_sync_at = ?1",
-            rusqlite::params![now],
-        ).ok();
+                rusqlite::params![now],
+            )
+            .ok();
     }
 
     // Post-sync: embed new mail subjects for semantic search (best-effort, background)
@@ -1717,23 +2376,32 @@ async fn mail_sync_inner(
 
 async fn mail_sync(State(state): State<AppState>) -> impl IntoResponse {
     let Some(mail) = state.mail.clone() else {
-        return (StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "Mail connector not accessible." })));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Mail connector not accessible." })),
+        );
     };
 
     match mail_sync_inner(state.db.clone(), mail, state.memory.clone()).await {
         Ok((count, now)) => {
             let total: i64 = {
                 let db = state.db.lock().await;
-                db.query_row("SELECT COUNT(*) FROM mail_cache", [], |r| r.get(0)).unwrap_or(0)
+                db.query_row("SELECT COUNT(*) FROM mail_cache", [], |r| r.get(0))
+                    .unwrap_or(0)
             };
-            (StatusCode::OK, Json(serde_json::json!({
-                "synced": count,
-                "total_cached": total,
-                "last_sync_at": now
-            })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "synced": count,
+                    "total_cached": total,
+                    "last_sync_at": now
+                })),
+            )
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        ),
     }
 }
 
@@ -1751,8 +2419,36 @@ fn parse_date_to_range(iso: &str) -> Option<(i64, i64)> {
     use chrono::{NaiveDate, TimeZone, Utc};
     let d = NaiveDate::parse_from_str(iso, "%Y-%m-%d").ok()?;
     let start = Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?).timestamp();
-    let end   = Utc.from_utc_datetime(&d.and_hms_opt(23, 59, 59)?).timestamp() + 1;
+    let end = Utc
+        .from_utc_datetime(&d.and_hms_opt(23, 59, 59)?)
+        .timestamp()
+        + 1;
     Some((start, end))
+}
+
+fn push_search_term(terms: &mut Vec<String>, term: Option<&str>) {
+    let Some(term) = term.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if !terms.iter().any(|existing| existing.eq_ignore_ascii_case(term)) {
+        terms.push(term.to_string());
+    }
+}
+
+async fn search_mail_messages(
+    mail: &Option<MailConnector>,
+    filter: MailSearchFilter,
+) -> Vec<apple_mail_connector::MailMessage> {
+    if let Some(ref mc) = *mail {
+        let mc = mc.clone();
+        tokio::task::spawn_blocking(move || mc.search_messages(&filter))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
+    } else {
+        vec![]
+    }
 }
 
 /// Helper: fetch recent messages, merging mail_cache with live Envelope Index.
@@ -1762,9 +2458,10 @@ async fn fetch_recent_mails(
     mail: &Option<MailConnector>,
     limit: usize,
 ) -> Vec<apple_mail_connector::MailMessage> {
-    let cached: Vec<apple_mail_connector::MailMessage> = {
-        let db_lock = db.lock().await;
-        db_lock.prepare(
+    let cached: Vec<apple_mail_connector::MailMessage> =
+        {
+            let db_lock = db.lock().await;
+            db_lock.prepare(
             "SELECT rowid, subject, sender, sender_display, received_at, is_read, mailbox_url \
              FROM mail_cache ORDER BY received_at DESC LIMIT ?1"
         )
@@ -1784,13 +2481,16 @@ async fn fetch_recent_mails(
             })
         }).map(|rows| rows.flatten().collect()))
         .unwrap_or_default()
-    };
+        };
 
     // Always also query live Envelope Index to catch emails received since last sync.
     let live: Vec<apple_mail_connector::MailMessage> = if let Some(ref mc) = *mail {
         let mc = mc.clone();
         tokio::task::spawn_blocking(move || mc.list_inbox(limit, false))
-            .await.ok().and_then(|r| r.ok()).unwrap_or_default()
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or_default()
     } else {
         vec![]
     };
@@ -1826,9 +2526,14 @@ async fn enrich_message(
     let full = {
         let mc2 = mc_clone.clone();
         tokio::task::spawn_blocking(move || mc2.get_message(rowid))
-            .await.ok().and_then(|r| r.ok()).flatten()
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten()
     };
-    let Some(mut full_msg) = full else { return vec![] };
+    let Some(mut full_msg) = full else {
+        return vec![];
+    };
     let subject_for_fallback = full_msg.subject.clone();
 
     // Format datetime as "DD.MM.YYYY HH:MM" in the system local timezone.
@@ -1849,7 +2554,8 @@ async fn enrich_message(
     let komu = if let Some(addr) = full_msg.recipient.as_deref() {
         addr
     } else {
-        komu_fallback = full_msg.mailbox_url
+        komu_fallback = full_msg
+            .mailbox_url
             .split("://")
             .nth(1)
             .and_then(|s| s.split('/').next())
@@ -1863,7 +2569,8 @@ async fn enrich_message(
     lines.push(
         "⚠️ SYSTÉMOVÁ INŠTRUKCIA: Nasledujúci email je skutočný, doslovný obsah zo schránky. \
          Zobraz hlavičku a telo PRESNE ako je — nič nevymýšľaj, nedoplňaj, nenahrádzaj prázdne \
-         polia vlastnými odhadmi, nemiešaj s inými rozhovormi ani kontextami.".to_string()
+         polia vlastnými odhadmi, nemiešaj s inými rozhovormi ani kontextami."
+            .to_string(),
     );
 
     // Use markdown hard line breaks (two trailing spaces) so each field renders on its own line.
@@ -1882,24 +2589,31 @@ async fn enrich_message(
     if wants_attachment && !full_msg.attachments.is_empty() {
         // Extract all non-image attachments
         for att_meta in &full_msg.attachments {
-            if att_meta.mimetype.starts_with("image/") { continue; }
+            if att_meta.mimetype.starts_with("image/") {
+                continue;
+            }
             let mc2 = mc_clone.clone();
             let part_idx = att_meta.part_index;
             let filename = att_meta.filename.clone();
             let mime = att_meta.mimetype.clone();
-            let bytes_result = tokio::task::spawn_blocking(move || {
-                mc2.get_message_attachment(rowid, part_idx)
-            }).await.ok().and_then(|r| r.ok());
+            let bytes_result =
+                tokio::task::spawn_blocking(move || mc2.get_message_attachment(rowid, part_idx))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok());
 
             if let Some((_, bytes)) = bytes_result {
                 let tmp = std::env::temp_dir().join(format!("bagent_mail_{}", &filename));
                 if std::fs::write(&tmp, &bytes).is_ok() {
                     let extracted = extract_attachment(&tmp, &mime)
-                        .ok().and_then(|r| r.extracted_text);
+                        .ok()
+                        .and_then(|r| r.extracted_text);
                     if let Some(text) = extracted {
                         lines.push(format!("\n\n**Obsah prílohy ({filename}):**\n\n{text}"));
                     } else {
-                        lines.push(format!("\n\n**Príloha:** {filename} (obsah nedostupný na analýzu)"));
+                        lines.push(format!(
+                            "\n\n**Príloha:** {filename} (obsah nedostupný na analýzu)"
+                        ));
                     }
                     att_files.push((filename, tmp));
                 }
@@ -1910,7 +2624,9 @@ async fn enrich_message(
         if let Some(ref body) = full_msg.body {
             let truncated = if body.len() > 2000 {
                 format!("{}…[skrátené]", &body[..body.floor_char_boundary(2000)])
-            } else { body.clone() };
+            } else {
+                body.clone()
+            };
             lines.push(format!("\n\n**Obsah:**\n\n{truncated}"));
         } else {
             lines.push("\n\n**Obsah:** TELO EMAILU SA NEPODARILO NAČÍTAŤ. Toto nie je šablóna — nič nevymýšľaj ani nedoplňaj.".to_string());
@@ -1941,7 +2657,11 @@ fn format_history_snippet(history: &[Message], max_turns: usize) -> String {
         .into_iter()
         .rev()
         .map(|m| {
-            let label = if m.role == "user" { "[User]" } else { "[Assistant]" };
+            let label = if m.role == "user" {
+                "[User]"
+            } else {
+                "[Assistant]"
+            };
             let body: String = m.content.chars().take(MAX_CHARS).collect();
             format!("{}: {}", label, body)
         })
@@ -1960,7 +2680,11 @@ async fn fetch_tool_context(
     ollama: OllamaClient,
     model: String,
     memory: Arc<MemoryStore>,
-) -> (Option<String>, Vec<(String, std::path::PathBuf)>, Option<MailRef>) {
+) -> (
+    Option<String>,
+    Vec<(String, std::path::PathBuf)>,
+    Option<MailRef>,
+) {
     let low = message.to_lowercase();
 
     // Cheap keyword gate — only run the LLM classifier when the turn looks mail-related.
@@ -1987,7 +2711,8 @@ async fn fetch_tool_context(
 
     let wants_notes = allowed_tools.contains("notes_list")
         && ["poznámk", "note", "zápis", "zapisal", "napísal"]
-            .iter().any(|kw| low.contains(kw));
+            .iter()
+            .any(|kw| low.contains(kw));
 
     let history_snippet = {
         let base = format_history_snippet(history, 4);
@@ -2029,15 +2754,26 @@ async fn fetch_tool_context(
             "list_recent" => {
                 let msgs = fetch_recent_mails(&db, &mail, 10).await;
                 if !msgs.is_empty() {
-                    let lines: Vec<String> = msgs.iter().map(|m| {
-                        let from = m.sender_display.as_deref().unwrap_or(&m.sender);
-                        let status = if m.is_read { "✓" } else { "●" };
-                        format!("  {status} [{}] Od: {} | Predmet: {}",
-                            relative_date(m.received_at), from, m.subject)
-                    }).collect();
-                    parts.push(format!("Posledné emaily (Apple Mail):\n{}", lines.join("\n")));
+                    let lines: Vec<String> = msgs
+                        .iter()
+                        .map(|m| {
+                            let from = m.sender_display.as_deref().unwrap_or(&m.sender);
+                            let status = if m.is_read { "✓" } else { "●" };
+                            format!(
+                                "  {status} [{}] Od: {} | Predmet: {}",
+                                relative_date(m.received_at),
+                                from,
+                                m.subject
+                            )
+                        })
+                        .collect();
+                    parts.push(format!(
+                        "Posledné emaily (Apple Mail):\n{}",
+                        lines.join("\n")
+                    ));
                 } else {
-                    parts.push("Posledné emaily (Apple Mail): žiadne správy nenájdené.".to_string());
+                    parts
+                        .push("Posledné emaily (Apple Mail): žiadne správy nenájdené.".to_string());
                 }
             }
 
@@ -2045,7 +2781,8 @@ async fn fetch_tool_context(
                 let is_attachment = intent.action == "read_attachment" || intent.wants_attachment;
                 let wants_open = intent.action == "open"
                     || ["otvor", "otvoriť", "open it", "show me", "ukáž mi"]
-                        .iter().any(|kw| low.contains(kw));
+                        .iter()
+                        .any(|kw| low.contains(kw));
 
                 // Short-circuit: "má tento mail prílohy?" with no new search filters
                 // → use the last found mail's rowid directly, skip re-search.
@@ -2055,13 +2792,20 @@ async fn fetch_tool_context(
                     && intent.keywords.is_empty();
                 if is_attachment && no_search_filters {
                     if let Some(ref lmr) = last_mail_ref {
-                        tracing::info!("attachment short-circuit via last_mail_ref rowid={}", lmr.rowid);
+                        tracing::info!(
+                            "attachment short-circuit via last_mail_ref rowid={}",
+                            lmr.rowid
+                        );
                         if let Some(ref mc) = mail {
                             let mc2 = mc.clone();
                             let rowid = lmr.rowid;
                             // get_message populates attachments from emlx parsing
-                            let full_msg = tokio::task::spawn_blocking(move || mc2.get_message(rowid))
-                                .await.ok().and_then(|r| r.ok()).flatten();
+                            let full_msg =
+                                tokio::task::spawn_blocking(move || mc2.get_message(rowid))
+                                    .await
+                                    .ok()
+                                    .and_then(|r| r.ok())
+                                    .flatten();
 
                             let attach_list = full_msg
                                 .as_ref()
@@ -2074,12 +2818,17 @@ async fn fetch_tool_context(
                                     lmr.subject, lmr.sender
                                 ));
                             } else {
-                                let att_lines: Vec<String> = attach_list.iter().map(|a| {
-                                    format!("  • {} ({}, {} B)", a.filename, a.mimetype, a.size)
-                                }).collect();
+                                let att_lines: Vec<String> = attach_list
+                                    .iter()
+                                    .map(|a| {
+                                        format!("  • {} ({}, {} B)", a.filename, a.mimetype, a.size)
+                                    })
+                                    .collect();
                                 parts.push(format!(
                                     "Prílohy emailu \"{}\" (od: {}):\n{}",
-                                    lmr.subject, lmr.sender, att_lines.join("\n")
+                                    lmr.subject,
+                                    lmr.sender,
+                                    att_lines.join("\n")
                                 ));
                                 // Stage PDF attachment paths for chips
                                 for (idx, a) in attach_list.iter().enumerate() {
@@ -2087,11 +2836,16 @@ async fn fetch_tool_context(
                                         if let Some(ref mc3) = mail {
                                             let mc3 = mc3.clone();
                                             let rid = lmr.rowid;
-                                            if let Ok(Some((_, bytes))) = tokio::task::spawn_blocking(move || {
-                                                mc3.get_message_attachment(rid, idx).ok()
-                                            }).await {
-                                                let tmp = std::env::temp_dir()
-                                                    .join(format!("bagent_att_{}_{}.pdf", rid, idx));
+                                            if let Ok(Some((_, bytes))) =
+                                                tokio::task::spawn_blocking(move || {
+                                                    mc3.get_message_attachment(rid, idx).ok()
+                                                })
+                                                .await
+                                            {
+                                                let tmp = std::env::temp_dir().join(format!(
+                                                    "bagent_att_{}_{}.pdf",
+                                                    rid, idx
+                                                ));
                                                 if std::fs::write(&tmp, &bytes).is_ok() {
                                                     pdf_paths.push((a.filename.clone(), tmp));
                                                 }
@@ -2115,159 +2869,234 @@ async fn fetch_tool_context(
                 // Only run the full search if we didn't short-circuit above
                 let already_handled = is_attachment && no_search_filters && last_mail_ref.is_some();
                 if !already_handled {
+                    let (date_from, date_to) = intent
+                        .date
+                        .as_deref()
+                        .and_then(parse_date_to_range)
+                        .map(|(s, e)| (Some(s), Some(e)))
+                        .unwrap_or((None, None));
 
-                let (date_from, date_to) = intent.date.as_deref()
-                    .and_then(parse_date_to_range)
-                    .map(|(s, e)| (Some(s), Some(e)))
-                    .unwrap_or((None, None));
+                    // When user says "recent"/"posledné"/"nové" but no explicit date, add a
+                    // 30-day window so we don't scan the entire inbox history.
+                    let date_from = date_from.or_else(|| {
+                        let has_recent_word =
+                            ["recent", "posledn", "nové", "najnov", "latest", "new"]
+                                .iter()
+                                .any(|kw| low.contains(kw));
+                        if has_recent_word && intent.date.is_none() {
+                            Some(chrono::Utc::now().timestamp() - 30 * 24 * 3600)
+                        } else {
+                            None
+                        }
+                    });
 
-                // When user says "recent"/"posledné"/"nové" but no explicit date, add a
-                // 30-day window so we don't scan the entire inbox history.
-                let date_from = date_from.or_else(|| {
-                    let has_recent_word = ["recent", "posledn", "nové", "najnov", "latest", "new"]
-                        .iter().any(|kw| low.contains(kw));
-                    if has_recent_word && intent.date.is_none() {
-                        Some(chrono::Utc::now().timestamp() - 30 * 24 * 3600)
-                    } else {
-                        None
-                    }
-                });
+                    // Stop-words that should never be used as SQL search filters.
+                    let mail_stopwords = [
+                        "recent", "mail", "email", "new", "latest", "inbox", "nové", "posledn",
+                        "správ", "schránk",
+                    ];
+                    let meaningful_keywords: Vec<String> = intent
+                        .keywords
+                        .iter()
+                        .filter(|kw| {
+                            !mail_stopwords
+                                .iter()
+                                .any(|sw| kw.to_lowercase().contains(sw))
+                        })
+                        .cloned()
+                        .collect();
 
-                // Stop-words that should never be used as SQL search filters.
-                let mail_stopwords = ["recent", "mail", "email", "new", "latest", "inbox",
-                                      "nové", "posledn", "správ", "schránk"];
-                let meaningful_keywords: Vec<String> = intent.keywords.iter()
-                    .filter(|kw| !mail_stopwords.iter().any(|sw| kw.to_lowercase().contains(sw)))
-                    .cloned()
-                    .collect();
+                    // If LLM put the search term in keywords instead of sender/subject,
+                    // promote the first meaningful keyword to sender as a fallback.
+                    let effective_sender = intent.sender.clone().or_else(|| {
+                        if intent.subject.is_none() && !meaningful_keywords.is_empty() {
+                            Some(meaningful_keywords[0].clone())
+                        } else {
+                            None
+                        }
+                    });
 
-                // If LLM put the search term in keywords instead of sender/subject,
-                // promote the first meaningful keyword to sender as a fallback.
-                let effective_sender = intent.sender.clone().or_else(|| {
-                    if intent.subject.is_none() && !meaningful_keywords.is_empty() {
-                        Some(meaningful_keywords[0].clone())
-                    } else {
-                        None
-                    }
-                });
+                    // Only use keywords as SQL filters when sender AND subject are both known
+                    // (avoids false-positive AND clauses filtering out valid results).
+                    let filter_keywords: Vec<String> =
+                        if effective_sender.is_some() || intent.subject.is_some() {
+                            vec![]
+                        } else {
+                            meaningful_keywords.clone()
+                        };
 
-                // Only use keywords as SQL filters when sender AND subject are both known
-                // (avoids false-positive AND clauses filtering out valid results).
-                let filter_keywords: Vec<String> = if effective_sender.is_some() || intent.subject.is_some() {
-                    vec![]
-                } else {
-                    meaningful_keywords
-                };
-
-                let filter = MailSearchFilter {
-                    sender: effective_sender,
-                    subject: intent.subject.clone(),
-                    date_from,
-                    date_to,
-                    limit: 10,
-                    keywords: filter_keywords,
-                };
-
-                let had_date_filter = filter.date_from.is_some() || filter.date_to.is_some();
-                let filter_sender_fb = filter.sender.clone();
-                let filter_subject_fb = filter.subject.clone();
-                let filter_keywords_fb = filter.keywords.clone();
-                let msgs: Vec<apple_mail_connector::MailMessage> = if let Some(ref mc) = mail {
-                    let mc = mc.clone();
-                    tokio::task::spawn_blocking(move || mc.search_messages(&filter))
-                        .await.ok().and_then(|r| r.ok()).unwrap_or_default()
-                } else {
-                    vec![]
-                };
-
-                // Fallback: if no results and we had a date filter, retry without it.
-                let msgs = if msgs.is_empty() && had_date_filter {
-                    let wider = MailSearchFilter {
-                        sender: filter_sender_fb,
-                        subject: filter_subject_fb,
-                        date_from: None,
-                        date_to: None,
+                    let filter = MailSearchFilter {
+                        sender: effective_sender,
+                        subject: intent.subject.clone(),
+                        date_from,
+                        date_to,
                         limit: 10,
-                        keywords: filter_keywords_fb,
+                        keywords: filter_keywords,
                     };
-                    if let Some(ref mc) = mail {
-                        let mc = mc.clone();
-                        tokio::task::spawn_blocking(move || mc.search_messages(&wider))
-                            .await.ok().and_then(|r| r.ok()).unwrap_or_default()
-                    } else {
-                        vec![]
+
+                    let had_date_filter = filter.date_from.is_some() || filter.date_to.is_some();
+                    let mut broad_terms = Vec::new();
+                    push_search_term(&mut broad_terms, filter.sender.as_deref());
+                    push_search_term(&mut broad_terms, filter.subject.as_deref());
+                    for kw in &meaningful_keywords {
+                        push_search_term(&mut broad_terms, Some(kw));
                     }
-                } else {
-                    msgs
-                };
 
-                if msgs.is_empty() {
-                    let mut why = Vec::new();
-                    if let Some(ref s) = intent.sender  { why.push(format!("odosielateľ: {s}")); }
-                    if let Some(ref s) = intent.subject { why.push(format!("predmet: {s}")); }
-                    if let Some(ref d) = intent.date    { why.push(format!("dátum: {d}")); }
-                    parts.push(format!(
-                        "Vyhľadávanie v Apple Mail ({}) — žiadny email nenájdený. \
+                    let mut msgs = search_mail_messages(&mail, filter.clone()).await;
+
+                    // Fallback 1: retry ambiguous company/person terms across sender and subject.
+                    // Example: "moneys3" may be classified as sender, while Apple Mail stores
+                    // "Money S3" in display name or subject.
+                    if msgs.is_empty() && !broad_terms.is_empty() {
+                        let broad = MailSearchFilter {
+                            sender: None,
+                            subject: None,
+                            date_from: filter.date_from,
+                            date_to: filter.date_to,
+                            limit: 10,
+                            keywords: broad_terms.clone(),
+                        };
+                        msgs = search_mail_messages(&mail, broad).await;
+                    }
+
+                    // Fallback 2: if no results and we had a date filter, retry without it.
+                    if msgs.is_empty() && had_date_filter {
+                        let wider = MailSearchFilter {
+                            sender: filter.sender.clone(),
+                            subject: filter.subject.clone(),
+                            date_from: None,
+                            date_to: None,
+                            limit: 10,
+                            keywords: filter.keywords.clone(),
+                        };
+                        msgs = search_mail_messages(&mail, wider).await;
+                    }
+
+                    // Fallback 3: combine both relaxations when each one alone failed.
+                    if msgs.is_empty() && had_date_filter && !broad_terms.is_empty() {
+                        let wider_broad = MailSearchFilter {
+                            sender: None,
+                            subject: None,
+                            date_from: None,
+                            date_to: None,
+                            limit: 10,
+                            keywords: broad_terms,
+                        };
+                        msgs = search_mail_messages(&mail, wider_broad).await;
+                    }
+
+                    let msgs = msgs;
+
+                    if msgs.is_empty() {
+                        let mut why = Vec::new();
+                        if let Some(ref s) = intent.sender {
+                            why.push(format!("odosielateľ: {s}"));
+                        }
+                        if let Some(ref s) = intent.subject {
+                            why.push(format!("predmet: {s}"));
+                        }
+                        if let Some(ref d) = intent.date {
+                            why.push(format!("dátum: {d}"));
+                        }
+                        parts.push(format!(
+                            "Vyhľadávanie v Apple Mail ({}) — žiadny email nenájdený. \
                          Email neexistuje v lokálnej schránke alebo nebol stiahnutý cez IMAP.",
-                        if why.is_empty() { "bez filtrov".to_string() } else { why.join(", ") }
-                    ));
-                } else {
-                    let mut lines: Vec<String> = msgs.iter().map(|m| {
-                        let from = m.sender_display.as_deref().unwrap_or(&m.sender);
-                        let status = if m.is_read { "✓" } else { "●" };
-                        format!("  {status} [{}] Od: {} <{}> | Predmet: {}",
-                            relative_date(m.received_at), from, m.sender, m.subject)
-                    }).collect();
+                            if why.is_empty() {
+                                "bez filtrov".to_string()
+                            } else {
+                                why.join(", ")
+                            }
+                        ));
+                    } else {
+                        let mut lines: Vec<String> = msgs
+                            .iter()
+                            .map(|m| {
+                                let from = m.sender_display.as_deref().unwrap_or(&m.sender);
+                                let status = if m.is_read { "✓" } else { "●" };
+                                format!(
+                                    "  {status} [{}] Od: {} <{}> | Predmet: {}",
+                                    relative_date(m.received_at),
+                                    from,
+                                    m.sender,
+                                    m.subject
+                                )
+                            })
+                            .collect();
 
-                    // Find best match: prefer message whose body contains a keyword.
-                    let mut best_rowid = msgs[0].rowid;
-                    if !intent.keywords.is_empty() {
-                        'outer: for msg_item in &msgs {
-                            if let Some(ref mc) = mail {
-                                let mc2 = mc.clone();
-                                let rid = msg_item.rowid;
-                                if let Some(full) = tokio::task::spawn_blocking(move || mc2.get_message(rid))
-                                    .await.ok().and_then(|r| r.ok()).flatten()
-                                {
-                                    if let Some(ref body) = full.body {
-                                        let body_low = body.to_lowercase();
-                                        if intent.keywords.iter().any(|kw| body_low.contains(kw.as_str())) {
-                                            best_rowid = msg_item.rowid;
-                                            break 'outer;
+                        // Find best match: prefer message whose body contains a keyword.
+                        let mut best_rowid = msgs[0].rowid;
+                        if !intent.keywords.is_empty() {
+                            'outer: for msg_item in &msgs {
+                                if let Some(ref mc) = mail {
+                                    let mc2 = mc.clone();
+                                    let rid = msg_item.rowid;
+                                    if let Some(full) =
+                                        tokio::task::spawn_blocking(move || mc2.get_message(rid))
+                                            .await
+                                            .ok()
+                                            .and_then(|r| r.ok())
+                                            .flatten()
+                                    {
+                                        if let Some(ref body) = full.body {
+                                            let body_low = body.to_lowercase();
+                                            if intent
+                                                .keywords
+                                                .iter()
+                                                .any(|kw| body_low.contains(kw.as_str()))
+                                            {
+                                                best_rowid = msg_item.rowid;
+                                                break 'outer;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+
+                        let found =
+                            enrich_message(best_rowid, &mail, is_attachment, &mut lines).await;
+                        pdf_paths.extend(found);
+
+                        let best_msg = msgs
+                            .iter()
+                            .find(|m| m.rowid == best_rowid)
+                            .unwrap_or(&msgs[0]);
+                        found_mail_ref = Some(MailRef {
+                            rowid: best_rowid,
+                            message_id: None,
+                            subject: best_msg.subject.clone(),
+                            sender: best_msg.sender.clone(),
+                            auto_open: wants_open,
+                        });
+
+                        parts.push(format!(
+                            "Nájdené emaily (Apple Mail):\n{}",
+                            lines.join("\n")
+                        ));
                     }
-
-                    let found = enrich_message(best_rowid, &mail, is_attachment, &mut lines).await;
-                    pdf_paths.extend(found);
-
-                    let best_msg = msgs.iter().find(|m| m.rowid == best_rowid).unwrap_or(&msgs[0]);
-                    found_mail_ref = Some(MailRef {
-                        rowid: best_rowid,
-                        message_id: None,
-                        subject: best_msg.subject.clone(),
-                        sender: best_msg.sender.clone(),
-                        auto_open: wants_open,
-                    });
-
-                    parts.push(format!("Nájdené emaily (Apple Mail):\n{}", lines.join("\n")));
-                }
                 } // end if !already_handled
             }
 
             _ => {
                 let msgs = fetch_recent_mails(&db, &mail, 10).await;
                 if !msgs.is_empty() {
-                    let lines: Vec<String> = msgs.iter().map(|m| {
-                        let from = m.sender_display.as_deref().unwrap_or(&m.sender);
-                        let status = if m.is_read { "✓" } else { "●" };
-                        format!("  {status} [{}] Od: {} | Predmet: {}",
-                            relative_date(m.received_at), from, m.subject)
-                    }).collect();
-                    parts.push(format!("Posledné emaily (Apple Mail):\n{}", lines.join("\n")));
+                    let lines: Vec<String> = msgs
+                        .iter()
+                        .map(|m| {
+                            let from = m.sender_display.as_deref().unwrap_or(&m.sender);
+                            let status = if m.is_read { "✓" } else { "●" };
+                            format!(
+                                "  {status} [{}] Od: {} | Predmet: {}",
+                                relative_date(m.received_at),
+                                from,
+                                m.subject
+                            )
+                        })
+                        .collect();
+                    parts.push(format!(
+                        "Posledné emaily (Apple Mail):\n{}",
+                        lines.join("\n")
+                    ));
                 }
             }
         }
@@ -2279,12 +3108,18 @@ async fn fetch_tool_context(
             let nc = n.clone();
             if let Ok(Ok(items)) = tokio::task::spawn_blocking(move || nc.list_notes(5)).await {
                 if !items.is_empty() {
-                    let lines: Vec<String> = items.iter().map(|note| {
-                        let folder = note.folder.as_deref().unwrap_or("Notes");
-                        let snip = note.snippet.as_deref().unwrap_or("");
-                        format!("  [{}] {} — {}", folder, note.title, snip)
-                    }).collect();
-                    parts.push(format!("Posledné poznámky (Apple Notes):\n{}", lines.join("\n")));
+                    let lines: Vec<String> = items
+                        .iter()
+                        .map(|note| {
+                            let folder = note.folder.as_deref().unwrap_or("Notes");
+                            let snip = note.snippet.as_deref().unwrap_or("");
+                            format!("  [{}] {} — {}", folder, note.title, snip)
+                        })
+                        .collect();
+                    parts.push(format!(
+                        "Posledné poznámky (Apple Notes):\n{}",
+                        lines.join("\n")
+                    ));
                 }
             }
         }
@@ -2293,13 +3128,23 @@ async fn fetch_tool_context(
     // ── AeroSpace window management ───────────────────────────────────────────
     // Cheap keyword gate — only invoke the classifier when the turn looks
     // like a window/workspace management request.
-    let looks_like_window = ["plochu", "ploch", "workspace", "prepni", "presuň",
-                             "presun", "zameraj", "otvor na ploch"]
-        .iter().any(|kw| low.contains(kw));
+    let looks_like_window = [
+        "plochu",
+        "ploch",
+        "workspace",
+        "prepni",
+        "presuň",
+        "presun",
+        "zameraj",
+        "otvor na ploch",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw));
 
     if looks_like_window {
         if let Ok(intent) = WindowIntentClassifier::new(ollama, model)
-            .classify(message, &history_snippet).await
+            .classify(message, &history_snippet)
+            .await
         {
             tracing::debug!("window_intent: {:?}", intent);
             if intent.action != "none" {
@@ -2334,7 +3179,8 @@ async fn find_aerospace_binary() -> Option<std::path::PathBuf> {
     // Try $PATH via `which`
     if let Ok(out) = tokio::process::Command::new("which")
         .arg("aerospace")
-        .output().await
+        .output()
+        .await
     {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -2344,16 +3190,20 @@ async fn find_aerospace_binary() -> Option<std::path::PathBuf> {
         }
     }
     // Bundled fallback
-    let bundled = std::path::PathBuf::from(
-        "/Applications/AeroSpace.app/Contents/Resources/aerospace"
-    );
-    if bundled.exists() { Some(bundled) } else { None }
+    let bundled =
+        std::path::PathBuf::from("/Applications/AeroSpace.app/Contents/Resources/aerospace");
+    if bundled.exists() {
+        Some(bundled)
+    } else {
+        None
+    }
 }
 
 /// Run an `aerospace` subcommand. Returns `Ok(stdout)` on success,
 /// `Err` on binary-not-found or non-zero exit (caller logs and silently degrades).
 async fn run_aerospace(args: &[&str]) -> anyhow::Result<String> {
-    let bin = find_aerospace_binary().await
+    let bin = find_aerospace_binary()
+        .await
         .ok_or_else(|| anyhow::anyhow!("aerospace binary not found"))?;
     let out = tokio::process::Command::new(&bin)
         .args(args)
@@ -2374,8 +3224,11 @@ async fn run_aerospace_intent(intent: &bagent_agent::WindowIntent) -> anyhow::Re
         "focus_workspace" => {
             if let Some(ref ws) = intent.workspace {
                 match run_aerospace(&["workspace", ws]).await {
-                    Ok(_)  => return Ok(format!("Prepnuté na plochu {ws}.")),
-                    Err(e) => { tracing::warn!("aerospace focus_workspace: {e}"); return Ok(String::new()); }
+                    Ok(_) => return Ok(format!("Prepnuté na plochu {ws}.")),
+                    Err(e) => {
+                        tracing::warn!("aerospace focus_workspace: {e}");
+                        return Ok(String::new());
+                    }
                 }
             }
         }
@@ -2385,7 +3238,8 @@ async fn run_aerospace_intent(intent: &bagent_agent::WindowIntent) -> anyhow::Re
             // 1. Launch (or focus) the application
             let _ = tokio::process::Command::new("open")
                 .args(["-a", app])
-                .output().await;
+                .output()
+                .await;
 
             if let Some(ref ws) = intent.workspace {
                 // 2. Poll until the window appears, then move it
@@ -2396,21 +3250,36 @@ async fn run_aerospace_intent(intent: &bagent_agent::WindowIntent) -> anyhow::Re
                     for _ in 0..30 {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         let Ok(list) = run_aerospace(&[
-                            "list-windows", "--all",
-                            "--app-bundle-id", &bundle_id,
-                            "--format", "%{window-id}",
-                        ]).await else { continue };
+                            "list-windows",
+                            "--all",
+                            "--app-bundle-id",
+                            &bundle_id,
+                            "--format",
+                            "%{window-id}",
+                        ])
+                        .await
+                        else {
+                            continue;
+                        };
                         let wid = list.lines().next().unwrap_or("").trim().to_string();
-                        if wid.is_empty() { continue; }
+                        if wid.is_empty() {
+                            continue;
+                        }
                         // Try with --window-id first (AeroSpace 0.15+), fall back to focus+move
                         let moved = run_aerospace(&[
-                            "move-node-to-workspace", "--window-id", &wid, &ws_str,
-                        ]).await;
+                            "move-node-to-workspace",
+                            "--window-id",
+                            &wid,
+                            &ws_str,
+                        ])
+                        .await;
                         if moved.is_err() {
                             let _ = run_aerospace(&["focus", "--window-id", &wid]).await;
                             let _ = run_aerospace(&["move-node-to-workspace", &ws_str]).await;
                         }
-                        tracing::info!("aerospace: moved {app_str} (wid={wid}) to workspace {ws_str}");
+                        tracing::info!(
+                            "aerospace: moved {app_str} (wid={wid}) to workspace {ws_str}"
+                        );
                         break;
                     }
                 });
@@ -2422,21 +3291,25 @@ async fn run_aerospace_intent(intent: &bagent_agent::WindowIntent) -> anyhow::Re
 
         "move_app" => {
             let app = intent.app.as_deref().unwrap_or("Mail");
-            let ws  = intent.workspace.as_deref().unwrap_or("1");
+            let ws = intent.workspace.as_deref().unwrap_or("1");
             let bundle_id = app_to_bundle_id(app);
             let Ok(list) = run_aerospace(&[
-                "list-windows", "--all",
-                "--app-bundle-id", &bundle_id,
-                "--format", "%{window-id}",
-            ]).await else {
+                "list-windows",
+                "--all",
+                "--app-bundle-id",
+                &bundle_id,
+                "--format",
+                "%{window-id}",
+            ])
+            .await
+            else {
                 tracing::warn!("aerospace move_app: could not list windows");
                 return Ok(String::new());
             };
             let wid = list.lines().next().unwrap_or("").trim().to_string();
             if !wid.is_empty() {
-                let moved = run_aerospace(&[
-                    "move-node-to-workspace", "--window-id", &wid, ws,
-                ]).await;
+                let moved =
+                    run_aerospace(&["move-node-to-workspace", "--window-id", &wid, ws]).await;
                 if moved.is_err() {
                     let _ = run_aerospace(&["focus", "--window-id", &wid]).await;
                     let _ = run_aerospace(&["move-node-to-workspace", ws]).await;
@@ -2449,10 +3322,15 @@ async fn run_aerospace_intent(intent: &bagent_agent::WindowIntent) -> anyhow::Re
             let app = intent.app.as_deref().unwrap_or("Mail");
             let bundle_id = app_to_bundle_id(app);
             let Ok(list) = run_aerospace(&[
-                "list-windows", "--all",
-                "--app-bundle-id", &bundle_id,
-                "--format", "%{window-id}",
-            ]).await else {
+                "list-windows",
+                "--all",
+                "--app-bundle-id",
+                &bundle_id,
+                "--format",
+                "%{window-id}",
+            ])
+            .await
+            else {
                 return Ok(String::new());
             };
             let wid = list.lines().next().unwrap_or("").trim().to_string();
@@ -2470,14 +3348,14 @@ async fn run_aerospace_intent(intent: &bagent_agent::WindowIntent) -> anyhow::Re
 /// Map common app display names to their bundle IDs for `aerospace list-windows`.
 fn app_to_bundle_id(app: &str) -> String {
     match app.to_lowercase().as_str() {
-        "mail"     => "com.apple.mail".to_string(),
-        "safari"   => "com.apple.Safari".to_string(),
-        "notes"    => "com.apple.Notes".to_string(),
-        "finder"   => "com.apple.finder".to_string(),
+        "mail" => "com.apple.mail".to_string(),
+        "safari" => "com.apple.Safari".to_string(),
+        "notes" => "com.apple.Notes".to_string(),
+        "finder" => "com.apple.finder".to_string(),
         "terminal" => "com.apple.Terminal".to_string(),
-        "xcode"    => "com.apple.dt.Xcode".to_string(),
+        "xcode" => "com.apple.dt.Xcode".to_string(),
         "vscode" | "visual studio code" => "com.microsoft.VSCode".to_string(),
-        "slack"    => "com.tinyspeck.slackmacgap".to_string(),
+        "slack" => "com.tinyspeck.slackmacgap".to_string(),
         _ => format!("com.apple.{}", app.to_lowercase()),
     }
 }
@@ -2489,18 +3367,19 @@ fn relative_date(unix: i64) -> String {
         .as_secs() as i64;
     let diff = now.saturating_sub(unix);
     match diff / 3600 {
-        0        => "práve teraz".to_string(),
-        1        => "pred 1 hodinou".to_string(),
-        2..=23   => format!("pred {} hodinami", diff / 3600),
-        24..=47  => "včera".to_string(),
-        hours    => format!("pred {} dňami", hours / 24),
+        0 => "práve teraz".to_string(),
+        1 => "pred 1 hodinou".to_string(),
+        2..=23 => format!("pred {} hodinami", diff / 3600),
+        24..=47 => "včera".to_string(),
+        hours => format!("pred {} dňami", hours / 24),
     }
 }
 
 // ── Context management ────────────────────────────────────────────────────────
 
 async fn load_session_summary(db: &Arc<Mutex<Connection>>, session_id: &str) -> Option<String> {
-    db.lock().await
+    db.lock()
+        .await
         .query_row(
             "SELECT summary FROM sessions WHERE id = ?1",
             rusqlite::params![session_id],
@@ -2521,7 +3400,9 @@ async fn save_last_mail_ref(db: &Arc<Mutex<Connection>>, session_id: &str, mail_
 }
 
 async fn load_last_mail_ref(db: &Arc<Mutex<Connection>>, session_id: &str) -> Option<MailRef> {
-    let json: Option<String> = db.lock().await
+    let json: Option<String> = db
+        .lock()
+        .await
         .query_row(
             "SELECT metadata_json FROM sessions WHERE id = ?1",
             rusqlite::params![session_id],
@@ -2537,7 +3418,7 @@ async fn load_session_history(db: &Arc<Mutex<Connection>>, session_id: &str) -> 
     let db = db.lock().await;
     let mut stmt = match db.prepare(
         "SELECT role, content FROM chat_turns \
-         WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 10"
+         WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 10",
     ) {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -2547,9 +3428,9 @@ async fn load_session_history(db: &Arc<Mutex<Connection>>, session_id: &str) -> 
             let role: String = row.get(0)?;
             let content: String = row.get(1)?;
             Ok(match role.as_str() {
-                "user"      => Message::user(content),
+                "user" => Message::user(content),
                 "assistant" => Message::assistant(content),
-                _           => Message::system(content),
+                _ => Message::system(content),
             })
         })
         .ok()
@@ -2566,13 +3447,13 @@ async fn prepare_history(
 ) -> Vec<OllamaMsg> {
     if history.len() > SUMMARIZE_THRESHOLD {
         let split = history.len() - KEEP_RECENT;
-        let old    = &history[..split];
+        let old = &history[..split];
         let recent = history[split..].to_vec();
 
         if let Ok(summary) = ollama.summarize(model, old).await {
-            let mut result = vec![Message::system(
-                format!("Zhrnutie predchádzajúcej konverzácie: {summary}")
-            )];
+            let mut result = vec![Message::system(format!(
+                "Zhrnutie predchádzajúcej konverzácie: {summary}"
+            ))];
             result.extend(recent);
             return result;
         }

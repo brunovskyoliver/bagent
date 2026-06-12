@@ -153,6 +153,18 @@ struct SettingsView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
 
+                Text("Model klasifikátora").font(.system(size: 11)).foregroundStyle(.secondary)
+                Picker("", selection: $viewModel.selectedClassifierModel) {
+                    ForEach(viewModel.availableModels, id: \.self) { m in
+                        Text(m).tag(m)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Text("Odporúčaný pre intent: qwen3:0.6b. Zmena sa použije po reštarte daemona.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+
                 Divider()
 
                 // Vision model status

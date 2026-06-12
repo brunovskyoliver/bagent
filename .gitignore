@@ -1,1 +1,15 @@
-target/
+# Rust
+/target/
+
+# Swift Package Manager / Xcode build products
+/.build/
+/apps/macos/.build/
+.swiftpm/
+DerivedData/
+
+# Generated macOS app bundles
+/apps/macos/*.app/
+
+# Local/editor noise
+.DS_Store
+*.swp

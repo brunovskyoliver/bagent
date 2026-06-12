@@ -77,6 +77,30 @@ pub struct MailConnector {
     mail_v10_dir: PathBuf,
 }
 
+fn like_pattern(value: &str) -> String {
+    format!("%{}%", value.to_lowercase())
+}
+
+fn compact_like_pattern(value: &str) -> String {
+    format!("%{}%", compact_search_text(value))
+}
+
+fn compact_search_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn compact_sender_expr() -> &'static str {
+    "REPLACE(LOWER(COALESCE(a.address,'') || COALESCE(a.comment,'')), ' ', '')"
+}
+
+fn compact_subject_expr() -> &'static str {
+    "REPLACE(LOWER(COALESCE(s.subject,'')), ' ', '')"
+}
+
 impl MailConnector {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
@@ -153,18 +177,28 @@ impl MailConnector {
         let mut idx = 1usize;
 
         if let Some(ref sender) = f.sender {
-            let pattern = format!("%{}%", sender.to_lowercase());
+            let pattern = like_pattern(sender);
+            let compact_pattern = compact_like_pattern(sender);
             clauses.push(format!(
-                "(LOWER(COALESCE(a.address,'')) LIKE ?{idx} OR LOWER(COALESCE(a.comment,'')) LIKE ?{idx})"
+                "(LOWER(COALESCE(a.address,'')) LIKE ?{idx} OR LOWER(COALESCE(a.comment,'')) LIKE ?{idx} OR {compact_sender_expr} LIKE ?{next_idx})",
+                compact_sender_expr = compact_sender_expr(),
+                next_idx = idx + 1,
             ));
             params.push(Box::new(pattern));
-            idx += 1;
+            params.push(Box::new(compact_pattern));
+            idx += 2;
         }
         if let Some(ref subject) = f.subject {
-            let pattern = format!("%{}%", subject.to_lowercase());
-            clauses.push(format!("LOWER(COALESCE(s.subject,'')) LIKE ?{idx}"));
+            let pattern = like_pattern(subject);
+            let compact_pattern = compact_like_pattern(subject);
+            clauses.push(format!(
+                "(LOWER(COALESCE(s.subject,'')) LIKE ?{idx} OR {compact_subject_expr} LIKE ?{next_idx})",
+                compact_subject_expr = compact_subject_expr(),
+                next_idx = idx + 1,
+            ));
             params.push(Box::new(pattern));
-            idx += 1;
+            params.push(Box::new(compact_pattern));
+            idx += 2;
         }
         if let Some(from) = f.date_from {
             clauses.push(format!("m.date_received >= ?{idx}"));
@@ -180,12 +214,17 @@ impl MailConnector {
         // Catches cases where the LLM classifier puts the company/person name in keywords
         // instead of the sender field.
         for kw in &f.keywords {
-            let pattern = format!("%{}%", kw.to_lowercase());
+            let pattern = like_pattern(kw);
+            let compact_pattern = compact_like_pattern(kw);
             clauses.push(format!(
-                "(LOWER(COALESCE(a.address,'')) LIKE ?{idx} OR LOWER(COALESCE(a.comment,'')) LIKE ?{idx} OR LOWER(COALESCE(s.subject,'')) LIKE ?{idx})"
+                "(LOWER(COALESCE(a.address,'')) LIKE ?{idx} OR LOWER(COALESCE(a.comment,'')) LIKE ?{idx} OR LOWER(COALESCE(s.subject,'')) LIKE ?{idx} OR {compact_sender_expr} LIKE ?{next_idx} OR {compact_subject_expr} LIKE ?{next_idx})",
+                compact_sender_expr = compact_sender_expr(),
+                compact_subject_expr = compact_subject_expr(),
+                next_idx = idx + 1,
             ));
             params.push(Box::new(pattern));
-            idx += 1;
+            params.push(Box::new(compact_pattern));
+            idx += 2;
         }
         let _ = idx; // suppress unused warning
 

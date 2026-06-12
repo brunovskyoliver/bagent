@@ -60,25 +60,14 @@ impl MailIntentClassifier {
             String::new()
         } else {
             format!(
-                "== PRIOR CONVERSATION (for pronoun resolution ONLY — do not classify this) ==\n\
+                "Prior conversation for resolving pronouns only. Do not classify it:\n\
                  {context}\n\
-                 == END PRIOR CONVERSATION ==\n\n\
-                 STEP 1 — Coreference resolution (mandatory):\n\
-                 Before classifying, replace every pronoun or vague reference in the CURRENT MESSAGE with \
-                 the concrete entity from the prior conversation above.\n\
-                 SK pronouns to resolve: \"nej\" (her), \"jej\" (her/hers), \"ho\" (him/it), \"od neho\" (from him), \
-                 \"od nej\" (from her), \"tej firmy\" (that company), \"toho emailu\" (that email), \
-                 \"ten mail\" (that mail), \"tej osoby\" (that person).\n\
-                 EN pronouns to resolve: \"her\", \"him\", \"it\", \"that person\", \"that company\", \"that email\", \"them\".\n\
-                 Example: prior context mentions \"Katarína Horváthová\"; current message says \"od nej správa\" \
-                 → treat it as \"správa od Katarína Horváthová\" → set sender=\"Katarína Horváthová\".\n\n\
-                 STEP 2 — Classify the resolved message (as if the pronoun was never there).\n\n"
+                 End prior conversation.\n\n"
             )
         };
         let prompt = format!(
             "{context_block}User message: \"{user_turn}\"\n\n\
-             Decide whether this message is asking to read or search Apple Mail.\n\
-             Respond with JSON ONLY, no markdown, no explanation:\n\
+             Classify ONLY the user message as an Apple Mail intent. Return JSON ONLY:\n\
              {{\n\
                \"action\": \"list_recent|search|read_attachment|open|none\",\n\
                \"sender\": null,\n\
@@ -87,30 +76,22 @@ impl MailIntentClassifier {
                \"keywords\": [],\n\
                \"wants_attachment\": false\n\
              }}\n\n\
-             Action rules (CRITICAL — read carefully):\n\
-             - action=\"list_recent\": ONLY when user wants a generic inbox overview with NO specific sender, company, subject, or content mentioned. Examples: \"show me my inbox\", \"aké mám maily\", \"čo mám nové\".\n\
-             - action=\"search\": whenever ANY of the following is present: a sender name, company name, email address, subject keywords, content keywords, or attachment mention — even if the user also says \"recent\" or \"new\" or \"posledné\". Examples: \"recent mails from ryanair\" → search. \"nové emaily od Petra\" → search. \"what did apple send me\" → search.\n\
-             - action=\"read_attachment\": user wants to read, analyse, or find a file attached to a mail.\n\
-             - action=\"open\": user explicitly asks to open or show a specific email in the Mail app. SK: \"otvor\", \"otvoriť\", \"ukáž mi ten mail\", \"zobraz mail\". EN: \"open it\", \"open the email\", \"show me that email\". Fill sender/subject/keywords if the message also identifies which email.\n\
-             - action=\"none\": the message is not about reading mail at all.\n\n\
+             Rules:\n\
+             - list_recent: generic inbox/unread overview, no sender/company/subject. Slovak examples: \"zhrň neprečítané správy\", \"aké mám nové maily\".\n\
+             - search: find mail by sender, company, subject, date, or content.\n\
+             - open: user asks to open/show an email in Mail app.\n\
+             - read_attachment: user asks about an attachment/pdf/document in email.\n\
+             - none: not about email.\n\
+             - sender: if the text says \"od X\", \"from X\", or \"sender X\", put X in sender. Do NOT put X in keywords.\n\
+             - date: use null unless stated in the user message. \"dnes\"/\"today\" = \"{today}\". \"včera\"/\"vcera\"/\"yesterday\" = \"{yesterday}\".\n\
+             - keywords: content terms only, never sender names.\n\n\
              Examples:\n\
-             - \"do i have any recent mails from ryanair?\" → {{\"action\":\"search\",\"sender\":\"ryanair\",\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}\n\
-             - \"nové maily od Petra\" → {{\"action\":\"search\",\"sender\":\"Peter\",\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}\n\
-             - \"what did apple send me?\" → {{\"action\":\"search\",\"sender\":\"apple\",\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}\n\
-             - \"show me my recent inbox\" → {{\"action\":\"list_recent\",\"sender\":null,\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}\n\
-             - \"akékoľvek nové správy?\" → {{\"action\":\"list_recent\",\"sender\":null,\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}\n\
-             - context mentions \"Katarína Horváthová\"; message \"mala by byt od nej sprava v maily\" → {{\"action\":\"search\",\"sender\":\"Katarína Horváthová\",\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}\n\
-             - context mentions \"firma Acme\"; message \"pozri emaily od nich\" → {{\"action\":\"search\",\"sender\":\"Acme\",\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}\n\
-             - context has [LastFoundMail] and user says \"ma tento mail aj nejake prilohy\" → {{\"action\":\"read_attachment\",\"sender\":null,\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":true}}\n\
-             - context has [LastFoundMail] and user says \"co je v tej prilohe\" → {{\"action\":\"read_attachment\",\"sender\":null,\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":true}}\n\n\
-             Field rules:\n\
-             - date: set ONLY when the user explicitly states a date in the message. If no date is stated, ALWAYS set date to null.\n\
-             - Relative dates: \"dnes\"/\"today\" → \"{today}\". \"včera\"/\"vcera\"/\"yesterday\" → \"{yesterday}\".\n\
-             - Normalise Slovak dates: \"10.6.2026\" → \"2026-06-10\".\n\
-             - Set wants_attachment=true for: príloha, prílohu, attachment, pdf, dokument, precitaj prilohu.\n\
-             - keywords: concrete content words only (invoice numbers, amounts, company names, booking codes). Do NOT put sender names in keywords — use the sender field instead.\n\
-             - sender: extract any company name, person name, or email domain that identifies who sent the mail. \
-               If the user used a pronoun (nej/jej/ho/her/him) that you resolved to a name in STEP 1, put that resolved name here.",
+             \"vies mi najst mail od alza ktory bol odoslany vcera?\" -> {{\"action\":\"search\",\"sender\":\"alza\",\"subject\":null,\"date\":\"{yesterday}\",\"keywords\":[],\"wants_attachment\":false}}\n\
+             \"nájdi mi email od Apple zo včera\" -> {{\"action\":\"search\",\"sender\":\"Apple\",\"subject\":null,\"date\":\"{yesterday}\",\"keywords\":[],\"wants_attachment\":false}}\n\
+             \"zhrň neprečítané správy\" -> {{\"action\":\"list_recent\",\"sender\":null,\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}\n\
+             \"otvor mail od fakturacia@example.com\" -> {{\"action\":\"open\",\"sender\":\"fakturacia@example.com\",\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}\n\
+             \"ma tento mail prilohy?\" -> {{\"action\":\"read_attachment\",\"sender\":null,\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":true}}\n\
+             \"mala by byt od nej sprava v maily\" with prior conversation naming Katarína Horváthová -> {{\"action\":\"search\",\"sender\":\"Katarína Horváthová\",\"subject\":null,\"date\":null,\"keywords\":[],\"wants_attachment\":false}}",
         );
 
         let raw = self.ollama.generate_raw(&self.model, &prompt, 0.0).await?;
@@ -200,5 +181,84 @@ mod tests {
             s.contains("horv") || s.contains("katarín") || s.contains("katarin"),
             "sender should resolve to Katarína Horváthová, got: {sender}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Ollama; set BAGENT_TEST_CLASSIFIER_MODEL to compare models"]
+    async fn inspect_slovak_mail_intent_cases() {
+        let ollama = OllamaClient::new(DEFAULT_BASE_URL);
+        let model = std::env::var("BAGENT_TEST_CLASSIFIER_MODEL")
+            .unwrap_or_else(|_| "qwen2.5:0.5b".to_string());
+        let classifier = MailIntentClassifier::new(ollama, model.clone());
+
+        let cases = vec![
+            (
+                "vies mi najst mail od ryanair ktory bol odoslany vcera?",
+                "",
+                "search",
+                Some("ryanair"),
+                true,
+            ),
+            (
+                "nájdi mi email od Apple zo včera",
+                "",
+                "search",
+                Some("apple"),
+                true,
+            ),
+            (
+                "zhrň neprečítané správy",
+                "",
+                "list_recent",
+                None,
+                false,
+            ),
+            (
+                "otvor mail od ryanair",
+                "",
+                "open",
+                Some("ryanair"),
+                false,
+            ),
+            (
+                "vies mi najst mail od ryanair ktory bol odoslany vcera?",
+                "[User]: Zhrň neprečítané správy\n[Assistant]: Neprečítané správy: 1. [Pred 7 dňami] Od: iCloud <noreply@email.apple.com> | Predmet: Hide My Email was used with omnigroup.com",
+                "search",
+                Some("ryanair"),
+                true,
+            ),
+        ];
+
+        let mut results = Vec::new();
+        for (message, context, expected_action, expected_sender, expects_date) in cases {
+            let intent = classifier.classify(message, context).await.unwrap();
+            println!("{model}: {message} -> {intent:?}");
+            results.push(intent.clone());
+            let mut failures = Vec::new();
+            if intent.action != expected_action {
+                failures.push(format!("action={}", intent.action));
+            }
+            if let Some(sender) = expected_sender {
+                let actual = intent
+                    .sender
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if !actual.contains(sender) {
+                    failures.push(format!("sender={:?}", intent.sender));
+                }
+            }
+            if intent.date.is_some() != expects_date {
+                failures.push(format!("date={:?}", intent.date));
+            }
+            if !failures.is_empty() {
+                println!(
+                    "{model}: mismatch for {message:?}; expected action={expected_action} sender={expected_sender:?} date_present={expects_date}; got {}",
+                    failures.join(", ")
+                );
+            }
+        }
+
+        assert_eq!(results.len(), 5);
     }
 }

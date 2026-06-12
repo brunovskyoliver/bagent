@@ -194,6 +194,7 @@ dependencies = [
  "bagent-memory",
  "chrono",
  "ollama-connector",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

@@ -32,6 +32,14 @@ pub struct MemoryHit {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTurnHit {
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+    pub score: f32,
+}
+
 pub struct MemoryStore {
     db: Arc<Mutex<Connection>>,
     ollama: OllamaClient,
@@ -163,25 +171,36 @@ impl MemoryStore {
                 params.push(Box::new(ns.to_string()));
             }
             params.push(Box::new(limit));
-            let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
             if let Ok(mut rows) = stmt.query(params_refs.as_slice()) {
                 while let Ok(Some(row)) = rows.next() {
                     if let Ok(item) = row_to_item(row) {
                         let bm25_score: f64 = row.get(12).unwrap_or(0.0);
                         let bm25_norm = (bm25_score.abs() as f32).min(10.0) / 10.0;
-                        hits.push(MemoryHit { item, score: bm25_norm * 0.4 });
+                        hits.push(MemoryHit {
+                            item,
+                            score: bm25_norm * 0.4,
+                        });
                     }
                 }
                 true
-            } else { false }
-        } else { false };
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         if !fts_ok {
             if let Ok(mut stmt) = db.prepare(&fallback_sql) {
-                let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-                    namespaces.iter().map(|ns| Box::new(ns.to_string()) as Box<dyn rusqlite::ToSql>).collect();
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> = namespaces
+                    .iter()
+                    .map(|ns| Box::new(ns.to_string()) as Box<dyn rusqlite::ToSql>)
+                    .collect();
                 params.push(Box::new(limit));
-                let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+                let params_refs: Vec<&dyn rusqlite::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
                 if let Ok(mut rows) = stmt.query(params_refs.as_slice()) {
                     while let Ok(Some(row)) = rows.next() {
                         if let Ok(item) = row_to_item(row) {
@@ -199,8 +218,10 @@ impl MemoryStore {
                 cos_ns_placeholder = cos_ns_placeholder
             );
             if let Ok(mut cos_stmt) = db.prepare(&cos_sql) {
-                let ns_params: Vec<&dyn rusqlite::ToSql> =
-                    namespaces.iter().map(|ns| ns as &dyn rusqlite::ToSql).collect();
+                let ns_params: Vec<&dyn rusqlite::ToSql> = namespaces
+                    .iter()
+                    .map(|ns| ns as &dyn rusqlite::ToSql)
+                    .collect();
                 if let Ok(mut cos_rows) = cos_stmt.query(ns_params.as_slice()) {
                     while let Ok(Some(row)) = cos_rows.next() {
                         let item_id: String = row.get(0)?;
@@ -215,7 +236,10 @@ impl MemoryStore {
                         } else if cos_contrib > 0.1 {
                             // Semantic-only hit (not in FTS results)
                             if let Ok(Some(item)) = self.get(&db, &item_id) {
-                                hits.push(MemoryHit { item, score: cos_contrib });
+                                hits.push(MemoryHit {
+                                    item,
+                                    score: cos_contrib,
+                                });
                             }
                         }
                     }
@@ -224,7 +248,11 @@ impl MemoryStore {
         }
 
         // Sort descending by score
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Per-namespace cap (max 3) then global top-k
         let mut ns_counts: std::collections::HashMap<String, usize> =
@@ -264,6 +292,22 @@ impl MemoryStore {
         exclude_session_id: Option<&str>,
         k: usize,
     ) -> Result<Vec<(String, String, String)>> {
+        Ok(self
+            .retrieve_turn_candidates(query, exclude_session_id, k)
+            .await?
+            .into_iter()
+            .map(|h| (h.role, h.content, h.created_at))
+            .collect())
+    }
+
+    /// Retrieve relevant past chat turns for diagnostics/simulation. Normal prompt
+    /// assembly should treat these as candidates, not authoritative context.
+    pub async fn retrieve_turn_candidates(
+        &self,
+        query: &str,
+        exclude_session_id: Option<&str>,
+        k: usize,
+    ) -> Result<Vec<ChatTurnHit>> {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
@@ -274,7 +318,8 @@ impl MemoryStore {
         let exclude = exclude_session_id.unwrap_or("");
 
         // BM25 via FTS5
-        let fts_sql = "SELECT ct.id, ct.role, ct.content, ct.created_at, bm25(chat_turns_fts) as score \
+        let fts_sql =
+            "SELECT ct.id, ct.role, ct.content, ct.created_at, bm25(chat_turns_fts) as score \
                        FROM chat_turns_fts \
                        JOIN chat_turns ct ON chat_turns_fts.id = ct.id \
                        WHERE chat_turns_fts MATCH ?1 \
@@ -287,14 +332,21 @@ impl MemoryStore {
         let mut results: Vec<(String, String, String, String, f32)> = Vec::new();
 
         if let Ok(mut stmt) = db.prepare(fts_sql) {
-            if let Ok(mut rows) = stmt.query(rusqlite::params![format!("{query}*"), exclude, limit]) {
+            if let Ok(mut rows) = stmt.query(rusqlite::params![format!("{query}*"), exclude, limit])
+            {
                 while let Ok(Some(row)) = rows.next() {
                     let id: String = row.get(0).unwrap_or_default();
                     let role: String = row.get(1).unwrap_or_default();
                     let content: String = row.get(2).unwrap_or_default();
                     let created_at: String = row.get(3).unwrap_or_default();
                     let score: f64 = row.get(4).unwrap_or(0.0);
-                    results.push((id, role, content, created_at, (score.abs() as f32).min(10.0) / 10.0 * 0.4));
+                    results.push((
+                        id,
+                        role,
+                        content,
+                        created_at,
+                        (score.abs() as f32).min(10.0) / 10.0 * 0.4,
+                    ));
                 }
             }
         }
@@ -337,14 +389,19 @@ impl MemoryStore {
         Ok(results
             .into_iter()
             .take(k)
-            .map(|(_, role, content, created_at, _)| {
+            .map(|(_, role, content, created_at, score)| {
                 let truncated = if content.len() > 300 {
                     let end = content.floor_char_boundary(300);
                     format!("{}…", &content[..end])
                 } else {
                     content
                 };
-                (role, truncated, created_at)
+                ChatTurnHit {
+                    role,
+                    content: truncated,
+                    created_at,
+                    score,
+                }
             })
             .collect())
     }
@@ -366,8 +423,14 @@ impl MemoryStore {
 
     pub fn delete(&self, id: &str) -> Result<bool> {
         let db = self.db.lock().unwrap();
-        let n = db.execute("DELETE FROM memory_items WHERE id = ?1", rusqlite::params![id])?;
-        let _ = db.execute("DELETE FROM embeddings WHERE item_id = ?1", rusqlite::params![id]);
+        let n = db.execute(
+            "DELETE FROM memory_items WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        let _ = db.execute(
+            "DELETE FROM embeddings WHERE item_id = ?1",
+            rusqlite::params![id],
+        );
         Ok(n > 0)
     }
 
@@ -388,7 +451,13 @@ impl MemoryStore {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    fn store_embedding(&self, db: &Connection, item_id: &str, namespace: &str, vec: &[f32]) -> Result<()> {
+    fn store_embedding(
+        &self,
+        db: &Connection,
+        item_id: &str,
+        namespace: &str,
+        vec: &[f32],
+    ) -> Result<()> {
         let blob = f32_to_blob(vec);
         let now = Utc::now().to_rfc3339();
         db.execute(
@@ -399,7 +468,13 @@ impl MemoryStore {
         Ok(())
     }
 
-    fn is_duplicate(&self, db: &Connection, namespace: &str, query_vec: &[f32], threshold: f32) -> Result<bool> {
+    fn is_duplicate(
+        &self,
+        db: &Connection,
+        namespace: &str,
+        query_vec: &[f32],
+        threshold: f32,
+    ) -> Result<bool> {
         let mut stmt = db.prepare(
             "SELECT e.vector FROM embeddings e \
              JOIN memory_items mi ON e.item_id = mi.id \
@@ -457,7 +532,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
 }
 
 fn f32_to_blob(v: &[f32]) -> Vec<u8> {
@@ -465,22 +544,24 @@ fn f32_to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 fn blob_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryItem> {
     Ok(MemoryItem {
-        id:            row.get(0)?,
-        namespace:     row.get(1)?,
-        kind:          row.get(2)?,
-        language:      row.get(3)?,
-        text:          row.get(4)?,
-        source_ref:    row.get(5)?,
+        id: row.get(0)?,
+        namespace: row.get(1)?,
+        kind: row.get(2)?,
+        language: row.get(3)?,
+        text: row.get(4)?,
+        source_ref: row.get(5)?,
         metadata_json: row.get(6)?,
-        last_used_at:  row.get(7)?,
-        use_count:     row.get(8)?,
-        created_at:    row.get(9)?,
-        updated_at:    row.get(10)?,
-        expires_at:    row.get(11)?,
+        last_used_at: row.get(7)?,
+        use_count: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        expires_at: row.get(11)?,
     })
 }

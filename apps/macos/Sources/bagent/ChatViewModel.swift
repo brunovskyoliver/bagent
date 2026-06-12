@@ -26,6 +26,12 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     /// Set when the assistant's response found a specific mail message.
     /// Drives the "Otvoriť mail" animated button.
     var mailRef: DaemonClient.MailRef? = nil
+    var debugTraceId: String? = nil
+    var debugPreview: String? = nil
+    var debugPromptChars: Int? = nil
+    var debugTokenEstimate: Int? = nil
+    var debugMessageCount: Int? = nil
+    var debugPayload: String? = nil
 
     enum Role { case user, assistant }
 }
@@ -61,6 +67,9 @@ final class ChatViewModel: ObservableObject {
     @Published var hasNotch = false
     @Published var showSettings = false
     @Published var showMemory = false
+    @Published var showDebug = false
+    @Published var debugConversationPayload: String? = nil
+    @Published var isLoadingDebug = false
     @Published var memorySearchQuery: String = ""
     @Published var filteredMemoryItems: [MemoryItem] = []
     @Published var memoryKindFilter: String = ""  // "" = all kinds
@@ -109,6 +118,10 @@ final class ChatViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(selectedModel, forKey: "bagent.model") }
     }
 
+    @Published var selectedClassifierModel: String = UserDefaults.standard.string(forKey: "bagent.classifier_model") ?? "qwen3:0.6b" {
+        didSet { UserDefaults.standard.set(selectedClassifierModel, forKey: "bagent.classifier_model") }
+    }
+
     @Published var chatWindowW: CGFloat = ChatViewModel.savedSize("bagent.chat.w", 400) {
         didSet { UserDefaults.standard.set(Double(chatWindowW), forKey: "bagent.chat.w") }
     }
@@ -130,6 +143,8 @@ final class ChatViewModel: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "bagent.session_id") }
     }
 
+    var currentSessionId: String? { sessionId }
+
     // MARK: - Actions
 
     func clear() {
@@ -137,6 +152,7 @@ final class ChatViewModel: ObservableObject {
         inputText = ""
         isThinking = false
         showSettings = false
+        showDebug = false
         pendingAttachments = []
         savedScrollAnchorId = nil
         savedScrollWasAtBottom = true
@@ -152,6 +168,9 @@ final class ChatViewModel: ObservableObject {
                 availableModels = fetched
                 if !fetched.contains(selectedModel) {
                     selectedModel = fetched.first ?? "qwen2.5:7b"
+                }
+                if !fetched.contains(selectedClassifierModel) {
+                    selectedClassifierModel = fetched.contains("qwen3:0.6b") ? "qwen3:0.6b" : (fetched.first ?? "qwen2.5:0.5b")
                 }
                 // Check whether the vision model is installed
                 visionModelAvailable = fetched.contains(where: {
@@ -194,7 +213,11 @@ final class ChatViewModel: ObservableObject {
     func refreshHealth() async {
         daemonHealth = await client.healthStatus()
         permissions.refresh()
-        if sessionId == nil { await startNewSession() }
+        if messages.isEmpty {
+            await startFreshSession()
+        } else if sessionId == nil {
+            await startNewSession()
+        }
     }
 
     func loadMemoryItems() async {
@@ -246,6 +269,7 @@ final class ChatViewModel: ObservableObject {
             showMemory = false
         } else {
             showSettings = false
+            showDebug = false
             showMemory = true
             Task { await loadMemoryItems() }
         }
@@ -256,7 +280,56 @@ final class ChatViewModel: ObservableObject {
             showSettings = false
         } else {
             showMemory = false
+            showDebug = false
             showSettings = true
+        }
+    }
+
+    func toggleDebugPanel() {
+        if showDebug {
+            showDebug = false
+        } else {
+            showSettings = false
+            showMemory = false
+            showDebug = true
+            Task { await loadDebugConversation() }
+        }
+    }
+
+    func loadDebugConversation() async {
+        guard let sessionId else {
+            debugConversationPayload = "No conversation id yet."
+            return
+        }
+        isLoadingDebug = true
+        do {
+            debugConversationPayload = try await client.debugConversation(id: sessionId)
+        } catch {
+            debugConversationPayload = "Chyba: \(error.localizedDescription)"
+        }
+        isLoadingDebug = false
+    }
+
+    func loadDebugTrace(for messageId: UUID) async {
+        guard let idx = messages.firstIndex(where: { $0.id == messageId }),
+              let traceId = messages[idx].debugTraceId
+        else { return }
+        let currentPayload = messages[idx].debugPayload ?? ""
+        guard currentPayload.isEmpty || currentPayload.contains("trace not found") || currentPayload.hasPrefix("Chyba:") else {
+            return
+        }
+        messages[idx].debugPayload = "Načítavam trace…"
+        for attempt in 0..<6 {
+            do {
+                messages[idx].debugPayload = try await client.debugTrace(id: traceId)
+                return
+            } catch {
+                if attempt == 5 {
+                    messages[idx].debugPayload = "Chyba: \(error.localizedDescription)"
+                } else {
+                    try? await Task.sleep(for: .seconds(1))
+                }
+            }
         }
     }
 
@@ -264,6 +337,9 @@ final class ChatViewModel: ObservableObject {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !pendingAttachments.isEmpty else { return }
         guard !isThinking else { return }
+        if messages.isEmpty {
+            sessionId = nil
+        }
         inputText = ""
         let model = selectedModel
         let sid = sessionId
@@ -286,6 +362,13 @@ final class ChatViewModel: ObservableObject {
                 var didAutoOpen = false
                 for try await event in stream {
                     switch event {
+                    case .debugTrace(let trace):
+                        messages[idx].debugTraceId = trace.prompt_trace_id
+                        messages[idx].debugPreview = trace.preview
+                        messages[idx].debugPromptChars = trace.prompt_chars
+                        messages[idx].debugTokenEstimate = trace.prompt_token_estimate
+                        messages[idx].debugMessageCount = trace.message_count
+                        if let sid = trace.session_id { sessionId = sid }
                     case .token(let t):
                         if first { isThinking = false; first = false }
                         messages[idx].content += t
@@ -331,6 +414,7 @@ final class ChatViewModel: ObservableObject {
                     case .done(let returnedSessionId):
                         if let sid = returnedSessionId { sessionId = sid }
                         if first { isThinking = false }
+                        Task { await loadDebugTrace(for: messages[idx].id) }
                     }
                 }
                 if first { isThinking = false }
@@ -421,6 +505,11 @@ final class ChatViewModel: ObservableObject {
     }
 
     // MARK: - Private
+
+    private func startFreshSession() async {
+        sessionId = nil
+        await startNewSession()
+    }
 
     private func startNewSession() async {
         guard sessionId == nil else { return }

@@ -144,12 +144,22 @@ struct DaemonClient: Sendable {
 
     enum ChatEvent: Sendable {
         case token(String)
+        case debugTrace(DebugTraceSummary)
         case memorySaved(id: String)
         case approvalRequested(id: String, tool: String, description: String?)
         case toolBlocked(tool: String)
         case mailAttachments([MailAttachmentRef])
         case mailFound(MailRef)
         case done(sessionId: String?)
+    }
+
+    struct DebugTraceSummary: Decodable, Sendable {
+        let prompt_trace_id: String
+        let session_id: String?
+        let preview: String
+        let prompt_chars: Int?
+        let prompt_token_estimate: Int?
+        let message_count: Int?
     }
 
     /// Upload a local file to `POST /attachments` and return a `ChatAttachment`.
@@ -270,6 +280,17 @@ struct DaemonClient: Sendable {
                         else { continue }
 
                         switch event.type {
+                        case "debug_trace":
+                            if let id = event.prompt_trace_id {
+                                continuation.yield(.debugTrace(DebugTraceSummary(
+                                    prompt_trace_id: id,
+                                    session_id: event.session_id,
+                                    preview: event.preview ?? "",
+                                    prompt_chars: event.prompt_chars,
+                                    prompt_token_estimate: event.prompt_token_estimate,
+                                    message_count: event.message_count
+                                )))
+                            }
                         case "token":
                             if let content = event.content {
                                 continuation.yield(.token(content))
@@ -456,11 +477,39 @@ struct DaemonClient: Sendable {
         return try JSONDecoder().decode(UsageStats.self, from: data)
     }
 
+    func debugTrace(id: String) async throws -> String {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/debug/traces/\(id)", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
+        }
+        return prettyJSONString(data)
+    }
+
+    func debugConversation(id: String) async throws -> String {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/debug/conversations/\(id)", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
+        }
+        return prettyJSONString(data)
+    }
+
     func clearMailCache() async throws {
         let c = try await loadCreds()
         var req = authedRequest("/mail/cache/clear", creds: c)
         req.httpMethod = "POST"
         _ = try await URLSession.shared.data(for: req)
+    }
+
+    private func prettyJSONString(_ data: Data) -> String {
+        guard
+            let obj = try? JSONSerialization.jsonObject(with: data),
+            let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+        else {
+            return String(decoding: data, as: UTF8.self)
+        }
+        return String(decoding: pretty, as: UTF8.self)
     }
 }
 
@@ -510,5 +559,10 @@ private struct SSEEvent: Decodable {
     let subject: String?
     let sender: String?
     let auto_open: Bool?
+    // debug_trace event fields
+    let prompt_trace_id: String?
+    let preview: String?
+    let prompt_chars: Int?
+    let prompt_token_estimate: Int?
+    let message_count: Int?
 }
-

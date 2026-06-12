@@ -26,6 +26,11 @@ final class DaemonLauncher {
     private func startProcess(url: URL) {
         let p = Process()
         p.executableURL = url
+        var environment = ProcessInfo.processInfo.environment
+        environment["BAGENT_DEFAULT_MODEL"] = UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen2.5:7b"
+        environment["BAGENT_CLASSIFIER_MODEL"] = UserDefaults.standard.string(forKey: "bagent.classifier_model") ?? "qwen3:0.6b"
+        environment["BAGENT_VISION_MODEL"] = "qwen2.5vl:7b"
+        p.environment = environment
         // terminationHandler is called on an arbitrary thread; dispatch back to @MainActor.
         p.terminationHandler = { proc in
             // Normal exit (our own stop()) — don't restart.
