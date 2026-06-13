@@ -679,20 +679,13 @@ struct ExpandedChatView: View {
             }
 
             HStack(alignment: .center, spacing: 8) {
-                // File picker button
-                Button {
-                    openFilePicker()
-                } label: {
-                    if viewModel.isUploadingAttachment {
-                        ProgressView().scaleEffect(0.7).frame(width: 20, height: 20)
-                    } else {
-                        Image(systemName: "plus.circle")
-                            .font(.system(size: 20))
-                            .foregroundStyle(Color.secondary)
-                    }
-                }
-                .buttonStyle(.plain)
-                .disabled(viewModel.isThinking || viewModel.pendingAttachments.count >= 5)
+                // Attachments (+) with a mic button that reveals on hover / while recording.
+                VoiceAttachControl(
+                    viewModel: viewModel,
+                    isUploading: viewModel.isUploadingAttachment,
+                    attachDisabled: viewModel.isThinking || viewModel.pendingAttachments.count >= 5,
+                    onPlus: { openFilePicker() }
+                )
 
                 TextField("Napíš správu…", text: $viewModel.inputText, axis: .vertical)
                     .lineLimit(1...4)
@@ -1021,6 +1014,41 @@ struct AttachmentStrip: View {
 }
 
 // MARK: - "Otvoriť mail" animated button (Phase 5E)
+
+/// Attachments `+` button and a microphone button, side by side. `+` opens the
+/// file picker; the mic toggles inline voice transcription into the text field.
+struct VoiceAttachControl: View {
+    @ObservedObject var viewModel: ChatViewModel
+    var isUploading: Bool
+    var attachDisabled: Bool
+    var onPlus: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button { onPlus() } label: {
+                if isUploading {
+                    ProgressView().scaleEffect(0.7).frame(width: 20, height: 20)
+                } else {
+                    Image(systemName: "plus.circle")
+                        .font(.system(size: 20))
+                        .foregroundStyle(Color.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled(attachDisabled)
+
+            Button { viewModel.toggleInlineVoice() } label: {
+                Image(systemName: viewModel.isVoiceRecording ? "waveform" : "mic")
+                    .font(.system(size: 18))
+                    .foregroundStyle(viewModel.isVoiceRecording ? Color.accentColor : Color.secondary)
+                    // `.repeating` is the macOS 14 equivalent of `.repeat(.continuous)`.
+                    .symbolEffect(.pulse.byLayer, options: .repeating,
+                                  isActive: viewModel.isVoiceRecording)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
 
 /// Circle-to-pill hover-morph button that opens the found email in Mail.app.
 /// Collapsed: 28 pt envelope-filled circle.

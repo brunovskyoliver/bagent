@@ -364,6 +364,43 @@ Classifiers previously saw only the current user turn. Pronoun references across
 
 ---
 
+## Phase 5G — Voice Input (Local Whisper STT)
+
+On-device, English-only speech-to-text via WhisperKit (CoreML/ANE). Audio captured in Swift (AVAudioEngine); transcript becomes normal text and enters the **unchanged** `/chat` pipeline — no backend changes. See `docs/spikes/whisper.md` and the voice section of `docs/UI_DESIGN.md`. Decisions: instant-voice on single ⌥Space + double-press → chat; voice overlay morphs into chat on finalize; model `large-v3-turbo`.
+
+### Phase A — Capture + STT core ✅
+- [x] `Package.swift` — WhisperKit SPM dependency (`from: "0.9.0"`); link `AVFoundation`
+- [x] `Info.plist` + `Makefile` — `NSMicrophoneUsageDescription`
+- [x] `SpeechController.swift` — `@MainActor ObservableObject`; WhisperKit `AudioStreamTranscriber` (owns mic capture, `bufferEnergy` → amplitude); state machine `idle → loadingModel → listening → finalizing → done`; silence VAD (~1.2 s); `startSession(mode:)`; `@Published amplitude/partialText/sentences/state/isModelLoaded`
+- [x] `PermissionsManager.swift` — `hasMicrophoneAccess` via `AVCaptureDevice.authorizationStatus(for: .audio)` + `requestMicrophoneAccess()`; deep-link `…Privacy_Microphone`
+- [x] `SettingsView.swift` — Oprávnenia: mic permission dot + grant button; Whisper model status / first-run download indicator
+- [x] Raw audio kept in-memory only (WhisperKit AudioProcessor); never sent to daemon
+
+### Phase B — Inline mic in chat input ✅
+- [x] `ChatView.swift` `VoiceAttachControl` — hover `+` reveals `mic.fill` button springing up above it; `.spring(response: 0.28, dampingFraction: 0.68)`
+- [x] Inline recording state in `ChatViewModel` (`isVoiceRecording`, `toggleInlineVoice`); binds `speech.$partialText → inputText` live; `.symbolEffect(.pulse.byLayer, options: .repeating)` (macOS-14 form of `.repeat(.continuous)`)
+- [x] Auto-stop or second click finalizes; user edits then sends via existing send button / `⌘↩`
+
+### Phase C — Voice overlay UI ✅
+- [x] `NotchWindowController.swift` — `voicePanel` + `buildVoicePanel()`; `presentVoice()` / `dismissVoice()` reuse `expand()` charge→pop timing + click-away monitor (Escape via `onExitCommand`)
+- [x] `SiriWaveView.swift` — `TimelineView(.animation)` + `Canvas` layered sine bands driven by `amplitude`; reduced-motion fallback
+- [x] `VoiceOverlayView.swift` — Siri-wave bg + `waveform` symbol with `.symbolEffect(.variableColor.iterative.dimInactiveLayers.reversing, options: .repeating)` + live 2-sentence transcript (per-sentence `.id()` + fade/slide transition)
+- [x] Silence VAD auto-stop → finalize
+
+### Phase D — Hotkey + voice→chat handoff ✅
+- [x] `AppDelegate.handleHotkey` — single ⌥Space (collapsed) → `presentVoice()` instantly; second ⌥Space within ~350 ms → `openChatFromVoice()`; expanded ⌥Space collapses
+- [x] `voiceToChatHandoff(text:)` — hide voice, `expand()`, `ChatViewModel.submitTranscript` → existing `send()`
+
+### Phase E — Polish, tests, docs
+- [x] Reduced-motion fallbacks (SiriWaveView static capsule; transcript `nil` animation)
+- [ ] Unit tests: `lastSentences` (last-2 buffer), silence-VAD debounce, double-press window (fake clock)
+- [ ] Integration: finalize → `submitTranscript` → `send()` (mock `DaemonClient`); permission-denied path; `/chat` transcript-vs-typed parity fixture
+- [ ] Manual QA checklist (see plan): hotkey timing, waveform tracking, transcript fade, auto-stop, inline mic, first-run download, offline transcription, notch + non-notch geometry
+- [x] `docs/spikes/whisper.md`, voice section in `docs/UI_DESIGN.md`, `docs/ROADMAP.md` entry
+- [ ] `swift run` lacks Info.plist → mic denied; **voice QA must use `make bundle && open bagent.app`**
+
+---
+
 ## Phase 1B — Chat Scroll UX (✅ COMPLETE — test pending)
 
 - [x] Smart sticky-scroll: `userScrolledUp: Bool @State` in `ExpandedChatView`; `ScrollOffsetKey` `PreferenceKey` detects offset via content `GeometryReader` background; auto-scroll `.onChange(streamingChunk)` / `.onChange(messages.count)` gated on `!userScrolledUp`; new user-message send resets flag to false (`apps/macos/Sources/bagent/ChatView.swift`)

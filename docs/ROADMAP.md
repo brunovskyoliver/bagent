@@ -169,6 +169,31 @@ Each phase follows the structure: **Goal · Deliverables · Risks · Acceptance 
 
 ---
 
+## Phase 5G — Voice Input (Local Whisper STT)
+
+**Goal:** On-device, English-only speech-to-text (WhisperKit / CoreML / ANE). The transcript becomes plain text and enters the existing `/chat` pipeline — no backend changes. See `docs/spikes/whisper.md` and the Voice Input section of `docs/UI_DESIGN.md`.
+
+**Deliverables:**
+- [x] `SpeechController` — AVAudioEngine/WhisperKit via `AudioStreamTranscriber`; state machine, RMS amplitude, silence-VAD auto-stop.
+- [x] Inline mic in chat input (`VoiceAttachControl`): hover-reveal above `+`, `.pulse.byLayer`, live-fill text field.
+- [x] Voice-only overlay (`VoiceOverlayView` + `SiriWaveView`): Siri waves, `waveform` variable-color effect, fading 2-sentence transcript.
+- [x] Hotkey: single ⌥Space → voice instantly; double ⌥Space → chat; voice→chat handoff on finalize.
+- [x] Microphone permission (`PermissionsManager`) + Settings rows (mic + Whisper model status); `NSMicrophoneUsageDescription`.
+- [ ] Unit/integration tests; manual QA on notch + non-notch.
+
+**Risks:**
+- WhisperKit + Swift 6 strict concurrency (actor-isolated `AudioStreamTranscriber`, non-Sendable components) — handled via `@preconcurrency import` + Sendable `AsyncStream` callback.
+- First-run model download (~1.5 GB) — overlay/Settings show progress.
+- Mic permission requires the bundled app (`make bundle`), not `swift run` (no Info.plist).
+
+**Acceptance Criteria:**
+- [ ] ⌥Space opens voice instantly; waveform tracks speech; auto-stops on silence; morphs into chat with the spoken message and a streamed reply.
+- [ ] Double ⌥Space opens chat directly.
+- [ ] Hover `+` reveals mic; inline recording fills the field; edits + send work.
+- [ ] Transcription works offline (after first download); only transcript text is logged, no audio persisted.
+
+---
+
 ## Phase 6 — Odoo Connector
 
 **Goal:** Agent can read contacts, invoices, opportunities, and tasks from Odoo.

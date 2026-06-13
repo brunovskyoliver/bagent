@@ -32,8 +32,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         GlobalHotkey.register { [weak self] in
-            DispatchQueue.main.async { self?.notchController?.toggle() }
+            DispatchQueue.main.async { self?.handleHotkey() }
         }
+    }
+
+    /// ⌥Space behavior:
+    /// - chat open → collapse
+    /// - collapsed → open voice overlay instantly; a second ⌥Space within the
+    ///   double-press window dismisses voice and opens the chat window instead.
+    private var lastHotkeyAt: Date?
+    private let doublePressWindow: TimeInterval = 0.35
+
+    private func handleHotkey() {
+        guard let nc = notchController else { return }
+        let now = Date()
+
+        if nc.isExpanded {
+            lastHotkeyAt = nil
+            nc.collapse()
+            return
+        }
+
+        if nc.isVoiceShowing,
+           let last = lastHotkeyAt,
+           now.timeIntervalSince(last) < doublePressWindow {
+            lastHotkeyAt = nil
+            nc.openChatFromVoice()
+            return
+        }
+
+        lastHotkeyAt = now
+        nc.presentVoice()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

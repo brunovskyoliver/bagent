@@ -134,3 +134,41 @@ The notch wrap is a **1-second UI surface**: glanceable, tappable, always visibl
 - Bottom bridge: not focusable (decorative)
 - Full expanded panel: standard `accessibilityElement(children: .contain)` on the container
 - Reduced-motion: read via `NSWorkspace.shared.accessibilityDisplayShouldReduceMotion`; when `true`, skip shape morph, use `opacity` transition only
+
+---
+
+## Voice Input (Phase 5G)
+
+Two distinct surfaces, one shared `SpeechController` (WhisperKit, on-device).
+
+### Voice-only overlay (⌥Space, collapsed)
+- Pops from the notch using the **same charge→pop timing as the chat panel**
+  (`pillHovered` spring, then panel after 150 ms) — `NotchWindowController.presentVoice()`.
+- `VoiceOverlayView` (360×240): `.regularMaterial` rounded rect, subtle white stroke.
+  - `waveform` SF Symbol with `.symbolEffect(.variableColor.iterative.dimInactiveLayers.reversing, options: .repeating, isActive:)`.
+    *(`.repeating` is the macOS-14 form of `.repeat(.continuous)`, which is macOS 15+.)*
+  - `SiriWaveView` — `TimelineView(.animation)` + `Canvas`, 3 layered translucent sine
+    bands whose height tracks `speech.amplitude` (from WhisperKit `bufferEnergy`).
+  - Live transcript: last ~2 sentences; each `Text` keyed by `.id(sentence)` with an
+    asymmetric fade+move transition (insertion from bottom, removal to top), animated with
+    `.spring(response: 0.32, dampingFraction: 0.78)`.
+- Auto-finalizes on ~1.2 s silence → **morphs into the chat window** (`voiceToChatHandoff`):
+  overlay hides, chat expands, transcript is submitted via the normal `send()` pipeline.
+- Escape / click-away cancels (`onExitCommand` + global mouse monitor, mirroring the chat panel).
+
+### Inline mic (chat input bar)
+- `VoiceAttachControl`: the existing `+` attachments button with a `mic.fill` button that
+  springs **up above it** on hover or while recording
+  (`.spring(response: 0.28, dampingFraction: 0.68)`) — two stacked icons, mic on top.
+- Clicking the mic does **not** open the overlay; it records inline, pulses the mic with
+  `.symbolEffect(.pulse.byLayer, options: .repeating, isActive:)`, and live-fills the text
+  field. The final transcript is editable like typed text; send normally.
+
+### Hotkey
+- Single ⌥Space (collapsed) → voice overlay **instantly**.
+- Second ⌥Space within ~350 ms → dismiss voice, open chat (`AppDelegate.handleHotkey`).
+- ⌥Space while chat open → collapse (unchanged).
+
+### Reduced motion
+- `SiriWaveView` falls back to a static amplitude capsule (no `Canvas`/`TimelineView`).
+- Transcript transitions drop to `nil` animation.

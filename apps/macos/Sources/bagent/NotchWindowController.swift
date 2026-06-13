@@ -19,11 +19,15 @@ final class NotchWindowController: NSObject {
     private var statusPanel: BagentPanel!
     /// The expandable chat sheet — appears below the pill, hidden when collapsed.
     private var chatPanel: BagentPanel!
+    /// Voice-only overlay — appears below the pill while recording, hidden otherwise.
+    private var voicePanel: BagentPanel!
     private let chatViewModel: ChatViewModel
     private(set) var isExpanded = false
+    private(set) var isVoiceShowing = false
     private var hasNotch = false
     private var localKeyMonitor: Any?
     private var globalMouseMonitor: Any?
+    private var voiceMouseMonitor: Any?
 
     private var pillFrame: NSRect = .zero
     private var chatFrame: NSRect = .zero
@@ -38,12 +42,23 @@ final class NotchWindowController: NSObject {
         computeGeometry()
         buildStatusPanel()
         buildChatPanel()
+        buildVoicePanel()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensChanged),
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
+
+        // Hands-free voice loop: after a voice-initiated reply finishes, collapse
+        // the chat and re-open the voice overlay for the next utterance.
+        chatViewModel.onVoiceTurnComplete = { [weak self] in
+            guard let self else { return }
+            self.collapse()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+                self?.presentVoice()
+            }
+        }
 
         sizeCancellable = Publishers.CombineLatest(
             chatViewModel.$chatWindowW,
@@ -187,6 +202,113 @@ final class NotchWindowController: NSObject {
         self.chatPanel = panel
     }
 
+    private func buildVoicePanel() {
+        let panel = makeBasePanel(frame: voiceFrame, styleMask: [.borderless, .nonactivatingPanel])
+        let content = VoiceOverlayView(
+            speech: chatViewModel.speech,
+            onCancel: { [weak self] in self?.dismissVoice() }
+        )
+        panel.contentView = NSHostingView(rootView: content)
+        // Stays hidden until presentVoice() is called.
+        self.voicePanel = panel
+    }
+
+    /// Voice overlay frame — centered on the notch, below the pill.
+    private var voiceFrame: NSRect {
+        let w: CGFloat = 360, h: CGFloat = 240
+        let cx = pillFrame.midX
+        return NSRect(x: cx - w / 2, y: pillFrame.minY - h - 8, width: w, height: h)
+    }
+
+    // MARK: - Voice overlay
+
+    /// Open the voice-only overlay instantly (single ⌥Space when collapsed).
+    func presentVoice() {
+        guard !isExpanded, !isVoiceShowing else { return }
+        isVoiceShowing = true
+        previousApp = NSWorkspace.shared.frontmostApplication
+
+        // On finalize (silence auto-stop), morph straight into the chat window.
+        chatViewModel.speech.onFinalTranscript = { [weak self] text in
+            self?.voiceToChatHandoff(text: text)
+        }
+
+        // Charge the notch, then pop the overlay (same timing as the chat panel).
+        chatViewModel.pillHovered = true
+        if hasNotch { hoverChanged(isHovered: true) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.isVoiceShowing else { return }
+            self.showVoicePanel()
+        }
+
+        Task { await chatViewModel.speech.startSession(mode: .overlay) }
+    }
+
+    private func showVoicePanel() {
+        voicePanel.styleMask = [.borderless]
+        voicePanel.hasShadow = true
+        voicePanel.setFrame(voiceFrame, display: false)
+        voicePanel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        voiceMouseMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            guard let self else { return }
+            let loc = NSEvent.mouseLocation
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if !self.voicePanel.frame.contains(loc) && !self.statusPanel.frame.contains(loc) {
+                    self.dismissVoice()
+                }
+            }
+        }
+    }
+
+    /// Cancel voice capture and hide the overlay (Escape / click-away).
+    func dismissVoice() {
+        guard isVoiceShowing else { return }
+        chatViewModel.speech.cancel()
+        teardownVoice(restoreApp: true)
+    }
+
+    /// Double ⌥Space: drop voice and open the chat window instead.
+    func openChatFromVoice() {
+        guard isVoiceShowing else { return }
+        chatViewModel.speech.cancel()
+        let original = previousApp
+        teardownVoice(restoreApp: false)
+        expand()
+        previousApp = original   // expand() overwrote it; restore pre-voice target
+    }
+
+    private func voiceToChatHandoff(text: String) {
+        guard isVoiceShowing else { return }
+        let original = previousApp
+        teardownVoice(restoreApp: false)
+        expand()
+        previousApp = original
+        chatViewModel.voiceTurnActive = true   // re-arm voice once the reply finishes
+        chatViewModel.submitTranscript(text)
+    }
+
+    private func teardownVoice(restoreApp: Bool) {
+        isVoiceShowing = false
+        if let m = voiceMouseMonitor { NSEvent.removeMonitor(m); voiceMouseMonitor = nil }
+        voicePanel.styleMask = [.borderless, .nonactivatingPanel]
+        voicePanel.hasShadow = false
+        let appToRestore = restoreApp ? previousApp : nil
+        if restoreApp { previousApp = nil }
+        voicePanel.orderOut(nil)
+        voicePanel.resignKey()
+        if let appToRestore { appToRestore.activate(options: []) }
+        let loc = NSEvent.mouseLocation
+        if !statusPanel.frame.contains(loc) {
+            chatViewModel.pillHovered = false
+            if hasNotch { hoverChanged(isHovered: false) }
+        }
+    }
+
     // MARK: - Toggle
 
     func toggle() {
@@ -290,6 +412,9 @@ final class NotchWindowController: NSObject {
         statusPanel.setFrame(pillFrame, display: true)
         if isExpanded {
             chatPanel.setFrame(chatFrame, display: true)
+        }
+        if isVoiceShowing {
+            voicePanel.setFrame(voiceFrame, display: true)
         }
     }
 }

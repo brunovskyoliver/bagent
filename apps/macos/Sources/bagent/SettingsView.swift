@@ -3,10 +3,12 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var viewModel: ChatViewModel
     @ObservedObject private var permissions: PermissionsManager
+    @ObservedObject private var speech: SpeechController
 
     init(viewModel: ChatViewModel) {
         self.viewModel = viewModel
         self.permissions = viewModel.permissions
+        self.speech = viewModel.speech
     }
 
     var body: some View {
@@ -55,6 +57,54 @@ struct SettingsView: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Divider().padding(.vertical, 2)
+
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(permissions.hasMicrophoneAccess ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                    Image(systemName: "mic.fill").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("Mikrofón")
+                        .font(.system(size: 12))
+                    Spacer()
+                    if !permissions.hasMicrophoneAccess {
+                        Button("Udeliť") {
+                            Task {
+                                await permissions.requestMicrophoneAccess()
+                                if !permissions.hasMicrophoneAccess { permissions.openMicrophoneSettings() }
+                            }
+                        }
+                        .font(.system(size: 11))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
+                    } else {
+                        Text("aktívne").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+                if !permissions.hasMicrophoneAccess {
+                    Text("Potrebné pre hlasový vstup (Whisper, lokálne na zariadení).")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                HStack(spacing: 8) {
+                    if speech.state == .loadingModel {
+                        ProgressView().scaleEffect(0.5).frame(width: 7, height: 7)
+                    } else {
+                        Circle()
+                            .fill(speech.isModelLoaded ? Color.green : Color.gray)
+                            .frame(width: 7, height: 7)
+                    }
+                    Image(systemName: "waveform").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("Whisper model")
+                        .font(.system(size: 12))
+                    Spacer()
+                    Text(speech.state == .loadingModel ? "sťahuje sa…"
+                         : (speech.isModelLoaded ? "pripravený" : "stiahne sa pri prvom použití"))
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
         }

@@ -7,9 +7,13 @@ DAEMON_REL = $(REPO_ROOT)/target/release/bagentd
 
 .PHONY: run build daemon bundle clean
 
-# Dev run: builds daemon first, then launches Swift app (which auto-finds the debug binary)
+# Dev run: builds daemon first, then the Swift app. The Info.plist is embedded in
+# the binary (see Package.swift) so microphone/TCC works without bundling. Ad-hoc
+# sign with a stable identifier so the mic grant is attributed consistently.
 run: daemon-dev
-	swift run
+	swift build
+	codesign --force --sign - --identifier sk.bagent.app .build/debug/bagent
+	.build/debug/bagent
 
 # Build daemon debug binary
 daemon-dev:
@@ -39,6 +43,7 @@ bundle: build daemon
   <key>NSPrincipalClass</key>    <string>NSApplication</string>\n\
   <key>LSUIElement</key>         <true/>\n\
   <key>NSHighResolutionCapable</key> <true/>\n\
+  <key>NSMicrophoneUsageDescription</key> <string>bagent uses the microphone to transcribe your voice on-device with Whisper. Audio never leaves your Mac.</string>\n\
 </dict></plist>\n' > "$(BUNDLE)/Contents/Info.plist"
 	codesign --force --sign - "$(BUNDLE)"
 	@echo "✓  $(BUNDLE) ready — open $(BUNDLE) or drag to Applications"

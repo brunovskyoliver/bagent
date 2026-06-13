@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 // MARK: - Attachment types
@@ -136,6 +137,18 @@ final class ChatViewModel: ObservableObject {
 
     private let client = DaemonClient()
     let permissions = PermissionsManager()
+
+    // MARK: - Voice input
+    /// On-device Whisper STT. Shared by the inline mic button and the voice overlay.
+    let speech = SpeechController()
+    /// True while the inline (chat-input) mic is recording into `inputText`.
+    @Published var isVoiceRecording = false
+    private var speechCancellables: Set<AnyCancellable> = []
+    /// Set by the voice overlay handoff: marks the next turn as voice-initiated so
+    /// the hands-free loop re-opens voice mode once the assistant replies.
+    var voiceTurnActive = false
+    /// Invoked after a voice-initiated turn finishes streaming (re-presents voice).
+    var onVoiceTurnComplete: (() -> Void)?
 
     // Session ID persisted in UserDefaults so it survives app restarts
     private var sessionId: String? {
@@ -351,6 +364,10 @@ final class ChatViewModel: ObservableObject {
         messages.append(userMsg)
         isThinking = true
 
+        // Only the turn immediately following a voice handoff loops back to voice.
+        let wasVoiceTurn = voiceTurnActive
+        voiceTurnActive = false
+
         Task {
             let assistantMsg = ChatMessage(role: .assistant, content: "")
             messages.append(assistantMsg)
@@ -415,6 +432,8 @@ final class ChatViewModel: ObservableObject {
                         if let sid = returnedSessionId { sessionId = sid }
                         if first { isThinking = false }
                         Task { await loadDebugTrace(for: messages[idx].id) }
+                        // Hands-free loop: re-open voice mode after a voice-initiated reply.
+                        if wasVoiceTurn { onVoiceTurnComplete?() }
                     }
                 }
                 if first { isThinking = false }
@@ -423,6 +442,66 @@ final class ChatViewModel: ObservableObject {
                 messages[idx].content = "Chyba: \(error.localizedDescription)"
             }
         }
+    }
+
+    // MARK: - Voice input
+
+    /// Feed a finalized voice transcript through the normal chat pipeline.
+    func submitTranscript(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        inputText = t
+        send()
+    }
+
+    /// Inline mic: toggle recording into the text field (does not open the overlay).
+    func toggleInlineVoice() {
+        if speech.isRunning {
+            speech.finalize()
+        } else {
+            startInlineVoice()
+        }
+    }
+
+    private func startInlineVoice() {
+        speechCancellables.removeAll()
+        isVoiceRecording = true
+
+        // Final transcript lands in the field, editable like typed text.
+        speech.onFinalTranscript = { [weak self] text in
+            guard let self else { return }
+            self.inputText = text
+            self.isVoiceRecording = false
+        }
+
+        // Live-fill the field with the running transcript.
+        speech.$partialText
+            .receive(on: RunLoop.main)
+            .sink { [weak self] text in
+                guard let self, self.isVoiceRecording, !text.isEmpty else { return }
+                self.inputText = text
+            }
+            .store(in: &speechCancellables)
+
+        // Clear the recording flag when the session ends or errors.
+        speech.$state
+            .receive(on: RunLoop.main)
+            .sink { [weak self] st in
+                guard let self else { return }
+                switch st {
+                case .done, .idle, .error: self.isVoiceRecording = false
+                default: break
+                }
+            }
+            .store(in: &speechCancellables)
+
+        Task { await speech.startSession(mode: .inline) }
+    }
+
+    func cancelInlineVoice() {
+        speech.cancel()
+        isVoiceRecording = false
+        speechCancellables.removeAll()
     }
 
     // MARK: - Approvals
