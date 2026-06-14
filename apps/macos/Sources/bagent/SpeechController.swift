@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import CoreML
 import Foundation
@@ -41,6 +42,9 @@ final class SpeechController: ObservableObject {
     @Published private(set) var state: State = .idle
     /// Smoothed 0…1 amplitude for the waveform animation.
     @Published private(set) var amplitude: CGFloat = 0
+    /// Live frequency spectrum: `SpectrumAnalyzer.bandCount` bands (0…1), 80 Hz–8 kHz.
+    /// Updated at ~60 fps while recording. Empty when idle.
+    @Published private(set) var spectrum: [CGFloat] = []
     /// Running transcript (confirmed + in-flight). Inline mode mirrors this into the text field.
     @Published private(set) var partialText: String = ""
     /// Last ~2 sentences, for the voice-overlay fade/blend display.
@@ -65,8 +69,13 @@ final class SpeechController: ObservableObject {
     private var streamTask: Task<Void, Never>?
     private var vadTask: Task<Void, Never>?
     private var frameTask: Task<Void, Never>?
+    private var displayTask: Task<Void, Never>?
     private var frameContinuation: AsyncStream<Frame>.Continuation?
     private var mode: Mode = .overlay
+
+    // Spectrum analysis — one stable analyzer instance reused across sessions.
+    private let analyzer = SpectrumAnalyzer()
+    private var smoothedSpectrum = [Float](repeating: 0, count: SpectrumAnalyzer.bandCount)
 
     // MARK: Silence VAD (session-level auto-stop)
     private var hasHeardSpeech = false
@@ -213,6 +222,21 @@ final class SpeechController: ObservableObject {
             }
         }
 
+        // ~60 fps spectrum update driven by WhisperKit's raw sample ring buffer.
+        let processor = wk.audioProcessor
+        displayTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(16))
+                guard let self else { break }
+                let raw = self.analyzer.analyze(processor.audioSamples)
+                let alpha: Float = 0.35
+                for i in 0..<SpectrumAnalyzer.bandCount {
+                    self.smoothedSpectrum[i] += (raw[i] - self.smoothedSpectrum[i]) * alpha
+                }
+                self.spectrum = self.smoothedSpectrum.map { CGFloat($0) }
+            }
+        }
+
         streamTask = Task { @MainActor [weak self] in
             do {
                 try await t.startStreamTranscription()
@@ -266,6 +290,7 @@ final class SpeechController: ObservableObject {
 
     private func stopInternal() {
         vadTask?.cancel(); vadTask = nil
+        displayTask?.cancel(); displayTask = nil
         streamTask?.cancel(); streamTask = nil
         frameContinuation?.finish(); frameContinuation = nil
         frameTask?.cancel(); frameTask = nil
@@ -279,6 +304,8 @@ final class SpeechController: ObservableObject {
 
     private func reset() {
         amplitude = 0
+        spectrum = []
+        smoothedSpectrum = [Float](repeating: 0, count: SpectrumAnalyzer.bandCount)
         partialText = ""
         sentences = []
         hasHeardSpeech = false

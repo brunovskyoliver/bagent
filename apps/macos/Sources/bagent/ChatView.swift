@@ -11,6 +11,8 @@ enum NotchWrapMetrics {
     static let innerCornerRadius: CGFloat = 8    // notch border
     static let expandedBridgeHeight: CGFloat = 520  // matches chatH
     static let expandedWingWidth: CGFloat   = 200   // chatW / 2
+    static let voiceWingWidth: CGFloat    = 100  // voice mode — wide enough for sentence
+    static let voiceBridgeHeight: CGFloat = 120  // voice mode — fits wave + 2 text lines
     static let notchBorderColor           = Color(white: 0.30)
 }
 
@@ -34,7 +36,7 @@ struct StatusPillView: View {
                 onHoverChanged: onHoverChanged
             )
         } else {
-            MenuBarPillView()
+            MenuBarPillView(viewModel: viewModel)
                 .contentShape(Rectangle())
                 .onTapGesture { onTap() }
         }
@@ -57,20 +59,34 @@ struct NotchWrapView: View {
     @State private var pulsing = false
     @State private var copyFlashed = false
     @State private var isDragTargeted = false
+    @State private var isVoiceActive = false
+    @State private var voiceContentOpacity: CGFloat = 0
+    @State private var borderPulseOpacity: CGFloat = 0.35
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    // Panel is always (2*hoverWingWidth + notchWidth) wide.
-    // notchOffset = fixed x of the notch left edge in panel coords.
-    private let notchOffset = NotchWrapMetrics.hoverWingWidth
+    // Panel is sized for voice mode (the widest/tallest state) so the frame never needs
+    // AppKit resizing. notchOffset = voiceWingWidth = left edge of the physical notch.
+    private let notchOffset = NotchWrapMetrics.voiceWingWidth
 
     private var spring: Animation {
         reduceMotion ? .easeInOut(duration: 0.18) : .spring(response: 0.28, dampingFraction: 0.78)
     }
     private var status: AgentStatus { viewModel.agentStatus }
+
+    /// SF Symbol name for the right-wing voice indicator.
+    private var voiceIconName: String {
+        switch viewModel.speech.state {
+        case .loadingModel:        return "waveform.badge.magnifyingglass"
+        case .listening:           return "waveform"
+        case .finalizing:          return "waveform.badge.clock"
+        case .error:               return "exclamationmark.triangle"
+        default:                   return "waveform"
+        }
+    }
     private var maxSize: CGSize {
         CGSize(
-            width: 2 * NotchWrapMetrics.hoverWingWidth + notchWidth,
-            height: notchHeight + NotchWrapMetrics.hoverBridgeHeight
+            width: 2 * NotchWrapMetrics.voiceWingWidth + notchWidth,
+            height: notchHeight + NotchWrapMetrics.voiceBridgeHeight
         )
     }
 
@@ -81,12 +97,39 @@ struct NotchWrapView: View {
         }
     }
 
-    // Icon positions track the center of the current wing area (x) and shape height (y).
+    private func setVoiceState(active: Bool) {
+        withAnimation(spring) {
+            wingWidth    = active ? NotchWrapMetrics.voiceWingWidth    : (viewModel.pillHovered ? NotchWrapMetrics.hoverWingWidth    : NotchWrapMetrics.idleWingWidth)
+            bridgeHeight = active ? NotchWrapMetrics.voiceBridgeHeight : (viewModel.pillHovered ? NotchWrapMetrics.hoverBridgeHeight : NotchWrapMetrics.idleBridgeHeight)
+        }
+        if active {
+            if !reduceMotion {
+                withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
+                    borderPulseOpacity = 0.75
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                withAnimation(.easeIn(duration: 0.20)) { voiceContentOpacity = 1 }
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.15)) {
+                voiceContentOpacity = 0
+                borderPulseOpacity = 0.35
+            }
+        }
+    }
+
+    // Icon x tracks wing center. Icon y is clamped to the notch/hover area so it
+    // doesn't drift into the bridge content during voice mode (bridge = 120 pt).
+    private var iconY: CGFloat {
+        let clampedBridge = min(bridgeHeight, NotchWrapMetrics.hoverBridgeHeight)
+        return (notchHeight + clampedBridge) / 2
+    }
     private var leftIconPos: CGPoint {
-        CGPoint(x: notchOffset - wingWidth / 2, y: (notchHeight + bridgeHeight) / 2)
+        CGPoint(x: notchOffset - wingWidth / 2, y: iconY)
     }
     private var rightIconPos: CGPoint {
-        CGPoint(x: notchOffset + notchWidth + wingWidth / 2, y: (notchHeight + bridgeHeight) / 2)
+        CGPoint(x: notchOffset + notchWidth + wingWidth / 2, y: iconY)
     }
 
     var body: some View {
@@ -125,19 +168,49 @@ struct NotchWrapView: View {
 
                 ctx.fill(fill, with: .color(.black))
                 ctx.stroke(border,
-                           with: .color(NotchWrapMetrics.notchBorderColor.opacity(isHovered ? 0.80 : 0.35)),
+                           with: .color(NotchWrapMetrics.notchBorderColor.opacity(
+                               isVoiceActive ? borderPulseOpacity : (isHovered ? 0.80 : 0.35)
+                           )),
                            lineWidth: 1)
             }
 
             // Left icon — tracks center of wing as it expands
             Image(systemName: "sparkles")
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(isHovered ? 1.0 : 0.75))
+                .foregroundStyle(Color.white.opacity((isHovered || isVoiceActive) ? 1.0 : 0.75))
+                .contentTransition(.symbolEffect(.replace))
                 .position(leftIconPos)
 
-            // Right status dot — tracks center of wing as it expands
-            StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
-                .position(rightIconPos)
+            // Right icon — animated waveform symbol in voice mode, status dot otherwise
+            if isVoiceActive {
+                Image(systemName: voiceIconName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    // `.repeating` is the macOS 14-compatible equivalent of `.repeat(.continuous)`.
+                    .symbolEffect(
+                        .variableColor.iterative.dimInactiveLayers.nonReversing,
+                        options: .repeating,
+                        isActive: viewModel.speech.state == .listening
+                    )
+                    .contentTransition(.symbolEffect(.replace))
+                    .position(rightIconPos)
+                    .opacity(voiceContentOpacity)
+            } else {
+                StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
+                    .position(rightIconPos)
+            }
+
+            // Voice content in bridge area (wave + live sentence)
+            if isVoiceActive {
+                VoiceNotchContent(speech: viewModel.speech, viewModel: viewModel)
+                    .frame(
+                        width: notchWidth + 2 * NotchWrapMetrics.voiceWingWidth - 20,
+                        height: NotchWrapMetrics.voiceBridgeHeight - 12
+                    )
+                    .position(x: notchOffset + notchWidth / 2,
+                              y: notchHeight + NotchWrapMetrics.voiceBridgeHeight / 2)
+                    .opacity(voiceContentOpacity)
+            }
         }
         .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
         .contentShape(
@@ -176,6 +249,10 @@ struct NotchWrapView: View {
         .onChange(of: isDragTargeted) { _, targeted in
             setExpansion(expanded: targeted || isHovered || viewModel.pillHovered)
             onHoverChanged(targeted || isHovered)
+        }
+        .onChange(of: viewModel.isVoiceNotchActive) { _, active in
+            isVoiceActive = active
+            setVoiceState(active: active)
         }
         .onChange(of: status) {
             pulsing = (status == .thinking)
@@ -293,17 +370,58 @@ struct StatusDotView: View {
 // MARK: - Menu-bar inline pill (external / non-notch display)
 
 struct MenuBarPillView: View {
+    @ObservedObject var viewModel: ChatViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var isVoice: Bool { viewModel.isVoiceNotchActive }
+
     var body: some View {
         Color.clear
             .overlay {
                 HStack(spacing: 5) {
+                    // Non-notch pill always stays "bagent" + sparkles.
+                    // (Voice feedback is shown in the dropdown VoiceOverlayView panel below.)
                     Image(systemName: "sparkles")
                         .font(.system(size: 11, weight: .semibold))
+
                     Text("bagent")
                         .font(.system(size: 12, weight: .medium))
                 }
                 .foregroundStyle(.primary)
             }
+    }
+}
+
+/// "Listening" label with three animated dots that fade in sequentially and
+/// drift left↔right as a group. Falls back to a static "Listening…" in
+/// Reduce Motion mode.
+struct ListeningDotsView: View {
+    let reduceMotion: Bool
+    @State private var dotOffset: CGFloat = 0
+
+    var body: some View {
+        if reduceMotion {
+            Text("Listening…")
+        } else {
+            HStack(spacing: 1) {
+                Text("Listening")
+                TimelineView(.animation) { timeline in
+                    HStack(spacing: 2) {
+                        ForEach(0..<3, id: \.self) { i in
+                            let t = timeline.date.timeIntervalSinceReferenceDate
+                            let phase = t * 2.2 + Double(i) * 0.55
+                            let opacity = (sin(phase) + 1) / 2   // 0…1
+                            Text("•")
+                                .opacity(0.30 + opacity * 0.70)
+                        }
+                    }
+                    .offset(x: {
+                        let t = timeline.date.timeIntervalSinceReferenceDate
+                        return CGFloat(sin(t * 1.1)) * 2.5
+                    }())
+                }
+            }
+        }
     }
 }
 

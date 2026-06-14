@@ -1097,8 +1097,8 @@ async fn chat(
         }
 
         tracing::info!("chat timing: rules checked {}ms", t0.elapsed().as_millis());
-        // Fetch live tool context (mail/notes) only for approved tools
-        let (tool_ctx, mail_pdf_paths, mail_ref_opt) = fetch_tool_context(
+        // Fetch live tool context (mail/notes/window) only for approved tools
+        let (tool_ctx, mail_pdf_paths, mail_ref_opt, action_taken) = fetch_tool_context(
             &user_message,
             &history,
             last_mail_ref.as_ref(),
@@ -1111,6 +1111,17 @@ async fn chat(
             memory.clone(),
         )
         .await;
+
+        // Background action (e.g. workspace switch): skip LLM, emit brief confirmation.
+        if let Some(action_msg) = action_taken {
+            let _ = tx.send(Ok(Event::default().data(
+                serde_json::json!({"type": "action_taken", "message": action_msg}).to_string()
+            ))).await;
+            let _ = tx.send(Ok(Event::default().data(
+                serde_json::json!({"type": "done", "session_id": session_id}).to_string()
+            ))).await;
+            return;
+        }
 
         // Emit mail_found before tokens so the MailRef is in place when the client
         // starts watching for the auto-open trigger.
@@ -2684,6 +2695,7 @@ async fn fetch_tool_context(
     Option<String>,
     Vec<(String, std::path::PathBuf)>,
     Option<MailRef>,
+    Option<String>,  // action_taken: Some(msg) skips LLM, shows brief notch confirmation
 ) {
     let low = message.to_lowercase();
 
@@ -3149,9 +3161,10 @@ async fn fetch_tool_context(
             tracing::debug!("window_intent: {:?}", intent);
             if intent.action != "none" {
                 if let Ok(note) = run_aerospace_intent(&intent).await {
-                    if !note.is_empty() {
-                        parts.push(note);
-                    }
+                    // Background action completed — signal caller to skip LLM streaming
+                    // and show a brief confirmation in the voice notch instead.
+                    tracing::info!("window action taken: {}", note);
+                    return (None, Vec::new(), None, Some(note));
                 }
             }
         }
@@ -3168,7 +3181,7 @@ async fn fetch_tool_context(
         ))
     };
 
-    (ctx, pdf_paths, found_mail_ref)
+    (ctx, pdf_paths, found_mail_ref, None)
 }
 
 // ── AeroSpace executor ────────────────────────────────────────────────────────

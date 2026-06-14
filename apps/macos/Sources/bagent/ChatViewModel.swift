@@ -149,6 +149,12 @@ final class ChatViewModel: ObservableObject {
     var voiceTurnActive = false
     /// Invoked after a voice-initiated turn finishes streaming (re-presents voice).
     var onVoiceTurnComplete: (() -> Void)?
+    /// Drives notch expansion into voice mode (no separate panel).
+    @Published var isVoiceNotchActive: Bool = false
+    /// Brief confirmation message shown in the notch after a silent background action.
+    @Published var voiceActionMessage: String? = nil
+    /// Called when the daemon executed a background action instead of streaming LLM.
+    var onVoiceActionTaken: ((String) -> Void)?
 
     // Session ID persisted in UserDefaults so it survives app restarts
     private var sessionId: String? {
@@ -428,6 +434,10 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].attachments.append(contentsOf: chips)
                     case .mailFound(let ref):
                         messages[idx].mailRef = ref
+                    case .actionTaken(let message):
+                        isThinking = false
+                        voiceActionMessage = message
+                        onVoiceActionTaken?(message)
                     case .done(let returnedSessionId):
                         if let sid = returnedSessionId { sessionId = sid }
                         if first { isThinking = false }
@@ -445,6 +455,15 @@ final class ChatViewModel: ObservableObject {
     }
 
     // MARK: - Voice input
+
+    /// Estimates how long the user needs to read the last assistant response
+    /// before voice re-entry. Based on ≈150 WPM, clamped 1.5–7 s.
+    func voiceTurnResumeDelay() -> TimeInterval {
+        let text = messages.last(where: { $0.role == .assistant })?.content ?? ""
+        let wordCount = text.split(separator: " ").count
+        let reading = Double(wordCount) / 150.0 * 60.0
+        return max(1.5, min(7.0, reading))
+    }
 
     /// Feed a finalized voice transcript through the normal chat pipeline.
     func submitTranscript(_ text: String) {

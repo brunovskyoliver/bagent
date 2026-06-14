@@ -150,6 +150,7 @@ struct DaemonClient: Sendable {
         case toolBlocked(tool: String)
         case mailAttachments([MailAttachmentRef])
         case mailFound(MailRef)
+        case actionTaken(message: String)
         case done(sessionId: String?)
     }
 
@@ -325,6 +326,10 @@ struct DaemonClient: Sendable {
                                     auto_open: event.auto_open ?? false
                                 )
                                 continuation.yield(.mailFound(ref_))
+                            }
+                        case "action_taken":
+                            if let msg = event.message {
+                                continuation.yield(.actionTaken(message: msg))
                             }
                         case "done":
                             continuation.yield(.done(sessionId: event.session_id))

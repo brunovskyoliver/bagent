@@ -401,6 +401,18 @@ On-device, English-only speech-to-text via WhisperKit (CoreML/ANE). Audio captur
 
 ---
 
+## Phase 5H — Non-Notch Voice Display + Wave Redesign ✅ COMPLETE
+
+- [x] `WaveBackgroundView.swift` — replaces `SiriWaveView`; `TimelineView(.animation)` + `Canvas`; 4 randomized bands spread across full canvas height; each band uses two sine harmonics for irregular curves; dots/mesh pattern fill under each curve via `clipToLayer`; slowed motion (~0.12–0.25× time multiplier); amplitude-reactive with idle-ripple floor; dots/mesh pattern scrolls subtly per band; reduced-motion fallback renders static dotted curves; deleted `SiriWaveView.swift`
+- [x] Non-notch voice panel — `NotchWindowController.swift`: added `voicePanel: BagentPanel?` + `voiceFrame`; `buildVoicePanel()` wires `VoiceOverlayView`; `computeGeometry()` non-notch branch computes `voiceFrame` (width ≥ 440, height 190, 8 pt below pill); `presentVoice()` branches on `hasNotch` — non-notch: `orderFront` voice panel + install global mouse-down monitor (click-away → `dismissVoice`) + global key monitor (Escape); `teardownVoiceNotch()` branches — non-notch: removes both monitors, `orderOut` voice panel; `screensChanged()` rebuilds voice panel
+- [x] Pill icon + label react to voice — `ChatView.swift` `MenuBarPillView` observes `viewModel.isVoiceNotchActive`: icon morphs `sparkles` → `waveform` via `.contentTransition(.symbolEffect(.replace))` + `.variableColor` pulse while listening; label swaps to new `ListeningDotsView` ("Listening" + 3 sequentially-pulsing dots that drift side-to-side via `TimelineView`; reduced-motion → static "Listening…")
+- [x] `VoiceNotchContent.swift` — `SiriWaveView` swapped for `WaveBackgroundView(bandCount: 3)` in bridge
+- [x] `VoiceOverlayView.swift` — redesigned as non-notch panel content: `WaveBackgroundView` fills background, dark overlay for text legibility, white border, `waveform` symbol + live transcript float on top; size 440×190
+- [ ] Manual QA — non-notch: ⌥Space → pill icon morphs, "Listening •••" appears, panel drops, waves animate; silence/Escape/click-away dismisses; double ⌥Space opens chat; speaking → transcript → chat handoff
+- [ ] Manual QA — notch: bridge wave bg shows new randomized dot-filled curves; transcript readable on top; all prior voice paths unchanged
+
+---
+
 ## Phase 1B — Chat Scroll UX (✅ COMPLETE — test pending)
 
 - [x] Smart sticky-scroll: `userScrolledUp: Bool @State` in `ExpandedChatView`; `ScrollOffsetKey` `PreferenceKey` detects offset via content `GeometryReader` background; auto-scroll `.onChange(streamingChunk)` / `.onChange(messages.count)` gated on `!userScrolledUp`; new user-message send resets flag to false (`apps/macos/Sources/bagent/ChatView.swift`)

@@ -14,25 +14,40 @@ private final class BagentPanel: NSPanel {
 final class NotchWindowController: NSObject {
 
     /// Always-visible pill that shows the label/status.
-    /// On notch displays the window frame stays at max hover size; SwiftUI
+    /// On notch displays the window frame stays at max voice size; SwiftUI
     /// animates the visible shape inside it to avoid AppKit resize clipping.
     private var statusPanel: BagentPanel!
     /// The expandable chat sheet — appears below the pill, hidden when collapsed.
     private var chatPanel: BagentPanel!
-    /// Voice-only overlay — appears below the pill while recording, hidden otherwise.
-    private var voicePanel: BagentPanel!
+    /// Voice visualization panel — used only on non-notch displays (notch path
+    /// renders voice content inline in the status panel's bridge area).
+    private var voicePanel: BagentPanel?
     private let chatViewModel: ChatViewModel
     private(set) var isExpanded = false
     private(set) var isVoiceShowing = false
     private var hasNotch = false
     private var localKeyMonitor: Any?
     private var globalMouseMonitor: Any?
+    /// Monitors used only for the non-notch voice panel (click-away + Escape).
     private var voiceMouseMonitor: Any?
+    private var voiceKeyMonitor: Any?
 
     private var pillFrame: NSRect = .zero
     private var chatFrame: NSRect = .zero
+    private var voiceFrame: NSRect = .zero
     private var notchWidth: CGFloat = 0
     private var notchHeight: CGFloat = 0
+    /// The real bottom-of-menu-bar Y coordinate (screen space).
+    /// Used to anchor the chat panel independently of the oversized voice pill frame.
+    private var menuBarBottomY: CGFloat = 0
+
+    /// Y below which the chat panel should start — accounts for the hover bridge
+    /// (22 pt) that hangs below the menu bar when the notch is expanded.
+    private var chatAnchorY: CGFloat {
+        hasNotch
+            ? menuBarBottomY - NotchWrapMetrics.hoverBridgeHeight
+            : menuBarBottomY
+    }
     private var sizeCancellable: AnyCancellable?
     private var previousApp: NSRunningApplication?
 
@@ -42,7 +57,7 @@ final class NotchWindowController: NSObject {
         computeGeometry()
         buildStatusPanel()
         buildChatPanel()
-        buildVoicePanel()
+        if !hasNotch { buildVoicePanel() }
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensChanged),
@@ -54,9 +69,24 @@ final class NotchWindowController: NSObject {
         // the chat and re-open the voice overlay for the next utterance.
         chatViewModel.onVoiceTurnComplete = { [weak self] in
             guard let self else { return }
+            // Give the user time to read/absorb the response before re-opening voice.
+            // Delay is proportional to response word count (≈150 WPM reading pace),
+            // clamped to a sensible range so very short or very long replies don't
+            // feel awkward.
+            let readDelay = self.chatViewModel.voiceTurnResumeDelay()
             self.collapse()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + readDelay) { [weak self] in
                 self?.presentVoice()
+            }
+        }
+
+        // Silent background action: show confirmation in notch for 2.5s then collapse.
+        chatViewModel.onVoiceActionTaken = { [weak self] _ in
+            guard let self else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let self else { return }
+                self.chatViewModel.voiceActionMessage = nil
+                self.teardownVoiceNotch(restoreApp: true)
             }
         }
 
@@ -71,6 +101,8 @@ final class NotchWindowController: NSObject {
             // in the same runloop pass as the SwiftUI layout change.
             self?.updateChatSize(w: w, h: h)
         }
+
+        setupFullscreenMonitoring()
     }
 
     // MARK: - Geometry
@@ -97,18 +129,20 @@ final class NotchWindowController: NSObject {
             notchWidth  = 0
             notchHeight = 0
         }
+        self.menuBarBottomY = menuBarBottomY
 
         chatViewModel.hasNotch = hasNotch
 
         if hasNotch {
-            // pillFrame spans both wings + the notch gap + bridge clearance.
-            // Width = 2*hoverWingWidth + notchWidth (wide enough for hover state).
-            // Height = menuBarH + hoverBridgeHeight (small room for the bridge).
-            let totalW = 2 * NotchWrapMetrics.hoverWingWidth + notchWidth
-            let totalH = menuBarH + NotchWrapMetrics.hoverBridgeHeight
+            // pillFrame sized for voice mode (widest/tallest state) so AppKit frame
+            // never needs resizing — SwiftUI animates the visible shape within it.
+            // Width = 2*voiceWingWidth + notchWidth.
+            // Height = menuBarH + voiceBridgeHeight.
+            let totalW = 2 * NotchWrapMetrics.voiceWingWidth + notchWidth
+            let totalH = menuBarH + NotchWrapMetrics.voiceBridgeHeight
             pillFrame = NSRect(
                 x: notchCenterX - totalW / 2,
-                y: menuBarBottomY - NotchWrapMetrics.hoverBridgeHeight,
+                y: menuBarBottomY - NotchWrapMetrics.voiceBridgeHeight,
                 width: totalW,
                 height: totalH
             )
@@ -120,15 +154,25 @@ final class NotchWindowController: NSObject {
                 width: pillW,
                 height: menuBarH
             )
+            // Voice panel drops from the pill on non-notch displays, like the chat panel.
+            let voiceW: CGFloat = max(pillW, 440)
+            let voiceH: CGFloat = 190
+            voiceFrame = NSRect(
+                x: notchCenterX - voiceW / 2,
+                y: pillFrame.minY - voiceH - 8,
+                width: voiceW,
+                height: voiceH
+            )
         }
 
-        // Chat panel sits below the pill with a small visual gap.
+        // Chat panel drops from below the hover-expanded notch bridge.
+        // chatAnchorY = menuBarBottomY - hoverBridgeHeight on notch displays.
         let chatW = chatViewModel.chatWindowW
         let chatH = chatViewModel.chatWindowH
         let chatGap: CGFloat = 8
         chatFrame = NSRect(
             x: notchCenterX - chatW / 2,
-            y: pillFrame.minY - chatH - chatGap,
+            y: chatAnchorY - chatH - chatGap,
             width: chatW,
             height: chatH
         )
@@ -138,7 +182,7 @@ final class NotchWindowController: NSObject {
         let notchCenterX = pillFrame.midX
         chatFrame = NSRect(
             x: notchCenterX - w / 2,
-            y: pillFrame.minY - h - 8,
+            y: chatAnchorY - h - 8,
             width: w,
             height: h
         )
@@ -209,67 +253,69 @@ final class NotchWindowController: NSObject {
             onCancel: { [weak self] in self?.dismissVoice() }
         )
         panel.contentView = NSHostingView(rootView: content)
-        // Stays hidden until presentVoice() is called.
+        // Stays hidden until presentVoice() is called on a non-notch display.
         self.voicePanel = panel
     }
 
-    /// Voice overlay frame — centered on the notch, below the pill.
-    private var voiceFrame: NSRect {
-        let w: CGFloat = 360, h: CGFloat = 240
-        let cx = pillFrame.midX
-        return NSRect(x: cx - w / 2, y: pillFrame.minY - h - 8, width: w, height: h)
-    }
+    // MARK: - Voice mode
 
-    // MARK: - Voice overlay
-
-    /// Open the voice-only overlay instantly (single ⌥Space when collapsed).
+    /// Open voice mode (single ⌥Space when collapsed).
+    ///
+    /// - Notch display: expands the notch bridge shape and renders `VoiceNotchContent` inside it.
+    /// - Non-notch display: shows the `voicePanel` below the centered pill; the pill's icon and
+    ///   label react to `isVoiceNotchActive` in SwiftUI.
     func presentVoice() {
         guard !isExpanded, !isVoiceShowing else { return }
         isVoiceShowing = true
         previousApp = NSWorkspace.shared.frontmostApplication
 
-        // On finalize (silence auto-stop), morph straight into the chat window.
         chatViewModel.speech.onFinalTranscript = { [weak self] text in
             self?.voiceToChatHandoff(text: text)
         }
 
-        // Charge the notch, then pop the overlay (same timing as the chat panel).
-        chatViewModel.pillHovered = true
-        if hasNotch { hoverChanged(isHovered: true) }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, self.isVoiceShowing else { return }
-            self.showVoicePanel()
+        // Signal SwiftUI so the pill icon/label react in both display types.
+        chatViewModel.isVoiceNotchActive = true
+
+        if hasNotch {
+            // ---- Notch path: inline bridge expansion (unchanged) ----
+            chatViewModel.pillHovered = true
+            hoverChanged(isHovered: true)
+        } else {
+            // ---- Non-notch path: drop the voice panel below the pill ----
+            if let vp = voicePanel {
+                vp.setFrame(voiceFrame, display: false)
+                vp.orderFront(nil)
+                vp.hasShadow = true
+            }
+            // Click-away monitor — clicking outside the voice or status panel dismisses voice.
+            voiceMouseMonitor = NSEvent.addGlobalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown]
+            ) { [weak self] _ in
+                guard let self else { return }
+                let loc = NSEvent.mouseLocation
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let inVoice  = self.voicePanel?.frame.contains(loc) ?? false
+                    let inStatus = self.statusPanel.frame.contains(loc)
+                    if !inVoice && !inStatus { self.dismissVoice() }
+                }
+            }
+            // Escape key monitor
+            voiceKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                if event.keyCode == 53 {   // Escape
+                    Task { @MainActor [weak self] in self?.dismissVoice() }
+                }
+            }
         }
 
         Task { await chatViewModel.speech.startSession(mode: .overlay) }
     }
 
-    private func showVoicePanel() {
-        voicePanel.styleMask = [.borderless]
-        voicePanel.hasShadow = true
-        voicePanel.setFrame(voiceFrame, display: false)
-        voicePanel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-
-        voiceMouseMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown]
-        ) { [weak self] _ in
-            guard let self else { return }
-            let loc = NSEvent.mouseLocation
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if !self.voicePanel.frame.contains(loc) && !self.statusPanel.frame.contains(loc) {
-                    self.dismissVoice()
-                }
-            }
-        }
-    }
-
-    /// Cancel voice capture and hide the overlay (Escape / click-away).
+    /// Cancel voice capture and collapse the notch back to idle.
     func dismissVoice() {
         guard isVoiceShowing else { return }
         chatViewModel.speech.cancel()
-        teardownVoice(restoreApp: true)
+        teardownVoiceNotch(restoreApp: true)
     }
 
     /// Double ⌥Space: drop voice and open the chat window instead.
@@ -277,36 +323,74 @@ final class NotchWindowController: NSObject {
         guard isVoiceShowing else { return }
         chatViewModel.speech.cancel()
         let original = previousApp
-        teardownVoice(restoreApp: false)
+        teardownVoiceNotch(restoreApp: false)
         expand()
-        previousApp = original   // expand() overwrote it; restore pre-voice target
+        previousApp = original
     }
 
     private func voiceToChatHandoff(text: String) {
         guard isVoiceShowing else { return }
-        let original = previousApp
-        teardownVoice(restoreApp: false)
-        expand()
-        previousApp = original
-        chatViewModel.voiceTurnActive = true   // re-arm voice once the reply finishes
-        chatViewModel.submitTranscript(text)
+        if isStopIntent(text) {
+            teardownVoiceNotch(restoreApp: true)
+            return
+        }
+        let savedApp = previousApp
+        teardownVoiceNotch(restoreApp: false)
+        // Brief pause so voice content fades before chat begins expanding.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self else { return }
+            self.expand()
+            self.previousApp = savedApp
+            self.chatViewModel.voiceTurnActive = true
+            self.chatViewModel.submitTranscript(text)
+        }
     }
 
-    private func teardownVoice(restoreApp: Bool) {
+    private func teardownVoiceNotch(restoreApp: Bool) {
+        guard isVoiceShowing else { return }
         isVoiceShowing = false
-        if let m = voiceMouseMonitor { NSEvent.removeMonitor(m); voiceMouseMonitor = nil }
-        voicePanel.styleMask = [.borderless, .nonactivatingPanel]
-        voicePanel.hasShadow = false
-        let appToRestore = restoreApp ? previousApp : nil
+        chatViewModel.isVoiceNotchActive = false   // triggers pill icon/label reset in SwiftUI
+
+        let app = restoreApp ? previousApp : nil
         if restoreApp { previousApp = nil }
-        voicePanel.orderOut(nil)
-        voicePanel.resignKey()
-        if let appToRestore { appToRestore.activate(options: []) }
-        let loc = NSEvent.mouseLocation
-        if !statusPanel.frame.contains(loc) {
-            chatViewModel.pillHovered = false
-            if hasNotch { hoverChanged(isHovered: false) }
+
+        if hasNotch {
+            // After content fades (150 ms), contract notch and restore focus.
+            // Always collapse regardless of mouse position — hover events will
+            // re-expand naturally if the user is still hovering.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
+                guard let self else { return }
+                if !self.isExpanded {
+                    self.chatViewModel.pillHovered = false
+                    self.hoverChanged(isHovered: false)
+                }
+                app?.activate(options: [])
+            }
+        } else {
+            // Remove voice monitors and hide the panel immediately.
+            if let m = voiceMouseMonitor { NSEvent.removeMonitor(m); voiceMouseMonitor = nil }
+            if let m = voiceKeyMonitor   { NSEvent.removeMonitor(m); voiceKeyMonitor   = nil }
+            voicePanel?.hasShadow = false
+            voicePanel?.orderOut(nil)
+            app?.activate(options: [])
         }
+    }
+
+    // MARK: - Stop intent detection
+
+    private static let stopPatterns: [String] = [
+        "thank you", "thanks", "that's it", "that's all", "that is it",
+        "that is all", "stop", "goodbye", "bye", "we're done", "you can stop",
+        "ok thanks", "okay thanks", "all good", "got it thanks",
+        "ďakujem", "to je všetko", "stačí", "skončime",
+        "dobre ďakujem", "dosť", "koniec", "dobré ďakujem",
+    ]
+
+    private func isStopIntent(_ text: String) -> Bool {
+        let lower = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let wordCount = lower.split(separator: " ").count
+        guard wordCount < 8 else { return false }
+        return Self.stopPatterns.contains { lower.contains($0) }
     }
 
     // MARK: - Toggle
@@ -402,6 +486,117 @@ final class NotchWindowController: NSObject {
         }
     }
 
+    // MARK: - Fullscreen detection (hide notch over fullscreen video)
+
+    private var fullscreenPollTimer: Timer?
+    /// Tracks last known hide state to avoid redundant show/hide calls.
+    private var notchHiddenForFullscreen = false
+
+    private func setupFullscreenMonitoring() {
+        let wsnc = NSWorkspace.shared.notificationCenter
+        // Space switch: entering/exiting fullscreen that creates a new Space.
+        wsnc.addObserver(self, selector: #selector(fullscreenEvent),
+                         name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        // App activation: catching cases where the same app re-activates.
+        wsnc.addObserver(self, selector: #selector(fullscreenEvent),
+                         name: NSWorkspace.didActivateApplicationNotification, object: nil)
+
+        // Polling at 0.8 s catches inline fullscreen (Safari F-key, Netflix, etc.)
+        // where no Space change or app switch notification fires. CGWindowListCopyWindowInfo
+        // is fast enough (~0.1 ms) that 0.8 s polling adds negligible CPU.
+        fullscreenPollTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.updateNotchVisibility() }
+        }
+        fullscreenPollTimer?.tolerance = 0.2   // allow coalescing
+    }
+
+    @objc private func fullscreenEvent() {
+        // Small delay so the window list settles after the Space transition animation.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.updateNotchVisibility()
+        }
+    }
+
+    private func updateNotchVisibility() {
+        let shouldHide = isExternalFullscreenActive()
+        guard shouldHide != notchHiddenForFullscreen else { return }
+        notchHiddenForFullscreen = shouldHide
+
+        if shouldHide {
+            if statusPanel.isVisible { statusPanel.orderOut(nil) }
+            if isVoiceShowing { dismissVoice() }
+            if isExpanded    { collapse() }
+        } else {
+            if !statusPanel.isVisible { statusPanel.orderFront(nil) }
+        }
+    }
+
+    /// Returns true when a fullscreen video/app is covering this screen.
+    ///
+    /// **Detection strategy:** scan CGWindowList for a window from another process
+    /// at layer 0 whose bounds cover the full screen (`Y ≈ 0`, meaning it reaches
+    /// above the menu bar). This is the only signal that works for *all* fullscreen
+    /// forms:
+    ///
+    /// - **Native fullscreen** (green button): creates a new Space and hides the menu
+    ///   bar (`visibleFrame.maxY == frame.maxY`), AND the covering window reaches Y=0.
+    /// - **HTML5 / F-key fullscreen** (Netflix, YouTube): draws a screen-covering
+    ///   window over the *current* desktop Space — `visibleFrame` is unchanged (the
+    ///   menu-bar space is still reported as reserved) so a `visibleFrame`-based check
+    ///   never fires. The covering window still reaches Y=0.
+    ///
+    /// A tiling WM window (AeroSpace / Amethyst) that fills `frame` but leaves the
+    /// menu bar visible has `Y ≈ menuBarHeight` (not 0) and fails the predicate, so
+    /// there are no false positives for maximised-but-not-fullscreen windows.
+    private func isExternalFullscreenActive() -> Bool {
+        guard let screen = NSScreen.main else { return false }
+
+        // Build the CG coordinate rect for this screen.
+        // (AppKit uses bottom-left origin; CG uses top-left of the primary screen.)
+        let primaryH = NSScreen.screens.first?.frame.height ?? screen.frame.height
+        let cgScreen = CGRect(
+            x: screen.frame.minX,
+            y: primaryH - screen.frame.maxY,   // AppKit bottom-left → CG top-left
+            width:  screen.frame.width,
+            height: screen.frame.height
+        )
+
+        let ourPID = Int32(ProcessInfo.processInfo.processIdentifier)
+        guard let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID)
+                as? [[String: Any]] else { return false }
+
+        var matched = false
+        for info in list {
+            // kCGWindowOwnerPID is absent when Screen Recording permission is not granted.
+            // Bounds and layer are always available. Our own panels sit at layer 25
+            // (NSWindow.Level.statusBar), so skipping the PID check is safe — they
+            // won't satisfy layer == 0.
+            let pid   = info[kCGWindowOwnerPID as String] as? Int32
+            if pid == ourPID { continue }   // skip our own windows if PID is available
+
+            guard let layer = info[kCGWindowLayer  as String] as? Int,  layer == 0,
+                  let bd    = info[kCGWindowBounds as String] as? [String: Any],
+                  let wx    = bd["X"] as? CGFloat, let wy = bd["Y"] as? CGFloat,
+                  let ww    = bd["Width"] as? CGFloat, let wh = bd["Height"] as? CGFloat
+            else { continue }
+
+            // Safari (and other browsers) in fullscreen leave the notch safe-area
+            // (~38-39 px) uncovered at the top, so the window starts at y≈38 with
+            // height≈1131 instead of spanning the full 1169px.
+            // AeroSpace-tiled windows have a small gap at the BOTTOM (y+h≈1163, not 1169).
+            // Detecting by bottom-edge reach (y+h ≈ screenH) cleanly separates the two.
+            let windowBottom = wy + wh
+            if ww >= cgScreen.width - 2 &&
+               windowBottom >= cgScreen.maxY - 2 &&   // reaches screen bottom
+               wx <= cgScreen.minX + 3 &&             // starts at left edge
+               wy <= cgScreen.minY + 50 {             // starts near top (notch safe area ≤ ~39px)
+                matched = true
+                break
+            }
+        }
+        return matched
+    }
+
     // MARK: - Screen changes
 
     @objc private func screensChanged() {
@@ -413,8 +608,10 @@ final class NotchWindowController: NSObject {
         if isExpanded {
             chatPanel.setFrame(chatFrame, display: true)
         }
-        if isVoiceShowing {
-            voicePanel.setFrame(voiceFrame, display: true)
+        // Rebuild voice panel on non-notch displays to pick up new frame.
+        if !hasNotch {
+            voicePanel?.orderOut(nil)
+            buildVoicePanel()
         }
     }
 }
