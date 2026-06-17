@@ -4,9 +4,14 @@ members = [
     "crates/agent",
     "crates/memory",
     "crates/rules",
+    "crates/skills",
     "crates/attachments",
     "crates/connectors/ollama",
     "crates/connectors/apple_mail",
     "crates/connectors/apple_notes",
+    "crates/connectors/filesystem",
+    "crates/connectors/codex",
+    "crates/connectors/odoo",
+    "crates/connectors/whatsapp",
 ]
 resolver = "2"

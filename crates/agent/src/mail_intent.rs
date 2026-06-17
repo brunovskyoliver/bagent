@@ -55,7 +55,8 @@ impl MailIntentClassifier {
     pub async fn classify(&self, user_turn: &str, context: &str) -> Result<MailIntent> {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
-            .format("%Y-%m-%d").to_string();
+            .format("%Y-%m-%d")
+            .to_string();
         let context_block = if context.is_empty() {
             String::new()
         } else {
@@ -96,8 +97,7 @@ impl MailIntentClassifier {
 
         let raw = self.ollama.generate_raw(&self.model, &prompt, 0.0).await?;
         tracing::debug!(raw_mail_intent = %raw, "mail_intent raw");
-        let intent: MailIntent = serde_json::from_str(clean_json(&raw))
-            .unwrap_or_default();
+        let intent: MailIntent = serde_json::from_str(clean_json(&raw)).unwrap_or_default();
         Ok(intent)
     }
 }
@@ -139,7 +139,8 @@ mod tests {
         assert!(
             intent.action == "read_attachment" || intent.wants_attachment,
             "should request attachment, got action={} wants_attachment={}",
-            intent.action, intent.wants_attachment
+            intent.action,
+            intent.wants_attachment
         );
         // sender/subject must be empty so the daemon short-circuits via last_mail_ref
         assert!(
@@ -173,7 +174,10 @@ mod tests {
         println!("keywords:        {:?}", intent.keywords);
         println!("wants_attachment:{}", intent.wants_attachment);
 
-        assert_eq!(intent.action, "search", "should search, not list_recent or none");
+        assert_eq!(
+            intent.action, "search",
+            "should search, not list_recent or none"
+        );
         let sender = intent.sender.expect("sender must be resolved from context");
         // Check for name fragments tolerant of diacritics variations
         let s = sender.to_lowercase();
@@ -239,11 +243,7 @@ mod tests {
                 failures.push(format!("action={}", intent.action));
             }
             if let Some(sender) = expected_sender {
-                let actual = intent
-                    .sender
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase();
+                let actual = intent.sender.as_deref().unwrap_or_default().to_lowercase();
                 if !actual.contains(sender) {
                     failures.push(format!("sender={:?}", intent.sender));
                 }

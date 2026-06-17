@@ -20,6 +20,9 @@ let package = Package(
                 .linkedFramework("Carbon"),
                 .linkedFramework("WebKit"),
                 .linkedFramework("AVFoundation"),
+                .linkedFramework("ScreenCaptureKit"),
+                .linkedFramework("Vision"),
+                .linkedFramework("ApplicationServices"),
                 // Embed Info.plist into the bare executable's __TEXT,__info_plist
                 // section so `swift run` (no .app bundle) still carries
                 // NSMicrophoneUsageDescription — required for microphone/TCC access.

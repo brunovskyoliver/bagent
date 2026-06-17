@@ -11,6 +11,8 @@ struct SettingsView: View {
         self.speech = viewModel.speech
     }
 
+    @State private var availableMics: [String] = []
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -19,12 +21,16 @@ struct SettingsView: View {
                 connectorsSection
                 ollamaSection
                 rulesSection
+                codexSection
+                odooSection
+                whatsappSection
                 shortcutsSection
                 usageSection
             }
             .padding(16)
         }
         .task {
+            availableMics = SpeechController.availableInputDeviceNames()
             await viewModel.loadModels()
             await viewModel.refreshHealth()
             await viewModel.loadUsage()
@@ -53,7 +59,7 @@ struct SettingsView: View {
                     }
                 }
                 if !permissions.hasFullDiskAccess {
-                    Text("Potrebné pre prístup k Mail a Poznámkam.")
+                    Text("Potrebné pre prístup k Mail, Poznámkam a vyhľadávanie lokálnych súborov (Dokumenty, Plocha, Stiahnuté, iCloud Drive).")
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -90,6 +96,66 @@ struct SettingsView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
+                Divider().padding(.vertical, 2)
+
+                // Screen Recording (Phase 7)
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(permissions.hasScreenRecording ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                    Image(systemName: "rectangle.dashed").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("Snímanie obrazovky")
+                        .font(.system(size: 12))
+                    Spacer()
+                    if !permissions.hasScreenRecording {
+                        Button("Udeliť") {
+                            permissions.requestScreenRecording()
+                            if !permissions.hasScreenRecording { permissions.openScreenRecordingSettings() }
+                        }
+                        .font(.system(size: 11))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
+                    } else {
+                        Text("aktívne").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+                if !permissions.hasScreenRecording {
+                    Text("Potrebné pre analýzu obrazovky. Snímky sa nikdy neukladajú na disk.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Divider().padding(.vertical, 2)
+
+                // Accessibility (Phase 7 — selected text)
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(permissions.hasAccessibility ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                    Image(systemName: "accessibility").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("Accessibility")
+                        .font(.system(size: 12))
+                    Spacer()
+                    if !permissions.hasAccessibility {
+                        Button("Udeliť") {
+                            permissions.requestAccessibility()
+                            if !permissions.hasAccessibility { permissions.openAccessibilitySettings() }
+                        }
+                        .font(.system(size: 11))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
+                    } else {
+                        Text("aktívne").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+                if !permissions.hasAccessibility {
+                    Text("Potrebné pre čítanie vybraného textu. Heslové polia sú vždy vynechané.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 HStack(spacing: 8) {
                     if speech.state == .loadingModel {
                         ProgressView().scaleEffect(0.5).frame(width: 7, height: 7)
@@ -106,6 +172,22 @@ struct SettingsView: View {
                          : (speech.isModelLoaded ? "pripravený" : "stiahne sa pri prvom použití"))
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
+
+                Divider().padding(.vertical, 2)
+
+                Text("Mikrofón").font(.system(size: 11)).foregroundStyle(.secondary)
+                Picker("", selection: $viewModel.selectedMicrophone) {
+                    Text("Predvolený systémom").tag("")
+                    ForEach(availableMics, id: \.self) { name in
+                        Text(name).tag(name)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Text("Ak vybraný mikrofón nie je dostupný, použije sa predvolený.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -246,6 +328,9 @@ struct SettingsView: View {
     @State private var rulesSaved: Bool = false
     @State private var isLoadingRules: Bool = false
 
+    // MARK: - Codex State (Phase 8)
+    @State private var codexStatusMessage: String? = nil
+
     private var rulesSection: some View {
         SettingsSection(title: "Pravidlá (rules.yaml)") {
             VStack(alignment: .leading, spacing: 8) {
@@ -305,6 +390,303 @@ struct SettingsView: View {
             rulesError = msg
         } catch {
             rulesError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Codex (Phase 8)
+
+    private var codexSection: some View {
+        SettingsSection(title: "Codex (pokročilé úlohy)") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Codex slúži ako externý harness pre zložité cross-source úlohy. Spúšťa sa iba po schválení kontextového paketu.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                // Binary path
+                HStack(spacing: 6) {
+                    Text("Cesta k binárke")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 110, alignment: .leading)
+                    TextField("(automaticky z $PATH)", text: $viewModel.codexBinaryPath)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                // Status / test button row
+                HStack(spacing: 8) {
+                    if viewModel.isTestingCodex {
+                        ProgressView().scaleEffect(0.65)
+                        Text("Testujem…")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    } else if let msg = viewModel.codexTestResult {
+                        Image(systemName: msg.hasPrefix("✓") ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(msg.hasPrefix("✓") ? Color.green : Color.red)
+                            .font(.system(size: 11))
+                        Text(msg)
+                            .font(.system(size: 11))
+                            .foregroundStyle(msg.hasPrefix("✓") ? Color.primary : Color.red)
+                            .lineLimit(1)
+                    } else {
+                        ConnectorRow(
+                            label: "Codex",
+                            icon: "cpu",
+                            accessible: viewModel.daemonHealth?.codexConnector
+                        )
+                    }
+                    Spacer()
+                    Button("Testovať Codex") {
+                        viewModel.testCodex()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(viewModel.isTestingCodex)
+                }
+
+                if viewModel.codexTestResult != nil {
+                    Button("Vymazať výsledok") {
+                        viewModel.codexTestResult = nil
+                    }
+                    .font(.system(size: 11))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
+
+                Divider()
+                Text("Codex nikdy nezíska prístup k súborom, mailov, databázam ani heslám priamo — dostáva iba schválený kontextový paket od daemona.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    // MARK: - Odoo (Phase 6)
+
+    private var odooSection: some View {
+        SettingsSection(title: "Odoo (CRM / Helpdesk)") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Pripojenie k Odoo 18 — len na čítanie (tikety, faktúry, partneri). Credentials sa ukladajú do Keychain.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                // URL field
+                HStack(spacing: 6) {
+                    Text("URL")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 80, alignment: .leading)
+                    TextField("https://mycompany.odoo.com", text: $viewModel.odooURL)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                // Database
+                HStack(spacing: 6) {
+                    Text("Databáza")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 80, alignment: .leading)
+                    TextField("mycompany", text: $viewModel.odooDB)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                // Username
+                HStack(spacing: 6) {
+                    Text("Používateľ")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 80, alignment: .leading)
+                    TextField("user@example.com", text: $viewModel.odooUser)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                // API Key
+                HStack(spacing: 6) {
+                    Text("API kľúč")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 80, alignment: .leading)
+                    SecureField("(z Odoo → Nastavenia → API Keys)", text: $viewModel.odooAPIKey)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                // Status / test button row
+                HStack(spacing: 8) {
+                    if viewModel.isTestingOdoo {
+                        ProgressView().scaleEffect(0.65)
+                        Text("Testujem…")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    } else if let msg = viewModel.odooTestResult {
+                        Image(systemName: msg.hasPrefix("✓") ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(msg.hasPrefix("✓") ? Color.green : Color.red)
+                            .font(.system(size: 11))
+                        Text(msg)
+                            .font(.system(size: 11))
+                            .foregroundStyle(msg.hasPrefix("✓") ? Color.primary : Color.red)
+                            .lineLimit(1)
+                    } else {
+                        ConnectorRow(
+                            label: "Odoo",
+                            icon: "building.2",
+                            accessible: viewModel.daemonHealth?.odooConnector
+                        )
+                    }
+                    Spacer()
+                    Button("Testovať Odoo") {
+                        viewModel.configureOdoo()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(viewModel.isTestingOdoo
+                              || viewModel.odooURL.isEmpty
+                              || viewModel.odooDB.isEmpty
+                              || viewModel.odooAPIKey.isEmpty)
+                }
+
+                if viewModel.odooTestResult != nil {
+                    Button("Vymazať výsledok") {
+                        viewModel.odooTestResult = nil
+                    }
+                    .font(.system(size: 11))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                }
+
+                Divider()
+                Text("API kľúč sa nikdy nezapíše na disk — uchováva sa iba v Keychain a v pamäti daemona.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    // MARK: - WhatsApp (Phase 11)
+
+    private var whatsappSection: some View {
+        SettingsSection(title: "WhatsApp") {
+            VStack(alignment: .leading, spacing: 10) {
+
+                // Warning box
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.system(size: 11))
+                    Text("Používa neoficiálny WhatsApp Web bridge (whatsapp-web.js). Odoslanie správy vždy vyžaduje tvoje schválenie. Nikdy sa neposielajú hromadné správy, média ani automatické odpovede.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(8)
+                .background(Color.orange.opacity(0.08))
+                .cornerRadius(6)
+
+                // Status row
+                HStack(spacing: 8) {
+                    let st = viewModel.whatsappStatus?.status ?? "stopped"
+                    Circle()
+                        .fill(whatsappStatusColor(st))
+                        .frame(width: 8, height: 8)
+                    Text(whatsappStatusLabel(st))
+                        .font(.system(size: 12))
+                    if let me = viewModel.whatsappStatus?.me_name {
+                        Text("(\(me))")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Obnoviť") { viewModel.refreshWhatsappStatus() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.accentColor)
+                }
+
+                // QR image — shown only when waiting for scan
+                if viewModel.whatsappStatus?.needs_qr == true {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Naskenuj QR kód v WhatsApp → Prepojené zariadenia → Prepojiť zariadenie")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        if let qrStr = viewModel.whatsappQrString, let img = QRImage.generate(from: qrStr) {
+                            Image(nsImage: img)
+                                .resizable()
+                                .interpolation(.none)
+                                .frame(width: 180, height: 180)
+                                .cornerRadius(6)
+                        } else {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                        }
+                        Button("Obnoviť QR") { viewModel.refreshWhatsappQr() }
+                            .buttonStyle(.bordered)
+                            .font(.system(size: 11))
+                    }
+                }
+
+                // Action buttons
+                HStack(spacing: 8) {
+                    if viewModel.isConnectingWhatsapp {
+                        ProgressView().scaleEffect(0.65)
+                        Text("Spúšťam bridge…")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        let st = viewModel.whatsappStatus?.status ?? "stopped"
+                        if st == "stopped" || st == "error" || st == "disconnected" || st == "missing_node" || st == "bridge_not_installed" {
+                            Button("Pripojiť WhatsApp") { viewModel.connectWhatsapp() }
+                                .buttonStyle(.borderedProminent)
+                                .font(.system(size: 12))
+                        } else {
+                            Button("Odpojiť") { viewModel.disconnectWhatsapp() }
+                                .buttonStyle(.bordered)
+                                .font(.system(size: 12))
+                        }
+                        Button("Odhlásiť a vymazať reláciu") { viewModel.logoutWhatsapp() }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+
+                if let msg = viewModel.whatsappStatusMessage {
+                    Text(msg)
+                        .font(.system(size: 11))
+                        .foregroundStyle(msg.hasPrefix("✓") ? Color.primary : Color.red)
+                }
+
+                Divider()
+                Text("Vyžaduje Node.js ≥18. Spusti `make whatsapp-bridge-install` pred prvým pripojením. Token ani session path sa nikdy nezobrazujú.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .task { viewModel.refreshWhatsappStatus() }
+    }
+
+    private func whatsappStatusColor(_ status: String) -> Color {
+        switch status {
+        case "ready":          return .green
+        case "qr", "starting", "authenticated": return .yellow
+        case "disconnected", "error": return .red
+        default:               return .gray
+        }
+    }
+
+    private func whatsappStatusLabel(_ status: String) -> String {
+        switch status {
+        case "stopped":             return "Nezačaté"
+        case "starting":            return "Spúšťam…"
+        case "qr":                  return "Čakám na QR"
+        case "authenticated":       return "Autentifikovaný"
+        case "ready":               return "Pripojený"
+        case "disconnected":        return "Odpojený"
+        case "error":               return "Chyba"
+        case "missing_node":        return "Node.js nenájdený"
+        case "bridge_not_installed": return "Bridge neinštalovaný"
+        default:                    return status
         }
     }
 

@@ -14,22 +14,38 @@ use axum::{
     Json, Router,
 };
 use bagent_agent::{
-    has_explicit_trigger, CorrectionClassifier, DirectiveExtractor, MailIntentClassifier,
-    MemoryExtractor, PromptBuilder, PromptTrace, WindowIntentClassifier,
+    has_explicit_trigger, ContextPlanner, CorrectionClassifier, DirectiveExtractor,
+    MailIntentClassifier, MemoryExtractor, OdooAction, OdooIntentClassifier, PromptBuilder,
+    PromptTrace, ScreenIntentClassifier, SelectedSkill, TaskRater, WhatsappAction,
+    WhatsappIntentClassifier, WindowIntentClassifier,
 };
 use bagent_attachments::extract as extract_attachment;
-use bagent_memory::MemoryStore;
+use bagent_memory::{selector as memory_selector, InsertParams, MemoryStore, RetrieveQuery};
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
+use bagent_skills::{selector as skill_selector, LoadedSkill};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use codex_connector::{
+    CodexConfig, CodexConnector, CodexContextPacket, CodexExpectedOutput, CodexTask, ContextItem,
+};
+use filesystem_connector::{
+    self, open as fs_open, search as fs_search, FileSearchRequest, FsConnector, OpenResponse,
+    ReadTextRequest,
+};
 use futures_util::StreamExt;
-use ollama_connector::{Message, OllamaClient, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL};
+use odoo_connector::{OdooConfig, OdooConnector, OdooRecordRef};
+use ollama_connector::{
+    ChatTurn as OllamaChatTurn, Message, OllamaClient, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL,
+};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, convert::Infallible, io::Write, path::PathBuf, sync::Arc};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
+use whatsapp_connector::{
+    WhatsappConfig, WhatsappConnectionStatus, WhatsappConnector, WhatsappSendTarget,
+};
 
 mod embedded {
     refinery::embed_migrations!("migrations");
@@ -53,10 +69,25 @@ struct AppState {
     ollama: OllamaClient,
     mail: Option<MailConnector>,
     notes: Option<NotesConnector>,
+    fs: Option<FsConnector>,
     memory: Arc<MemoryStore>,
     prompt_builder: Arc<PromptBuilder>,
     rules: Arc<RuleEngine>,
     pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    /// Loaded skill manifests + bodies, scanned at startup.
+    skills: Arc<Vec<LoadedSkill>>,
+    /// Context planner for the planning layer (deterministic + LLM fallback).
+    context_planner: Arc<ContextPlanner>,
+    /// Deterministic task rater — classifies local vs Codex tasks.
+    task_rater: Arc<TaskRater>,
+    /// Codex external-reasoning connector (None when binary not found).
+    codex: Option<CodexConnector>,
+    /// Odoo connector — in-memory only; API key never written to disk.
+    /// Swift re-pushes credentials from Keychain on each launch.
+    odoo: Arc<RwLock<Option<OdooConnector>>>,
+    /// WhatsApp Web bridge connector. Always present; owns the bridge subprocess.
+    /// Bridge is started/stopped explicitly via `/whatsapp/start` and `/whatsapp/stop`.
+    whatsapp: Arc<WhatsappConnector>,
 }
 
 type OllamaMsg = Message;
@@ -71,6 +102,20 @@ struct ChatRequest {
     /// IDs returned by POST /attachments — empty when no files attached.
     #[serde(default)]
     attachment_ids: Vec<String>,
+    // ── Screen context (Phase 7) ─────────────────────────────────────────────
+    /// Base64-encoded PNG of the user's screen captured in Swift.
+    /// Never persisted to disk — injected into the model turn in-memory only.
+    #[serde(default)]
+    screen_image_b64: Option<String>,
+    /// On-device OCR text extracted from the captured frame (Vision framework).
+    #[serde(default)]
+    screen_ocr_text: Option<String>,
+    /// Frontmost application name + bundle id at capture time.
+    #[serde(default)]
+    active_app: Option<String>,
+    /// Accessibility selected-text at capture time (password fields excluded).
+    #[serde(default)]
+    selected_text: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -118,6 +163,12 @@ struct MemoryInsertRequest {
     source_ref: Option<String>,
     metadata_json: Option<String>,
     expires_at: Option<String>,
+    // V11 ledger fields
+    confidence: Option<f32>,
+    importance: Option<f32>,
+    source: Option<String>,
+    sensitivity: Option<String>,
+    subject: Option<String>,
 }
 
 fn default_und() -> String {
@@ -132,6 +183,9 @@ struct MemorySearchQuery {
     namespace: String,
     #[serde(default = "default_limit")]
     limit: usize,
+    // V11 filter: empty string = all kinds
+    #[serde(default)]
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +214,15 @@ fn default_limit() -> usize {
 }
 
 /// Stable reference to a found mail message — surfaced to the frontend so
+/// Stable reference to the most recently found local file/folder, persisted in
+/// `sessions.metadata_json` so cross-turn references ("open it", "otvor ho") resolve correctly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileRef {
+    path: String,
+    display_name: String,
+    kind: String,
+}
+
 /// it can render an "Otvoriť mail" button without re-running a search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MailRef {
@@ -194,6 +257,16 @@ struct HealthResponse {
 struct ConnectorStatus {
     mail: bool,
     notes: bool,
+    odoo: bool,
+    whatsapp: WhatsappHealthStatus,
+}
+
+#[derive(Serialize)]
+struct WhatsappHealthStatus {
+    status: String,
+    connected: bool,
+    needs_qr: bool,
+    error: Option<String>,
 }
 
 #[tokio::main]
@@ -224,6 +297,7 @@ async fn main() -> Result<()> {
 
     let mail = MailConnector::new().ok().filter(|c| c.is_accessible());
     let notes = NotesConnector::new().ok().filter(|c| c.is_accessible());
+    let fs = FsConnector::new().ok().filter(|c| c.is_accessible());
 
     if mail.is_some() {
         tracing::info!("Mail connector: accessible");
@@ -235,14 +309,19 @@ async fn main() -> Result<()> {
     } else {
         tracing::warn!("Notes connector: no Full Disk Access");
     }
+    if fs.is_some() {
+        tracing::info!("Filesystem connector: accessible");
+    } else {
+        tracing::warn!("Filesystem connector: could not build default policy");
+    }
 
     let ollama = OllamaClient::new(DEFAULT_BASE_URL);
 
     // MemoryStore uses a separate connection with std::sync::Mutex (blocking SQLite ops)
     let mem_conn = rusqlite::Connection::open(data_dir.join("bagent.db"))?;
     let mem_db = Arc::new(std::sync::Mutex::new(mem_conn));
-    let memory = Arc::new(MemoryStore::new(mem_db, ollama.clone()));
-    let prompt_builder = Arc::new(PromptBuilder::new(memory.clone()));
+    let memory = Arc::new(MemoryStore::new(mem_db, ollama.clone()).with_data_dir(data_dir.clone()));
+    let prompt_builder = Arc::new(PromptBuilder::new());
 
     // Startup: warm both chat model and embed model into GPU memory so first user
     // query doesn't pay cold-load cost (~5-10s for 4.7GB + 1.2GB models).
@@ -267,6 +346,14 @@ async fn main() -> Result<()> {
             if r_embed.is_ok() {
                 tracing::info!("warmup: embed model loaded");
             }
+        });
+    }
+
+    // Startup: import any markdown mirror files changed since last run
+    {
+        let mirror_memory = memory.clone();
+        tokio::spawn(async move {
+            mirror_memory.scan_and_import_mirror().await;
         });
     }
 
@@ -427,6 +514,77 @@ async fn main() -> Result<()> {
     let vision_model =
         std::env::var("BAGENT_VISION_MODEL").unwrap_or_else(|_| "qwen2.5vl:7b".to_string());
 
+    // Scan skills directories: repo skills/ first, then user skills dir (override by name).
+    let skills = {
+        let mut skills_dirs: Vec<std::path::PathBuf> = vec![];
+        if let Ok(exe) = std::env::current_exe() {
+            for candidate in [
+                exe.parent().map(|p| p.join("skills")),
+                exe.parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("skills")),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if candidate.is_dir() {
+                    skills_dirs.push(candidate);
+                }
+            }
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_skills = cwd.join("skills");
+            if cwd_skills.is_dir() && !skills_dirs.contains(&cwd_skills) {
+                skills_dirs.push(cwd_skills);
+            }
+        }
+        skills_dirs.push(data_dir.join("skills")); // user override dir
+        let loaded = bagent_skills::scan_dirs(&skills_dirs);
+        tracing::info!(
+            "skills: loaded {} — {:?}",
+            loaded.len(),
+            loaded
+                .iter()
+                .map(|s| s.manifest.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        Arc::new(loaded)
+    };
+
+    let context_planner = Arc::new(ContextPlanner::new(
+        ollama.clone(),
+        classifier_model.clone(),
+    ));
+
+    let task_rater = Arc::new(TaskRater::new());
+
+    let codex = {
+        let config = CodexConfig {
+            binary_path: None, // auto-discover from $PATH
+            timeout: std::time::Duration::from_secs(120),
+        };
+        match CodexConnector::new(config) {
+            Ok(c) => {
+                tracing::info!(
+                    binary = %c.resolved_path().display(),
+                    "Codex connector available"
+                );
+                Some(c)
+            }
+            Err(e) => {
+                tracing::info!("Codex connector unavailable: {e}");
+                None
+            }
+        }
+    };
+
+    // Odoo connector — starts unconfigured; Swift pushes creds from Keychain via POST /odoo/config.
+    let odoo: Arc<RwLock<Option<OdooConnector>>> = Arc::new(RwLock::new(None));
+
+    // WhatsApp connector — always present; bridge not started until POST /whatsapp/start.
+    let whatsapp = Arc::new(WhatsappConnector::new(WhatsappConfig::default()));
+
     let state = AppState {
         db,
         db_path: data_dir.join("bagent.db"),
@@ -439,10 +597,17 @@ async fn main() -> Result<()> {
         ollama,
         mail,
         notes,
+        fs,
         memory,
         prompt_builder,
         rules,
         pending_approvals,
+        skills,
+        context_planner,
+        task_rater,
+        codex,
+        odoo,
+        whatsapp,
     };
 
     let app = Router::new()
@@ -489,6 +654,44 @@ async fn main() -> Result<()> {
         // Phase 4H — Prompt trace debug
         .route("/debug/conversations/:id", get(debug_conversation))
         .route("/debug/traces/:id", get(debug_trace))
+        // Skills
+        .route("/skills", get(skills_list))
+        .route("/skills/:name", get(skills_get))
+        // Context plan debug
+        .route("/debug/context-plan", post(debug_context_plan))
+        // Phase 13A — Filesystem + app-open
+        .route("/filesystem/roots", get(filesystem_roots))
+        .route("/filesystem/search", post(filesystem_search))
+        .route("/filesystem/read", post(filesystem_read))
+        .route("/filesystem/metadata", get(filesystem_metadata))
+        .route("/filesystem/reveal", post(filesystem_reveal))
+        .route("/filesystem/open-folder", post(filesystem_open_folder))
+        .route("/filesystem/open", post(filesystem_open))
+        .route("/filesystem/open-with", post(filesystem_open_with))
+        .route("/macos/open-app", post(macos_open_app))
+        .route("/macos/focus-app", post(macos_focus_app))
+        .route("/screen/intent", post(screen_intent_handler))
+        // Phase 8 — Codex external-reasoning harness
+        .route("/codex/status", get(codex_status_handler))
+        .route("/codex/rate-task", post(codex_rate_task_handler))
+        .route("/codex/run-task", post(codex_run_task_handler))
+        // Phase 6 — Odoo connector
+        .route("/odoo/config", post(odoo_config_handler))
+        .route("/odoo/status", get(odoo_status_handler))
+        .route("/odoo/open", post(odoo_open_handler))
+        // Phase 11 — WhatsApp connector
+        .route("/whatsapp/status", get(whatsapp_status_handler))
+        .route("/whatsapp/start", post(whatsapp_start_handler))
+        .route("/whatsapp/stop", post(whatsapp_stop_handler))
+        .route("/whatsapp/qr", get(whatsapp_qr_handler))
+        .route("/whatsapp/logout", post(whatsapp_logout_handler))
+        .route("/whatsapp/contacts", get(whatsapp_contacts_handler))
+        .route("/whatsapp/chats", get(whatsapp_chats_handler))
+        .route(
+            "/whatsapp/chats/:id/messages",
+            get(whatsapp_chat_messages_handler),
+        )
+        .route("/whatsapp/send", post(whatsapp_send_handler))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
@@ -499,6 +702,508 @@ async fn main() -> Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// ── Filesystem handlers ───────────────────────────────────────────────────────
+
+async fn filesystem_roots(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(fs) = state.fs else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Filesystem connector not accessible" })),
+        );
+    };
+    let roots: Vec<String> = fs
+        .policy
+        .allowed_roots
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({ "roots": roots })))
+}
+
+async fn filesystem_search(
+    State(state): State<AppState>,
+    Json(req): Json<FileSearchRequest>,
+) -> impl IntoResponse {
+    let Some(fs) = state.fs else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Filesystem connector not accessible" })),
+        );
+    };
+    let policy = fs.policy.clone();
+    match fs_search::search_files(policy, req).await {
+        Ok(resp) => {
+            audit_fs(
+                &state.db,
+                "filesystem_search",
+                &serde_json::json!({
+                    "result_count": resp.results.len(), "ok": true
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(resp).unwrap_or_default()),
+            )
+        }
+        Err(e) => {
+            audit_fs(
+                &state.db,
+                "filesystem_search",
+                &serde_json::json!({ "ok": false, "error": e.to_string() }),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    }
+}
+
+async fn filesystem_read(
+    State(state): State<AppState>,
+    Json(req): Json<ReadTextRequest>,
+) -> impl IntoResponse {
+    let Some(fs) = state.fs else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Filesystem connector not accessible" })),
+        );
+    };
+    let path_hash = sha256_str(&req.path);
+    let policy = fs.policy.clone();
+    match fs_search::read_text(policy, req).await {
+        Ok(resp) => {
+            audit_fs(
+                &state.db,
+                "filesystem_read_text",
+                &serde_json::json!({
+                    "path_hash": path_hash, "ok": true
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(resp).unwrap_or_default()),
+            )
+        }
+        Err(e) => {
+            audit_fs(
+                &state.db,
+                "filesystem_read_text",
+                &serde_json::json!({ "path_hash": path_hash, "ok": false, "error": e.to_string() }),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MetadataQuery {
+    path: String,
+}
+
+async fn filesystem_metadata(
+    State(state): State<AppState>,
+    Query(q): Query<MetadataQuery>,
+) -> impl IntoResponse {
+    let Some(fs) = state.fs else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Filesystem connector not accessible" })),
+        );
+    };
+    let policy = fs.policy.clone();
+    match fs_search::metadata(policy, q.path).await {
+        Ok(resp) => {
+            audit_fs(
+                &state.db,
+                "filesystem_metadata",
+                &serde_json::json!({ "ok": true }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(resp).unwrap_or_default()),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct PathBody {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct PathWithAppBody {
+    path: String,
+    app: String,
+}
+
+#[derive(Deserialize)]
+struct AppBody {
+    app: String,
+}
+
+async fn filesystem_reveal(
+    State(state): State<AppState>,
+    Json(body): Json<PathBody>,
+) -> impl IntoResponse {
+    let Some(fs) = state.fs else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Filesystem connector not accessible" })),
+        );
+    };
+    let path_hash = sha256_str(&body.path);
+    match state.rules.check("filesystem.reveal_in_finder", "{}") {
+        ApprovalLevel::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "blocked by rules" })),
+            );
+        }
+        ApprovalLevel::Ask => {
+            // REST route: ask is not supported (no SSE channel). Return 409.
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval required — use chat interface" })),
+            );
+        }
+        ApprovalLevel::Auto => {}
+    }
+    match fs_open::reveal_in_finder(&fs.policy, &body.path).await {
+        Ok(resp) => {
+            audit_fs(
+                &state.db,
+                "filesystem_reveal_in_finder",
+                &serde_json::json!({ "path_hash": path_hash, "ok": true }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(resp).unwrap_or_default()),
+            )
+        }
+        Err(e) => {
+            audit_fs(
+                &state.db,
+                "filesystem_reveal_in_finder",
+                &serde_json::json!({ "path_hash": path_hash, "ok": false, "error": e.to_string() }),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    }
+}
+
+async fn filesystem_open_folder(
+    State(state): State<AppState>,
+    Json(body): Json<PathBody>,
+) -> impl IntoResponse {
+    let Some(fs) = state.fs else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Filesystem connector not accessible" })),
+        );
+    };
+    let path_hash = sha256_str(&body.path);
+    match state.rules.check("filesystem.open_folder", "{}") {
+        ApprovalLevel::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "blocked by rules" })),
+            )
+        }
+        ApprovalLevel::Ask => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval required — use chat interface" })),
+            )
+        }
+        ApprovalLevel::Auto => {}
+    }
+    match fs_open::open_folder(&fs.policy, &body.path).await {
+        Ok(resp) => {
+            audit_fs(
+                &state.db,
+                "filesystem_open_folder",
+                &serde_json::json!({ "path_hash": path_hash, "ok": true }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(resp).unwrap_or_default()),
+            )
+        }
+        Err(e) => {
+            audit_fs(
+                &state.db,
+                "filesystem_open_folder",
+                &serde_json::json!({ "path_hash": path_hash, "ok": false, "error": e.to_string() }),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    }
+}
+
+async fn filesystem_open(
+    State(state): State<AppState>,
+    Json(body): Json<PathBody>,
+) -> impl IntoResponse {
+    let Some(fs) = state.fs else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Filesystem connector not accessible" })),
+        );
+    };
+    let path_hash = sha256_str(&body.path);
+    match state.rules.check("filesystem.open_file", "{}") {
+        ApprovalLevel::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "blocked by rules" })),
+            )
+        }
+        ApprovalLevel::Ask => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval required — use chat interface" })),
+            )
+        }
+        ApprovalLevel::Auto => {}
+    }
+    match fs_open::open_file(&fs.policy, &body.path).await {
+        Ok(resp) => {
+            audit_fs(
+                &state.db,
+                "filesystem_open_file",
+                &serde_json::json!({ "path_hash": path_hash, "ok": true }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(resp).unwrap_or_default()),
+            )
+        }
+        Err(e) => {
+            audit_fs(
+                &state.db,
+                "filesystem_open_file",
+                &serde_json::json!({ "path_hash": path_hash, "ok": false, "error": e.to_string() }),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    }
+}
+
+async fn filesystem_open_with(
+    State(state): State<AppState>,
+    Json(body): Json<PathWithAppBody>,
+) -> impl IntoResponse {
+    let Some(fs) = state.fs else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "Filesystem connector not accessible" })),
+        );
+    };
+    let path_hash = sha256_str(&body.path);
+    match state.rules.check("filesystem.open_file_with", "{}") {
+        ApprovalLevel::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "blocked by rules" })),
+            )
+        }
+        ApprovalLevel::Ask => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval required — use chat interface" })),
+            )
+        }
+        ApprovalLevel::Auto => {}
+    }
+    match fs_open::open_file_with(&fs.policy, &body.path, &body.app).await {
+        Ok(resp) => {
+            audit_fs(
+                &state.db,
+                "filesystem_open_file_with",
+                &serde_json::json!({ "path_hash": path_hash, "app": body.app, "ok": true }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(resp).unwrap_or_default()),
+            )
+        }
+        Err(e) => {
+            audit_fs(
+                &state.db,
+                "filesystem_open_file_with",
+                &serde_json::json!({ "path_hash": path_hash, "ok": false, "error": e.to_string() }),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    }
+}
+
+async fn macos_open_app(
+    State(state): State<AppState>,
+    Json(body): Json<AppBody>,
+) -> impl IntoResponse {
+    match state.rules.check("macos.open_app", "{}") {
+        ApprovalLevel::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "blocked by rules" })),
+            )
+        }
+        ApprovalLevel::Ask => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval required — use chat interface" })),
+            )
+        }
+        ApprovalLevel::Auto => {}
+    }
+    match fs_open::open_app(&body.app).await {
+        Ok(resp) => {
+            audit_fs(
+                &state.db,
+                "macos_open_app",
+                &serde_json::json!({ "app": body.app, "ok": true }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(resp).unwrap_or_default()),
+            )
+        }
+        Err(e) => {
+            audit_fs(
+                &state.db,
+                "macos_open_app",
+                &serde_json::json!({ "app": body.app, "ok": false, "error": e.to_string() }),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    }
+}
+
+async fn macos_focus_app(
+    State(state): State<AppState>,
+    Json(body): Json<AppBody>,
+) -> impl IntoResponse {
+    match state.rules.check("macos.focus_app", "{}") {
+        ApprovalLevel::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "blocked by rules" })),
+            )
+        }
+        ApprovalLevel::Ask => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "approval required — use chat interface" })),
+            )
+        }
+        ApprovalLevel::Auto => {}
+    }
+    match fs_open::focus_app(&body.app).await {
+        Ok(resp) => {
+            audit_fs(
+                &state.db,
+                "macos_focus_app",
+                &serde_json::json!({ "app": body.app, "ok": true }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(resp).unwrap_or_default()),
+            )
+        }
+        Err(e) => {
+            audit_fs(
+                &state.db,
+                "macos_focus_app",
+                &serde_json::json!({ "app": body.app, "ok": false, "error": e.to_string() }),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        }
+    }
+}
+
+// ── Screen intent handler (Phase 7) ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ScreenIntentRequest {
+    message: String,
+}
+
+/// POST /screen/intent — classifies whether the user turn requires screen context.
+///
+/// Uses `ContextPlanner` as the single source of truth: returns
+/// `{ wants_screen, wants_ocr, wants_selection, task_type }` so the Swift
+/// side can decide what to capture before sending the `/chat` request.
+async fn screen_intent_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ScreenIntentRequest>,
+) -> impl IntoResponse {
+    let classifier =
+        ScreenIntentClassifier::new(state.ollama.clone(), state.classifier_model.clone());
+    match classifier.classify(&req.message, "").await {
+        Ok(intent) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&intent).unwrap_or_default()),
+        ),
+        Err(_) => {
+            // Graceful degrade — caller treats unknown as "no screen needed"
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "action": "none",
+                    "wants_screen": false,
+                    "wants_ocr": false,
+                    "wants_selection": false
+                })),
+            )
+        }
+    }
+}
+
+/// Helper: fire-and-forget audit entry for a filesystem/macos action.
+fn audit_fs(db: &Arc<Mutex<Connection>>, action: &str, meta: &serde_json::Value) {
+    if let Ok(db) = db.try_lock() {
+        let _ = db.execute(
+            "INSERT INTO audit_entries (action, payload, model) VALUES (?1, ?2, ?3)",
+            rusqlite::params![action, meta.to_string(), ""],
+        );
+    }
+}
+
+fn sha256_str(s: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())
 }
 
 fn app_data_dir() -> PathBuf {
@@ -597,6 +1302,124 @@ async fn debug_trace(State(state): State<AppState>, Path(id): Path<String>) -> i
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }
+}
+
+// ── Skills handlers ───────────────────────────────────────────────────────────
+
+async fn skills_list(State(state): State<AppState>) -> impl IntoResponse {
+    let items: Vec<serde_json::Value> = state
+        .skills
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.manifest.name,
+                "description": s.manifest.description,
+                "version": s.manifest.version,
+                "risk": format!("{:?}", s.manifest.risk).to_lowercase(),
+                "tags": s.manifest.tags,
+                "allowed_tools": s.manifest.allowed_tools,
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({ "skills": items })))
+}
+
+async fn skills_get(State(state): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+    match state.skills.iter().find(|s| s.manifest.name == name) {
+        Some(skill) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "name": skill.manifest.name,
+                "description": skill.manifest.description,
+                "version": skill.manifest.version,
+                "risk": format!("{:?}", skill.manifest.risk).to_lowercase(),
+                "tags": skill.manifest.tags,
+                "allowed_tools": skill.manifest.allowed_tools,
+                "body": skill.body,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("skill '{}' not found", name) })),
+        ),
+    }
+}
+
+// ── Debug: context plan ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ContextPlanRequest {
+    message: String,
+    #[serde(default = "default_und")]
+    language: String,
+    #[serde(default)]
+    has_mail_ctx: bool,
+}
+
+async fn debug_context_plan(
+    State(state): State<AppState>,
+    Json(req): Json<ContextPlanRequest>,
+) -> impl IntoResponse {
+    let lang = if req.language == "auto" {
+        if req.message.chars().any(|c| "áčďéíľĺňóôŕšťúýž".contains(c)) {
+            "sk"
+        } else {
+            "en"
+        }
+    } else {
+        &req.language
+    };
+
+    let plan = state
+        .context_planner
+        .plan(&req.message, lang, req.has_mail_ctx)
+        .await;
+
+    // Run skill selection for the response
+    let selected_skills =
+        skill_selector::select(&plan.candidate_skill_names, &state.skills, &req.message);
+    let selected_skill_names: Vec<&str> = selected_skills.iter().map(|s| s.name.as_str()).collect();
+
+    // Run memory selection (dry run — no updates to use_count)
+    let selected_memory_ids: Vec<String> =
+        if plan.needs_memory && !plan.memory_namespaces.is_empty() {
+            let ns_refs: Vec<&str> = plan.memory_namespaces.iter().map(|s| s.as_str()).collect();
+            let kind_refs: Vec<&str> = plan.memory_kinds.iter().map(|s| s.as_str()).collect();
+            state
+                .memory
+                .retrieve_filtered(RetrieveQuery {
+                    query: &req.message,
+                    namespaces: &ns_refs,
+                    kinds: &kind_refs,
+                    k: 6,
+                    max_per_namespace: 3,
+                    score_threshold: 0.0,
+                    allow_sensitive: false,
+                })
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|h| h.item.id)
+                .collect()
+        } else {
+            vec![]
+        };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "task_type": plan.task_type,
+            "response_language_hint": format!("{:?}", plan.response_language_hint),
+            "needs_memory": plan.needs_memory,
+            "memory_namespaces": plan.memory_namespaces,
+            "memory_kinds": plan.memory_kinds,
+            "needs_conversation_recall": plan.needs_conversation_recall,
+            "candidate_skill_names": plan.candidate_skill_names,
+            "selected_skill_names": selected_skill_names,
+            "selected_memory_ids": selected_memory_ids,
+            "confidence": plan.confidence,
+        })),
+    )
 }
 
 async fn debug_conversation(
@@ -825,6 +1648,16 @@ async fn require_auth(
 // ── Core handlers ─────────────────────────────────────────────────────────────
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let odoo_configured = state.odoo.read().await.is_some();
+    let wa_status = state
+        .whatsapp
+        .status()
+        .await
+        .unwrap_or(whatsapp_connector::WhatsappStatus {
+            status: WhatsappConnectionStatus::Stopped,
+            me: None,
+            error: Some("status unavailable".into()),
+        });
     Json(HealthResponse {
         status: "ok",
         ollama: state.ollama.is_up().await,
@@ -833,6 +1666,13 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         connectors: ConnectorStatus {
             mail: state.mail.is_some(),
             notes: state.notes.is_some(),
+            odoo: odoo_configured,
+            whatsapp: WhatsappHealthStatus {
+                connected: wa_status.status == WhatsappConnectionStatus::Ready,
+                needs_qr: wa_status.status == WhatsappConnectionStatus::Qr,
+                error: wa_status.error.clone(),
+                status: wa_status.status.to_string(),
+            },
         },
     })
 }
@@ -966,6 +1806,16 @@ async fn chat(
     let pending_approvals = state.pending_approvals.clone();
     let vision_model = state.vision_model.clone();
     let attachment_ids = req.attachment_ids.clone();
+    // Screen context (Phase 7) — never persisted to disk
+    let screen_image_b64 = req.screen_image_b64.clone();
+    let screen_ocr_text = req.screen_ocr_text.clone();
+    let active_app = req.active_app.clone();
+    let selected_text = req.selected_text.clone();
+    let skills = state.skills.clone();
+    let context_planner = state.context_planner.clone();
+    let task_rater = state.task_rater.clone();
+    let fs = state.fs.clone();
+    let fs_exec = state.fs.clone(); // kept for action execution in handler post-classify
 
     tokio::spawn(async move {
         let t0 = std::time::Instant::now();
@@ -991,15 +1841,17 @@ async fn chat(
             if let Ok(Some(directive)) = directive_extractor.detect_and_extract(&user_message).await
             {
                 if let Ok(Some(mem_id)) = memory
-                    .insert(
-                        &directive.namespace,
-                        &directive.kind,
-                        &directive.language,
-                        &directive.directive,
-                        None,
-                        None,
-                        None,
-                    )
+                    .insert_full(InsertParams {
+                        namespace: &directive.namespace,
+                        kind: &directive.kind,
+                        language: &directive.language,
+                        text: &directive.directive,
+                        source: "explicit",
+                        confidence: 0.95,
+                        importance: 0.80,
+                        sensitivity: "normal",
+                        ..Default::default()
+                    })
                     .await
                 {
                     let ev = Event::default()
@@ -1013,8 +1865,8 @@ async fn chat(
             "chat timing: directive check {}ms",
             t0.elapsed().as_millis()
         );
-        // Load server-side history + session summary + last mail ref in parallel
-        let (history, session_summary, last_mail_ref) = tokio::join!(
+        // Load server-side history + session summary + last mail ref + last file ref + last odoo ref in parallel
+        let (history, session_summary, last_mail_ref, last_file_ref, last_odoo_ref) = tokio::join!(
             async {
                 if req.history.is_empty() {
                     load_session_history(&db, &session_id).await
@@ -1024,6 +1876,8 @@ async fn chat(
             },
             load_session_summary(&db, &session_id),
             load_last_mail_ref(&db, &session_id),
+            load_last_file_ref(&db, &session_id),
+            load_last_odoo_ref(&db, &session_id),
         );
         tracing::info!("chat timing: history loaded {}ms", t0.elapsed().as_millis());
 
@@ -1059,6 +1913,19 @@ async fn chat(
         let needs_notes = ["poznámk", "note", "zápis", "zapisal", "napísal"]
             .iter()
             .any(|kw| low.contains(kw));
+        let needs_file = fs.is_some() && [
+            "nájdi", "vyhľadaj", "kde mám", "kde je súbor", "súbor", "priečinok",
+            "finder", "preview", "faktúr", "zmluv", "zmluvu", "zmluva",
+            "find file", "find document", "find invoice", "find contract",
+            "search files", "search documents", "search for file", "files containing",
+            "open file", "open folder", "reveal in finder", "show in finder",
+            "open in", "open with", "launch ", "focus finder",
+        ].iter().any(|kw| low.contains(kw))
+            // Also trigger when user references last found file
+            || (last_file_ref.is_some() && [
+                "otvor ho", "otvor ju", "otvor to", "open it", "reveal it",
+                "show it", "ukáž", "ten súbor", "that file",
+            ].iter().any(|kw| low.contains(kw)));
 
         let mut allowed_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1069,6 +1936,11 @@ async fn chat(
                 "Čítanie poštovej schránky (Apple Mail)",
             ),
             (needs_notes, "notes_list", "Čítanie poznámok (Apple Notes)"),
+            (
+                needs_file,
+                "filesystem.search_files",
+                "Vyhľadávanie lokálnych súborov",
+            ),
         ] {
             if !needed {
                 continue;
@@ -1097,29 +1969,40 @@ async fn chat(
         }
 
         tracing::info!("chat timing: rules checked {}ms", t0.elapsed().as_millis());
-        // Fetch live tool context (mail/notes/window) only for approved tools
-        let (tool_ctx, mail_pdf_paths, mail_ref_opt, action_taken) = fetch_tool_context(
-            &user_message,
-            &history,
-            last_mail_ref.as_ref(),
-            &allowed_tools,
-            ctx_db,
-            mail,
-            notes,
-            ollama.clone(),
-            intent_model.clone(),
-            memory.clone(),
-        )
-        .await;
+        // Fetch live tool context (mail/notes/window) only for approved tools.
+        // Filesystem turns are now handled by the agentic tool loop below.
+        let (tool_ctx, mail_pdf_paths, mail_ref_opt, action_taken, odoo_ref_opt) =
+            fetch_tool_context(
+                &user_message,
+                &history,
+                last_mail_ref.as_ref(),
+                last_odoo_ref.as_ref(),
+                &allowed_tools,
+                ctx_db,
+                mail,
+                notes,
+                ollama.clone(),
+                intent_model.clone(),
+                memory.clone(),
+                state.odoo.clone(),
+                state.whatsapp.clone(),
+                state.pending_approvals.clone(),
+                state.rules.clone(),
+            )
+            .await;
 
         // Background action (e.g. workspace switch): skip LLM, emit brief confirmation.
         if let Some(action_msg) = action_taken {
-            let _ = tx.send(Ok(Event::default().data(
-                serde_json::json!({"type": "action_taken", "message": action_msg}).to_string()
-            ))).await;
-            let _ = tx.send(Ok(Event::default().data(
-                serde_json::json!({"type": "done", "session_id": session_id}).to_string()
-            ))).await;
+            let _ = tx
+                .send(Ok(Event::default().data(
+                    serde_json::json!({"type": "action_taken", "message": action_msg}).to_string(),
+                )))
+                .await;
+            let _ = tx
+                .send(Ok(Event::default().data(
+                    serde_json::json!({"type": "done", "session_id": session_id}).to_string(),
+                )))
+                .await;
             return;
         }
 
@@ -1141,6 +2024,23 @@ async fn chat(
                 .await;
             // Persist for cross-turn reference ("tento mail", "má prílohy?")
             save_last_mail_ref(&db, &session_id, mail_ref).await;
+        }
+
+        // Emit odoo_found so the client can show an "Otvoriť v Safari" button.
+        if let Some(ref odoo_ref) = odoo_ref_opt {
+            let _ = tx
+                .send(Ok(Event::default().data(
+                    serde_json::json!({
+                        "type": "odoo_found",
+                        "model": odoo_ref.model,
+                        "record_id": odoo_ref.id,
+                        "name": odoo_ref.name,
+                        "url": odoo_ref.url,
+                    })
+                    .to_string(),
+                )))
+                .await;
+            save_last_odoo_ref(&db, &session_id, odoo_ref).await;
         }
 
         // Load attachment records from DB and build context + image data for Ollama.
@@ -1205,11 +2105,11 @@ async fn chat(
                         "INSERT INTO audit_entries (action, payload, model) VALUES ('model_swap', ?1, ?2)",
                         rusqlite::params![
                             serde_json::json!({"from": model, "to": vision_model, "reason": "image_attachment"}).to_string(),
-                            vision_model
+                            vision_model.clone()
                         ],
                     );
                 }
-                Some(vision_model)
+                Some(vision_model.clone())
             } else {
                 None
             };
@@ -1222,24 +2122,205 @@ async fn chat(
             }
         };
 
+        // ── Screen context injection (Phase 7) ────────────────────────────────
+        // In-memory only — never written to the attachments table or disk.
+        // Merges into the same att_data fields so existing vision-routing logic fires.
+        let att_data = {
+            let AttachmentData {
+                mut images_b64,
+                ctx,
+                model_override,
+                turn_ids,
+            } = att_data;
+
+            let mut screen_ctx_parts: Vec<String> = Vec::new();
+            let mut has_screen_image = false;
+
+            if let Some(b64) = &screen_image_b64 {
+                images_b64.push(b64.clone());
+                has_screen_image = true;
+                screen_ctx_parts.push(
+                    "### Snímka obrazovky (pii: true — zhrň obsah, necituj doslovne)".to_string(),
+                );
+            }
+            if let Some(app) = &active_app {
+                screen_ctx_parts.push(format!("### Aktívna aplikácia\n{app}"));
+            }
+            if let Some(sel) = &selected_text {
+                if !sel.is_empty() {
+                    screen_ctx_parts.push(format!("### Vybraný text (pii: true)\n{sel}"));
+                }
+            }
+            if let Some(ocr) = &screen_ocr_text {
+                if !ocr.is_empty() {
+                    screen_ctx_parts.push(format!("### OCR text z obrazovky (pii: true)\n{ocr}"));
+                }
+            }
+
+            let merged_ctx = match (ctx, screen_ctx_parts.is_empty()) {
+                (Some(existing), false) => {
+                    Some(format!("{existing}\n\n{}", screen_ctx_parts.join("\n\n")))
+                }
+                (None, false) => Some(screen_ctx_parts.join("\n\n")),
+                (existing, true) => existing,
+            };
+
+            // Upgrade model_override to vision when a screen image was added but no
+            // file-attachment already triggered the vision swap.
+            let merged_override = if has_screen_image && model_override.is_none() {
+                if let Ok(db_guard) = db.try_lock() {
+                    let _ = db_guard.execute(
+                        "INSERT INTO audit_entries (action, payload, model) VALUES ('model_swap', ?1, ?2)",
+                        rusqlite::params![
+                            serde_json::json!({"from": model, "to": vision_model, "reason": "screen_context"}).to_string(),
+                            vision_model
+                        ],
+                    );
+                }
+                Some(vision_model.to_string())
+            } else {
+                model_override
+            };
+
+            AttachmentData {
+                images_b64,
+                ctx: merged_ctx,
+                model_override: merged_override,
+                turn_ids,
+            }
+        };
+
         let effective_model = att_data.model_override.clone().unwrap_or(model.clone());
 
         tracing::info!(
             "chat timing: tool_ctx fetched {}ms",
             t0.elapsed().as_millis()
         );
-        // Build layered prompt
+
+        // ── Planning layer ────────────────────────────────────────────────────
+        // ContextPlanner → SkillSelector → MemorySelector (all before prompt build)
+        let has_mail_ctx = tool_ctx.is_some();
+        let context_plan = context_planner
+            .plan(&user_message, lang, has_mail_ctx)
+            .await;
+        tracing::info!(
+            "chat timing: context plan ready {}ms — task={} needs_memory={} skills={:?}",
+            t0.elapsed().as_millis(),
+            context_plan.task_type,
+            context_plan.needs_memory,
+            context_plan.candidate_skill_names
+        );
+
+        // ── Task rating (Phase 8) ─────────────────────────────────────────────
+        // Rate the task deterministically and emit a lightweight SSE event.
+        // This does NOT route the task to Codex automatically — it is used for
+        // UI hints and future Codex-offer flows.
+        {
+            let task_rating = task_rater.rate(&user_message, &[], None);
+            if task_rating.codex_recommended {
+                let _ = tx
+                    .send(Ok(Event::default().data(
+                        serde_json::json!({
+                            "type":    "task_rating",
+                            "level":   format!("{}", task_rating.level),
+                            "score":   task_rating.score,
+                            "reasons": task_rating.reasons,
+                            "privacy_risk": format!("{}", task_rating.privacy_risk),
+                        })
+                        .to_string(),
+                    )))
+                    .await;
+            }
+        }
+
+        // Select skills
+        let selected_skills: Vec<SelectedSkill> = {
+            let bagent_selected =
+                skill_selector::select(&context_plan.candidate_skill_names, &skills, &user_message);
+            bagent_selected
+                .into_iter()
+                .map(|s| SelectedSkill {
+                    name: s.name,
+                    body: s.body,
+                })
+                .collect()
+        };
+
+        // Select memory + corrections
+        let (selected_memory, corrections, recall_candidates) = {
+            let (mem_result, corr_result, recall_result) = tokio::join!(
+                async {
+                    if context_plan.needs_memory && !context_plan.memory_namespaces.is_empty() {
+                        memory_selector::select(
+                            &memory,
+                            memory_selector::SelectQuery {
+                                query: &user_message,
+                                namespaces: &context_plan.memory_namespaces,
+                                kinds: &context_plan.memory_kinds,
+                                max_cards: None,
+                            },
+                        )
+                        .await
+                        .unwrap_or_default()
+                    } else {
+                        vec![]
+                    }
+                },
+                async {
+                    // Corrections and glossary always retrieved when memory is needed
+                    if context_plan.needs_memory {
+                        memory
+                            .retrieve(
+                                &user_message,
+                                &["sk_glossary", "correction", "corrections", "negative_rules"],
+                                6,
+                            )
+                            .await
+                            .unwrap_or_default()
+                    } else {
+                        vec![]
+                    }
+                },
+                async {
+                    // Recall candidates fetched always for debug trace; injected only when planned
+                    memory
+                        .retrieve_turn_candidates(&user_message, Some(&session_id), 3)
+                        .await
+                        .unwrap_or_default()
+                },
+            );
+            (mem_result, corr_result, recall_result)
+        };
+
+        tracing::info!(
+            "chat timing: memory selected {}ms — {} cards, {} corrections, recall={}",
+            t0.elapsed().as_millis(),
+            selected_memory.len(),
+            corrections.len(),
+            context_plan.needs_conversation_recall
+        );
+
+        let context_plan_json = serde_json::to_value(&context_plan).ok();
+
+        // ── Build layered prompt ──────────────────────────────────────────────
         let prompt_trace_id = Uuid::new_v4().to_string();
         let mut prompt_trace: Option<PromptTrace> = None;
-        let messages = match prompt_builder
+        let mut messages = match prompt_builder
             .build(
-                Some(&session_id),
                 &user_message,
                 lang,
+                &context_plan.response_language_hint,
+                &selected_skills,
+                &selected_memory,
+                &corrections,
                 tool_ctx,
                 att_data.ctx,
                 history,
                 session_summary,
+                recall_candidates,
+                context_plan.needs_conversation_recall,
+                context_plan_json,
+                &user_message,
             )
             .await
         {
@@ -1270,6 +2351,9 @@ async fn chat(
                             "prompt_chars": prompt_chars,
                             "prompt_token_estimate": prompt_chars / 4,
                             "message_count": built.messages.len(),
+                            "selected_skill_names": built.trace.selected_skill_names,
+                            "selected_memory_ids": built.trace.selected_memory_ids,
+                            "conversation_recall_injected": built.trace.conversation_recall_injected,
                         })
                         .to_string(),
                     )))
@@ -1317,6 +2401,541 @@ async fn chat(
             prompt_chars / 4
         );
         let prompt_messages_for_log = messages.clone();
+
+        // ── Agentic file tool loop ────────────────────────────────────────────
+        // For file-search turns the model drives search/read/open tool calls
+        // and sees only real filesystem results — hallucination is structurally
+        // impossible because the model can only name files that tools returned.
+        let is_file_turn = context_plan.task_type == "file_search"
+            || needs_file
+            || (last_file_ref.is_some() && {
+                let lv = user_message.to_lowercase();
+                [
+                    "otvor ho",
+                    "otvor ju",
+                    "otvor to",
+                    "open it",
+                    "reveal it",
+                    "show it",
+                    "ukáž",
+                    "ten súbor",
+                    "that file",
+                ]
+                .iter()
+                .any(|kw| lv.contains(kw))
+            });
+
+        if is_file_turn {
+            if let Some(ref fs_c) = fs_exec {
+                // Define filesystem tools exposed to the model
+                use ollama_connector::ToolDef as OllamaToolDef;
+                let fs_tools: Vec<OllamaToolDef> = vec![
+                    OllamaToolDef::function(
+                        "filesystem_search_files",
+                        "Search the user's Mac for files by name or content using macOS Spotlight. \
+                         Use multiple Slovak/English synonym terms for best recall on Slovak documents. \
+                         IMPORTANT: Never name or describe a file that was not returned by this tool.",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "terms": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Search terms (OR semantics). When the user's query is in English but the files are Slovak business documents, include Slovak synonyms and transliterations. E.g. 'customer statement' → ['zákazník','zakaznik','preplatk','saldokonto','výpis','prehľad']."
+                                },
+                                "roots": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Folders to search, e.g. ['~/Downloads']. Omit to search all allowed folders."
+                                },
+                                "extensions": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "File extensions without dot, e.g. ['pdf','xlsx']."
+                                },
+                                "search_contents": {
+                                    "type": "boolean",
+                                    "description": "Also search inside document contents (needed when the filename doesn't match but contents do)."
+                                },
+                                "max_results": {
+                                    "type": "integer",
+                                    "description": "Max results to return. Default 10."
+                                }
+                            },
+                            "required": ["terms"]
+                        }),
+                    ),
+                    OllamaToolDef::function(
+                        "filesystem_read_text",
+                        "Read the text content of a local file (PDF, Word, Excel, or plain text). \
+                         Use this to inspect candidate files returned by filesystem_search_files.",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the file."}
+                            },
+                            "required": ["path"]
+                        }),
+                    ),
+                    OllamaToolDef::function(
+                        "filesystem_open_file",
+                        "Open a local file in its default application. Requires user approval.",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Absolute path to the file."}
+                            },
+                            "required": ["path"]
+                        }),
+                    ),
+                    OllamaToolDef::function(
+                        "filesystem_open_file_with",
+                        "Open a local file in a specific application. Requires user approval.",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "app": {"type": "string", "description": "App name, e.g. 'Microsoft Excel', 'Preview'."}
+                            },
+                            "required": ["path", "app"]
+                        }),
+                    ),
+                    OllamaToolDef::function(
+                        "filesystem_reveal_in_finder",
+                        "Reveal a local file in the macOS Finder.",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"}
+                            },
+                            "required": ["path"]
+                        }),
+                    ),
+                    OllamaToolDef::function(
+                        "macos_open_app",
+                        "Launch or focus a macOS application by name.",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "app": {"type": "string", "description": "App name, e.g. 'Mail', 'Finder', 'Preview'."}
+                            },
+                            "required": ["app"]
+                        }),
+                    ),
+                ];
+
+                let mut found_file_ref: Option<FileRef> = None;
+
+                // Status hint so the UI shows activity during tool-calling rounds
+                let _ = tx
+                    .send(Ok(Event::default().data(
+                        serde_json::json!({"type":"tool_status","message":"🔎 searching..."})
+                            .to_string(),
+                    )))
+                    .await;
+
+                // Tool-calling loop (max 5 rounds)
+                'agent: for _round in 0..5 {
+                    match ollama
+                        .chat_once_with_tools(
+                            effective_model.clone(),
+                            messages.clone(),
+                            fs_tools.clone(),
+                        )
+                        .await
+                    {
+                        Ok(OllamaChatTurn::ToolCalls(calls)) => {
+                            // Append the assistant message carrying the tool calls
+                            messages.push(Message::assistant_tool_calls(calls.clone()));
+
+                            for call in &calls {
+                                let fn_name = &call.function.name;
+                                let args = &call.function.arguments;
+                                tracing::debug!("file agent tool call: {} {:?}", fn_name, args);
+
+                                // Dispatch the tool call
+                                let tool_result: String = match fn_name.as_str() {
+                                    "filesystem_search_files" => {
+                                        let terms: Vec<String> = args["terms"]
+                                            .as_array()
+                                            .map(|a| {
+                                                a.iter()
+                                                    .filter_map(|v| {
+                                                        v.as_str().map(|s| s.to_string())
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        let query = terms.first().cloned().unwrap_or_default();
+                                        let roots: Option<Vec<String>> =
+                                            args["roots"].as_array().map(|a| {
+                                                a.iter()
+                                                    .filter_map(|v| {
+                                                        v.as_str().map(|s| s.to_string())
+                                                    })
+                                                    .collect()
+                                            });
+                                        let extensions: Option<Vec<String>> =
+                                            args["extensions"].as_array().map(|a| {
+                                                a.iter()
+                                                    .filter_map(|v| {
+                                                        v.as_str().map(|s| s.to_string())
+                                                    })
+                                                    .collect()
+                                            });
+                                        let search_contents =
+                                            args["search_contents"].as_bool().unwrap_or(false);
+                                        let max_results = args["max_results"]
+                                            .as_u64()
+                                            .map(|n| n as usize)
+                                            .unwrap_or(10);
+
+                                        let req = FileSearchRequest {
+                                            query,
+                                            terms,
+                                            roots,
+                                            search_names: true,
+                                            search_contents,
+                                            extensions,
+                                            include_hidden: false,
+                                            max_results,
+                                            max_depth: Some(8),
+                                        };
+                                        let policy = fs_c.policy.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            fs_search::search_files_sync(&policy, req)
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(resp)) => {
+                                                audit_fs(
+                                                    &db,
+                                                    "filesystem_search",
+                                                    &serde_json::json!({
+                                                        "result_count": resp.results.len(),
+                                                        "ok": true
+                                                    }),
+                                                );
+                                                // Track top result for coreference
+                                                if found_file_ref.is_none() {
+                                                    if let Some(top) = resp.results.first() {
+                                                        found_file_ref = Some(FileRef {
+                                                            path: top.path.clone(),
+                                                            display_name: top.display_name.clone(),
+                                                            kind: format!("{:?}", top.kind)
+                                                                .to_lowercase(),
+                                                        });
+                                                    }
+                                                }
+                                                serde_json::to_string(&resp)
+                                                    .unwrap_or_else(|_| "[]".to_string())
+                                            }
+                                            Ok(Err(e)) => {
+                                                format!("{{\"error\":\"{}\"}}", e)
+                                            }
+                                            Err(e) => {
+                                                format!("{{\"error\":\"{}\"}}", e)
+                                            }
+                                        }
+                                    }
+
+                                    "filesystem_read_text" => {
+                                        let path = args["path"].as_str().unwrap_or("").to_string();
+                                        let req = ReadTextRequest {
+                                            path,
+                                            max_bytes: None,
+                                            around_line: None,
+                                        };
+                                        let policy = fs_c.policy.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            fs_search::read_text_sync(&policy, req)
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(resp)) => {
+                                                // Cap content to avoid huge context
+                                                let content: String =
+                                                    resp.content.chars().take(4000).collect();
+                                                let truncated_note = if resp.truncated {
+                                                    " [truncated]"
+                                                } else {
+                                                    ""
+                                                };
+                                                format!(
+                                                    "[File: {}]\n{}{}",
+                                                    resp.path, content, truncated_note
+                                                )
+                                            }
+                                            Ok(Err(e)) => format!("Error reading file: {e}"),
+                                            Err(e) => format!("Error: {e}"),
+                                        }
+                                    }
+
+                                    tool @ ("filesystem_open_file"
+                                    | "filesystem_open_file_with"
+                                    | "filesystem_reveal_in_finder"
+                                    | "filesystem_open_folder"
+                                    | "macos_open_app"
+                                    | "macos_focus_app") => {
+                                        // Derive the dotted rule name from the underscore tool name
+                                        let rule_name = match tool {
+                                            "filesystem_open_file" => "filesystem.open_file",
+                                            "filesystem_open_file_with" => {
+                                                "filesystem.open_file_with"
+                                            }
+                                            "filesystem_reveal_in_finder" => {
+                                                "filesystem.reveal_in_finder"
+                                            }
+                                            "filesystem_open_folder" => "filesystem.open_folder",
+                                            "macos_open_app" => "macos.open_app",
+                                            "macos_focus_app" => "macos.focus_app",
+                                            _ => tool,
+                                        };
+                                        let path = args["path"].as_str().map(|s| s.to_string());
+                                        let app = args["app"].as_str().map(|s| s.to_string());
+                                        let approval_level = rules.check(rule_name, "{}");
+                                        let approved = match approval_level {
+                                            ApprovalLevel::Auto => true,
+                                            ApprovalLevel::Ask => {
+                                                request_tool_approval(
+                                                    &db,
+                                                    &pending_approvals,
+                                                    &tx,
+                                                    rule_name,
+                                                    &format!(
+                                                        "Open: {}",
+                                                        path.as_deref()
+                                                            .or(app.as_deref())
+                                                            .unwrap_or("?")
+                                                    ),
+                                                )
+                                                .await
+                                            }
+                                            ApprovalLevel::Forbidden => {
+                                                let _ = tx
+                                                    .send(Ok(Event::default().data(
+                                                        serde_json::json!({
+                                                            "type": "tool_blocked",
+                                                            "tool": rule_name
+                                                        })
+                                                        .to_string(),
+                                                    )))
+                                                    .await;
+                                                false
+                                            }
+                                        };
+                                        if !approved {
+                                            format!(
+                                                "Tool {rule_name} blocked — user did not approve."
+                                            )
+                                        } else {
+                                            let result: anyhow::Result<OpenResponse> =
+                                                match rule_name {
+                                                    "filesystem.open_file" => {
+                                                        if let Some(ref p) = path {
+                                                            fs_open::open_file(&fs_c.policy, p)
+                                                                .await
+                                                        } else {
+                                                            Err(anyhow::anyhow!("no path"))
+                                                        }
+                                                    }
+                                                    "filesystem.open_file_with" => {
+                                                        if let (Some(ref p), Some(ref a)) =
+                                                            (&path, &app)
+                                                        {
+                                                            fs_open::open_file_with(
+                                                                &fs_c.policy,
+                                                                p,
+                                                                a,
+                                                            )
+                                                            .await
+                                                        } else {
+                                                            Err(anyhow::anyhow!("no path or app"))
+                                                        }
+                                                    }
+                                                    "filesystem.reveal_in_finder" => {
+                                                        if let Some(ref p) = path {
+                                                            fs_open::reveal_in_finder(
+                                                                &fs_c.policy,
+                                                                p,
+                                                            )
+                                                            .await
+                                                        } else {
+                                                            Err(anyhow::anyhow!("no path"))
+                                                        }
+                                                    }
+                                                    "filesystem.open_folder" => {
+                                                        if let Some(ref p) = path {
+                                                            fs_open::open_folder(&fs_c.policy, p)
+                                                                .await
+                                                        } else {
+                                                            Err(anyhow::anyhow!("no path"))
+                                                        }
+                                                    }
+                                                    "macos.open_app" | "macos.focus_app" => {
+                                                        if let Some(ref a) = app {
+                                                            fs_open::open_app(a).await
+                                                        } else {
+                                                            Err(anyhow::anyhow!("no app"))
+                                                        }
+                                                    }
+                                                    _ => Err(anyhow::anyhow!("unknown")),
+                                                };
+                                            match result {
+                                                Ok(ref resp) => {
+                                                    let path_hash = path.as_deref().map(sha256_str);
+                                                    audit_fs(
+                                                        &db,
+                                                        &rule_name.replace('.', "_"),
+                                                        &serde_json::json!({
+                                                            "path_hash": path_hash,
+                                                            "app": app,
+                                                            "ok": true
+                                                        }),
+                                                    );
+                                                    let _ = tx
+                                                        .send(Ok(Event::default().data(
+                                                            serde_json::json!({
+                                                                "type": "file_opened",
+                                                                "path": resp.path,
+                                                                "app": resp.app,
+                                                                "action": resp.action,
+                                                            })
+                                                            .to_string(),
+                                                        )))
+                                                        .await;
+                                                    format!(
+                                                        "Opened: {}",
+                                                        path.as_deref()
+                                                            .or(app.as_deref())
+                                                            .unwrap_or("ok")
+                                                    )
+                                                }
+                                                Err(ref e) => {
+                                                    audit_fs(
+                                                        &db,
+                                                        &rule_name.replace('.', "_"),
+                                                        &serde_json::json!({
+                                                            "ok": false,
+                                                            "error": e.to_string()
+                                                        }),
+                                                    );
+                                                    format!("Error: {e}")
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    other => {
+                                        tracing::warn!("unknown file agent tool: {}", other);
+                                        format!("Unknown tool: {other}")
+                                    }
+                                };
+
+                                messages.push(Message::tool_result(fn_name, tool_result));
+                            }
+                        }
+
+                        Ok(OllamaChatTurn::Content(_)) => {
+                            // Model is done calling tools — exit to the final stream
+                            break 'agent;
+                        }
+
+                        Err(e) => {
+                            tracing::warn!("file agent tool loop error: {}", e);
+                            break 'agent;
+                        }
+                    }
+                } // end 'agent loop
+
+                // Persist found file ref for cross-turn coreference
+                if let Some(ref fref) = found_file_ref {
+                    save_last_file_ref(&db, &session_id, fref).await;
+                }
+
+                // Final streaming answer: model has all tool results in context.
+                // We call chat_stream without tools so the model answers (not calls more tools).
+                tracing::info!(
+                    "chat timing: file agent loop done {}ms, streaming final answer",
+                    t0.elapsed().as_millis()
+                );
+                let token_stream_agent = ollama.chat_stream(effective_model.clone(), messages);
+                tokio::pin!(token_stream_agent);
+
+                let mut full_response = String::new();
+                while let Some(result) = token_stream_agent.next().await {
+                    match result {
+                        Ok(token) => {
+                            full_response.push_str(&token);
+                            let ev = Event::default().data(
+                                serde_json::json!({"type":"token","content":token}).to_string(),
+                            );
+                            if tx.send(Ok(ev)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Ok(err_event(&e.to_string()))).await;
+                            return;
+                        }
+                    }
+                }
+
+                // Persist assistant turn
+                {
+                    let turn_id = Uuid::new_v4().to_string();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    if let Ok(db) = db.try_lock() {
+                        let _ = db.execute(
+                            "INSERT INTO chat_turns (id, session_id, role, content, language, model, created_at) \
+                             VALUES (?1,?2,'assistant',?3,?4,?5,?6)",
+                            rusqlite::params![turn_id, session_id, full_response, lang, effective_model, now],
+                        );
+                        let _ = db.execute(
+                            "INSERT INTO audit_entries (action, payload, model) VALUES (?1, ?2, ?3)",
+                            rusqlite::params!["chat", &user_message, &effective_model],
+                        );
+                    }
+                }
+
+                let _ = tx
+                    .send(Ok(Event::default().data(
+                        serde_json::json!({"type":"done","session_id": session_id}).to_string(),
+                    )))
+                    .await;
+
+                // Background: memory extraction + turn embedding
+                let memory_extractor =
+                    MemoryExtractor::new(ollama.clone(), classifier_model.clone());
+                let memory_bg = memory.clone();
+                let user_msg_bg = user_message.clone();
+                let reply_bg = full_response.clone();
+                let lang_bg = lang.to_string();
+                let db_bg = db.clone();
+                let turn_id_bg = {
+                    let db_g = db_bg.try_lock().ok();
+                    db_g.and_then(|d| {
+                        d.query_row(
+                            "SELECT id FROM chat_turns WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1",
+                            rusqlite::params![session_id],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_default()
+                };
+                tokio::spawn(async move {
+                    let extract_fut =
+                        memory_extractor.run(&user_msg_bg, &reply_bg, memory_bg.clone(), &lang_bg);
+                    let embed_fut = memory_bg.embed_chat_turn(&turn_id_bg, &reply_bg);
+                    let _ = tokio::join!(extract_fut, embed_fut);
+                });
+
+                return; // ← early return; skip the non-file single-LLM path below
+            }
+        }
+        // ── End agentic file tool loop ────────────────────────────────────────
+
         // Stream response
         let token_stream = ollama.chat_stream(effective_model.clone(), messages);
         tokio::pin!(token_stream);
@@ -1442,10 +3061,20 @@ async fn chat(
                             let namespace = if result.scope == "sk_lang" {
                                 "sk_glossary"
                             } else {
-                                "correction"
+                                "corrections"
                             };
                             let _ = mem
-                                .insert(namespace, "correction", "und", &text, None, None, None)
+                                .insert_full(InsertParams {
+                                    namespace,
+                                    kind: "correction",
+                                    language: "und",
+                                    text: &text,
+                                    source: "passive",
+                                    confidence: result.confidence,
+                                    importance: 0.75,
+                                    sensitivity: "normal",
+                                    ..Default::default()
+                                })
                                 .await;
                         }
                     }
@@ -1623,15 +3252,20 @@ async fn memory_insert(
 ) -> impl IntoResponse {
     match state
         .memory
-        .insert(
-            &req.namespace,
-            &req.kind,
-            &req.language,
-            &req.text,
-            req.source_ref.as_deref(),
-            req.metadata_json.as_deref(),
-            req.expires_at.as_deref(),
-        )
+        .insert_full(InsertParams {
+            namespace: &req.namespace,
+            kind: &req.kind,
+            language: &req.language,
+            text: &req.text,
+            source_ref: req.source_ref.as_deref(),
+            metadata_json: req.metadata_json.as_deref(),
+            expires_at: req.expires_at.as_deref(),
+            source: req.source.as_deref().unwrap_or("explicit"),
+            confidence: req.confidence.unwrap_or(0.9),
+            importance: req.importance.unwrap_or(0.7),
+            sensitivity: req.sensitivity.as_deref().unwrap_or("normal"),
+            subject: req.subject.as_deref(),
+        })
         .await
     {
         Ok(Some(id)) => {
@@ -1665,12 +3299,14 @@ async fn memory_list(
 ) -> impl IntoResponse {
     let db = state.db.lock().await;
     let sql = if q.namespace.is_empty() {
-        "SELECT id, namespace, kind, language, text, source_ref, created_at, use_count \
-         FROM memory_items ORDER BY updated_at DESC LIMIT ?1"
+        "SELECT id, namespace, kind, language, text, source_ref, created_at, use_count, \
+                status, source, confidence, importance, sensitivity \
+         FROM memory_items WHERE status = 'active' ORDER BY updated_at DESC LIMIT ?1"
             .to_string()
     } else {
-        "SELECT id, namespace, kind, language, text, source_ref, created_at, use_count \
-         FROM memory_items WHERE namespace = ?2 ORDER BY updated_at DESC LIMIT ?1"
+        "SELECT id, namespace, kind, language, text, source_ref, created_at, use_count, \
+                status, source, confidence, importance, sensitivity \
+         FROM memory_items WHERE namespace = ?2 AND status = 'active' ORDER BY updated_at DESC LIMIT ?1"
             .to_string()
     };
 
@@ -1684,6 +3320,11 @@ async fn memory_list(
             "source_ref": row.get::<_, Option<String>>(5)?,
             "created_at": row.get::<_, String>(6)?,
             "use_count": row.get::<_, i64>(7)?,
+            "status": row.get::<_, String>(8)?,
+            "source": row.get::<_, String>(9)?,
+            "confidence": row.get::<_, f64>(10)?,
+            "importance": row.get::<_, f64>(11)?,
+            "sensitivity": row.get::<_, String>(12)?,
         }))
     };
 
@@ -1719,8 +3360,25 @@ async fn memory_search(
     } else {
         vec![q.namespace.as_str()]
     };
+    let kind_filter: Vec<&str> = if q.kind.is_empty() {
+        vec![]
+    } else {
+        vec![q.kind.as_str()]
+    };
 
-    match state.memory.retrieve(&q.q, &namespaces, q.limit).await {
+    match state
+        .memory
+        .retrieve_filtered(RetrieveQuery {
+            query: &q.q,
+            namespaces: &namespaces,
+            kinds: &kind_filter,
+            k: q.limit,
+            max_per_namespace: 3,
+            score_threshold: 0.0,
+            allow_sensitive: false,
+        })
+        .await
+    {
         Ok(hits) => {
             let items: Vec<serde_json::Value> = hits
                 .into_iter()
@@ -2229,16 +3887,21 @@ async fn notes_get(State(state): State<AppState>, Path(pk): Path<i64>) -> impl I
     )
 }
 
-// ── Approval helper ──────────────────────────────────────────────────────────
+// ── Approval helpers ─────────────────────────────────────────────────────────
 
-/// Insert a pending_approvals record, emit an SSE event to the client, and
-/// block until the user decides (Allow/Deny) or the 60 s countdown elapses.
-async fn request_tool_approval(
+/// Core approval logic: insert a `pending_approvals` DB row, register the
+/// oneshot channel, optionally emit an SSE notification, then block until the
+/// user decides (Allow/Deny) or the 60 s countdown elapses.
+///
+/// `sse_tx` — pass `Some(&tx)` from the chat SSE flow to emit the
+/// `approval_requested` event; pass `None` for REST callers (the Swift app's
+/// 1 s poll of `GET /approvals/pending` will surface the row automatically).
+async fn request_approval_core(
     db: &Arc<Mutex<Connection>>,
     pending: &Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
-    tx: &mpsc::Sender<Result<Event, Infallible>>,
     tool_name: &str,
     description: &str,
+    sse_tx: Option<&mpsc::Sender<Result<Event, Infallible>>>,
 ) -> bool {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -2255,18 +3918,21 @@ async fn request_tool_approval(
     let (send, recv) = oneshot::channel::<bool>();
     pending.lock().unwrap().insert(id.clone(), send);
 
-    let _ = tx
-        .send(Ok(Event::default().data(
-            serde_json::json!({
-                "type":        "approval_requested",
-                "id":          id,
-                "tool":        tool_name,
-                "description": description,
-                "expires_in":  60
-            })
-            .to_string(),
-        )))
-        .await;
+    // Emit SSE event only when a chat stream is active.
+    if let Some(tx) = sse_tx {
+        let _ = tx
+            .send(Ok(Event::default().data(
+                serde_json::json!({
+                    "type":        "approval_requested",
+                    "id":          id,
+                    "tool":        tool_name,
+                    "description": description,
+                    "expires_in":  60
+                })
+                .to_string(),
+            )))
+            .await;
+    }
 
     match tokio::time::timeout(tokio::time::Duration::from_secs(60), recv).await {
         Ok(Ok(decision)) => {
@@ -2303,6 +3969,673 @@ async fn request_tool_approval(
                 );
             }
             false
+        }
+    }
+}
+
+/// Convenience wrapper for the chat SSE path (always emits the SSE event).
+async fn request_tool_approval(
+    db: &Arc<Mutex<Connection>>,
+    pending: &Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    tool_name: &str,
+    description: &str,
+) -> bool {
+    request_approval_core(db, pending, tool_name, description, Some(tx)).await
+}
+
+// ── Codex handlers (Phase 8) ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CodexRateTaskRequest {
+    description: String,
+    #[serde(default)]
+    context_sources: Vec<String>,
+    #[serde(default)]
+    privacy_hint: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CodexRunTaskRequest {
+    description: String,
+    #[serde(default)]
+    context_sources: Vec<String>,
+    #[serde(default)]
+    context_refs: Vec<String>,
+    #[serde(default)]
+    force_codex: bool,
+}
+
+/// `GET /codex/status`
+async fn codex_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match &state.codex {
+        Some(c) => {
+            let version = c.version().await;
+            Json(serde_json::json!({
+                "available": true,
+                "binary_path": c.resolved_path().to_string_lossy(),
+                "version": version,
+                "configured_path": null
+            }))
+        }
+        None => Json(serde_json::json!({
+            "available": false,
+            "error": "codex_not_found"
+        })),
+    }
+}
+
+/// `POST /codex/rate-task`
+async fn codex_rate_task_handler(
+    State(state): State<AppState>,
+    Json(req): Json<CodexRateTaskRequest>,
+) -> impl IntoResponse {
+    let rating = state.task_rater.rate(
+        &req.description,
+        &req.context_sources,
+        req.privacy_hint.as_deref(),
+    );
+    Json(serde_json::json!({
+        "level": format!("{}", rating.level),
+        "score": rating.score,
+        "codex_recommended": rating.codex_recommended,
+        "requires_approval": rating.requires_approval,
+        "privacy_risk": format!("{}", rating.privacy_risk),
+        "suggested_context_scope": rating.suggested_context_scope,
+        "reasons": rating.reasons,
+    }))
+}
+
+/// `POST /codex/run-task`
+async fn codex_run_task_handler(
+    State(state): State<AppState>,
+    Json(req): Json<CodexRunTaskRequest>,
+) -> impl IntoResponse {
+    use bagent_agent::TaskLevel;
+
+    // 1. Rate the task.
+    let rating = state
+        .task_rater
+        .rate(&req.description, &req.context_sources, None);
+
+    // 2. Bail early if local model is sufficient and force_codex is not set.
+    if matches!(
+        rating.level,
+        TaskLevel::LocalOnly | TaskLevel::LocalPreferred
+    ) && !req.force_codex
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ran": false,
+                "reason": "local_sufficient",
+                "rating": {
+                    "level": format!("{}", rating.level),
+                    "score": rating.score,
+                    "reasons": rating.reasons,
+                }
+            })),
+        );
+    }
+
+    // 3. Bail if Codex binary is unavailable.
+    let connector = match &state.codex {
+        Some(c) => c.clone(),
+        None => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ran": false,
+                    "error": "codex_not_found",
+                    "message": "Codex CLI not found. Install it and configure the path in Settings."
+                })),
+            );
+        }
+    };
+
+    // 4. Check the rules gate.
+    match state.rules.check("codex.run_task", "{}") {
+        ApprovalLevel::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "ran": false,
+                    "error": "forbidden",
+                    "message": "codex.run_task is forbidden by the rules engine."
+                })),
+            );
+        }
+        _ => {} // Auto or Ask — both proceed to explicit approval below.
+    }
+
+    // 5. Build a proposed context packet from context_refs (summaries only by default).
+    let allowed_context: Vec<ContextItem> = req
+        .context_refs
+        .iter()
+        .map(|r| {
+            // Derive source from the ref prefix (e.g. "mail:rowid:123" → "mail")
+            let source = r.split(':').next().unwrap_or("unknown").to_string();
+            ContextItem {
+                source,
+                title: None,
+                summary: format!("(Summary for {} pending user approval)", r),
+                record_ref: Some(r.clone()),
+                pii: true, // conservative default
+            }
+        })
+        .collect();
+
+    let context_packet = CodexContextPacket {
+        user_request: req.description.clone(),
+        allowed_context,
+        expected_output: CodexExpectedOutput::Analysis,
+        ..Default::default()
+    };
+
+    // 6. Build approval description text (shown in the modal).
+    let sources_str = if req.context_sources.is_empty() {
+        "none declared".to_string()
+    } else {
+        req.context_sources.join(", ")
+    };
+    let approval_description = format!(
+        "Codex External Reasoning — {}\n\
+         Level: {} | Privacy: {} | Sources: {}\n\
+         Codex is an external harness. It will receive only the approved context packet \
+         (summaries and record refs, no raw bodies). It cannot perform side effects directly.",
+        req.description, rating.level, rating.privacy_risk, sources_str,
+    );
+
+    // 7. Request approval via the DB-backed poll path (no SSE channel needed).
+    let approved = request_approval_core(
+        &state.db,
+        &state.pending_approvals,
+        "codex.run_task",
+        &approval_description,
+        None, // REST path — Swift polls GET /approvals/pending
+    )
+    .await;
+
+    // 8. Audit the attempt.
+    let task_id = Uuid::new_v4().to_string();
+    if !approved {
+        audit_fs(
+            &state.db,
+            "codex_run_task",
+            &serde_json::json!({
+                "task_id": &task_id,
+                "description": &req.description,
+                "level": format!("{}", rating.level),
+                "privacy_risk": format!("{}", rating.privacy_risk),
+                "context_sources": &req.context_sources,
+                "decision": "denied",
+            }),
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ran": false,
+                "reason": "denied"
+            })),
+        );
+    }
+
+    // 9. Run Codex.
+    let codex_task = CodexTask {
+        id: task_id.clone(),
+        description: req.description.clone(),
+        context_packet,
+        task_level: format!("{}", rating.level),
+        privacy_risk: format!("{}", rating.privacy_risk),
+    };
+
+    let run_result = match connector.run(&codex_task).await {
+        Ok(r) => r,
+        Err(e) => {
+            audit_fs(
+                &state.db,
+                "codex_run_task",
+                &serde_json::json!({
+                    "task_id": &task_id,
+                    "description": &req.description,
+                    "level": format!("{}", rating.level),
+                    "error": e.to_string(),
+                }),
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ran": false,
+                    "error": "spawn_failed",
+                    "message": e.to_string()
+                })),
+            );
+        }
+    };
+
+    // 10. Audit the result (never include raw bodies).
+    audit_fs(
+        &state.db,
+        "codex_run_task",
+        &serde_json::json!({
+            "task_id": &task_id,
+            "description": &req.description,
+            "level": format!("{}", rating.level),
+            "privacy_risk": format!("{}", rating.privacy_risk),
+            "context_sources": &req.context_sources,
+            "exit_code": run_result.exit_code,
+            "timed_out": run_result.timed_out,
+            "output_hash": &run_result.output_hash,
+        }),
+    );
+
+    // 11. Build structured response. Extract fields from parsed JSON output if
+    //     available; fall back to plain text.
+    let empty_vec: Vec<serde_json::Value> = vec![];
+    let empty_str = serde_json::Value::String(String::new());
+    let (summary, findings, conflicts, proposed_actions, drafts, questions) =
+        if let Some(ref v) = run_result.parsed_output {
+            (
+                v.get("summary").cloned().unwrap_or(empty_str.clone()),
+                v.get("findings")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                v.get("conflicts")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                v.get("proposed_actions")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                v.get("drafts")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                v.get("questions_for_user")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        } else {
+            (
+                serde_json::Value::String(run_result.result_text.clone()),
+                empty_vec.clone(),
+                empty_vec.clone(),
+                empty_vec.clone(),
+                empty_vec.clone(),
+                empty_vec,
+            )
+        };
+
+    // Truncate raw stdout/stderr for the response (they're already truncated to 64 KiB;
+    // trim further for the API response).
+    let stdout_snippet = if run_result.stdout.len() > 2048 {
+        format!("{}…", &run_result.stdout[..2048])
+    } else {
+        run_result.stdout.clone()
+    };
+    let stderr_snippet = if run_result.stderr.len() > 1024 {
+        format!("{}…", &run_result.stderr[..1024])
+    } else {
+        run_result.stderr.clone()
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ran": true,
+            "task_id": task_id,
+            "rating": {
+                "level": format!("{}", rating.level),
+                "score": rating.score,
+                "privacy_risk": format!("{}", rating.privacy_risk),
+                "reasons": rating.reasons,
+            },
+            "summary": summary,
+            "findings": findings,
+            "conflicts": conflicts,
+            "proposed_actions": proposed_actions,
+            "drafts": drafts,
+            "questions_for_user": questions,
+            "stdout_snippet": stdout_snippet,
+            "stderr_snippet": stderr_snippet,
+            "exit_code": run_result.exit_code,
+            "timed_out": run_result.timed_out,
+            "output_hash": run_result.output_hash,
+        })),
+    )
+}
+
+// ── Odoo handlers (Phase 6) ──────────────────────────────────────────────────
+
+/// `POST /odoo/config` — authenticate and store the connector in-memory.
+/// Doubles as the Settings "Test" button: returns version + uid on success.
+async fn odoo_config_handler(
+    State(state): State<AppState>,
+    Json(cfg): Json<OdooConfig>,
+) -> impl IntoResponse {
+    match OdooConnector::connect(cfg).await {
+        Ok(conn) => {
+            let version = conn.server_version.clone();
+            let uid = conn.uid;
+            *state.odoo.write().await = Some(conn);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "version": version,
+                    "uid": uid,
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": e.to_string(),
+            })),
+        ),
+    }
+}
+
+/// `GET /odoo/status` — current connector state (no network call).
+async fn odoo_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let guard = state.odoo.read().await;
+    match &*guard {
+        Some(conn) => Json(serde_json::json!({
+            "configured": true,
+            "connected": true,
+            "version": conn.server_version,
+            "uid": conn.uid,
+        })),
+        None => Json(serde_json::json!({
+            "configured": false,
+            "connected": false,
+        })),
+    }
+}
+
+#[derive(Deserialize)]
+struct OdooOpenReq {
+    url: String,
+}
+
+/// `POST /odoo/open` — open an Odoo record URL in Safari.
+async fn odoo_open_handler(Json(body): Json<OdooOpenReq>) -> impl IntoResponse {
+    match fs_open::open_url_in_safari(&body.url).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+// ── WhatsApp handlers (Phase 11) ─────────────────────────────────────────────
+
+/// `GET /whatsapp/status`
+async fn whatsapp_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.whatsapp.status().await {
+        Ok(s) => Json(serde_json::json!({
+            "status": s.status.to_string(),
+            "connected": s.status == WhatsappConnectionStatus::Ready,
+            "needs_qr": s.status == WhatsappConnectionStatus::Qr,
+            "me": s.me,
+            "error": s.error,
+        })),
+        Err(e) => Json(serde_json::json!({
+            "status": "error",
+            "connected": false,
+            "needs_qr": false,
+            "error": e.to_string(),
+        })),
+    }
+}
+
+/// `POST /whatsapp/start`
+async fn whatsapp_start_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.whatsapp.start().await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `POST /whatsapp/stop`
+async fn whatsapp_stop_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.whatsapp.stop().await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `GET /whatsapp/qr`
+async fn whatsapp_qr_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.whatsapp.qr().await {
+        Ok(qr) => (StatusCode::OK, Json(serde_json::json!({ "qr": qr }))),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "qr": null, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `POST /whatsapp/logout`
+async fn whatsapp_logout_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let _ = state.whatsapp.logout().await;
+    let _ = state.whatsapp.stop().await;
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct WhatsappContactsQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /whatsapp/contacts?limit=N`
+async fn whatsapp_contacts_handler(
+    State(state): State<AppState>,
+    Query(q): Query<WhatsappContactsQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(100).min(500);
+    match state.whatsapp.list_contacts(limit).await {
+        Ok(contacts) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(contacts).unwrap_or_default()),
+        ),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct WhatsappChatsQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /whatsapp/chats?limit=N`
+async fn whatsapp_chats_handler(
+    State(state): State<AppState>,
+    Query(q): Query<WhatsappChatsQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(30).min(200);
+    match state.whatsapp.list_chats(limit).await {
+        Ok(chats) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(chats).unwrap_or_default()),
+        ),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct WhatsappMessagesQuery {
+    limit: Option<usize>,
+    before: Option<i64>,
+}
+
+/// `GET /whatsapp/chats/:id/messages?limit=N&before=TS`
+async fn whatsapp_chat_messages_handler(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Query(q): Query<WhatsappMessagesQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(20).min(100);
+    match state
+        .whatsapp
+        .chat_messages(&chat_id, limit, q.before)
+        .await
+    {
+        Ok(msgs) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(msgs).unwrap_or_default()),
+        ),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct WhatsappSendReq {
+    /// WhatsApp chat JID (mutually exclusive with `phone`).
+    chat_id: Option<String>,
+    /// Phone number in any format (mutually exclusive with `chat_id`).
+    phone: Option<String>,
+    /// Exact message text. Required.
+    text: String,
+}
+
+/// `POST /whatsapp/send`
+///
+/// # Approval contract (trap #1 from plan)
+///
+/// The enforcement floor lives **here**, not in `rules.yaml`.
+/// We call `request_approval_core` regardless of the `rules.check()` result,
+/// unless the rule is `Forbidden` (which blocks immediately).
+/// This ensures the invariant holds even for existing installations that have
+/// an old `rules.yaml` on disk which does not contain the new WhatsApp rule.
+async fn whatsapp_send_handler(
+    State(state): State<AppState>,
+    Json(req): Json<WhatsappSendReq>,
+) -> impl IntoResponse {
+    // Basic validation
+    let text = req.text.trim().to_string();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "sent": false, "reason": "text_empty" })),
+        );
+    }
+    let target = match (req.chat_id.clone(), req.phone.clone()) {
+        (Some(id), _) => WhatsappSendTarget::ChatId(id),
+        (None, Some(ph)) => WhatsappSendTarget::Phone(ph),
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "sent": false, "reason": "chat_id_or_phone_required" })),
+            );
+        }
+    };
+    let recipient_display = req
+        .chat_id
+        .as_deref()
+        .or(req.phone.as_deref())
+        .unwrap_or("unknown");
+
+    // Rules gate — Forbidden blocks immediately; Auto and Ask both proceed to approval.
+    match state.rules.check("whatsapp.send_message", "{}") {
+        ApprovalLevel::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "sent": false,
+                    "reason": "forbidden_by_rules"
+                })),
+            );
+        }
+        _ => {} // Auto or Ask — BOTH proceed to explicit approval below (trap #1).
+    }
+
+    // Approval modal description — shown verbatim to the user.
+    // Trap #2: the audit_description passed to request_approval_core must be
+    // REDACTED (preview only) to keep raw message bodies out of audit_entries.
+    let approval_description = format!(
+        "Odoslať WhatsApp správu — Príjemca: {}\nText: {}",
+        recipient_display, &text
+    );
+    let text_preview = if text.len() > 60 {
+        format!("{}… ({} znakov)", &text[..60], text.len())
+    } else {
+        text.clone()
+    };
+    let audit_description = format!(
+        "Odoslať WhatsApp správu — Príjemca: {} | Náhľad: {}",
+        recipient_display, text_preview
+    );
+
+    // Request approval (REST path — Swift polls GET /approvals/pending).
+    // Note: approval modal shows `approval_description` with full text;
+    //       audit row stores `audit_description` (truncated preview, no full body).
+    let approved = request_approval_core(
+        &state.db,
+        &state.pending_approvals,
+        "whatsapp.send_message",
+        &audit_description, // stored in audit_entries — redacted (trap #2)
+        None,               // REST path; no SSE channel
+    )
+    .await;
+
+    if !approved {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "sent": false, "reason": "denied" })),
+        );
+    }
+
+    // Store the approval description (with full text) in the modal side-channel
+    // so the Swift app can show it before the user decides. Here we just proceed.
+    // (The full-text version was already shown via `approval_description` above in the
+    //  approval request that the Swift app rendered.)
+
+    match state.whatsapp.send_message(target, &text).await {
+        Ok(msg_ref) => {
+            tracing::info!(
+                message_id = %msg_ref.message_id,
+                "WhatsApp message sent"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "sent": true,
+                    "message_id": msg_ref.message_id,
+                    "chat_id": msg_ref.chat_id,
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("WhatsApp send error: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "sent": false,
+                    "reason": "send_error",
+                    "error": e.to_string(),
+                })),
+            )
         }
     }
 }
@@ -2441,7 +4774,10 @@ fn push_search_term(terms: &mut Vec<String>, term: Option<&str>) {
     let Some(term) = term.map(str::trim).filter(|s| !s.is_empty()) else {
         return;
     };
-    if !terms.iter().any(|existing| existing.eq_ignore_ascii_case(term)) {
+    if !terms
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(term))
+    {
         terms.push(term.to_string());
     }
 }
@@ -2684,6 +5020,7 @@ async fn fetch_tool_context(
     message: &str,
     history: &[Message],
     last_mail_ref: Option<&MailRef>,
+    last_odoo_ref: Option<&OdooRecordRef>,
     allowed_tools: &std::collections::HashSet<String>,
     db: Arc<Mutex<Connection>>,
     mail: Option<MailConnector>,
@@ -2691,11 +5028,16 @@ async fn fetch_tool_context(
     ollama: OllamaClient,
     model: String,
     memory: Arc<MemoryStore>,
+    odoo: Arc<RwLock<Option<OdooConnector>>>,
+    whatsapp: Arc<WhatsappConnector>,
+    pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    rules: Arc<RuleEngine>,
 ) -> (
     Option<String>,
     Vec<(String, std::path::PathBuf)>,
     Option<MailRef>,
-    Option<String>,  // action_taken: Some(msg) skips LLM, shows brief notch confirmation
+    Option<String>,        // action_taken: Some(msg) skips LLM
+    Option<OdooRecordRef>, // top Odoo record found this turn
 ) {
     let low = message.to_lowercase();
 
@@ -2728,18 +5070,26 @@ async fn fetch_tool_context(
 
     let history_snippet = {
         let base = format_history_snippet(history, 4);
-        match last_mail_ref {
+        let with_mail = match last_mail_ref {
             Some(r) => format!(
                 "[LastFoundMail]: rowid={} sender=\"{}\" subject=\"{}\"\n{}",
                 r.rowid, r.sender, r.subject, base
             ),
             None => base,
+        };
+        match last_odoo_ref {
+            Some(r) => format!(
+                "[LastFoundOdooRecord]: model=\"{}\" id={} name=\"{}\"\n{}",
+                r.model, r.id, r.name, with_mail
+            ),
+            None => with_mail,
         }
     };
 
     let mut parts: Vec<String> = Vec::new();
     let mut pdf_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut found_mail_ref: Option<MailRef> = None;
+    let mut found_odoo_ref: Option<OdooRecordRef> = None;
 
     // ── Mail ─────────────────────────────────────────────────────────────────
     if looks_like_mail {
@@ -3154,7 +5504,7 @@ async fn fetch_tool_context(
     .any(|kw| low.contains(kw));
 
     if looks_like_window {
-        if let Ok(intent) = WindowIntentClassifier::new(ollama, model)
+        if let Ok(intent) = WindowIntentClassifier::new(ollama.clone(), model.clone())
             .classify(message, &history_snippet)
             .await
         {
@@ -3164,7 +5514,596 @@ async fn fetch_tool_context(
                     // Background action completed — signal caller to skip LLM streaming
                     // and show a brief confirmation in the voice notch instead.
                     tracing::info!("window action taken: {}", note);
-                    return (None, Vec::new(), None, Some(note));
+                    return (None, Vec::new(), None, Some(note), None);
+                }
+            }
+        }
+    }
+
+    // ── Odoo ──────────────────────────────────────────────────────────────────
+    {
+        let odoo_guard = odoo.read().await;
+        let odoo_configured = odoo_guard.is_some();
+        drop(odoo_guard);
+
+        // Keyword gate — independent of the context_planner's is_odoo(), because
+        // "faktúra" routes to invoice_analysis there (→ hits this branch too).
+        let looks_like_odoo = odoo_configured
+            && ([
+                "odoo",
+                "faktúr",
+                "faktura",
+                "invoice",
+                "partner",
+                "kontakt",
+                "zákazník",
+                "zakaznik",
+                "helpdesk",
+                "tiket",
+                "ticket",
+                "úloh",
+                "uloh",
+                "objednávk",
+            ]
+            .iter()
+            .any(|kw| low.contains(kw))
+                || (last_odoo_ref.is_some()
+                    && [
+                        "otvor to",
+                        "otvor ho",
+                        "otvor ju",
+                        "open it",
+                        "otvoriť",
+                        "ten záznam",
+                        "that record",
+                        "show in odoo",
+                    ]
+                    .iter()
+                    .any(|kw| low.contains(kw))));
+
+        if looks_like_odoo {
+            let odoo_guard = odoo.read().await;
+            if let Some(ref conn) = *odoo_guard {
+                let intent = OdooIntentClassifier::new(ollama.clone(), model.clone())
+                    .classify(message, &history_snippet)
+                    .await
+                    .unwrap_or_default();
+
+                tracing::debug!("odoo_intent: {:?}", intent);
+
+                match intent.action {
+                    OdooAction::SearchContacts => {
+                        let query = intent.query.as_deref().unwrap_or("");
+                        match conn.search_partners(query, 5).await {
+                            Ok(partners) if !partners.is_empty() => {
+                                let lines: Vec<String> = partners
+                                    .iter()
+                                    .map(|p| {
+                                        let mut line = format!(
+                                            "  • {} (id:{})",
+                                            p.name.as_deref().unwrap_or("—"),
+                                            p.id
+                                        );
+                                        if let Some(e) = &p.email {
+                                            line.push_str(&format!(", email: {e}"));
+                                        }
+                                        if let Some(ph) = &p.phone {
+                                            line.push_str(&format!(", tel: {ph}"));
+                                        }
+                                        if let Some(v) = &p.vat {
+                                            line.push_str(&format!(", IČO/DIČ: {v}"));
+                                        }
+                                        if let Some(c) = &p.city {
+                                            line.push_str(&format!(", {c}"));
+                                        }
+                                        line
+                                    })
+                                    .collect();
+                                parts.push(format!(
+                                    "## Živé dáta z Odoo — partneri\n{}",
+                                    lines.join("\n")
+                                ));
+                                if let Some(p) = partners.first() {
+                                    let name = p.name.as_deref().unwrap_or("Partner");
+                                    found_odoo_ref =
+                                        Some(conn.record_ref("res.partner", p.id, name));
+                                }
+                            }
+                            Ok(_) => parts
+                                .push(format!("Odoo: žiadny partner nenájdený pre \"{query}\".")),
+                            Err(e) => {
+                                tracing::warn!("Odoo search_partners error: {e}");
+                                parts.push("Odoo partner vyhľadávanie nedostupné.".into());
+                            }
+                        }
+                    }
+
+                    OdooAction::GetInvoices => {
+                        match conn.my_invoices(intent.open_only, 10).await {
+                            Ok(invoices) if !invoices.is_empty() => {
+                                let lines: Vec<String> = invoices.iter().map(|inv| {
+                                    let num = inv.name.as_deref().unwrap_or("—");
+                                    let partner = inv.partner_id.display();
+                                    let amt = inv.amount_total.map(|a| format!("{a:.2}")).unwrap_or_else(|| "—".into());
+                                    let cur = inv.currency_id.display();
+                                    let state = inv.payment_state.as_deref().unwrap_or("—");
+                                    let date = inv.invoice_date.as_deref().unwrap_or("—");
+                                    format!("  • {num} | {partner} | {amt} {cur} | {state} | {date}")
+                                }).collect();
+                                let header = if intent.open_only {
+                                    "neuhradené faktúry"
+                                } else {
+                                    "faktúry"
+                                };
+                                parts.push(format!(
+                                    "## Živé dáta z Odoo — {header}\n{}",
+                                    lines.join("\n")
+                                ));
+                                if let Some(inv) = invoices.first() {
+                                    let name = inv.name.as_deref().unwrap_or("Faktúra");
+                                    found_odoo_ref =
+                                        Some(conn.record_ref("account.move", inv.id, name));
+                                }
+                            }
+                            Ok(_) => parts.push("Odoo: žiadne faktúry nenájdené.".into()),
+                            Err(e) => {
+                                tracing::warn!("Odoo my_invoices error: {e}");
+                                parts.push("Odoo faktúry nedostupné.".into());
+                            }
+                        }
+                    }
+
+                    OdooAction::ListTickets => {
+                        match conn.my_helpdesk_tickets(intent.open_only, 10).await {
+                            Ok(tickets) if !tickets.is_empty() => {
+                                let lines: Vec<String> = tickets
+                                    .iter()
+                                    .map(|t| {
+                                        let name = t.name.as_deref().unwrap_or("—");
+                                        let stage = t.stage_id.display();
+                                        let partner = t.partner_id.display();
+                                        let date = t.create_date.as_deref().unwrap_or("—");
+                                        format!("  • [{stage}] {name} | {partner} | {date}")
+                                    })
+                                    .collect();
+                                let header = if intent.open_only {
+                                    "otvorené helpdesk tikety"
+                                } else {
+                                    "helpdesk tikety"
+                                };
+                                parts.push(format!(
+                                    "## Živé dáta z Odoo — {header}\n{}",
+                                    lines.join("\n")
+                                ));
+                                if let Some(t) = tickets.first() {
+                                    let name = t.name.as_deref().unwrap_or("Tiket");
+                                    found_odoo_ref =
+                                        Some(conn.record_ref("helpdesk.ticket", t.id, name));
+                                }
+                            }
+                            Ok(_) => parts.push("Odoo: žiadne helpdesk tikety nenájdené.".into()),
+                            Err(e) => {
+                                tracing::warn!("Odoo my_helpdesk_tickets error: {e}");
+                                parts.push("Odoo helpdesk nedostupný.".into());
+                            }
+                        }
+                    }
+
+                    OdooAction::GetRecord => {
+                        if let (Some(model_str), Some(id)) =
+                            (intent.query.as_deref(), intent.record_id)
+                        {
+                            match conn.get_record(model_str, id).await {
+                                Ok(Some(rec)) => {
+                                    let name = rec["name"]
+                                        .as_str()
+                                        .or_else(|| rec["display_name"].as_str())
+                                        .unwrap_or("Záznam")
+                                        .to_string();
+                                    parts.push(format!("## Živé dáta z Odoo — záznam\n{rec}"));
+                                    found_odoo_ref = Some(conn.record_ref(model_str, id, &name));
+                                }
+                                Ok(None) => {
+                                    parts.push(format!("Odoo: záznam {model_str} #{id} nenájdený."))
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Odoo get_record error: {e}");
+                                    parts.push("Odoo záznam nedostupný.".into());
+                                }
+                            }
+                        }
+                    }
+
+                    OdooAction::Open => {
+                        // Resolve the record to open: from intent or last_odoo_ref.
+                        let target_ref = last_odoo_ref.cloned().or_else(|| found_odoo_ref.clone());
+                        if let Some(ref r) = target_ref {
+                            let url = r.url.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = fs_open::open_url_in_safari(&url).await {
+                                    tracing::warn!("odoo open_url_in_safari error: {e}");
+                                }
+                            });
+                            found_odoo_ref = target_ref;
+                        } else {
+                            parts.push(
+                                "Odoo: žiadny záznam na otvorenie. Najprv vyhľadajte záznam."
+                                    .into(),
+                            );
+                        }
+                    }
+
+                    OdooAction::None => {}
+                }
+            }
+        }
+    }
+
+    // ── WhatsApp (Phase 11) ───────────────────────────────────────────────────
+    {
+        // Keyword gate — only run classifier when turn looks WhatsApp-related.
+        let looks_like_whatsapp = {
+            let explicit = ["whatsapp", " wa ", "na whatsappe", "cez whatsapp"];
+            let send_signals = [
+                "napíš mu",
+                "napíš jej",
+                "pošli mu správu",
+                "pošli jej správu",
+                "napíš petrovi",
+                "napíš katke",
+                "write to ",
+                "send to ",
+            ];
+            let find_signals = [
+                "kde mi písal",
+                "kde mi písala",
+                "čo mi písal",
+                "čo mi písala",
+                "čo sme si písali",
+                "nájdi správu od",
+                "find message from",
+            ];
+            let has_mail = low.contains("mail") || low.contains("email");
+            explicit.iter().any(|k| low.contains(k))
+                || (send_signals.iter().any(|k| low.contains(k)) && !has_mail)
+                || (find_signals.iter().any(|k| low.contains(k)) && !has_mail)
+        };
+
+        if looks_like_whatsapp {
+            // Check bridge accessibility (cheap — no HTTP call when not started).
+            let wa_status = whatsapp.status().await;
+            let is_ready = matches!(
+                wa_status.as_ref().map(|s| &s.status),
+                Ok(WhatsappConnectionStatus::Ready)
+            );
+            let is_qr = matches!(
+                wa_status.as_ref().map(|s| &s.status),
+                Ok(WhatsappConnectionStatus::Qr)
+            );
+            let is_missing_node = matches!(
+                wa_status.as_ref().map(|s| &s.status),
+                Ok(WhatsappConnectionStatus::MissingNode)
+            );
+            let is_not_installed = matches!(
+                wa_status.as_ref().map(|s| &s.status),
+                Ok(WhatsappConnectionStatus::BridgeNotInstalled)
+            );
+
+            if is_qr {
+                parts.push(
+                    "## WhatsApp\nWhatsApp čaká na QR kód — prejdi do Nastavení a naskenuj QR."
+                        .into(),
+                );
+            } else if is_missing_node {
+                parts.push(
+                    "## WhatsApp\nNode.js nie je nainštalovaný — WhatsApp bridge nedostupný."
+                        .into(),
+                );
+            } else if is_not_installed {
+                parts.push("## WhatsApp\nWhatsApp bridge nie je nainštalovaný — spusti `make whatsapp-bridge-install`.".into());
+            } else if !is_ready {
+                parts.push(
+                    "## WhatsApp\nWhatsApp nie je pripojený — v Nastaveniach sa pripojiť.".into(),
+                );
+            } else {
+                // Classify intent
+                let wa_intent = WhatsappIntentClassifier::new(ollama.clone(), model.clone())
+                    .classify(message, &history_snippet)
+                    .await
+                    .unwrap_or_default();
+
+                tracing::debug!("whatsapp_intent: {:?}", wa_intent);
+
+                match wa_intent.action {
+                    WhatsappAction::ListRecent => match whatsapp.list_chats(10).await {
+                        Ok(chats) if !chats.is_empty() => {
+                            let lines: Vec<String> = chats
+                                .iter()
+                                .map(|c| {
+                                    let name = c.name.as_deref().unwrap_or("—");
+                                    let unread = if c.unread_count > 0 {
+                                        format!(" [{}]", c.unread_count)
+                                    } else {
+                                        String::new()
+                                    };
+                                    let preview = c
+                                        .last_message_preview
+                                        .as_deref()
+                                        .unwrap_or("")
+                                        .chars()
+                                        .take(60)
+                                        .collect::<String>();
+                                    format!("  • {name}{unread}: {preview}")
+                                })
+                                .collect();
+                            parts.push(format!(
+                                "## WhatsApp — posledné chaty (PII)\n{}",
+                                lines.join("\n")
+                            ));
+                        }
+                        Ok(_) => parts.push("WhatsApp: žiadne chaty nenájdené.".into()),
+                        Err(e) => {
+                            tracing::warn!("WhatsApp list_chats error: {e}");
+                            parts.push("WhatsApp chaty nedostupné.".into());
+                        }
+                    },
+
+                    WhatsappAction::Search => {
+                        // Search cached messages (LIKE + recency)
+                        let keywords = if wa_intent.keywords.is_empty() {
+                            message
+                                .split_whitespace()
+                                .filter(|w| w.len() > 3)
+                                .take(5)
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                        } else {
+                            wa_intent.keywords.clone()
+                        };
+                        let results = search_whatsapp_cache(&db, &keywords, 8).await;
+                        if !results.is_empty() {
+                            let lines: Vec<String> = results
+                                .iter()
+                                .map(|r| {
+                                    let body_preview = r.body.chars().take(300).collect::<String>();
+                                    format!(
+                                        "  [{sender}] {body}",
+                                        sender = r.sender,
+                                        body = body_preview
+                                    )
+                                })
+                                .collect();
+                            parts.push(format!(
+                                "## WhatsApp — hľadanie (PII)\n{}",
+                                lines.join("\n")
+                            ));
+                        } else {
+                            // Fallback: live bridge recent chats
+                            match whatsapp.list_chats(5).await {
+                                Ok(chats) if !chats.is_empty() => {
+                                    let lines: Vec<String> = chats
+                                        .iter()
+                                        .filter_map(|c| {
+                                            c.last_message_preview.as_deref().map(|p| {
+                                                let name = c.name.as_deref().unwrap_or("—");
+                                                format!(
+                                                    "  • {name}: {}",
+                                                    p.chars().take(80).collect::<String>()
+                                                )
+                                            })
+                                        })
+                                        .collect();
+                                    if !lines.is_empty() {
+                                        parts.push(format!(
+                                            "## WhatsApp — posledné správy (PII)\n{}",
+                                            lines.join("\n")
+                                        ));
+                                    } else {
+                                        parts.push(format!(
+                                            "WhatsApp: žiadne správy nenájdené pre: {}.",
+                                            keywords.join(", ")
+                                        ));
+                                    }
+                                }
+                                _ => {
+                                    parts.push(format!(
+                                        "WhatsApp: žiadne správy nenájdené pre: {}.",
+                                        keywords.join(", ")
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    WhatsappAction::ReadHistory => {
+                        // Try to resolve contact → chat
+                        let contact_query = wa_intent
+                            .contact_name
+                            .as_deref()
+                            .or(wa_intent.phone.as_deref())
+                            .unwrap_or("");
+                        if !contact_query.is_empty() {
+                            // Search chats for name match
+                            match whatsapp.list_chats(50).await {
+                                Ok(chats) => {
+                                    let matched = chats.iter().find(|c| {
+                                        c.name
+                                            .as_deref()
+                                            .map(|n| {
+                                                n.to_lowercase()
+                                                    .contains(&contact_query.to_lowercase())
+                                            })
+                                            .unwrap_or(false)
+                                    });
+                                    if let Some(chat) = matched {
+                                        match whatsapp.chat_messages(&chat.id, 10, None).await {
+                                            Ok(msgs) if !msgs.is_empty() => {
+                                                let lines: Vec<String> = msgs
+                                                    .iter()
+                                                    .rev()
+                                                    .take(8)
+                                                    .map(|m| {
+                                                        let sender = if m.from_me {
+                                                            "Ja"
+                                                        } else {
+                                                            chat.name.as_deref().unwrap_or(&m.from)
+                                                        };
+                                                        let body = m
+                                                            .body
+                                                            .chars()
+                                                            .take(300)
+                                                            .collect::<String>();
+                                                        format!("  [{sender}]: {body}")
+                                                    })
+                                                    .collect();
+                                                let chat_name =
+                                                    chat.name.as_deref().unwrap_or(contact_query);
+                                                parts.push(format!("## WhatsApp — história s {chat_name} (PII)\n{}", lines.join("\n")));
+
+                                                // Cache messages in DB for future searches
+                                                let msgs_to_cache = msgs.clone();
+                                                let db_cache = db.clone();
+                                                let chat_name_str =
+                                                    chat.name.clone().unwrap_or_default();
+                                                tokio::spawn(async move {
+                                                    cache_whatsapp_messages(
+                                                        &db_cache,
+                                                        &msgs_to_cache,
+                                                        &chat_name_str,
+                                                    )
+                                                    .await;
+                                                });
+                                            }
+                                            Ok(_) => parts.push(format!(
+                                                "WhatsApp: žiadne správy s {}.",
+                                                contact_query
+                                            )),
+                                            Err(e) => {
+                                                tracing::warn!("WhatsApp chat_messages error: {e}");
+                                                parts.push("WhatsApp história nedostupná.".into());
+                                            }
+                                        }
+                                    } else {
+                                        parts.push(format!(
+                                            "WhatsApp: kontakt \"{}\" nenájdený.",
+                                            contact_query
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("WhatsApp list_chats error: {e}");
+                                    parts.push("WhatsApp chaty nedostupné.".into());
+                                }
+                            }
+                        } else {
+                            parts.push("WhatsApp: uveď meno kontaktu.".into());
+                        }
+                    }
+
+                    WhatsappAction::DraftSend => {
+                        let contact = wa_intent
+                            .contact_name
+                            .as_deref()
+                            .or(wa_intent.phone.as_deref());
+                        let text = wa_intent.message_text.as_deref().unwrap_or("");
+
+                        if text.is_empty() {
+                            parts.push("WhatsApp: text správy chýba.".into());
+                        } else if contact.is_none() {
+                            parts.push("WhatsApp: príjemca správy chýba.".into());
+                        } else {
+                            let contact_str = contact.unwrap().to_string();
+                            let text_str = text.to_string();
+
+                            // Resolve chat JID from contact name
+                            let chat_id_opt = match whatsapp.list_chats(50).await {
+                                Ok(chats) => chats
+                                    .iter()
+                                    .find(|c| {
+                                        c.name
+                                            .as_deref()
+                                            .map(|n| {
+                                                n.to_lowercase()
+                                                    .contains(&contact_str.to_lowercase())
+                                            })
+                                            .unwrap_or(false)
+                                    })
+                                    .map(|c| c.id.clone()),
+                                Err(_) => None,
+                            };
+
+                            let target_opt: Option<WhatsappSendTarget> = match chat_id_opt {
+                                Some(id) => Some(WhatsappSendTarget::ChatId(id)),
+                                None => wa_intent.phone.clone().map(WhatsappSendTarget::Phone),
+                            };
+                            if target_opt.is_none() {
+                                parts.push(format!(
+                                    "WhatsApp: kontakt \"{}\" nenájdený. Uveď telefónne číslo.",
+                                    contact_str
+                                ));
+                            }
+                            if let Some(target) = target_opt {
+                                let recipient_display = &contact_str;
+                                // Check rules gate — Forbidden blocks immediately
+                                let rules_level = rules.check("whatsapp.send_message", "{}");
+                                if matches!(rules_level, ApprovalLevel::Forbidden) {
+                                    parts.push(
+                                        "WhatsApp: posielanie správ je zakázané pravidlami.".into(),
+                                    );
+                                } else {
+                                    // Approval flow (trap #1: always request regardless of Auto/Ask)
+                                    let text_preview = if text_str.len() > 60 {
+                                        format!("{}… ({} znakov)", &text_str[..60], text_str.len())
+                                    } else {
+                                        text_str.clone()
+                                    };
+                                    let audit_description = format!(
+                                        "WhatsApp správa — Príjemca: {} | Náhľad: {}",
+                                        recipient_display, text_preview
+                                    );
+
+                                    // We don't have a tx sender here (called outside SSE stream context
+                                    // in the REST-style tool-context path). Use None → Swift polls /approvals/pending.
+                                    let approved = request_approval_core(
+                                        &db,
+                                        &pending_approvals,
+                                        "whatsapp.send_message",
+                                        &audit_description,
+                                        None,
+                                    )
+                                    .await;
+
+                                    if !approved {
+                                        parts.push(format!(
+                                        "WhatsApp: odoslanie správy pre \"{}\" bolo zamietnuté.",
+                                        recipient_display
+                                    ));
+                                    } else {
+                                        match whatsapp.send_message(target, &text_str).await {
+                                            Ok(msg_ref) => {
+                                                tracing::info!(message_id = %msg_ref.message_id, "WhatsApp message sent via tool context");
+                                                parts.push(format!(
+                                                "WhatsApp: správa pre \"{}\" bola odoslaná (id: {}).",
+                                                recipient_display, msg_ref.message_id
+                                            ));
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "WhatsApp send error in tool ctx: {e}"
+                                                );
+                                                parts.push(format!(
+                                                    "WhatsApp: odoslanie zlyhalo — {}",
+                                                    e
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } // end DraftSend
+
+                    WhatsappAction::None => {}
                 }
             }
         }
@@ -3181,7 +6120,91 @@ async fn fetch_tool_context(
         ))
     };
 
-    (ctx, pdf_paths, found_mail_ref, None)
+    (ctx, pdf_paths, found_mail_ref, None, found_odoo_ref)
+}
+
+// ── WhatsApp DB helpers ───────────────────────────────────────────────────────
+
+/// Simple row returned by `search_whatsapp_cache`.
+struct WaCacheRow {
+    sender: String,
+    body: String,
+}
+
+/// Search the messages cache for WhatsApp messages matching `keywords` via LIKE.
+/// Returns up to `limit` rows ordered by recency (newest first).
+async fn search_whatsapp_cache(
+    db: &Arc<Mutex<Connection>>,
+    keywords: &[String],
+    limit: usize,
+) -> Vec<WaCacheRow> {
+    if keywords.is_empty() {
+        return vec![];
+    }
+    let Ok(db) = db.try_lock() else {
+        return vec![];
+    };
+
+    // Build a LIKE clause for each keyword: body LIKE '%kw%'
+    let clauses: Vec<String> = keywords
+        .iter()
+        .map(|k| format!("body LIKE '%{}%'", k.replace('\'', "''")))
+        .collect();
+    let where_clause = clauses.join(" OR ");
+    let sql = format!(
+        "SELECT sender, body FROM messages \
+         WHERE source = 'whatsapp' AND ({where_clause}) \
+         ORDER BY received_at DESC LIMIT {limit}"
+    );
+
+    let mut stmt = match db.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("search_whatsapp_cache prepare error: {e}");
+            return vec![];
+        }
+    };
+    stmt.query_map([], |row| {
+        Ok(WaCacheRow {
+            sender: row.get::<_, String>(0).unwrap_or_default(),
+            body: row.get::<_, String>(1).unwrap_or_default(),
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Upsert WhatsApp messages into the messages table (idempotent on external_id).
+/// chat_name goes into `subject`; `metadata_json` stores chat_id / from_me / has_media.
+async fn cache_whatsapp_messages(
+    db: &Arc<Mutex<Connection>>,
+    msgs: &[whatsapp_connector::WhatsappMessage],
+    chat_name: &str,
+) {
+    let Ok(db) = db.try_lock() else {
+        return;
+    };
+    for msg in msgs {
+        let meta = serde_json::json!({
+            "chat_id": msg.chat_id,
+            "from_me": msg.from_me,
+            "has_media": msg.has_media,
+            "to": msg.to,
+        });
+        let _ = db.execute(
+            "INSERT OR IGNORE INTO messages \
+             (source, external_id, subject, body, sender, received_at, metadata_json) \
+             VALUES ('whatsapp', ?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                msg.id,
+                chat_name,
+                msg.body,
+                msg.from,
+                msg.timestamp,
+                meta.to_string(),
+            ],
+        );
+    }
 }
 
 // ── AeroSpace executor ────────────────────────────────────────────────────────
@@ -3403,13 +6426,44 @@ async fn load_session_summary(db: &Arc<Mutex<Connection>>, session_id: &str) -> 
         .filter(|s| !s.is_empty())
 }
 
-async fn save_last_mail_ref(db: &Arc<Mutex<Connection>>, session_id: &str, mail_ref: &MailRef) {
-    if let Ok(json) = serde_json::to_string(&serde_json::json!({ "last_mail_ref": mail_ref })) {
+/// Read-modify-write a single key inside `sessions.metadata_json`.
+/// Safe to call concurrently: each call holds the mutex for the duration.
+async fn merge_session_metadata(
+    db: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let existing: Option<String> = db
+        .lock()
+        .await
+        .query_row(
+            "SELECT metadata_json FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+
+    let mut blob: serde_json::Value = existing
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+
+    if let Some(obj) = blob.as_object_mut() {
+        obj.insert(key.to_string(), value);
+    }
+
+    if let Ok(json) = serde_json::to_string(&blob) {
         let _ = db.lock().await.execute(
             "UPDATE sessions SET metadata_json = ?1 WHERE id = ?2",
             rusqlite::params![json, session_id],
         );
     }
+}
+
+async fn save_last_mail_ref(db: &Arc<Mutex<Connection>>, session_id: &str, mail_ref: &MailRef) {
+    let val = serde_json::to_value(mail_ref).unwrap_or(serde_json::Value::Null);
+    merge_session_metadata(db, session_id, "last_mail_ref", val).await;
 }
 
 async fn load_last_mail_ref(db: &Arc<Mutex<Connection>>, session_id: &str) -> Option<MailRef> {
@@ -3425,6 +6479,53 @@ async fn load_last_mail_ref(db: &Arc<Mutex<Connection>>, session_id: &str) -> Op
         .flatten();
     let val: serde_json::Value = serde_json::from_str(&json?).ok()?;
     serde_json::from_value(val["last_mail_ref"].clone()).ok()
+}
+
+async fn save_last_file_ref(db: &Arc<Mutex<Connection>>, session_id: &str, file_ref: &FileRef) {
+    let val = serde_json::to_value(file_ref).unwrap_or(serde_json::Value::Null);
+    merge_session_metadata(db, session_id, "last_file_ref", val).await;
+}
+
+async fn load_last_file_ref(db: &Arc<Mutex<Connection>>, session_id: &str) -> Option<FileRef> {
+    let json: Option<String> = db
+        .lock()
+        .await
+        .query_row(
+            "SELECT metadata_json FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let val: serde_json::Value = serde_json::from_str(&json?).ok()?;
+    serde_json::from_value(val["last_file_ref"].clone()).ok()
+}
+
+async fn save_last_odoo_ref(
+    db: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    odoo_ref: &OdooRecordRef,
+) {
+    let val = serde_json::to_value(odoo_ref).unwrap_or(serde_json::Value::Null);
+    merge_session_metadata(db, session_id, "last_odoo_ref", val).await;
+}
+
+async fn load_last_odoo_ref(
+    db: &Arc<Mutex<Connection>>,
+    session_id: &str,
+) -> Option<OdooRecordRef> {
+    let json: Option<String> = db
+        .lock()
+        .await
+        .query_row(
+            "SELECT metadata_json FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let val: serde_json::Value = serde_json::from_str(&json?).ok()?;
+    serde_json::from_value(val["last_odoo_ref"].clone()).ok()
 }
 
 async fn load_session_history(db: &Arc<Mutex<Connection>>, session_id: &str) -> Vec<Message> {

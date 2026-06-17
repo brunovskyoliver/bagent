@@ -99,7 +99,7 @@ impl RuleEngine {
             None => return,
         };
         tokio::spawn(async move {
-            use tokio::time::{Duration, interval};
+            use tokio::time::{interval, Duration};
             let mut last_mtime: Option<std::time::SystemTime> = None;
             let mut ticker = interval(Duration::from_secs(5));
             loop {
@@ -178,6 +178,164 @@ fn default_rules() -> Vec<Rule> {
             args_pattern: None,
             level: ApprovalLevel::Auto,
         },
+        // ── Phase 13A: Filesystem / app-open tools ────────────────────────────
+        Rule {
+            name: "auto_fs_search_files".into(),
+            description: Some("Filename/path search runs automatically".into()),
+            tool: Some("filesystem.search_files".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
+        Rule {
+            name: "auto_fs_search_content".into(),
+            description: Some("Content search runs automatically".into()),
+            tool: Some("filesystem.search_content".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
+        Rule {
+            name: "auto_fs_read_text".into(),
+            description: Some("Reading a small text snippet runs automatically".into()),
+            tool: Some("filesystem.read_text".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
+        Rule {
+            name: "auto_fs_metadata".into(),
+            description: None,
+            tool: Some("filesystem.metadata".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
+        Rule {
+            name: "auto_fs_reveal_in_finder".into(),
+            description: Some("Revealing a file in Finder runs automatically".into()),
+            tool: Some("filesystem.reveal_in_finder".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
+        Rule {
+            name: "auto_fs_open_folder".into(),
+            description: Some("Opening a folder runs automatically".into()),
+            tool: Some("filesystem.open_folder".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
+        Rule {
+            name: "ask_fs_open_file".into(),
+            description: Some("Opening a file requires approval".into()),
+            tool: Some("filesystem.open_file".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Ask,
+        },
+        Rule {
+            name: "ask_fs_open_file_with".into(),
+            description: Some("Opening a file with a specific app requires approval".into()),
+            tool: Some("filesystem.open_file_with".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Ask,
+        },
+        Rule {
+            name: "auto_macos_open_app".into(),
+            description: Some("Launching an app runs automatically".into()),
+            tool: Some("macos.open_app".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
+        Rule {
+            name: "auto_macos_focus_app".into(),
+            description: Some("Focusing an app runs automatically".into()),
+            tool: Some("macos.focus_app".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
+        Rule {
+            name: "forbidden_shell_exec".into(),
+            description: Some("Arbitrary shell execution is always forbidden".into()),
+            tool: Some("macos.shell_exec".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Forbidden,
+        },
+        Rule {
+            name: "forbidden_applescript_run".into(),
+            description: Some("Arbitrary AppleScript execution is always forbidden".into()),
+            tool: Some("macos.applescript_run".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Forbidden,
+        },
+        // ── Phase 8: Codex external-reasoning harness ─────────────────────────
+        Rule {
+            name: "ask_codex_run_task".into(),
+            description: Some(
+                "Dispatching a task to the Codex external-reasoning harness always \
+                 requires explicit user approval — Codex is external and receives a \
+                 daemon-built context packet."
+                    .into(),
+            ),
+            tool: Some("codex.run_task".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Ask,
+        },
+        // ── Phase 6: Odoo connector — write-side guard ────────────────────────
+        Rule {
+            name: "forbidden_odoo_create_record".into(),
+            description: Some("Creating Odoo records is always forbidden".into()),
+            tool: Some("odoo.create_record".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Forbidden,
+        },
+        Rule {
+            name: "forbidden_odoo_write_record".into(),
+            description: Some("Updating Odoo records is always forbidden".into()),
+            tool: Some("odoo.write_record".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Forbidden,
+        },
+        Rule {
+            name: "forbidden_odoo_unlink_record".into(),
+            description: Some("Deleting Odoo records is always forbidden".into()),
+            tool: Some("odoo.unlink_record".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Forbidden,
+        },
+        Rule {
+            name: "forbidden_odoo_send_email".into(),
+            description: Some("Sending email from Odoo is always forbidden".into()),
+            tool: Some("odoo.send_email".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Forbidden,
+        },
+        // ── Phase 11: WhatsApp connector ──────────────────────────────────────
+        // NOTE: The send rule here is *cosmetic* documentation only.
+        // The enforcement floor lives in the daemon send route, which always
+        // calls request_approval_core regardless of rules.yaml state.
+        // (Existing installs already have rules.yaml on disk; adding it here
+        // ensures fresh installs and in-memory defaults are consistent.)
+        Rule {
+            name: "ask_whatsapp_send_message".into(),
+            description: Some(
+                "Sending a WhatsApp message always requires explicit user approval \
+                 — one approval per message, no bulk, no auto-reply."
+                    .into(),
+            ),
+            tool: Some("whatsapp.send_message".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Ask,
+        },
+        Rule {
+            name: "auto_whatsapp_list_chats".into(),
+            description: Some("Listing recent WhatsApp chats runs automatically".into()),
+            tool: Some("whatsapp.list_chats".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
+        Rule {
+            name: "auto_whatsapp_search_messages".into(),
+            description: Some("Searching WhatsApp message cache runs automatically".into()),
+            tool: Some("whatsapp.search_messages".into()),
+            args_pattern: None,
+            level: ApprovalLevel::Auto,
+        },
     ]
 }
 
@@ -201,5 +359,109 @@ rules:
 
   - name: auto_notes_search
     tool: notes_search
+    level: auto
+
+  # Phase 13A — Filesystem / app-open tools
+  - name: auto_fs_search_files
+    description: "Filename/path search runs automatically"
+    tool: filesystem.search_files
+    level: auto
+
+  - name: auto_fs_search_content
+    description: "Content search runs automatically"
+    tool: filesystem.search_content
+    level: auto
+
+  - name: auto_fs_read_text
+    description: "Reading a small text snippet runs automatically"
+    tool: filesystem.read_text
+    level: auto
+
+  - name: auto_fs_metadata
+    tool: filesystem.metadata
+    level: auto
+
+  - name: auto_fs_reveal_in_finder
+    description: "Revealing a file in Finder runs automatically"
+    tool: filesystem.reveal_in_finder
+    level: auto
+
+  - name: auto_fs_open_folder
+    description: "Opening a folder runs automatically"
+    tool: filesystem.open_folder
+    level: auto
+
+  - name: ask_fs_open_file
+    description: "Opening a file requires approval"
+    tool: filesystem.open_file
+    level: ask
+
+  - name: ask_fs_open_file_with
+    description: "Opening a file with a specific app requires approval"
+    tool: filesystem.open_file_with
+    level: ask
+
+  - name: auto_macos_open_app
+    description: "Launching an app runs automatically"
+    tool: macos.open_app
+    level: auto
+
+  - name: auto_macos_focus_app
+    description: "Focusing an app runs automatically"
+    tool: macos.focus_app
+    level: auto
+
+  - name: forbidden_shell_exec
+    description: "Arbitrary shell execution is always forbidden"
+    tool: macos.shell_exec
+    level: forbidden
+
+  - name: forbidden_applescript_run
+    description: "Arbitrary AppleScript execution is always forbidden"
+    tool: macos.applescript_run
+    level: forbidden
+
+  # Phase 8 — Codex external-reasoning harness
+  - name: ask_codex_run_task
+    description: "Dispatching to the Codex external-reasoning harness always requires approval"
+    tool: codex.run_task
+    level: ask
+
+  # Phase 6 — Odoo connector write-side guard
+  - name: forbidden_odoo_create_record
+    description: "Creating Odoo records is always forbidden"
+    tool: odoo.create_record
+    level: forbidden
+
+  - name: forbidden_odoo_write_record
+    description: "Updating Odoo records is always forbidden"
+    tool: odoo.write_record
+    level: forbidden
+
+  - name: forbidden_odoo_unlink_record
+    description: "Deleting Odoo records is always forbidden"
+    tool: odoo.unlink_record
+    level: forbidden
+
+  - name: forbidden_odoo_send_email
+    description: "Sending email from Odoo is always forbidden"
+    tool: odoo.send_email
+    level: forbidden
+
+  # Phase 11 — WhatsApp connector
+  # NOTE: The send rule is cosmetic documentation; enforcement is in the daemon route.
+  - name: ask_whatsapp_send_message
+    description: "Sending a WhatsApp message always requires explicit user approval — one per message, no bulk, no auto-reply"
+    tool: whatsapp.send_message
+    level: ask
+
+  - name: auto_whatsapp_list_chats
+    description: "Listing recent WhatsApp chats runs automatically"
+    tool: whatsapp.list_chats
+    level: auto
+
+  - name: auto_whatsapp_search_messages
+    description: "Searching WhatsApp message cache runs automatically"
+    tool: whatsapp.search_messages
     level: auto
 "#;

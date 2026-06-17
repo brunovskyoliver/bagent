@@ -39,11 +39,11 @@ Check off items as they are completed.
   - [x] Note body: protobuf (ZMERGEABLEDATA) — use AppleScript/JXA, not direct decode
   - [ ] Identify ICNote Z_ENT number on this macOS version
   - [ ] Test JXA body retrieval for 5 sample notes
-- [ ] Odoo XML-RPC handshake:
-  - [ ] Authenticate against sandbox Odoo instance (needs credentials)
-  - [ ] Read one `account.move` invoice record
-  - [ ] Document version detection via `/web/webclient/version_info`
-  - [ ] Document in `docs/spikes/odoo.md`
+- [ ] Odoo JSON-RPC handshake:
+  - [x] Authenticate via `common.authenticate` → `uid` (Phase 6 connector built + unit-tested)
+  - [x] Read `account.move` invoices + `helpdesk.ticket` + `res.partner` (live `#[ignore]` tests)
+  - [x] Version detection via `common.version` service call
+  - [ ] Document in `docs/spikes/odoo.md` (deferred)
 - [x] Create SK QA fixtures (`fixtures/sk/`) — faktura-upomienka, stretnutie, staznost
 - [x] Write spike docs under `docs/spikes/`
 
@@ -484,51 +484,141 @@ On-device, English-only speech-to-text via WhisperKit (CoreML/ANE). Audio captur
 
 ---
 
-## Phase 6 — Odoo Connector
+## Phase 4J — Memory Ledger + Skills Refactor ✅ COMPLETE (deferred items below)
 
-- [ ] `crates/connectors/odoo/`:
-  - [ ] XML-RPC client (`/xmlrpc/2/common`, `/xmlrpc/2/object`)
-  - [ ] Version detection
-  - [ ] Tool: `odoo_search_contacts`
-  - [ ] Tool: `odoo_get_invoice`
-  - [ ] Tool: `odoo_list_opportunities`
-  - [ ] Tool: `odoo_get_task`
-  - [ ] All write tools registered as `Forbidden`
-- [ ] Keychain storage for Odoo credentials
-- [ ] Settings tab: connection config + test button
-- [ ] Privacy filter: `pii_present = true` for Odoo connector
-- [ ] Slovak field values preserved verbatim
+Guiding rule: **store generously, retrieve conservatively, inject minimally.**
+Adds a planning layer (ContextPlanner → SkillSelector → MemorySelector) before prompt assembly.
+Memory extended with ledger fields; skills become loadable `SKILL.md` files; English-default persona.
+
+### Completed
+
+- [x] `OllamaClient::generate_json()` — `/api/chat` with `"format":"json"` for guaranteed parseable classifier output (`crates/connectors/ollama/src/lib.rs`)
+- [x] Migration `V11__memory_ledger_skills.sql` — ALTER `memory_items` to add: `confidence REAL DEFAULT 0.8`, `importance REAL DEFAULT 0.5`, `status TEXT DEFAULT 'active'`, `source TEXT DEFAULT 'passive'`, `sensitivity TEXT DEFAULT 'normal'`, `subject TEXT`, `supersedes_id TEXT`; new index `(status, namespace, kind)` (`crates/daemon/migrations/`)
+- [x] `MemoryItem` struct extended with all V11 fields (`crates/memory/src/lib.rs`)
+- [x] `InsertParams` struct + `insert_full()` — blocks sensitive+passive, deduplication against active-only, supersedes conflicting passive on explicit/user_edit insert (`crates/memory/src/lib.rs`)
+- [x] `RetrieveQuery` struct + `retrieve_filtered()` — hard filters: `status='active'`, `sensitivity='normal'`; score `0.45*sem + 0.35*bm25 + 0.10*importance + 0.10*recency`; near-dup MMR filter; optional kind filter (`crates/memory/src/lib.rs`)
+- [x] `supersede(old_id)` — soft-supersede via `status='superseded'`; `delete()` — soft-delete; `prune()` — hard-deletes only deleted/superseded stale rows (`crates/memory/src/lib.rs`)
+- [x] `crates/memory/src/selector.rs` — `select(store, SelectQuery)` thin layer over `retrieve_filtered`; MAX_MEMORY_CARDS=6, MAX_PER_NAMESPACE=3, MAX_MEMORY_CHARS=4800 token budget
+- [x] `crates/agent/src/context_planner.rs` — `ContextPlanner` with deterministic rules + Ollama JSON-mode fallback; `ResponseLanguageHint` enum; `ContextPlan` struct; 16 unit tests
+- [x] `crates/skills/` — new crate: `manifest.rs` (SkillManifest, LoadedSkill, RiskLevel), `loader.rs` (scan_dir/scan_dirs with last-wins override, YAML frontmatter parser), `selector.rs` (select up to 3 skills, keyword-match fallback)
+- [x] Added `crates/skills` to workspace `Cargo.toml` and `crates/daemon/Cargo.toml`
+- [x] `skills/sk-business-email/SKILL.md` — formal Slovak email: "Dobrý deň"/"S pozdravom", diacritics, no Czech
+- [x] `skills/mail-search/SKILL.md` — Apple Mail search; no invented content; coreference rules
+- [x] `skills/invoice-analysis/SKILL.md` — DPH/faktúra/splatnosť/IBAN/IČO/DIČ preservation; summary format
+- [x] `skills/odoo-readonly/SKILL.md` — doc-only (no Odoo connector yet); all writes forbidden
+- [x] `skills/aerospace-window-control/SKILL.md` — AeroSpace workspace control; graceful degrade
+- [x] `MemoryExtractor` rewrite — `generate_json()`, confidence/importance/sensitivity gates, `is_one_off_content()` filter, `insert_full(source="passive")` (`crates/agent/src/memory_extractor.rs`)
+- [x] `PromptBuilder` rewire — English-default `BASE_IDENTITY`; `ResponseLanguageHint` → `language_hint_instruction()`; selected_skills + selected_memory injected as pre-selected inputs; conversation recall only when `needs_conversation_recall=true`; extended `PromptTrace` (`crates/agent/src/prompt.rs`)
+- [x] Daemon planning layer — ContextPlanner → SkillSelector → `tokio::join!` MemorySelector+corrections+recall; new routes `GET /skills`, `GET /skills/:name`, `POST /debug/context-plan`; `AppState` gains `skills` + `context_planner` (`crates/daemon/src/main.rs`)
+- [x] `cargo build --workspace` clean; **56 tests pass, 10 `#[ignore]` (live Ollama), 0 failures**
+
+### Deferred — Markdown Memory Mirror ✅ COMPLETE
+
+- [x] `crates/memory/src/markdown_mirror.rs` — bidirectional sync SQLite ↔ `~/Library/Application Support/bagent/memories/`
+  - [x] Directory layout: `memories/{namespace}/{id}.md` with YAML frontmatter (id, kind, namespace, status, confidence, importance, source, created_at, updated_at)
+  - [x] On `insert_full` / `supersede` / soft-delete: export/update matching `.md` file
+  - [x] On startup: scan changed `.md` files, upsert SQLite, re-embed changed text
+  - [x] Invalid frontmatter: log + skip, never crash
+  - [x] Deleted memory: set `status='deleted'`, do not physically remove `.md` file
+  - [x] Sensitive items skipped in both export and import scan
+  - [x] Anti-loop: uses frontmatter `updated_at` (1 s epsilon) not file mtime; export → scan returns empty
+  - [x] 4 unit tests: `round_trip_parse`, `is_file_newer_detects_newer`, `export_then_scan_round_trips_and_does_not_loop`, `sensitive_skipped_in_scan`
+
+### Deferred — Swift UI updates ✅ COMPLETE
+
+- [x] `DaemonClient.swift` — new methods: `skills()`, `skill(name:)`, `debugContextPlan(message:)`
+- [x] Memory panel V11 fields: show `source` badge (non-passive) + `confidence`/`importance` per item
+- [x] Skills panel (`SkillsPanelView.swift`): list loaded skills with name/risk badge/description/tag chips, toggle body expand
+- [x] Debug/prompt trace panel: display `selected_skill_names`, `selected_memory_ids`, `conversation_recall_injected` from SSE `debug_trace` event
+
+### Deferred — HTTP API gaps ✅ COMPLETE
+
+- [x] `POST /memory` handler — accepts `confidence`, `importance`, `source`, `sensitivity`, `subject`; calls `insert_full()` (`crates/daemon/src/main.rs`)
+- [x] `GET /memory/search` — exposes `kind` query param; calls `retrieve_filtered(RetrieveQuery { kinds: &kind_filter, ... })`
+- [x] `DELETE /memory/:id` — already soft-deletes; wired to `mirror_export` so `.md` file reflects `status='deleted'`
+
+### Deferred — Live Ollama tests (currently `#[ignore]`)
+
+- [ ] `context_planner::tests::llm_fallback_parses_json` — needs Ollama + classifier model
+- [ ] `memory_extractor::tests::passive_extraction_returns_empty_for_one_off` — needs Ollama + classifier model
+- [ ] Mail intent classifier round-trip tests (3 existing `#[ignore]` tests in `crates/agent/`)
+- [ ] End-to-end acceptance scenarios via `/chat` SSE (Slovak invoice draft, English chat over SK source, explicit memory trigger, no memory for one-off content)
 
 ---
 
-## Phase 7 — Screen Context
+## Phase 6 — Odoo Connector ✅ COMPLETE
 
-- [ ] ScreenCaptureKit frame capture (one-shot, on-demand)
-- [ ] Active app via `NSWorkspace`
-- [ ] Selected text via Accessibility `AXSelectedText`
-- [ ] Vision OCR via `VNRecognizeTextRequest` (on-device)
-- [ ] Screen context attached to chat turn
-- [ ] Permission prompt: Screen Recording at first use
-- [ ] Ephemeral frame policy: no persistence by default
-- [ ] `Tool: screen_get_active_app` (auto)
-- [ ] `Tool: screen_get_selected_text` (auto after Accessibility)
-- [ ] `Tool: screen_capture_frame` (ask per session)
-- [ ] Password field exclusion (`AXIsPasswordField`)
+- [x] `crates/connectors/odoo/` — JSON-RPC transport (Odoo 18):
+  - [x] `src/json_rpc.rs` — `build_call_payload` / `extract_result` (pure, unit-tested)
+  - [x] `src/types.rs` — `OdooConfig` (Debug-redacts api_key), `OdooError`, `false_or_string`/`false_or_f64` deserializers, `M2O` Many2one newtype, `Partner`, `Invoice`, `HelpdeskTicket`, `OdooRecordRef`
+  - [x] `src/lib.rs` — `OdooConnector::connect` (auth via `common.authenticate`), `execute_kw`, `search_partners`, `my_invoices`, `my_helpdesk_tickets`, `get_record`, `web_url`
+  - [x] Tool: `odoo_search_contacts` (`res.partner` ilike search)
+  - [x] Tool: `odoo_get_invoices` (`account.move` with open/all filter)
+  - [x] Tool: `odoo_list_tickets` (`helpdesk.ticket` assigned to authenticated user)
+  - [x] Tool: `odoo_get_record` (single-record read for any model)
+  - [x] All write tools (`odoo.create_record`, `odoo.write_record`, `odoo.unlink_record`, `odoo.send_email`) registered as `Forbidden` in rules engine
+  - [x] 9 unit tests pass; 3 live `#[ignore]` tests for auth round-trip
+- [x] `crates/agent/src/odoo_intent.rs` — `OdooAction` enum + `OdooIntentClassifier` (SK/EN few-shots, coreference)
+- [x] Daemon integration — `AppState.odoo: Arc<RwLock<Option<OdooConnector>>>` (in-memory only); routes `POST /odoo/config`, `GET /odoo/status`, `POST /odoo/open`; SSE `odoo_found` event; `save/load_last_odoo_ref` coreference persistence
+- [x] `apps/macos/Sources/bagent/KeychainStore.swift` — first Keychain code in project; `SecItemAdd`/`SecItemCopyMatching`/`SecItemDelete`; `saveOdoo`/`loadOdoo`/`deleteOdoo` helpers
+- [x] Keychain storage for Odoo credentials — API key **never** written to daemon disk; Swift re-pushes from Keychain on each launch via `restoreOdooFromKeychain()`
+- [x] Settings → Odoo section: URL/DB/user TextFields, SecureField for API key, status dot, "Testovať Odoo" button
+- [x] `OdooOpenButton` in `ChatView.swift` — globe icon, "Otvoriť v Safari", orange accent
+- [x] `open_url_in_safari` in `crates/connectors/filesystem/src/open.rs` — validates `http(s)` scheme only, bypasses PathPolicy
+- [x] Slovak field values preserved verbatim (IČO, DIČ, DPH, faktúra, tiket)
+- [x] `skills/odoo-readonly/SKILL.md` — read-only allowed tools; all writes forbidden; SK term preservation note
+- [ ] End-to-end manual verification with live Odoo 18 instance (steps in plan)
+- [ ] `docs/spikes/odoo.md` — JSON-RPC handshake, version detection, models used (deferred)
 
 ---
 
-## Phase 8 — Codex Connector
+## Phase 7 — Screen Context ✅ COMPLETE
 
-- [ ] `crates/connectors/codex/`:
-  - [ ] Subprocess wrapper for `codex` binary
-  - [ ] Sandboxed temp working directory
-  - [ ] JSON I/O protocol
-  - [ ] 120 s timeout (SIGTERM + SIGKILL)
-- [ ] Tool: `codex_run_task` (Ask every time)
-- [ ] Diff preview in approval modal
-- [ ] Codex binary path configurable in Settings
-- [ ] Graceful "not found" message
-- [ ] Audit: task description + exit code + diff hash
+- [x] `ScreenContextProvider.swift` — `@MainActor` class; ScreenCaptureKit one-shot capture → in-memory PNG base64; downscale ≤1568px; Vision OCR (`sk-SK`+`en-US`); active app via `NSWorkspace`; AX selected text (`kAXSecureTextFieldSubrole` password exclusion)
+- [x] `crates/agent/src/screen_intent.rs` — `ScreenIntent` + `ScreenIntentClassifier`; `ScreenAction { None, View, Analyze, Read, Find }`; `wants_screen/wants_ocr/wants_selection` fields; uses `qwen2.5:0.5b` via `generate_json`; 4 unit tests
+- [x] `crates/agent/src/context_planner.rs` — `is_screen_context(low)` gate (SK+EN keywords) placed before `is_file_search`; `task_type:"screen_context"` returned; `"screen_context"` added to LLM fallback task-type enum; `screen-context` skill candidate
+- [x] `crates/daemon/src/main.rs`:
+  - [x] `ChatRequest` extended with `screen_image_b64`, `screen_ocr_text`, `active_app`, `selected_text` (`#[serde(default)]`)
+  - [x] In-memory injection block: pushes `screen_image_b64` into `images_b64`, injects app/selection/OCR as `ctx_parts`, triggers `model_swap` audit (reason: `screen_context`) → routes to `qwen2.5vl:7b`
+  - [x] `POST /screen/intent` route → `ScreenIntentClassifier`; graceful degrade on error
+- [x] `apps/macos/Sources/bagent/DaemonClient.swift`:
+  - [x] `ScreenContextFields` + `ScreenIntentResponse` structs
+  - [x] `chatStream` extended with `screenContext: ScreenContextFields?` param
+  - [x] `screenIntent(message:)` async method → `POST /screen/intent`
+- [x] `apps/macos/Sources/bagent/ChatViewModel.swift`:
+  - [x] Screen pre-gate `looksLikeScreenTurn(_:)` (static, SK+EN keywords)
+  - [x] `send()` calls `/screen/intent` when pre-gate passes → captures via `ScreenContextProvider` → passes `screenContext` to `chatStream`
+- [x] `PermissionsManager.swift` — `hasScreenRecording` (CGPreflightScreenCaptureAccess) + `requestScreenRecording()` + `openScreenRecordingSettings()`; `hasAccessibility` (AXIsProcessTrusted) + `requestAccessibility()` + `openAccessibilitySettings()`
+- [x] `SettingsView.swift` — Screen Recording + Accessibility rows in permissionsSection (dot + label + "Udeliť" button + explanation text)
+- [x] `Info.plist` + `Makefile` — `NSScreenCaptureUsageDescription` added to both
+- [x] `Package.swift` — `ScreenCaptureKit`, `Vision`, `ApplicationServices` frameworks linked
+- [x] `skills/screen-context/SKILL.md` — rules: no invented UI content, pii:true, password exclusion, vision over OCR
+- [x] Notch idle polish — collapsed idle = blank (no sparkles, no dot); dot visible when chat open or status != .ready (error always shown); sparkles visible on hover/voice/expanded
+
+### Phase 7 deferred items
+- [ ] Manual QA: `make bundle && open bagent.app` — grant Screen Recording + Accessibility in Settings; ask "čo je na obrazovke?" → vision model answers; "prečítaj výber" → AX selection used; verify no file written under `~/Library/Application Support/bagent/attachments` for screen frames
+- [ ] Image paste QA: ⌘V with image in clipboard → `[image #1]` token + chip; send → thumbnail in bubble
+- [ ] Unit tests: `is_screen_context` keyword combos; `ScreenIntent` JSON deserialisation incl. `action:"none"` (4 already in screen_intent.rs)
+- [ ] Live Ollama classifier round-trip test (`#[ignore]`)
+- [ ] `ollama pull qwen2.5vl:7b` — required for vision analysis (user must run once)
+
+---
+
+## Phase 8 — Codex Connector ✅
+
+- [x] `crates/connectors/codex/` — subprocess wrapper with `--sandbox read-only`, stdin prompt, 120 s timeout (SIGTERM + SIGKILL), SHA-256 output hash
+- [x] Deterministic task rater (`crates/agent/src/task_rater.rs`) — bilingual SK/EN keyword gates, 5 levels (LocalOnly → CodexRequired), 28 tests
+- [x] Tool rule: `codex.run_task` → Ask (never Auto) in rules engine + YAML
+- [x] Daemon routes: `GET /codex/status`, `POST /codex/rate-task`, `POST /codex/run-task`
+- [x] Context packet privacy model — forbidden list enforced; user approves before dispatch
+- [x] Approval-gated via existing REST poll modal (`pending_approvals` table + oneshot)
+- [x] Codex binary path configurable in Settings → Codex section
+- [x] Graceful "codex_not_found" degradation
+- [x] Audit: description + level + privacy_risk + exit_code + timed_out + output_hash (no raw bodies)
+- [x] Chat SSE: `task_rating` event emitted for CodexCandidate+ turns
+- [x] Swift: `CodexRatingBadge` in `MessageBubble`; `testCodex()` in SettingsView
+- [x] Skill file: `skills/codex-advanced-task/SKILL.md`
+- [x] Docs updated: `ARCHITECTURE.md`, `DATA_MODEL.md`
 
 ---
 
@@ -589,6 +679,28 @@ On-device, English-only speech-to-text via WhisperKit (CoreML/ANE). Audio captur
 - [ ] Model router: long-context refactor tasks → route to Claude Code over Codex when available
 
 ---
+
+## Phase 13A — Safe Local File + App Access ✅
+
+- [x] `crates/connectors/filesystem/` crate: `PathPolicy`, `search_files`, `read_text`, `metadata`, `open` (argv-only + async exec)
+- [x] `PathPolicy::default_for_user_home()`: allowed roots (Desktop/Documents/Downloads/Pictures/Movies/Music/iCloud Drive), denied roots (.ssh/.gnupg/Keychains/1Password/Bitwarden/Chrome/Brave/Firefox/.Trash/system dirs)
+- [x] `DANGEROUS_EXTENSIONS` list — blocks .app/.sh/.py/.scpt/.pkg/.dmg etc. from open
+- [x] `open.rs`: pure `build_*_argv` functions (test-safe) + async exec via `/usr/bin/open` only, never `sh -c`
+- [x] `search.rs`: WalkDir walk, filename/content/path scoring, Slovak diacritics, binary skip, 500-char line truncation
+- [x] `crates/agent/src/file_intent.rs`: `FileIntent`/`FileAction` + `FileIntentClassifier` (Ollama JSON, SK/EN few-shots)
+- [x] `crates/rules/src/lib.rs`: filesystem/macos rules (auto/ask/forbidden)
+- [x] `crates/agent/src/context_planner.rs`: `is_file_search()` (placed after `is_mail_search`), file skill names
+- [x] `crates/agent/src/prompt.rs`: `PromptTrace` file_* fields
+- [x] `crates/daemon/src/main.rs`: `AppState.fs`, 10 new routes, handlers, `fetch_tool_context` file branch, `FileActionPlan`, `save/load_last_file_ref`, `merge_session_metadata`, SSE `file_found`/`file_opened` events
+- [x] `skills/file-search/SKILL.md`, `skills/file-open/SKILL.md`, `skills/app-open-control/SKILL.md`
+- [x] `apps/macos/Sources/bagent/DaemonClient.swift`: `FileRef`, `FileSearchRequest/Response/Result`, SSE event cases, REST methods
+- [x] `apps/macos/Sources/bagent/ChatViewModel.swift`: `ChatMessage.fileRef`, switch cases
+- [x] `apps/macos/Sources/bagent/SettingsView.swift`: Full Disk Access copy updated for file search
+- [x] All workspace tests pass (`cargo test --workspace`)
+- [x] Workspace and Swift build clean
+- [ ] Chat UI file cards (Open/Reveal/Open With buttons) — deferred
+- [ ] PDF/docx/xlsx content indexing during bulk walk — deferred (filename-only in v1; on-demand via read_text)
+- [ ] Interactive Ask approval on direct REST open routes — deferred (Ask via chat path; REST returns 409)
 
 ## Phase 13 — Universal Computer Access
 

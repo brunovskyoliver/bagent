@@ -1,5 +1,6 @@
 import Accelerate
 import AVFoundation
+import CoreAudio
 import CoreML
 import Foundation
 import SwiftUI
@@ -55,6 +56,11 @@ final class SpeechController: ObservableObject {
     /// Fired once per session with the trimmed final transcript (only if non-empty).
     var onFinalTranscript: ((String) -> Void)?
 
+    /// If set, `startSession` temporarily changes the system default input device to this
+    /// mic (matched by name from `availableInputDeviceNames()`). Falls back to the system
+    /// default when nil or when the device is not currently connected.
+    var preferredInputName: String?
+
     /// One transcription update, reduced to Sendable primitives so the WhisperKit
     /// callback never has to capture the (main-actor) controller.
     private struct Frame: Sendable {
@@ -72,6 +78,9 @@ final class SpeechController: ObservableObject {
     private var displayTask: Task<Void, Never>?
     private var frameContinuation: AsyncStream<Frame>.Continuation?
     private var mode: Mode = .overlay
+    /// The system default input device that was active before a preferred-mic swap,
+    /// saved here so `stopInternal` can restore it.
+    private var savedDefaultInput: AudioDeviceID?
 
     // Spectrum analysis — one stable analyzer instance reused across sessions.
     private let analyzer = SpectrumAnalyzer()
@@ -100,6 +109,7 @@ final class SpeechController: ObservableObject {
         }
         do {
             try await ensureModelLoaded()
+            await swapToPreferredInput()
             try startTranscriber()
             state = .listening
             startVAD()
@@ -115,6 +125,10 @@ final class SpeechController: ObservableObject {
         state = .finalizing
         stopInternal()
         let text = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Clear before emit so that the next session's $partialText subscriber does not
+        // replay this transcript into the input field the moment it subscribes (Bug 3).
+        partialText = ""
+        sentences = []
         state = .done
         if !text.isEmpty { onFinalTranscript?(text) }
     }
@@ -183,6 +197,17 @@ final class SpeechController: ObservableObject {
         guard let wk = whisperKit, let tokenizer = wk.tokenizer else {
             throw SpeechError.modelNotLoaded
         }
+
+        // Pre-flight: AVAudioEngine.inputNode can return a zero sample-rate/channel
+        // format before the HAL has registered the current default input device.
+        // If we let WhisperKit call installTap with that format, it raises an
+        // NSException (not catchable in Swift) and terminates the process.
+        let probeEngine = AVAudioEngine()
+        let rate = probeEngine.inputNode.inputFormat(forBus: 0).sampleRate
+        let channels = probeEngine.inputNode.outputFormat(forBus: 0).channelCount
+        guard rate > 0, channels > 0 else {
+            throw SpeechError.audioInputUnavailable
+        }
         var options = DecodingOptions()
         options.task = .transcribe
         options.language = "en"
@@ -249,7 +274,7 @@ final class SpeechController: ObservableObject {
     }
 
     private func ingest(energy: Float, confirmed: [String], unconfirmed: [String], current: String) {
-        // Smooth the waveform amplitude.
+        // Smooth the waveform amplitude (always, for visual feedback even on silence).
         let target = CGFloat(min(1, max(0, energy)))
         amplitude += (target - amplitude) * 0.35
 
@@ -258,6 +283,12 @@ final class SpeechController: ObservableObject {
             hasHeardSpeech = true
             lastVoiceAt = Date()
         }
+
+        // Gate transcript writes on real speech detection. Whisper regularly hallucinates
+        // tokens ("Thank you.", "you", etc.) over silence; suppressing the text until the
+        // energy gate has fired prevents phantom transcripts from reaching the UI or being
+        // auto-submitted via the overlay handoff (Bug 2).
+        guard hasHeardSpeech else { return }
 
         let confirmedText = confirmed.joined().trimmingCharacters(in: .whitespaces)
         let tail = unconfirmed.joined().trimmingCharacters(in: .whitespaces)
@@ -300,6 +331,7 @@ final class SpeechController: ObservableObject {
             Task { await t.stopStreamTranscription() }
         }
         transcriber = nil
+        restoreDefaultInput()
     }
 
     private func reset() {
@@ -310,6 +342,68 @@ final class SpeechController: ObservableObject {
         sentences = []
         hasHeardSpeech = false
         lastVoiceAt = nil
+    }
+
+    // MARK: - Input device selection
+
+    /// Names of all currently available input devices, forwarding WhisperKit's enumeration.
+    /// Call from the main thread. Returns an empty array if enumeration fails.
+    static func availableInputDeviceNames() -> [String] {
+        AudioProcessor.getAudioDevices().map(\.name)
+    }
+
+    /// Reads the current system default input device ID via CoreAudio.
+    private static func readDefaultInputDevice() -> AudioDeviceID? {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &deviceID
+        )
+        guard status == noErr, deviceID != 0 else { return nil }
+        return deviceID
+    }
+
+    /// Sets the system default input device via CoreAudio.
+    /// While recording, the system-wide default input is temporarily changed and restored in
+    /// `stopInternal`. This is acceptable for a single-user assistant doing short bursts.
+    private static func writeDefaultInputDevice(_ deviceID: AudioDeviceID) {
+        var id = deviceID
+        let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectSetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, size, &id
+        )
+    }
+
+    /// If `preferredInputName` matches a live device, saves the current default and
+    /// swaps to the preferred one. If no match, leaves the system default untouched.
+    /// Async so we can sleep briefly after `AudioObjectSetPropertyData` — the HAL
+    /// sends the change asynchronously, and `setupEngine` must not read the new
+    /// device's format before the HAL has settled (zero sample-rate → installTap crash).
+    private func swapToPreferredInput() async {
+        guard let name = preferredInputName, !name.isEmpty else { return }
+        let devices = AudioProcessor.getAudioDevices()
+        guard let match = devices.first(where: { $0.name == name }) else { return }
+        savedDefaultInput = Self.readDefaultInputDevice()
+        Self.writeDefaultInputDevice(match.id)
+        try? await Task.sleep(for: .milliseconds(200))
+    }
+
+    /// Restores the system default input that was saved by `swapToPreferredInput`. No-op if
+    /// no swap was made. Idempotent — safe to call multiple times.
+    private func restoreDefaultInput() {
+        guard let original = savedDefaultInput else { return }
+        Self.writeDefaultInputDevice(original)
+        savedDefaultInput = nil
     }
 
     // MARK: - Helpers
@@ -335,9 +429,11 @@ final class SpeechController: ObservableObject {
 
 enum SpeechError: LocalizedError {
     case modelNotLoaded
+    case audioInputUnavailable
     var errorDescription: String? {
         switch self {
         case .modelNotLoaded: return "Speech model not loaded"
+        case .audioInputUnavailable: return "Audio input not ready — try again in a moment"
         }
     }
 }

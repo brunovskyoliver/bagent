@@ -84,18 +84,20 @@
 - `serde` / `serde_json` for all wire formats.
 - `tracing` + `tracing-subscriber` for structured logs.
 
-### Core Crates (planned)
+### Core Crates
 
 ```
 crates/
-  daemon/        — axum server, startup, port/token mgmt
-  agent/         — agent runtime, turn loop, tool dispatcher
-  router/        — model router, privacy filter
-  rules/         — rules engine (YAML loader + matcher)
-  memory/        — SQLite read/write, FTS5, embeddings
-  audit/         — append-only audit log, hash chain
-  connectors/    — connector trait + impls
-  tools/         — MCP-style tool registry
+  daemon/        — axum server, startup, port/token mgmt, route handlers
+  agent/         — PromptBuilder, ContextPlanner, MemoryExtractor, MailIntent, WindowIntent
+  rules/         — rules engine (YAML loader + matcher, hot-reload)
+  memory/        — SQLite read/write, FTS5, embeddings, MemorySelector
+  skills/        — SKILL.md loader + selector (repo skills/ dir + app data override)
+  attachments/   — file extraction pipeline (text/PDF/image)
+  connectors/
+    ollama/      — chat stream, embeddings, generate_json (format:json mode)
+    apple_mail/  — Envelope Index SQLite + emlx parser + AppleScript fallback
+    apple_notes/ — NoteStore SQLite + JXA body retrieval
 ```
 
 ---
@@ -136,8 +138,8 @@ Replace HTTP with a UDS at `~/Library/Application Support/bagent/daemon.sock`. S
 See [`MODEL_ROUTER.md`](MODEL_ROUTER.md) for full routing table and prompt templates.
 
 Summary:
-- Local Ollama → classification, summarization, embeddings, Slovak text.
-- Codex CLI → coding tasks only.
+- Local Ollama → classification, summarization, embeddings, Slovak text, single-source tasks.
+- Codex CLI → advanced cross-source business/admin reasoning (Phase 8, approval-gated).
 - Cloud LLM → complex reasoning, user opt-in, privacy-filtered.
 
 ---
@@ -153,15 +155,81 @@ Summary:
 
 ---
 
-## Codex CLI Integration
+## Codex CLI Integration (Phase 8 — Advanced Task Harness)
 
-- Invoked via `tokio::process::Command::new("codex")` with `["--json", "--no-confirm"]` (all confirmations handled by daemon approval layer, not Codex's own prompts).
-- Working directory: sandboxed temp dir per session, cleaned after.
-- Stdin: JSON task description (`{"task": "…", "context": "…"}`).
-- Stdout: JSON stream `{"type":"patch"|"message"|"done", …}`.
-- Approval required for every invocation (side-effect class: `CODE_WRITE`).
-- Timeout: 120 s default; SIGTERM on timeout.
-- Codex binary path configurable; graceful degradation if not found.
+Codex is an **external reasoning harness** for complex cross-source business/admin workflows,
+not a coding tool. It is invoked only when the deterministic `TaskRater` returns
+`CodexRecommended` or `CodexRequired` (score ≥ 60), and only after explicit user approval.
+
+### Task Rating
+
+`crates/agent/src/task_rater.rs` — deterministic keyword-gate rater (no LLM fallback):
+
+| Level | Score | Meaning | Example |
+|---|---|---|---|
+| `LocalOnly` | 0–9 | Ollama handles it | "zhrň mi tento email" |
+| `LocalPreferred` | 10–29 | Ollama preferred | "navrhni krátky email" |
+| `CodexCandidate` | 30–59 | May benefit from Codex | "porovnaj dve zmluvy" |
+| `CodexRecommended` | 60–84 | Codex recommended | "priprav brief pre klienta z mailov a Odoo" |
+| `CodexRequired` | 85+ | Codex required | "hromadné odpovede na faktúry po splatnosti" |
+
+### Context Packet Privacy Model
+
+Codex receives only a daemon-built `CodexContextPacket` (JSON via stdin). It **never** gets:
+- Raw email/WhatsApp/Gmail bodies (unless explicitly approved)
+- Memory DB, conversation history, session tokens
+- Odoo credentials or API tokens
+- Keychain, `.ssh`, `.gnupg`, browser stores, password managers
+- `~/Library/Application Support/bagent/` contents
+- Unrelated private files or screenshots
+
+The user must approve the context packet before dispatch. The packet is shown in the
+approval modal including: task description, complexity rating, privacy risk, list of context
+items (summaries + record refs).
+
+### Codex Binary Configuration
+
+- Binary path: user-configurable in Settings → Codex (`UserDefaults` key `bagent.codex_path`).
+- Default: auto-discover from `$PATH`.
+- The connector resolves the actual binary path; never uses shell aliases.
+- Invoked as: `codex exec --sandbox read-only -` (prompt via stdin, never `--dangerously-bypass-*`).
+- Timeout: 120 s; SIGTERM then SIGKILL on timeout.
+- Graceful degradation: `{ran:false, error:"codex_not_found"}` if binary absent.
+
+### Output Contract
+
+Codex returns structured JSON:
+```json
+{
+  "summary": "...",
+  "findings": [...],
+  "conflicts": [...],
+  "proposed_actions": [...],
+  "drafts": [...],
+  "questions_for_user": [...]
+}
+```
+**Proposed actions are never auto-executed.** They flow back as proposals into bagent's
+normal approval/tools framework.
+
+### Rules Engine
+
+`codex.run_task` is set to `Ask` level in `rules.yaml` — approval is always required,
+regardless of session context. This cannot be downgraded to `Auto`.
+
+### API Routes
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/codex/status` | Binary availability + version |
+| `POST` | `/codex/rate-task` | Rate task complexity (no Codex invoked) |
+| `POST` | `/codex/run-task` | Rate → approve → run → structured result |
+
+### Audit
+
+Every `/codex/run-task` attempt is logged to the audit table with:
+`{description, level, privacy_risk, context_sources, approval_id, exit_code, timed_out, output_hash}`
+Raw private context bodies are never audited.
 
 ---
 
@@ -225,14 +293,54 @@ rules:
 
 ---
 
+## Planning Layer (Phase 4J+)
+
+Before prompt assembly, every chat turn runs through three sequential stages:
+
+```
+user_turn
+  │
+  ▼
+ContextPlanner::plan()          — deterministic rules + Ollama JSON-mode fallback
+  │  produces ContextPlan { task_type, response_language_hint, needs_memory,
+  │                         memory_namespaces, memory_kinds, needs_conversation_recall,
+  │                         candidate_skill_names, confidence }
+  ▼
+skill_selector::select()        — picks ≤ 3 SKILL.md files matching candidate_skill_names
+  │                               or keyword-matched from user_turn
+  ▼
+tokio::join!
+  memory_selector::select()     — RetrieveQuery filtered by namespaces+kinds; max 6 items, budget 4800 chars
+  corrections retrieve          — namespace="corrections", kind filter
+  recall_candidates retrieve    — injected only when needs_conversation_recall=true
+  │
+  ▼
+PromptBuilder::build()          — injects selected skills + memory into prompt layers
+```
+
+**Rule:** `confidence < 0.6` on the deterministic plan triggers the LLM JSON-mode fallback (`generate_json`). Parse failure → fail closed (fewer injections, `needs_memory=false`).
+
+---
+
 ## Memory and Indexing
 
 - SQLite with FTS5 virtual tables for full-text search over `messages`, `notes`, `memory_items`.
-- `sqlite-vss` (or `sqlite-vec`) extension for cosine similarity search on embeddings.
-- Embedding model: `nomic-embed-text` or `bge-m3` via Ollama (multilingual SK/EN).
+- `sqlite-vec` extension for cosine similarity search on embeddings.
+- Embedding model: `bge-m3` via Ollama (multilingual SK/EN).
 - Per-source namespaces prevent cross-connector bleed.
 - `language` column on every text-storing table (`sk`, `en`, `und`).
-- Retrieval: hybrid BM25 + cosine; top-K re-ranked by recency.
+- Retrieval: hybrid BM25×0.35 + cosine×0.45 + importance×0.10 + recency×0.10; per-namespace cap 3; MMR near-dup filter.
+- **Memory ledger fields** (V11): `confidence`, `importance`, `status` (`active`/`superseded`/`deleted`), `source` (`passive`/`explicit`/`user_edit`/`import`), `sensitivity` (`normal`/`sensitive`), `subject`, `supersedes_id`.
+- Hard retrieval filter: `status='active'` + `sensitivity='normal'`; explicit/user_edit insertion supersedes conflicting passive items.
+- Passive extraction gates: `confidence ≥ 0.75`, `importance ≥ 0.60`, no sensitive-text indicators, no one-off content patterns.
+
+## Skills
+
+- Local `SKILL.md` files with YAML frontmatter (`name`, `description`, `version`, `risk`, `allowed_tools`, `tags`) + Markdown body.
+- Scanned from `skills/` (repo root, dev) and `~/Library/Application Support/bagent/skills/` (user override); later dirs win by name.
+- Selected at runtime by `ContextPlanner` candidate names + keyword matching; max 3 per turn; body truncated to 1 500 chars.
+- `allowed_tools` in frontmatter is **descriptive only** — rules engine remains the authority for actual permission grants.
+- Default skills shipped: `sk-business-email`, `mail-search`, `invoice-analysis`, `odoo-readonly`, `aerospace-window-control`.
 
 ---
 

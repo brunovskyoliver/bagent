@@ -26,7 +26,7 @@ const EXPLICIT_EN: &[&str] = &[
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectiveResult {
     pub directive: String,
-    pub kind: String,        // "preference" | "sk_glossary" | "style_profile"
+    pub kind: String, // "preference" | "sk_glossary" | "style_profile"
     pub namespace: String,
     pub language: String,
 }
@@ -36,16 +36,16 @@ pub struct CorrectionResult {
     pub is_correction: bool,
     pub what_was_wrong: Option<String>,
     pub correct_behavior: Option<String>,
-    pub scope: String,       // "global" | "sk_lang" | "this_session"
+    pub scope: String, // "global" | "sk_lang" | "this_session"
     pub confidence: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StyleProfile {
-    pub formality: String,           // "formal" | "informal"
-    pub address_form: String,        // "Vy" | "Ty"
-    pub brevity: String,             // "concise" | "detailed"
-    pub response_length_pref: String,// "short" | "medium" | "long"
+    pub formality: String,            // "formal" | "informal"
+    pub address_form: String,         // "Vy" | "Ty"
+    pub brevity: String,              // "concise" | "detailed"
+    pub response_length_pref: String, // "short" | "medium" | "long"
 }
 
 pub struct DirectiveExtractor {
@@ -118,8 +118,7 @@ impl CorrectionClassifier {
 
 pub fn has_explicit_trigger(text: &str) -> bool {
     let lower = text.to_lowercase();
-    EXPLICIT_SK.iter().any(|t| lower.contains(t))
-        || EXPLICIT_EN.iter().any(|t| lower.contains(t))
+    EXPLICIT_SK.iter().any(|t| lower.contains(t)) || EXPLICIT_EN.iter().any(|t| lower.contains(t))
 }
 
 fn clean_json(s: &str) -> &str {

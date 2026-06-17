@@ -10,10 +10,15 @@ path = "src/main.rs"
 [dependencies]
 ollama-connector      = { path = "../connectors/ollama" }
 apple-mail-connector  = { path = "../connectors/apple_mail" }
-apple-notes-connector = { path = "../connectors/apple_notes" }
+apple-notes-connector  = { path = "../connectors/apple_notes" }
+filesystem-connector  = { path = "../connectors/filesystem" }
+codex-connector       = { path = "../connectors/codex" }
+odoo-connector        = { path = "../connectors/odoo" }
+whatsapp-connector    = { path = "../connectors/whatsapp" }
 bagent-agent          = { path = "../agent" }
 bagent-memory         = { path = "../memory" }
 bagent-rules          = { path = "../rules" }
+bagent-skills         = { path = "../skills" }
 bagent-attachments    = { path = "../attachments" }
 
 tokio       = { version = "1", features = ["full"] }

@@ -10,6 +10,9 @@ struct DaemonHealth: Sendable {
     let classifierModel: String
     let mailConnector: Bool
     let notesConnector: Bool
+    let codexConnector: Bool
+    let odooConnector: Bool
+    let whatsappConnector: Bool
 }
 
 // MARK: - Memory
@@ -23,6 +26,12 @@ struct MemoryItem: Identifiable, Decodable, Sendable {
     let source_ref: String?
     let created_at: String
     let use_count: Int
+    // V11 ledger fields (optional — absent when constructed from search hits)
+    let status: String?
+    let source: String?
+    let confidence: Double?
+    let importance: Double?
+    let sensitivity: String?
 }
 
 struct MemoryHit: Identifiable, Decodable, Sendable {
@@ -31,6 +40,38 @@ struct MemoryHit: Identifiable, Decodable, Sendable {
     let kind: String
     let text: String
     let score: Float
+}
+
+// MARK: - Skills
+
+struct SkillItem: Identifiable, Decodable, Sendable {
+    let name: String
+    let description: String
+    let version: Int
+    let risk: String
+    let tags: [String]
+    let allowed_tools: [String]
+    var body: String?
+
+    var id: String { name }
+}
+
+// MARK: - Screen context (Phase 7)
+
+/// Ephemeral screen context collected by ScreenContextProvider and forwarded to
+/// the daemon in the `/chat` request body. Never persisted to disk on either side.
+struct ScreenContextFields: Sendable {
+    var imagePNGBase64: String?
+    var ocrText: String
+    var activeApp: String?
+    var selectedText: String?
+}
+
+struct ScreenIntentResponse: Decodable, Sendable {
+    let action: String
+    let wants_screen: Bool
+    let wants_ocr: Bool
+    let wants_selection: Bool
 }
 
 // MARK: - Client
@@ -77,9 +118,13 @@ struct DaemonClient: Sendable {
             let (data, response) = try await URLSession.shared.data(for: req)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—",
-                                    classifierModel: "—", mailConnector: false, notesConnector: false)
+                                    classifierModel: "—", mailConnector: false, notesConnector: false,
+                                    codexConnector: false, odooConnector: false, whatsappConnector: false)
             }
-            struct ConnectorResp: Decodable { let mail: Bool; let notes: Bool }
+            struct ConnectorResp: Decodable {
+                let mail: Bool; let notes: Bool; let codex: Bool?; let odoo: Bool?
+                let whatsapp: Bool?
+            }
             struct HealthResp: Decodable {
                 let status: String; let ollama: Bool; let model: String
                 let classifier_model: String?
@@ -91,12 +136,16 @@ struct DaemonClient: Sendable {
                 ollamaUp: h.ollama,
                 model: h.model,
                 classifierModel: h.classifier_model ?? "qwen2.5:0.5b",
-                mailConnector:  h.connectors?.mail  ?? false,
-                notesConnector: h.connectors?.notes ?? false
+                mailConnector:      h.connectors?.mail      ?? false,
+                notesConnector:     h.connectors?.notes     ?? false,
+                codexConnector:     h.connectors?.codex     ?? false,
+                odooConnector:      h.connectors?.odoo      ?? false,
+                whatsappConnector:  h.connectors?.whatsapp  ?? false
             )
         } catch {
             return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—",
-                                classifierModel: "—", mailConnector: false, notesConnector: false)
+                                classifierModel: "—", mailConnector: false, notesConnector: false,
+                                codexConnector: false, odooConnector: false, whatsappConnector: false)
         }
     }
 
@@ -142,6 +191,45 @@ struct DaemonClient: Sendable {
         let auto_open: Bool
     }
 
+    // MARK: - Filesystem types (Phase 13A)
+
+    struct FileRef: Decodable, Sendable {
+        let path: String
+        let display_name: String
+        let kind: String
+    }
+
+    struct FileSearchRequest: Encodable {
+        let query: String
+        let roots: [String]?
+        let search_names: Bool
+        let search_contents: Bool
+        let extensions: [String]?
+        let include_hidden: Bool
+        let max_results: Int
+        let max_depth: Int?
+    }
+
+    struct FileSearchResult: Decodable, Sendable {
+        let path: String
+        let display_name: String
+        let parent: String?
+        let kind: String
+        let mime: String?
+        let size_bytes: Int?
+        let modified_at: String?
+        let match_type: String
+        let matched_line: String?
+        let line_number: Int?
+        let score: Double
+    }
+
+    struct FileSearchResponse: Decodable, Sendable {
+        let query: String
+        let results: [FileSearchResult]
+        let truncated: Bool
+    }
+
     enum ChatEvent: Sendable {
         case token(String)
         case debugTrace(DebugTraceSummary)
@@ -150,8 +238,32 @@ struct DaemonClient: Sendable {
         case toolBlocked(tool: String)
         case mailAttachments([MailAttachmentRef])
         case mailFound(MailRef)
+        case fileFound(FileRef)
+        case fileOpened(path: String, success: Bool)
         case actionTaken(message: String)
+        /// Task complexity rating emitted after context planning (Phase 8).
+        /// Only emitted when level ≥ CodexCandidate.
+        case taskRating(level: String, score: Int, reasons: [String], privacyRisk: String)
+        /// Phase 6: Odoo record found — shown as "Otvoriť v Safari" button.
+        case odooFound(OdooRef)
+        /// Phase 11: WhatsApp chat found.
+        case whatsappFound(WhatsappRef)
         case done(sessionId: String?)
+    }
+
+    /// Stable reference to a found Odoo record. Analogue of `MailRef` / `FileRef`.
+    struct OdooRef: Decodable, Sendable {
+        let model: String
+        let id: Int
+        let name: String
+        let url: String
+    }
+
+    /// Phase 11: Reference to a WhatsApp chat found during tool context.
+    struct WhatsappRef: Decodable, Sendable {
+        let chat_id: String
+        let contact_name: String?
+        let snippet: String?
     }
 
     struct DebugTraceSummary: Decodable, Sendable {
@@ -161,6 +273,9 @@ struct DaemonClient: Sendable {
         let prompt_chars: Int?
         let prompt_token_estimate: Int?
         let message_count: Int?
+        let selected_skill_names: [String]?
+        let selected_memory_ids: [String]?
+        let conversation_recall_injected: Bool?
     }
 
     /// Upload a local file to `POST /attachments` and return a `ChatAttachment`.
@@ -244,7 +359,8 @@ struct DaemonClient: Sendable {
         text: String,
         sessionId: String?,
         model: String,
-        attachmentIds: [String] = []
+        attachmentIds: [String] = [],
+        screenContext: ScreenContextFields? = nil
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -260,12 +376,21 @@ struct DaemonClient: Sendable {
                         let model: String
                         let session_id: String?
                         let attachment_ids: [String]
+                        // Screen context (Phase 7) — ephemeral, never persisted
+                        let screen_image_b64: String?
+                        let screen_ocr_text: String?
+                        let active_app: String?
+                        let selected_text: String?
                     }
                     req.httpBody = try JSONEncoder().encode(Body(
                         message: text,
                         model: model,
                         session_id: sessionId,
-                        attachment_ids: attachmentIds
+                        attachment_ids: attachmentIds,
+                        screen_image_b64: screenContext?.imagePNGBase64,
+                        screen_ocr_text: screenContext?.ocrText.isEmpty == false ? screenContext?.ocrText : nil,
+                        active_app: screenContext?.activeApp,
+                        selected_text: screenContext?.selectedText
                     ))
 
                     let (bytes, response) = try await URLSession.shared.bytes(for: req)
@@ -289,7 +414,10 @@ struct DaemonClient: Sendable {
                                     preview: event.preview ?? "",
                                     prompt_chars: event.prompt_chars,
                                     prompt_token_estimate: event.prompt_token_estimate,
-                                    message_count: event.message_count
+                                    message_count: event.message_count,
+                                    selected_skill_names: event.selected_skill_names,
+                                    selected_memory_ids: event.selected_memory_ids,
+                                    conversation_recall_injected: event.conversation_recall_injected
                                 )))
                             }
                         case "token":
@@ -327,9 +455,56 @@ struct DaemonClient: Sendable {
                                 )
                                 continuation.yield(.mailFound(ref_))
                             }
+                        case "file_found":
+                            if let path = event.path,
+                               let name = event.display_name,
+                               let kind = event.kind {
+                                continuation.yield(.fileFound(FileRef(
+                                    path: path,
+                                    display_name: name,
+                                    kind: kind
+                                )))
+                            }
+                        case "file_opened":
+                            if let path = event.path {
+                                continuation.yield(.fileOpened(
+                                    path: path,
+                                    success: event.success ?? true
+                                ))
+                            }
+                        case "odoo_found":
+                            if let model = event.model,
+                               let recordId = event.record_id,
+                               let name = event.name,
+                               let url = event.url {
+                                continuation.yield(.odooFound(OdooRef(
+                                    model: model,
+                                    id: recordId,
+                                    name: name,
+                                    url: url
+                                )))
+                            }
+                        case "whatsapp_found":
+                            if let chatId = event.chat_id {
+                                continuation.yield(.whatsappFound(WhatsappRef(
+                                    chat_id: chatId,
+                                    contact_name: event.contact_name,
+                                    snippet: event.snippet
+                                )))
+                            }
                         case "action_taken":
                             if let msg = event.message {
                                 continuation.yield(.actionTaken(message: msg))
+                            }
+                        case "task_rating":
+                            // Phase 8: Codex task complexity hint (only emitted when ≥ CodexCandidate)
+                            if let level = event.level, let score = event.score {
+                                continuation.yield(.taskRating(
+                                    level: level,
+                                    score: score,
+                                    reasons: event.reasons ?? [],
+                                    privacyRisk: event.privacy_risk ?? "unknown"
+                                ))
                             }
                         case "done":
                             continuation.yield(.done(sessionId: event.session_id))
@@ -386,6 +561,36 @@ struct DaemonClient: Sendable {
         var req = authedRequest("/memory/\(id)", creds: c)
         req.httpMethod = "DELETE"
         _ = try await URLSession.shared.data(for: req)
+    }
+
+    // MARK: - Skills
+
+    func skills() async throws -> [SkillItem] {
+        let c = try await loadCreds()
+        let (data, _) = try await URLSession.shared.data(for: authedRequest("/skills", creds: c))
+        struct Resp: Decodable { let skills: [SkillItem] }
+        return try JSONDecoder().decode(Resp.self, from: data).skills
+    }
+
+    func skill(name: String) async throws -> SkillItem {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/skills/\(name)", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
+        return try JSONDecoder().decode(SkillItem.self, from: data)
+    }
+
+    func debugContextPlan(message: String) async throws -> String {
+        let c = try await loadCreds()
+        var req = authedRequest("/debug/context-plan", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let message: String }
+        req.httpBody = try JSONEncoder().encode(Body(message: message))
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
+        }
+        return prettyJSONString(data)
     }
 
     // MARK: - Approvals
@@ -452,6 +657,354 @@ struct DaemonClient: Sendable {
         _ = try await URLSession.shared.data(for: req)
     }
 
+    // MARK: - Filesystem (Phase 13A)
+
+    func searchFiles(_ request: FileSearchRequest) async throws -> FileSearchResponse {
+        let c = try await loadCreds()
+        var req = authedRequest("/filesystem/search", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(request)
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode(FileSearchResponse.self, from: data)
+    }
+
+    func revealInFinder(path: String) async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/filesystem/reveal", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let path: String }
+        req.httpBody = try JSONEncoder().encode(Body(path: path))
+        _ = try await URLSession.shared.data(for: req)
+    }
+
+    func openFolder(path: String) async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/filesystem/open-folder", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let path: String }
+        req.httpBody = try JSONEncoder().encode(Body(path: path))
+        _ = try await URLSession.shared.data(for: req)
+    }
+
+    func openFile(path: String) async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/filesystem/open", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let path: String }
+        req.httpBody = try JSONEncoder().encode(Body(path: path))
+        _ = try await URLSession.shared.data(for: req)
+    }
+
+    func openFileWith(path: String, app: String) async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/filesystem/open-with", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let path: String; let app: String }
+        req.httpBody = try JSONEncoder().encode(Body(path: path, app: app))
+        _ = try await URLSession.shared.data(for: req)
+    }
+
+    // MARK: - Codex (Phase 8)
+
+    struct CodexStatus: Decodable, Sendable {
+        let available: Bool
+        let binaryPath: String?
+        let version: String?
+        let configuredPath: String?
+        let error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case available
+            case binaryPath    = "binary_path"
+            case version
+            case configuredPath = "configured_path"
+            case error
+        }
+    }
+
+    struct CodexTaskRating: Decodable, Sendable {
+        let level: String
+        let score: Int
+        let codexRecommended: Bool
+        let requiresApproval: Bool
+        let privacyRisk: String
+        let suggestedContextScope: String
+        let reasons: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case level, score, reasons
+            case codexRecommended    = "codex_recommended"
+            case requiresApproval    = "requires_approval"
+            case privacyRisk         = "privacy_risk"
+            case suggestedContextScope = "suggested_context_scope"
+        }
+    }
+
+    struct CodexFinding: Decodable, Sendable {
+        let claim: String
+        let sourceRefs: [String]
+        let confidence: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case claim, confidence
+            case sourceRefs = "source_refs"
+        }
+    }
+
+    struct CodexConflict: Decodable, Sendable {
+        let description: String
+        let sourceRefs: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case description
+            case sourceRefs = "source_refs"
+        }
+    }
+
+    struct CodexProposedAction: Decodable, Sendable {
+        let kind: String
+        let description: String
+        let requiresUserApproval: Bool
+        let targetRef: String?
+
+        enum CodingKeys: String, CodingKey {
+            case kind, description
+            case requiresUserApproval = "requires_user_approval"
+            case targetRef            = "target_ref"
+        }
+    }
+
+    struct CodexDraft: Decodable, Sendable {
+        let channel: String
+        let language: String
+        let body: String
+    }
+
+    struct CodexRunResult: Decodable, Sendable {
+        let ran: Bool
+        let reason: String?
+        let error: String?
+        let message: String?
+        let taskId: String?
+        let summary: String?
+        let findings: [CodexFinding]?
+        let conflicts: [CodexConflict]?
+        let proposedActions: [CodexProposedAction]?
+        let drafts: [CodexDraft]?
+        let questionsForUser: [String]?
+        let stdoutSnippet: String?
+        let stderrSnippet: String?
+        let exitCode: Int?
+        let timedOut: Bool?
+        let outputHash: String?
+        let rating: CodexTaskRating?
+
+        enum CodingKeys: String, CodingKey {
+            case ran, reason, error, message, summary, findings, conflicts, drafts, rating
+            case taskId           = "task_id"
+            case proposedActions  = "proposed_actions"
+            case questionsForUser = "questions_for_user"
+            case stdoutSnippet    = "stdout_snippet"
+            case stderrSnippet    = "stderr_snippet"
+            case exitCode         = "exit_code"
+            case timedOut         = "timed_out"
+            case outputHash       = "output_hash"
+        }
+    }
+
+    func codexStatus() async throws -> CodexStatus {
+        let c = try await loadCreds()
+        let (data, _) = try await URLSession.shared.data(for: authedRequest("/codex/status", creds: c))
+        return try JSONDecoder().decode(CodexStatus.self, from: data)
+    }
+
+    func rateCodexTask(description: String, contextSources: [String]) async throws -> CodexTaskRating {
+        let c = try await loadCreds()
+        var req = authedRequest("/codex/rate-task", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let description: String; let context_sources: [String] }
+        req.httpBody = try JSONEncoder().encode(Body(description: description, context_sources: contextSources))
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode(CodexTaskRating.self, from: data)
+    }
+
+    func runCodexTask(
+        description: String,
+        contextSources: [String],
+        contextRefs: [String],
+        forceCodex: Bool
+    ) async throws -> CodexRunResult {
+        let c = try await loadCreds()
+        var req = authedRequest("/codex/run-task", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 180 // Codex may take up to 2 min
+        struct Body: Encodable {
+            let description: String
+            let context_sources: [String]
+            let context_refs: [String]
+            let force_codex: Bool
+        }
+        req.httpBody = try JSONEncoder().encode(Body(
+            description: description,
+            context_sources: contextSources,
+            context_refs: contextRefs,
+            force_codex: forceCodex
+        ))
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode(CodexRunResult.self, from: data)
+    }
+
+    // MARK: - Odoo (Phase 6)
+
+    struct OdooConfigResult: Decodable, Sendable {
+        let ok: Bool
+        let version: String?
+        let uid: Int?
+        let error: String?
+    }
+
+    struct OdooStatusResult: Decodable, Sendable {
+        let configured: Bool
+        let connected: Bool
+        let version: String?
+        let uid: Int?
+        let error: String?
+    }
+
+    /// Authenticate and store the connector in-memory.
+    /// Also used as the Settings "Testovať Odoo" action — returns version on success.
+    func odooConfigure(url: String, db: String, user: String, apiKey: String) async throws -> OdooConfigResult {
+        let c = try await loadCreds()
+        var req = authedRequest("/odoo/config", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable {
+            let base_url: String; let db: String; let username: String; let api_key: String
+        }
+        req.httpBody = try JSONEncoder().encode(Body(base_url: url, db: db, username: user, api_key: apiKey))
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode(OdooConfigResult.self, from: data)
+    }
+
+    func odooStatus() async throws -> OdooStatusResult {
+        let c = try await loadCreds()
+        let (data, _) = try await URLSession.shared.data(for: authedRequest("/odoo/status", creds: c))
+        return try JSONDecoder().decode(OdooStatusResult.self, from: data)
+    }
+
+    func odooOpen(url: String) async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/odoo/open", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let url: String }
+        req.httpBody = try JSONEncoder().encode(Body(url: url))
+        let (_, _) = try await URLSession.shared.data(for: req)
+    }
+
+    // MARK: - WhatsApp (Phase 11)
+
+    struct WhatsappStatusResult: Decodable, Sendable {
+        let status: String          // "stopped" | "starting" | "qr" | "authenticated" | "ready" | "disconnected" | "error" | "missing_node" | "bridge_not_installed"
+        let connected: Bool
+        let needs_qr: Bool
+        let error: String?
+        let me_name: String?
+        let me_phone: String?
+    }
+
+    struct WhatsappQrResult: Decodable, Sendable {
+        let qr: String?
+        let status: String?
+    }
+
+    struct WhatsappContact: Identifiable, Decodable, Sendable {
+        let id: String
+        let name: String?
+        let phone: String?
+    }
+
+    struct WhatsappChat: Identifiable, Decodable, Sendable {
+        let id: String
+        let name: String?
+        let is_group: Bool
+        let unread_count: Int
+        let last_message_preview: String?
+    }
+
+    struct WhatsappMessage: Identifiable, Decodable, Sendable {
+        let id: String
+        let from: String
+        let body: String
+        let timestamp: Int
+        let from_me: Bool
+    }
+
+    func whatsappStatus() async throws -> WhatsappStatusResult {
+        let c = try await loadCreds()
+        let (data, _) = try await URLSession.shared.data(for: authedRequest("/whatsapp/status", creds: c))
+        return try JSONDecoder().decode(WhatsappStatusResult.self, from: data)
+    }
+
+    func whatsappStart() async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/whatsapp/start", creds: c)
+        req.httpMethod = "POST"
+        let (_, _) = try await URLSession.shared.data(for: req)
+    }
+
+    func whatsappStop() async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/whatsapp/stop", creds: c)
+        req.httpMethod = "POST"
+        let (_, _) = try await URLSession.shared.data(for: req)
+    }
+
+    func whatsappQr() async throws -> WhatsappQrResult {
+        let c = try await loadCreds()
+        let (data, _) = try await URLSession.shared.data(for: authedRequest("/whatsapp/qr", creds: c))
+        return try JSONDecoder().decode(WhatsappQrResult.self, from: data)
+    }
+
+    func whatsappLogout() async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/whatsapp/logout", creds: c)
+        req.httpMethod = "POST"
+        let (_, _) = try await URLSession.shared.data(for: req)
+    }
+
+    func whatsappContacts(limit: Int = 50) async throws -> [WhatsappContact] {
+        let c = try await loadCreds()
+        var req = authedRequest("/whatsapp/contacts?limit=\(limit)", creds: c)
+        req.timeoutInterval = 10
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode([WhatsappContact].self, from: data)
+    }
+
+    func whatsappChats(limit: Int = 20) async throws -> [WhatsappChat] {
+        let c = try await loadCreds()
+        var req = authedRequest("/whatsapp/chats?limit=\(limit)", creds: c)
+        req.timeoutInterval = 10
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode([WhatsappChat].self, from: data)
+    }
+
+    func whatsappMessages(chatId: String, limit: Int = 20) async throws -> [WhatsappMessage] {
+        let c = try await loadCreds()
+        let enc = chatId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? chatId
+        var req = authedRequest("/whatsapp/chats/\(enc)/messages?limit=\(limit)", creds: c)
+        req.timeoutInterval = 10
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode([WhatsappMessage].self, from: data)
+    }
+
     // MARK: - Disk usage (Phase 4G)
 
     struct UsageStats: Decodable, Sendable {
@@ -505,6 +1058,28 @@ struct DaemonClient: Sendable {
         var req = authedRequest("/mail/cache/clear", creds: c)
         req.httpMethod = "POST"
         _ = try await URLSession.shared.data(for: req)
+    }
+
+    // MARK: - Screen intent (Phase 7)
+
+    /// Classify whether a user message requires screen context.
+    /// Returns `ScreenIntentResponse` on success; gracefully returns a "none" default on failure.
+    func screenIntent(message: String) async -> ScreenIntentResponse {
+        guard let c = try? await loadCreds() else {
+            return ScreenIntentResponse(action: "none", wants_screen: false, wants_ocr: false, wants_selection: false)
+        }
+        var req = authedRequest("/screen/intent", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let message: String }
+        req.httpBody = try? JSONEncoder().encode(Body(message: message))
+
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let intent = try? JSONDecoder().decode(ScreenIntentResponse.self, from: data)
+        else {
+            return ScreenIntentResponse(action: "none", wants_screen: false, wants_ocr: false, wants_selection: false)
+        }
+        return intent
     }
 
     private func prettyJSONString(_ data: Data) -> String {
@@ -564,10 +1139,32 @@ private struct SSEEvent: Decodable {
     let subject: String?
     let sender: String?
     let auto_open: Bool?
+    // file_found / file_opened event fields
+    let path: String?
+    let display_name: String?
+    let kind: String?
+    let success: Bool?
+    // odoo_found event fields
+    let model: String?
+    let record_id: Int?
+    let name: String?
+    let url: String?
     // debug_trace event fields
     let prompt_trace_id: String?
     let preview: String?
     let prompt_chars: Int?
     let prompt_token_estimate: Int?
     let message_count: Int?
+    let selected_skill_names: [String]?
+    let selected_memory_ids: [String]?
+    let conversation_recall_injected: Bool?
+    // task_rating event fields (Phase 8)
+    let level: String?
+    let score: Int?
+    let reasons: [String]?
+    let privacy_risk: String?
+    // whatsapp_found event fields (Phase 11)
+    let chat_id: String?
+    let contact_name: String?
+    let snippet: String?
 }

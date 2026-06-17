@@ -1,23 +1,33 @@
-use anyhow::Result;
-use bagent_memory::{MemoryHit, MemoryStore};
+//! Layered system prompt assembly.
+//!
+//! Layer order (highest authority → appended first):
+//!   1. Core identity, safety rules, and language policy
+//!   2. Selected skills (bounded section, bodies truncated)
+//!   3. Relevant user memory (filtered, formatted with id/kind/confidence)
+//!   4. Live tool data (mail/notes/odoo)
+//!   5. Attachment context
+//!   6. Session summary
+//!   7. Recent session history
+//!   8. Current user turn ← added by caller
+//!
+//! The builder now accepts pre-selected context from the planning layer
+//! (ContextPlanner → SkillSelector → MemorySelector).
+//! It no longer runs its own memory retrieval.
+
+use bagent_memory::MemoryHit;
 use ollama_connector::Message;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
-/// Layered system prompt assembly.
-///
-/// Layer order (highest authority → appended first in message list):
-///   1. base persona
-///   2. language profile (SK formal tone when lang=sk)
-///   3. user style profile
-///   4. corrections / sk_glossary
-///   5. retrieved memory (hybrid BM25+cosine)
-///   6. live tool data (mail/notes/odoo)
-///   7. session summary (from prepare_history)
-///   8. recent history
-///   9. user turn  ← added by caller
-pub struct PromptBuilder {
-    memory: Arc<MemoryStore>,
+// Re-exports for daemon usage
+pub use crate::context_planner::ResponseLanguageHint;
+
+/// A skill chosen for the current prompt turn.
+/// Mirrors `bagent_skills::selector::SelectedSkill` so agent crate
+/// doesn't depend on the skills crate directly.
+#[derive(Debug, Clone)]
+pub struct SelectedSkill {
+    pub name: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,10 +40,39 @@ pub struct BuiltPrompt {
 pub struct PromptTrace {
     pub language: String,
     pub recall_policy: String,
+    pub context_plan: Option<serde_json::Value>,
     pub layers: Vec<PromptLayerTrace>,
     pub memory_hits: Vec<PromptMemoryHitTrace>,
     pub correction_hits: Vec<PromptMemoryHitTrace>,
     pub past_turn_candidates: Vec<PromptPastTurnTrace>,
+    pub selected_skill_names: Vec<String>,
+    pub selected_memory_ids: Vec<String>,
+    pub conversation_recall_injected: bool,
+    pub memory_query: String,
+    // Phase 13A — File intent trace
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_intent: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_tool_called: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_result_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_action_required_approval: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_action_approved: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_action_denied_reason: Option<String>,
+    // Phase 11 — WhatsApp intent trace
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whatsapp_intent: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whatsapp_contact: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whatsapp_chat_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whatsapp_context_injected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub whatsapp_send_approval_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,117 +103,194 @@ pub struct PromptPastTurnTrace {
     pub preview: String,
 }
 
-const BASE_PERSONA: &str = "\
-Ty si bagent — chatovací asistent zabudovaný do systémovej lišty Macu.\n\
-Pravidlá:\n\
-- Si CHATBOT, nie e-mailový klient. Nikdy neformátuj odpovede ako e-mail (bez \"Dobrý deň,\" / \"S pozdravom,\" / \"[Tvoje meno]\").\n\
-- Komunikuj vždy v jazyku používateľa (slovensky ak píše po slovensky, anglicky ak po anglicky).\n\
-- Zachovaj diakritiku: á, é, í, ó, ú, ä, ĺ, ľ, ŕ, š, č, ž, ý.\n\
-- Nikdy neprekladaj termíny: DPH, faktúra, splatnosť, IČO, DIČ, odberateľ, dodávateľ, upomienka.\n\
-- Ak dostaneš dáta z emailov alebo poznámok v kontexte, pracuj s nimi priamo — nepýtaj sa používateľa na ďalšie info, ktoré už máš.\n\
-- Keď kontext obsahuje nájdený email (začína \"Našiel som email:\"), zopakuj celý hlavičkový blok (Od/Komu/Prijaté/Predmet) PRESNE ako je v kontexte — vrátane prázdnych/neznámych polí. NIKDY nenahrádzaj polia odhadmi (napr. \"(tvoja schránka)\" zobraz ako \"(tvoja schránka)\", nie ako meno alebo adresu).\n\
-- Obsah emailu zobrazuj DOSLOVNE. NIKDY nevymýšľaj, nedoplňaj ani nemiešaj telo emailu s inými kontextami alebo minulými rozhovormi.\n\
-- Ak obsah emailu hovorí \"TELO EMAILU SA NEPODARILO NAČÍTAŤ\", povedz používateľovi len toto — nikdy nevymýšľaj čo mohlo byť v emaily.\n\
-- Buď stručný a presný. Nikdy nevymýšľaj informácie ktoré nemáš k dispozícii.";
+// ── Base persona ──────────────────────────────────────────────────────────────
 
-const SK_LANGUAGE_PROFILE: &str = "\
-Si asistent pre slovensky hovoriacich podnikateľov. Odpovedaj konverzačne, nie vo formáte e-mailu.\n\
-Zachovaj diakritiku: á č ď é í ľ ĺ ň ó ô ŕ š ť ú ý ž.\n\
-Neprekladaj: DPH, faktúra, splatnosť, IČO, DIČ, zmluva, objednávka, zákazník, dodávateľ, odberateľ.\n\
-Ak skladáš odpoveď NA e-mail (používateľ o to explicitne požiada), VTEDY použi \"Dobrý deň,\" a \"S pozdravom,\".\n\
-Pri bežných otázkach odpovedaj priamo bez pozdravov.\n\
-Teplota odpovede: presná, žiadne domýšľanie.";
+/// Core identity, safety rules, and language policy.
+/// Language policy: English default; Slovak-aware preservation rules always active.
+const BASE_IDENTITY: &str = "\
+You are bagent — a personal macOS assistant built into the system status bar.\n\
+\n\
+## Safety rules\n\
+- You are a conversational assistant, NOT an email client. Do not format responses as emails \
+  (no \"Dobrý deň,\" / \"S pozdravom,\" / sign-off) unless the user explicitly asks you to draft or reply to an email.\n\
+- Be concise and accurate. Never invent information you do not have.\n\
+- If live data (mail, notes, attachments) is present in the context, work directly with it \
+  — do not ask for information you already have.\n\
+- When a found email is shown (starts with \"Našiel som email:\"), reproduce the full header block \
+  (Od/Komu/Prijaté/Predmet) exactly as provided. Never substitute unknown fields with guesses.\n\
+- Reproduce email body text verbatim. Never mix in content from other contexts or past turns.\n\
+- If the email body says \"TELO EMAILU SA NEPODARILO NAČÍTAŤ\", say exactly that — never invent contents.\n\
+\n\
+## Language policy\n\
+- Default conversation language: English, unless the user writes in Slovak or explicitly asks for Slovak.\n\
+- Task output language: match the user's request or source content (email/invoice/note language).\n\
+- Slovak content handling: always understand, preserve meaning, preserve diacritics, and preserve business terms.\n\
+- Slovak diacritics to always preserve: á č ď é í ľ ĺ ň ó ô ŕ š ť ú ý ž.\n\
+- Never translate these Slovak business/legal terms — keep them verbatim in all outputs:\n\
+  DPH, faktúra, splatnosť, IČO, DIČ, IBAN, zmluva, objednávka, odberateľ, dodávateľ, upomienka, záloha, dobropis.\n\
+- Never mix Czech into Slovak business output.\n\
+\n\
+## Memory usage rules\n\
+- Use memory only as user-specific context hints. Do not invent preferences not present in memory.\n\
+- If memory is absent, proceed without assuming user preferences.\n\
+- If memories conflict, follow the newest explicit correction or ask the user.\n\
+- Do not quote private source content (emails, notes, documents) unless the user asked for it.\n\
+\n\
+## Slovak email drafting (only when asked)\n\
+When the user explicitly asks to draft or reply to a Slovak business email:\n\
+- Use formal Slovak with \"Dobrý deň,\" opening and \"S pozdravom,\" closing.\n\
+- Use the \"Vy\" form (capitalized). No informal greetings.\n\
+- Preserve all Slovak business terms verbatim.\n\
+- Never use Czech expressions in Slovak output.";
+
+// ── Language hint helpers ─────────────────────────────────────────────────────
+
+fn language_hint_instruction(hint: &ResponseLanguageHint, language: &str) -> Option<String> {
+    match hint {
+        ResponseLanguageHint::EnglishDefault => None, // base persona already says English default
+        ResponseLanguageHint::MatchUser => {
+            if language == "sk" {
+                Some("Respond in Slovak — the user is writing in Slovak.".to_string())
+            } else {
+                None
+            }
+        }
+        ResponseLanguageHint::MatchSourceContent => {
+            Some("Match the language of the source content (email, invoice, note) in your output. \
+                  For Slovak source content, respond in Slovak and preserve all Slovak terms verbatim.".to_string())
+        }
+        ResponseLanguageHint::SlovakRequired => {
+            Some("This task requires Slovak output. Respond in formal Slovak. \
+                  Preserve diacritics and all Slovak business terms verbatim.".to_string())
+        }
+        ResponseLanguageHint::UserSpecified(lang) => {
+            Some(format!("Respond in {lang} as the user requested."))
+        }
+    }
+}
+
+// ── Builder ───────────────────────────────────────────────────────────────────
+
+pub struct PromptBuilder;
 
 impl PromptBuilder {
-    pub fn new(memory: Arc<MemoryStore>) -> Self {
-        Self { memory }
+    pub fn new() -> Self {
+        Self
     }
 
-    /// Build the full message list up through layer 8 (session summary + history).
+    /// Build the full message list up through layer 7 (session summary + history).
     /// Caller appends the user turn and submits to Ollama.
+    ///
+    /// All context (skills, memory, recall candidates) is pre-selected by the caller.
     pub async fn build(
         &self,
-        session_id: Option<&str>,
-        user_turn: &str,
+        _user_turn: &str,
         language: &str,
+        response_language_hint: &ResponseLanguageHint,
+        selected_skills: &[SelectedSkill],
+        selected_memory: &[MemoryHit],
+        corrections: &[MemoryHit],
         tool_ctx: Option<String>,
         attachments_ctx: Option<String>,
         history: Vec<Message>,
         session_summary: Option<String>,
-    ) -> Result<BuiltPrompt> {
+        recall_candidates: Vec<crate::ChatTurnHit>,
+        needs_conversation_recall: bool,
+        context_plan: Option<serde_json::Value>,
+        memory_query: &str,
+    ) -> anyhow::Result<BuiltPrompt> {
         let mut messages: Vec<Message> = Vec::new();
         let mut layers: Vec<PromptLayerTrace> = Vec::new();
 
-        // Layer 1 — base persona
-        push_system_layer(&mut messages, &mut layers, "base_persona", BASE_PERSONA);
-
-        // Layer 2 — language profile
-        if language == "sk" {
-            push_system_layer(
-                &mut messages,
-                &mut layers,
-                "language_profile",
-                SK_LANGUAGE_PROFILE,
-            );
-        }
-
-        // Layers 3-5 plus diagnostic recall candidates: run lookups in parallel — each requires a
-        // bge-m3 embed call; sequential = ~300-600ms blocked before first token.
-        let (style_opt, corrections, mem_hits, past_turn_candidates) = tokio::join!(
-            self.load_style_profile(),
-            self.memory
-                .retrieve(user_turn, &["sk_glossary", "correction"], 6),
-            self.memory.retrieve(user_turn, &["global", "user_pref"], 8),
-            self.memory
-                .retrieve_turn_candidates(user_turn, session_id, 3),
+        // Layer 1 — core identity + language policy
+        push_system_layer(
+            &mut messages,
+            &mut layers,
+            "identity_language_policy",
+            BASE_IDENTITY,
         );
-        let corrections = corrections.unwrap_or_default();
-        let mem_hits = mem_hits.unwrap_or_default();
-        let past_turn_candidates = past_turn_candidates.unwrap_or_default();
 
-        // Layer 3 — user style profile
-        if let Some(style) = style_opt {
-            push_system_layer(
-                &mut messages,
-                &mut layers,
-                "user_style_profile",
-                &format!("Používateľský štýl: {style}"),
-            );
+        // Layer 1b — language hint (only when non-default)
+        if let Some(hint_text) = language_hint_instruction(response_language_hint, language) {
+            push_system_layer(&mut messages, &mut layers, "language_hint", &hint_text);
         }
 
-        // Layer 4 — corrections + sk_glossary
+        // Layer 2 — selected skills
+        if !selected_skills.is_empty() {
+            let skill_block = format_skills_block(selected_skills);
+            push_system_layer(&mut messages, &mut layers, "selected_skills", &skill_block);
+        }
+
+        // Layer 3a — corrections + sk_glossary
         if !corrections.is_empty() {
-            let block = format_memory_block("Opravy a glosár:", &corrections);
+            let block = format_memory_block("## Active corrections and glossary", corrections);
             push_system_layer(&mut messages, &mut layers, "corrections_glossary", &block);
         }
 
-        // Layer 5 — retrieved memory (facts, prefs, etc.)
-        if !mem_hits.is_empty() {
-            let block = format_memory_block("Relevantná pamäť:", &mem_hits);
+        // Layer 3b — relevant user memory
+        if !selected_memory.is_empty() {
+            let block = format_memory_block("## Relevant user memory", selected_memory);
             push_system_layer(&mut messages, &mut layers, "retrieved_memory", &block);
         }
 
-        // Layer 6 — live tool data
+        // Layer 4 — live tool data
         if let Some(ctx) = tool_ctx {
             push_system_layer(&mut messages, &mut layers, "live_tool_context", &ctx);
         }
 
-        // Layer 6.5 — attachment context (extracted text/pdf content)
+        // Layer 5 — attachment context
         if let Some(att) = attachments_ctx {
             push_system_layer(&mut messages, &mut layers, "attachment_context", &att);
         }
 
-        // Layer 7.5 — session summary
+        // Layer 6 — session summary
         if let Some(summary) = session_summary {
             push_system_layer(
                 &mut messages,
                 &mut layers,
                 "session_summary",
-                &format!("Zhrnutie predchádzajúcej konverzácie: {summary}"),
+                &format!("## Session summary\n{summary}"),
             );
         }
 
-        // Layer 8 — recent history
+        // Layer 7 — conversation recall (injected only when explicitly planned)
+        let mut past_turn_traces: Vec<PromptPastTurnTrace> = Vec::new();
+        for candidate in &recall_candidates {
+            let injected = needs_conversation_recall;
+            let reason = if injected {
+                "explicit_recall_requested".to_string()
+            } else {
+                "automatic_cross_session_recall_disabled".to_string()
+            };
+            past_turn_traces.push(PromptPastTurnTrace {
+                role: candidate.role.clone(),
+                created_at: candidate.created_at.clone(),
+                score: candidate.score,
+                injected,
+                reason,
+                preview: preview(&candidate.content, 300),
+            });
+        }
+        let recall_policy = if needs_conversation_recall {
+            "explicit_recall_injected"
+        } else {
+            "cross_session_chat_recall_disabled_by_default"
+        };
+        if needs_conversation_recall && !recall_candidates.is_empty() {
+            let recall_block: String = recall_candidates
+                .iter()
+                .map(|h| format!("[{}] {}", h.role, h.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            push_system_layer(
+                &mut messages,
+                &mut layers,
+                "conversation_recall",
+                &format!("## Relevant past conversation\n{recall_block}"),
+            );
+        }
+
+        // Layer 8 — recent session history
         if !history.is_empty() {
             layers.push(PromptLayerTrace {
                 name: "recent_session_history".to_string(),
@@ -193,38 +309,70 @@ impl PromptBuilder {
         }
         messages.extend(history);
 
+        let selected_skill_names: Vec<String> =
+            selected_skills.iter().map(|s| s.name.clone()).collect();
+        let selected_memory_ids: Vec<String> = selected_memory
+            .iter()
+            .chain(corrections.iter())
+            .map(|h| h.item.id.clone())
+            .collect();
+
         let trace = PromptTrace {
             language: language.to_string(),
-            recall_policy: "cross_session_chat_recall_disabled_by_default".to_string(),
+            recall_policy: recall_policy.to_string(),
+            context_plan,
             layers,
-            memory_hits: mem_hits.iter().map(memory_hit_trace).collect(),
+            memory_hits: selected_memory.iter().map(memory_hit_trace).collect(),
             correction_hits: corrections.iter().map(memory_hit_trace).collect(),
-            past_turn_candidates: past_turn_candidates
-                .into_iter()
-                .map(|h| PromptPastTurnTrace {
-                    role: h.role,
-                    created_at: h.created_at,
-                    score: h.score,
-                    injected: false,
-                    reason: "automatic_cross_session_recall_disabled".to_string(),
-                    preview: preview(&h.content, 300),
-                })
-                .collect(),
+            past_turn_candidates: past_turn_traces,
+            selected_skill_names,
+            selected_memory_ids,
+            conversation_recall_injected: needs_conversation_recall
+                && !recall_candidates.is_empty(),
+            memory_query: memory_query.to_string(),
+            file_intent: None,
+            file_tool_called: None,
+            file_result_count: None,
+            file_action_required_approval: None,
+            file_action_approved: None,
+            file_action_denied_reason: None,
+            whatsapp_intent: None,
+            whatsapp_contact: None,
+            whatsapp_chat_id: None,
+            whatsapp_context_injected: None,
+            whatsapp_send_approval_id: None,
         };
 
         Ok(BuiltPrompt { messages, trace })
     }
+}
 
-    // ── Private ──────────────────────────────────────────────────────────────
-
-    async fn load_style_profile(&self) -> Option<String> {
-        let hits = self.memory.retrieve("", &["style_profile"], 1).await.ok()?;
-        hits.into_iter().next().map(|h| h.item.text)
+impl Default for PromptBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
+// ── Formatting helpers ────────────────────────────────────────────────────────
+
+fn format_skills_block(skills: &[SelectedSkill]) -> String {
+    let mut parts = vec!["## Selected skills\n".to_string()];
+    for skill in skills {
+        parts.push(format!("### {}\n{}", skill.name, skill.body));
+    }
+    parts.join("\n")
+}
+
 fn format_memory_block(header: &str, hits: &[MemoryHit]) -> String {
-    let lines: Vec<String> = hits.iter().map(|h| format!("- {}", h.item.text)).collect();
+    let lines: Vec<String> = hits
+        .iter()
+        .map(|h| {
+            format!(
+                "- [id:{} | {} | confidence:{:.2}] {}",
+                h.item.id, h.item.kind, h.item.confidence, h.item.text
+            )
+        })
+        .collect();
     format!("{header}\n{}", lines.join("\n"))
 }
 
@@ -254,7 +402,7 @@ fn memory_hit_trace(hit: &MemoryHit) -> PromptMemoryHitTrace {
     }
 }
 
-fn preview(s: &str, max: usize) -> String {
+pub fn preview(s: &str, max: usize) -> String {
     let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.len() <= max {
         compact
@@ -264,100 +412,67 @@ fn preview(s: &str, max: usize) -> String {
     }
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bagent_memory::MemoryStore;
-    use ollama_connector::OllamaClient;
-    use rusqlite::Connection;
-    use std::sync::{Arc, Mutex};
 
-    fn test_store() -> Arc<MemoryStore> {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE memory_items (
-                id TEXT PRIMARY KEY,
-                namespace TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                language TEXT NOT NULL DEFAULT 'und',
-                text TEXT NOT NULL,
-                source_ref TEXT,
-                metadata_json TEXT,
-                last_used_at TEXT,
-                use_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                expires_at TEXT
-            );
-            CREATE VIRTUAL TABLE memory_fts USING fts5(
-                id UNINDEXED,
-                text,
-                content='memory_items',
-                content_rowid='rowid',
-                tokenize='unicode61'
-            );
-            CREATE TABLE embeddings (
-                item_id TEXT PRIMARY KEY,
-                namespace TEXT NOT NULL,
-                model TEXT NOT NULL,
-                dim INTEGER NOT NULL,
-                vector BLOB NOT NULL,
-                created_at TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'memory_item'
-            );
-            CREATE TABLE chat_turns (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                language TEXT NOT NULL DEFAULT 'und',
-                model TEXT,
-                created_at TEXT NOT NULL,
-                parent_turn_id TEXT
-            );
-            CREATE VIRTUAL TABLE chat_turns_fts USING fts5(
-                id UNINDEXED,
-                content,
-                content='chat_turns',
-                content_rowid='rowid',
-                tokenize='unicode61'
-            );
-            CREATE TRIGGER chat_turns_ai AFTER INSERT ON chat_turns BEGIN
-                INSERT INTO chat_turns_fts(rowid, id, content) VALUES (new.rowid, new.id, new.content);
-            END;
-            ",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO chat_turns (id, session_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                "turn-old",
-                "old-session",
-                "assistant",
-                "Katka z TENENET poslala email s predmetom dochádzky.",
-                "2026-06-12T10:00:00Z"
-            ],
-        )
-        .unwrap();
-        Arc::new(MemoryStore::new(
-            Arc::new(Mutex::new(conn)),
-            OllamaClient::new("http://127.0.0.1:9"),
-        ))
+    async fn build_simple(
+        user_turn: &str,
+        lang: &str,
+        hint: ResponseLanguageHint,
+        needs_recall: bool,
+    ) -> BuiltPrompt {
+        let builder = PromptBuilder::new();
+        builder
+            .build(
+                user_turn,
+                lang,
+                &hint,
+                &[],    // no skills
+                &[],    // no memory
+                &[],    // no corrections
+                None,   // no tool ctx
+                None,   // no attachments
+                vec![], // no history
+                None,   // no summary
+                vec![], // no recall candidates
+                needs_recall,
+                None,
+                user_turn,
+            )
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn past_chat_candidates_are_not_injected_by_default() {
-        let builder = PromptBuilder::new(test_store());
+        // Simulate a recall candidate
+        let recall = crate::ChatTurnHit {
+            role: "assistant".to_string(),
+            content: "Katka z TENENET poslala email s predmetom dochádzky.".to_string(),
+            created_at: "2026-06-12T10:00:00Z".to_string(),
+            score: 0.8,
+        };
+
+        let builder = PromptBuilder::new();
         let built = builder
             .build(
-                Some("new-session"),
                 "katka dochádzky",
                 "sk",
+                &ResponseLanguageHint::MatchUser,
+                &[],
+                &[],
+                &[],
                 None,
                 None,
                 vec![],
                 None,
+                vec![recall],
+                false, // needs_conversation_recall = false
+                None,
+                "katka dochádzky",
             )
             .await
             .unwrap();
@@ -371,7 +486,7 @@ mod tests {
 
         assert!(
             !sent_prompt.contains("TENENET"),
-            "past chat content must not be injected into model messages"
+            "past chat content must not be injected into model messages when recall not needed"
         );
         assert!(
             built
@@ -381,5 +496,236 @@ mod tests {
                 .any(|c| c.preview.contains("TENENET") && !c.injected),
             "past chat should remain visible as a non-injected debug candidate"
         );
+        assert_eq!(built.trace.conversation_recall_injected, false);
+    }
+
+    #[tokio::test]
+    async fn past_chat_injected_when_recall_requested() {
+        let recall = crate::ChatTurnHit {
+            role: "assistant".to_string(),
+            content: "We decided to postpone the invoice.".to_string(),
+            created_at: "2026-06-10T10:00:00Z".to_string(),
+            score: 0.85,
+        };
+
+        let builder = PromptBuilder::new();
+        let built = builder
+            .build(
+                "what did we decide about the invoice?",
+                "en",
+                &ResponseLanguageHint::EnglishDefault,
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+                vec![],
+                None,
+                vec![recall],
+                true, // needs_conversation_recall = true
+                None,
+                "invoice",
+            )
+            .await
+            .unwrap();
+
+        let sent_prompt = built
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            sent_prompt.contains("postpone the invoice"),
+            "recall content must appear in prompt when needs_conversation_recall=true"
+        );
+        assert_eq!(built.trace.conversation_recall_injected, true);
+    }
+
+    #[tokio::test]
+    async fn trace_includes_selected_skill_names() {
+        let skill = SelectedSkill {
+            name: "sk-business-email".to_string(),
+            body: "Some skill body.".to_string(),
+        };
+        let builder = PromptBuilder::new();
+        let built = builder
+            .build(
+                "test",
+                "sk",
+                &ResponseLanguageHint::SlovakRequired,
+                &[skill],
+                &[],
+                &[],
+                None,
+                None,
+                vec![],
+                None,
+                vec![],
+                false,
+                None,
+                "test",
+            )
+            .await
+            .unwrap();
+
+        assert!(built
+            .trace
+            .selected_skill_names
+            .contains(&"sk-business-email".to_string()));
+        let skill_layer = built
+            .trace
+            .layers
+            .iter()
+            .find(|l| l.name == "selected_skills");
+        assert!(skill_layer.is_some(), "skills layer must be present");
+    }
+
+    #[tokio::test]
+    async fn trace_includes_selected_memory_ids() {
+        use bagent_memory::{MemoryHit, MemoryItem};
+        let item = MemoryItem {
+            id: "mem_test_123".to_string(),
+            namespace: "user_pref".to_string(),
+            kind: "preference".to_string(),
+            language: "en".to_string(),
+            text: "User prefers bullet points.".to_string(),
+            source_ref: None,
+            metadata_json: None,
+            last_used_at: None,
+            use_count: 0,
+            created_at: "2026-06-01T00:00:00Z".to_string(),
+            updated_at: "2026-06-01T00:00:00Z".to_string(),
+            expires_at: None,
+            confidence: 0.9,
+            importance: 0.7,
+            status: "active".to_string(),
+            source: "explicit".to_string(),
+            sensitivity: "normal".to_string(),
+            subject: None,
+            supersedes_id: None,
+        };
+        let hit = MemoryHit { item, score: 0.85 };
+        let builder = PromptBuilder::new();
+        let built = builder
+            .build(
+                "test",
+                "en",
+                &ResponseLanguageHint::EnglishDefault,
+                &[],
+                &[hit],
+                &[],
+                None,
+                None,
+                vec![],
+                None,
+                vec![],
+                false,
+                None,
+                "test",
+            )
+            .await
+            .unwrap();
+
+        assert!(built
+            .trace
+            .selected_memory_ids
+            .contains(&"mem_test_123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn english_default_no_extra_language_layer() {
+        let built = build_simple(
+            "how are you?",
+            "en",
+            ResponseLanguageHint::EnglishDefault,
+            false,
+        )
+        .await;
+        let has_lang_hint = built.trace.layers.iter().any(|l| l.name == "language_hint");
+        assert!(
+            !has_lang_hint,
+            "English default should not add an extra language hint layer"
+        );
+    }
+
+    #[tokio::test]
+    async fn slovak_required_adds_language_layer() {
+        let built = build_simple(
+            "napíš email",
+            "sk",
+            ResponseLanguageHint::SlovakRequired,
+            false,
+        )
+        .await;
+        let has_lang_hint = built.trace.layers.iter().any(|l| l.name == "language_hint");
+        assert!(
+            has_lang_hint,
+            "SlovakRequired should add a language hint layer"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_formatted_with_id_kind_confidence() {
+        use bagent_memory::{MemoryHit, MemoryItem};
+        let item = MemoryItem {
+            id: "mem_xyz".to_string(),
+            namespace: "sk_glossary".to_string(),
+            kind: "sk_glossary".to_string(),
+            language: "sk".to_string(),
+            text: "Preserve DPH verbatim.".to_string(),
+            source_ref: None,
+            metadata_json: None,
+            last_used_at: None,
+            use_count: 0,
+            created_at: "2026-06-01T00:00:00Z".to_string(),
+            updated_at: "2026-06-01T00:00:00Z".to_string(),
+            expires_at: None,
+            confidence: 0.95,
+            importance: 0.8,
+            status: "active".to_string(),
+            source: "explicit".to_string(),
+            sensitivity: "normal".to_string(),
+            subject: None,
+            supersedes_id: None,
+        };
+        let hit = MemoryHit { item, score: 0.9 };
+        let builder = PromptBuilder::new();
+        let built = builder
+            .build(
+                "test",
+                "sk",
+                &ResponseLanguageHint::SlovakRequired,
+                &[],
+                &[hit],
+                &[],
+                None,
+                None,
+                vec![],
+                None,
+                vec![],
+                false,
+                None,
+                "test",
+            )
+            .await
+            .unwrap();
+
+        let mem_layer = built
+            .trace
+            .layers
+            .iter()
+            .find(|l| l.name == "retrieved_memory");
+        assert!(mem_layer.is_some());
+        let sent = built
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sent.contains("mem_xyz"), "memory id must appear in prompt");
+        assert!(sent.contains("sk_glossary"), "kind must appear in prompt");
+        assert!(sent.contains("0.95"), "confidence must appear in prompt");
     }
 }

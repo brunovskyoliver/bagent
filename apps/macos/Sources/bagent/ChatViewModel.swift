@@ -1,4 +1,5 @@
 import Combine
+import ScreenCaptureKit
 import SwiftUI
 
 // MARK: - Attachment types
@@ -27,12 +28,23 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     /// Set when the assistant's response found a specific mail message.
     /// Drives the "Otvoriť mail" animated button.
     var mailRef: DaemonClient.MailRef? = nil
+    /// Set when the assistant's response found a local file (Phase 13A).
+    var fileRef: DaemonClient.FileRef? = nil
+    /// Set when the assistant's response found an Odoo record (Phase 6).
+    var odooRef: DaemonClient.OdooRef? = nil
+    /// Set when the assistant's response found a WhatsApp chat (Phase 11).
+    var whatsappRef: DaemonClient.WhatsappRef? = nil
     var debugTraceId: String? = nil
     var debugPreview: String? = nil
     var debugPromptChars: Int? = nil
     var debugTokenEstimate: Int? = nil
     var debugMessageCount: Int? = nil
     var debugPayload: String? = nil
+    var debugSelectedSkills: [String]? = nil
+    var debugSelectedMemoryIds: [String]? = nil
+    var debugConversationRecallInjected: Bool? = nil
+    /// Codex task complexity rating (Phase 8). Set from `task_rating` SSE event.
+    var taskRating: (level: String, score: Int, reasons: [String], privacyRisk: String)? = nil
 
     enum Role { case user, assistant }
 }
@@ -68,6 +80,7 @@ final class ChatViewModel: ObservableObject {
     @Published var hasNotch = false
     @Published var showSettings = false
     @Published var showMemory = false
+    @Published var showSkills = false
     @Published var showDebug = false
     @Published var debugConversationPayload: String? = nil
     @Published var isLoadingDebug = false
@@ -86,6 +99,8 @@ final class ChatViewModel: ObservableObject {
     @Published var lastMemorySavedId: String? = nil
     @Published var memoryItems: [MemoryItem] = []
     @Published var isLoadingMemory = false
+    @Published var skills: [SkillItem] = []
+    @Published var isLoadingSkills = false
     @Published var pendingApprovals: [ApprovalItem] = []
     /// Files queued to send with the next message.
     @Published var pendingAttachments: [ChatAttachment] = []
@@ -121,6 +136,194 @@ final class ChatViewModel: ObservableObject {
 
     @Published var selectedClassifierModel: String = UserDefaults.standard.string(forKey: "bagent.classifier_model") ?? "qwen3:0.6b" {
         didSet { UserDefaults.standard.set(selectedClassifierModel, forKey: "bagent.classifier_model") }
+    }
+
+    // MARK: - Codex (Phase 8)
+
+    /// User-configured path to the `codex` binary. Empty = auto-discover from $PATH.
+    @Published var codexBinaryPath: String = UserDefaults.standard.string(forKey: "bagent.codex_path") ?? "" {
+        didSet { UserDefaults.standard.set(codexBinaryPath, forKey: "bagent.codex_path") }
+    }
+    /// Last result from "Testovať Codex" — nil while not tested, true/false after.
+    @Published var codexTestResult: String? = nil
+    @Published var isTestingCodex: Bool = false
+
+    func testCodex() {
+        isTestingCodex = true
+        codexTestResult = nil
+        Task {
+            do {
+                let status = try await client.codexStatus()
+                await MainActor.run {
+                    if status.available {
+                        self.codexTestResult = "✓ \(status.version ?? "dostupný")"
+                    } else {
+                        self.codexTestResult = "✗ \(status.error ?? "nenájdený")"
+                    }
+                    self.isTestingCodex = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.codexTestResult = "✗ \(error.localizedDescription)"
+                    self.isTestingCodex = false
+                }
+            }
+        }
+    }
+
+    // MARK: - Odoo (Phase 6)
+
+    /// Odoo connection settings — URL, DB, user stored in UserDefaults (not secrets).
+    @Published var odooURL:  String = UserDefaults.standard.string(forKey: "bagent.odoo.url")  ?? ""
+    @Published var odooDB:   String = UserDefaults.standard.string(forKey: "bagent.odoo.db")   ?? ""
+    @Published var odooUser: String = UserDefaults.standard.string(forKey: "bagent.odoo.user") ?? ""
+    /// API key is loaded from Keychain; the `@Published` field holds the live session value only.
+    @Published var odooAPIKey: String = ""
+
+    @Published var odooTestResult: String? = nil
+    @Published var isTestingOdoo: Bool = false
+
+    /// Save creds to Keychain + UserDefaults and authenticate with the daemon.
+    func configureOdoo() {
+        // Persist non-secret fields in UserDefaults (URL, DB, user).
+        UserDefaults.standard.set(odooURL,  forKey: "bagent.odoo.url")
+        UserDefaults.standard.set(odooDB,   forKey: "bagent.odoo.db")
+        UserDefaults.standard.set(odooUser, forKey: "bagent.odoo.user")
+        // API key goes to Keychain only.
+        KeychainStore.saveOdoo(url: odooURL, db: odooDB, user: odooUser, apiKey: odooAPIKey)
+
+        isTestingOdoo = true
+        odooTestResult = nil
+        Task {
+            do {
+                let result = try await client.odooConfigure(
+                    url: odooURL, db: odooDB, user: odooUser, apiKey: odooAPIKey
+                )
+                await MainActor.run {
+                    if result.ok {
+                        self.odooTestResult = "✓ Odoo \(result.version ?? "pripojený"), uid=\(result.uid ?? 0)"
+                    } else {
+                        self.odooTestResult = "✗ \(result.error ?? "chyba autentifikácie")"
+                    }
+                    self.isTestingOdoo = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.odooTestResult = "✗ \(error.localizedDescription)"
+                    self.isTestingOdoo = false
+                }
+            }
+        }
+    }
+
+    /// Re-push Odoo credentials from Keychain to the daemon (called on each launch).
+    func restoreOdooFromKeychain() {
+        guard let creds = KeychainStore.loadOdoo() else { return }
+        odooURL  = creds.url
+        odooDB   = creds.db
+        odooUser = creds.user
+        odooAPIKey = creds.apiKey
+        Task {
+            _ = try? await client.odooConfigure(
+                url: creds.url, db: creds.db, user: creds.user, apiKey: creds.apiKey
+            )
+        }
+    }
+
+    /// Open an Odoo record in Safari (called by the "Otvoriť v Safari" button).
+    func openOdoo(_ ref: DaemonClient.OdooRef) {
+        Task {
+            try? await client.odooOpen(url: ref.url)
+        }
+    }
+
+    // MARK: - WhatsApp (Phase 11)
+
+    @Published var whatsappStatus: DaemonClient.WhatsappStatusResult? = nil
+    @Published var whatsappQrString: String? = nil
+    @Published var isConnectingWhatsapp: Bool = false
+    @Published var whatsappStatusMessage: String? = nil
+
+    func connectWhatsapp() {
+        isConnectingWhatsapp = true
+        whatsappStatusMessage = nil
+        Task {
+            do {
+                try await client.whatsappStart()
+                await pollWhatsappStatus()
+            } catch {
+                await MainActor.run {
+                    self.whatsappStatusMessage = "✗ \(error.localizedDescription)"
+                    self.isConnectingWhatsapp = false
+                }
+            }
+        }
+    }
+
+    func disconnectWhatsapp() {
+        Task {
+            try? await client.whatsappStop()
+            await pollWhatsappStatus()
+        }
+    }
+
+    func logoutWhatsapp() {
+        Task {
+            try? await client.whatsappLogout()
+            await pollWhatsappStatus()
+            await MainActor.run {
+                self.whatsappQrString = nil
+            }
+        }
+    }
+
+    func refreshWhatsappQr() {
+        Task {
+            if let qr = try? await client.whatsappQr() {
+                await MainActor.run {
+                    self.whatsappQrString = qr.qr
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func pollWhatsappStatus() async {
+        // Poll up to 120 s (240 × 500 ms) — Puppeteer/Chromium startup can take ~30 s.
+        for _ in 0..<240 {
+            if let s = try? await client.whatsappStatus() {
+                self.whatsappStatus = s
+                self.isConnectingWhatsapp = s.status == "starting"
+                if s.needs_qr && self.whatsappQrString == nil {
+                    refreshWhatsappQr()
+                }
+                if s.status == "ready" || s.status == "error" || s.status == "disconnected" {
+                    break
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        self.isConnectingWhatsapp = false
+    }
+
+    func refreshWhatsappStatus() {
+        Task {
+            if let s = try? await client.whatsappStatus() {
+                await MainActor.run {
+                    self.whatsappStatus = s
+                    if s.needs_qr { self.refreshWhatsappQr() }
+                }
+            }
+        }
+    }
+
+    /// Preferred microphone name. Empty string = "System default" (no swap).
+    /// Persisted across launches; pushed to `speech.preferredInputName` on change and at init.
+    @Published var selectedMicrophone: String = UserDefaults.standard.string(forKey: "bagent.microphone") ?? "" {
+        didSet {
+            UserDefaults.standard.set(selectedMicrophone, forKey: "bagent.microphone")
+            speech.preferredInputName = selectedMicrophone.isEmpty ? nil : selectedMicrophone
+        }
     }
 
     @Published var chatWindowW: CGFloat = ChatViewModel.savedSize("bagent.chat.w", 400) {
@@ -163,6 +366,20 @@ final class ChatViewModel: ObservableObject {
     }
 
     var currentSessionId: String? { sessionId }
+
+    // MARK: - Init
+
+    init() {
+        // Push the persisted mic preference into the speech controller so it is
+        // available the first time a voice session starts (didSet doesn't fire for
+        // inline stored-property initializers).
+        let savedMic = UserDefaults.standard.string(forKey: "bagent.microphone") ?? ""
+        speech.preferredInputName = savedMic.isEmpty ? nil : savedMic
+
+        // Restore Odoo credentials from Keychain so the in-memory daemon connector is
+        // populated without requiring the user to re-enter creds after restart.
+        restoreOdooFromKeychain()
+    }
 
     // MARK: - Actions
 
@@ -268,7 +485,8 @@ final class ChatViewModel: ObservableObject {
                 // MemoryHit is flat (id, namespace, kind, text, score) — map to MemoryItem shape
                 filteredMemoryItems = hits.map { h in
                     MemoryItem(id: h.id, namespace: h.namespace, kind: h.kind,
-                               language: "und", text: h.text, source_ref: nil, created_at: "", use_count: 0)
+                               language: "und", text: h.text, source_ref: nil, created_at: "", use_count: 0,
+                               status: nil, source: nil, confidence: nil, importance: nil, sensitivity: nil)
                 }
             }
         } catch {}
@@ -283,14 +501,35 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    func loadSkills() async {
+        isLoadingSkills = true
+        do {
+            skills = try await client.skills()
+        } catch {}
+        isLoadingSkills = false
+    }
+
     func toggleMemoryPanel() {
         if showMemory {
             showMemory = false
         } else {
             showSettings = false
+            showSkills = false
             showDebug = false
             showMemory = true
             Task { await loadMemoryItems() }
+        }
+    }
+
+    func toggleSkillsPanel() {
+        if showSkills {
+            showSkills = false
+        } else {
+            showSettings = false
+            showMemory = false
+            showDebug = false
+            showSkills = true
+            Task { await loadSkills() }
         }
     }
 
@@ -299,6 +538,7 @@ final class ChatViewModel: ObservableObject {
             showSettings = false
         } else {
             showMemory = false
+            showSkills = false
             showDebug = false
             showSettings = true
         }
@@ -310,6 +550,7 @@ final class ChatViewModel: ObservableObject {
         } else {
             showSettings = false
             showMemory = false
+            showSkills = false
             showDebug = true
             Task { await loadDebugConversation() }
         }
@@ -380,7 +621,29 @@ final class ChatViewModel: ObservableObject {
             let idx = messages.count - 1
 
             do {
-                let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds)
+                // ── Screen context gate (Phase 7) ─────────────────────────────
+                // 1. Cheap local keyword pre-gate (avoids LLM call on every turn)
+                // 2. If pre-gate passes → authoritative LLM classifier via /screen/intent
+                // 3. Capture according to classifier flags
+                var screenCtx: ScreenContextFields? = nil
+                if permissions.hasScreenRecording && Self.looksLikeScreenTurn(text) {
+                    let intent = await client.screenIntent(message: text)
+                    if intent.wants_screen || intent.wants_selection {
+                        let raw = await ScreenContextProvider.shared.capture(
+                            wantsScreen: intent.wants_screen,
+                            wantsOCR: intent.wants_ocr,
+                            wantsSelection: intent.wants_selection
+                        )
+                        screenCtx = ScreenContextFields(
+                            imagePNGBase64: raw.imagePNGBase64,
+                            ocrText: raw.ocrText,
+                            activeApp: raw.activeApp,
+                            selectedText: raw.selectedText
+                        )
+                    }
+                }
+
+                let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds, screenContext: screenCtx)
                 var first = true
                 var didAutoOpen = false
                 for try await event in stream {
@@ -391,6 +654,9 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].debugPromptChars = trace.prompt_chars
                         messages[idx].debugTokenEstimate = trace.prompt_token_estimate
                         messages[idx].debugMessageCount = trace.message_count
+                        messages[idx].debugSelectedSkills = trace.selected_skill_names
+                        messages[idx].debugSelectedMemoryIds = trace.selected_memory_ids
+                        messages[idx].debugConversationRecallInjected = trace.conversation_recall_injected
                         if let sid = trace.session_id { sessionId = sid }
                     case .token(let t):
                         if first { isThinking = false; first = false }
@@ -434,10 +700,20 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].attachments.append(contentsOf: chips)
                     case .mailFound(let ref):
                         messages[idx].mailRef = ref
+                    case .fileFound(let ref):
+                        messages[idx].fileRef = ref
+                    case .odooFound(let ref):
+                        messages[idx].odooRef = ref
+                    case .whatsappFound(let ref):
+                        messages[idx].whatsappRef = ref
+                    case .fileOpened:
+                        break // no UI action for now; daemon already opened the file
                     case .actionTaken(let message):
                         isThinking = false
                         voiceActionMessage = message
                         onVoiceActionTaken?(message)
+                    case .taskRating(let level, let score, let reasons, let privacyRisk):
+                        messages[idx].taskRating = (level: level, score: score, reasons: reasons, privacyRisk: privacyRisk)
                     case .done(let returnedSessionId):
                         if let sid = returnedSessionId { sessionId = sid }
                         if first { isThinking = false }
@@ -582,6 +858,36 @@ final class ChatViewModel: ObservableObject {
         pendingAttachments.removeAll { $0.id == id }
     }
 
+    // MARK: - Image paste (Part B — Phase 7)
+
+    /// Tries to read an image from the general pasteboard.
+    /// Returns true and inserts `[image #n]` into `inputText` when an image is found.
+    @discardableResult
+    func pasteImageFromClipboard() -> Bool {
+        let pb = NSPasteboard.general
+        guard let image = NSImage(pasteboard: pb) else { return false }
+
+        // Count how many images have been pasted this compose session
+        let n = pendingAttachments.filter { $0.kind == .image }.count + 1
+
+        // Write to a temp PNG file — uploadAttachment requires a file URL
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let pngData = NSBitmapImageRep(cgImage: cgImage)
+                                .representation(using: .png, properties: [:]) else { return false }
+
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("paste_\(UUID().uuidString).png")
+        do {
+            try pngData.write(to: tmpURL)
+        } catch {
+            return false
+        }
+
+        addAttachments(urls: [tmpURL])
+        inputText += inputText.isEmpty ? "[image #\(n)]" : " [image #\(n)]"
+        return true
+    }
+
     // MARK: - Mail open (Phase 5E)
 
     func openMail(_ ref: DaemonClient.MailRef) {
@@ -593,6 +899,30 @@ final class ChatViewModel: ObservableObject {
                 sender: ref.sender
             )
         }
+    }
+
+    // MARK: - Screen context (Phase 7)
+
+    /// Cheap local pre-gate: returns true when the message contains keywords that
+    /// suggest the user wants the agent to look at the screen. Avoids a daemon round-
+    /// trip on every turn. The authoritative check is the LLM classifier via /screen/intent.
+    static func looksLikeScreenTurn(_ message: String) -> Bool {
+        let low = message.lowercased()
+        let keywords = [
+            // Slovak
+            "obrazovk", "vidíš", "čo vidíš", "pozri na", "pozri sem",
+            "analyzuj toto", "analyzuj to", "prečítaj toto", "prečítaj to",
+            "čo tam píše", "čo sa zobrazuje", "nájdi na obrazovke",
+            "prečítaj výber", "vybraný text", "tento výber",
+            // English
+            "what's on screen", "what's on my screen", "what is on screen",
+            "what can you see", "on the screen",
+            "look at my screen", "look at the screen", "what do you see",
+            "analyze this", "analyse this", "read this", "read the screen",
+            "what does it say", "what does this say", "find on screen",
+            "find the button", "locate on screen", "read selection", "selected text",
+        ]
+        return keywords.contains { low.contains($0) }
     }
 
     // MARK: - Vision model check

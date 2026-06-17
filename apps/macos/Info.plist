@@ -9,4 +9,5 @@
   <key>LSUIElement</key>         <true/>
   <key>NSHighResolutionCapable</key> <true/>
   <key>NSMicrophoneUsageDescription</key> <string>bagent uses the microphone to transcribe your voice on-device with Whisper. Audio never leaves your Mac.</string>
+  <key>NSScreenCaptureUsageDescription</key> <string>bagent captures your screen on demand to answer questions about what is displayed. Screenshots are processed in memory and never saved to disk.</string>
 </dict></plist>

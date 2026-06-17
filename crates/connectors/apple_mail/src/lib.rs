@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::{Deserialize, Serialize};
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -106,7 +106,10 @@ impl MailConnector {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
         let mail_v10_dir = home.join("Library/Mail/V10");
         let envelope_index = mail_v10_dir.join("MailData/Envelope Index");
-        Ok(Self { envelope_index, mail_v10_dir })
+        Ok(Self {
+            envelope_index,
+            mail_v10_dir,
+        })
     }
 
     /// True when Full Disk Access is granted and the Envelope Index is readable.
@@ -149,7 +152,11 @@ impl MailConnector {
                 received_at: row.get(1)?,
                 is_read: row.get::<_, i64>(2)? != 0,
                 subject: row.get(3)?,
-                sender_display: if sender_display.is_empty() { None } else { Some(sender_display) },
+                sender_display: if sender_display.is_empty() {
+                    None
+                } else {
+                    Some(sender_display)
+                },
                 sender: row.get(5)?,
                 mailbox_url: row.get(6)?,
                 recipient: row.get(7).ok().flatten(),
@@ -259,7 +266,11 @@ impl MailConnector {
                 received_at: row.get(1)?,
                 is_read: row.get::<_, i64>(2)? != 0,
                 subject: row.get(3)?,
-                sender_display: if display.is_empty() { None } else { Some(display) },
+                sender_display: if display.is_empty() {
+                    None
+                } else {
+                    Some(display)
+                },
                 sender: row.get(5)?,
                 mailbox_url: row.get(6)?,
                 recipient: row.get(7).ok().flatten(),
@@ -304,7 +315,11 @@ impl MailConnector {
                 received_at: row.get(1)?,
                 is_read: row.get::<_, i64>(2)? != 0,
                 subject: row.get(3)?,
-                sender_display: if display.is_empty() { None } else { Some(display) },
+                sender_display: if display.is_empty() {
+                    None
+                } else {
+                    Some(display)
+                },
                 sender: row.get(5)?,
                 mailbox_url: row.get(6)?,
                 recipient: row.get(7).ok().flatten(),
@@ -349,7 +364,11 @@ impl MailConnector {
                 received_at: row.get(1)?,
                 is_read: row.get::<_, i64>(2)? != 0,
                 subject: row.get(3)?,
-                sender_display: if display.is_empty() { None } else { Some(display) },
+                sender_display: if display.is_empty() {
+                    None
+                } else {
+                    Some(display)
+                },
                 sender: row.get(5)?,
                 mailbox_url: row.get(6)?,
                 recipient: row.get(7).ok().flatten(),
@@ -390,7 +409,11 @@ impl MailConnector {
                     received_at: row.get(1)?,
                     is_read: row.get::<_, i64>(2)? != 0,
                     subject: row.get(3)?,
-                    sender_display: if sender_display.is_empty() { None } else { Some(sender_display) },
+                    sender_display: if sender_display.is_empty() {
+                        None
+                    } else {
+                        Some(sender_display)
+                    },
                     sender: row.get(5)?,
                     mailbox_url: row.get(6)?,
                     recipient: row.get(7).ok().flatten(),
@@ -427,7 +450,8 @@ impl MailConnector {
             let mut sorted = fs_atts;
             sorted.sort_by(|a, b| a.0.cmp(&b.0)); // sort by part-folder name
             for (idx, (_, path)) in sorted.into_iter().enumerate() {
-                let filename = path.file_name()
+                let filename = path
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("attachment")
                     .to_string();
@@ -450,7 +474,11 @@ impl MailConnector {
     /// Fetch the raw (decoded) bytes for a single attachment by ROWID + part_index.
     /// First tries emlx-embedded bytes; falls back to the on-disk Attachments directory
     /// (used when the message is a .partial.emlx with separately-stored attachments).
-    pub fn get_message_attachment(&self, rowid: i64, part_index: usize) -> Result<(MailAttachment, Vec<u8>)> {
+    pub fn get_message_attachment(
+        &self,
+        rowid: i64,
+        part_index: usize,
+    ) -> Result<(MailAttachment, Vec<u8>)> {
         // Try emlx parse first
         if let Some(emlx_path) = self.find_emlx(rowid) {
             if let Ok(result) = get_attachment_bytes(&emlx_path, part_index) {
@@ -461,19 +489,38 @@ impl MailConnector {
         // Fall back to filesystem Attachments directory
         let mut sorted = self.find_attachment_files(rowid);
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let (_, path) = sorted.into_iter().nth(part_index)
+        let (_, path) = sorted
+            .into_iter()
+            .nth(part_index)
             .ok_or_else(|| anyhow!("attachment index {part_index} not found for rowid {rowid}"))?;
-        let filename = path.file_name()
-            .and_then(|n| n.to_str()).unwrap_or("attachment").to_string();
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
         let mimetype = mime_guess::from_path(&path)
-            .first_or_octet_stream().to_string();
+            .first_or_octet_stream()
+            .to_string();
         let size = path.metadata().map(|m| m.len() as usize).unwrap_or(0);
         let bytes = std::fs::read(&path)?;
-        Ok((MailAttachment { part_index, filename, mimetype, size, content_id: None }, bytes))
+        Ok((
+            MailAttachment {
+                part_index,
+                filename,
+                mimetype,
+                size,
+                content_id: None,
+            },
+            bytes,
+        ))
     }
 
     /// Fetch attachment bytes as a base64-encoded string (for Ollama vision / JSON APIs).
-    pub fn get_message_attachment_base64(&self, rowid: i64, part_index: usize) -> Result<(MailAttachment, String)> {
+    pub fn get_message_attachment_base64(
+        &self,
+        rowid: i64,
+        part_index: usize,
+    ) -> Result<(MailAttachment, String)> {
         let (meta, bytes) = self.get_message_attachment(rowid, part_index)?;
         Ok((meta, B64.encode(&bytes)))
     }
@@ -499,25 +546,39 @@ impl MailConnector {
 
         for acct in std::fs::read_dir(&self.mail_v10_dir).ok()?.flatten() {
             let Ok(ft) = acct.file_type() else { continue };
-            if !ft.is_dir() { continue }
+            if !ft.is_dir() {
+                continue;
+            }
 
             for mbox in std::fs::read_dir(acct.path()).ok()?.flatten() {
                 let mp = mbox.path();
-                if mp.extension().and_then(|e| e.to_str()) != Some("mbox") { continue }
+                if mp.extension().and_then(|e| e.to_str()) != Some("mbox") {
+                    continue;
+                }
 
                 for guid in std::fs::read_dir(&mp).ok()?.flatten() {
                     let Ok(gft) = guid.file_type() else { continue };
-                    if !gft.is_dir() { continue }
+                    if !gft.is_dir() {
+                        continue;
+                    }
 
-                    let base = guid.path().join("Data")
-                        .join(d1.to_string()).join(d2.to_string()).join(d3.to_string())
+                    let base = guid
+                        .path()
+                        .join("Data")
+                        .join(d1.to_string())
+                        .join(d2.to_string())
+                        .join(d3.to_string())
                         .join("Messages");
 
                     // Prefer full emlx, fall back to partial
                     let full = base.join(format!("{rowid}.emlx"));
-                    if full.exists() { return Some(full); }
+                    if full.exists() {
+                        return Some(full);
+                    }
                     let partial = base.join(format!("{rowid}.partial.emlx"));
-                    if partial.exists() { return Some(partial); }
+                    if partial.exists() {
+                        return Some(partial);
+                    }
                 }
             }
         }
@@ -536,12 +597,21 @@ impl MailConnector {
         let mut walk = |acct: std::fs::DirEntry| -> Option<()> {
             for mbox in std::fs::read_dir(acct.path()).ok()?.flatten() {
                 let mp = mbox.path();
-                if mp.extension().and_then(|e| e.to_str()) != Some("mbox") { continue }
+                if mp.extension().and_then(|e| e.to_str()) != Some("mbox") {
+                    continue;
+                }
                 for guid in std::fs::read_dir(&mp).ok()?.flatten() {
-                    let att_dir = guid.path().join("Data")
-                        .join(d1.to_string()).join(d2.to_string()).join(d3.to_string())
-                        .join("Attachments").join(rowid.to_string());
-                    if !att_dir.exists() { continue }
+                    let att_dir = guid
+                        .path()
+                        .join("Data")
+                        .join(d1.to_string())
+                        .join(d2.to_string())
+                        .join(d3.to_string())
+                        .join("Attachments")
+                        .join(rowid.to_string());
+                    if !att_dir.exists() {
+                        continue;
+                    }
                     for part in std::fs::read_dir(&att_dir).ok()?.flatten() {
                         let part_name = part.file_name().to_string_lossy().to_string();
                         for file in std::fs::read_dir(part.path()).ok()?.flatten() {
@@ -577,7 +647,9 @@ impl MailConnector {
 fn parse_emlx_email_bytes(path: &Path) -> Result<Vec<u8>> {
     let bytes = std::fs::read(path)?;
 
-    let nl = bytes.iter().position(|&b| b == b'\n')
+    let nl = bytes
+        .iter()
+        .position(|&b| b == b'\n')
         .ok_or_else(|| anyhow!("invalid emlx: no newline"))?;
     let plist_len: usize = std::str::from_utf8(&bytes[..nl])?
         .trim()
@@ -594,15 +666,25 @@ fn parse_emlx_email_bytes(path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Parse body text, attachment metadata, and Message-ID in one pass.
-fn parse_emlx_body_and_attachments(path: &Path) -> Result<(String, Vec<MailAttachment>, Option<String>)> {
+fn parse_emlx_body_and_attachments(
+    path: &Path,
+) -> Result<(String, Vec<MailAttachment>, Option<String>)> {
     let email_bytes = parse_emlx_email_bytes(path)?;
     let parsed = mailparse::parse_mail(&email_bytes)?;
     let text = extract_plain_text(&parsed)?;
     let attachments = extract_attachments_from_parsed(&parsed);
     // Extract Message-ID from top-level headers (strip surrounding angle brackets).
-    let message_id = parsed.headers.iter()
+    let message_id = parsed
+        .headers
+        .iter()
         .find(|h| h.get_key().to_lowercase() == "message-id")
-        .map(|h| h.get_value().trim().trim_matches('<').trim_matches('>').to_string())
+        .map(|h| {
+            h.get_value()
+                .trim()
+                .trim_matches('<')
+                .trim_matches('>')
+                .to_string()
+        })
         .filter(|s| !s.is_empty());
     Ok((text, attachments, message_id))
 }
@@ -654,18 +736,26 @@ fn extract_plain_text(mail: &mailparse::ParsedMail) -> Result<String> {
             let pct = part.ctype.mimetype.as_str();
             if pct == "text/plain" {
                 let t = part.get_body()?;
-                if !t.trim().is_empty() { plain_parts.push(t); }
+                if !t.trim().is_empty() {
+                    plain_parts.push(t);
+                }
             } else if pct == "text/html" && html_fallback.is_none() {
                 html_fallback = Some(strip_html(&part.get_body()?));
             } else if pct.starts_with("multipart/") {
                 if let Ok(nested) = extract_plain_text(part) {
-                    if !nested.trim().is_empty() { plain_parts.push(nested); }
+                    if !nested.trim().is_empty() {
+                        plain_parts.push(nested);
+                    }
                 }
             }
         }
 
-        if !plain_parts.is_empty() { return Ok(plain_parts.join("\n\n")); }
-        if let Some(html) = html_fallback { return Ok(html); }
+        if !plain_parts.is_empty() {
+            return Ok(plain_parts.join("\n\n"));
+        }
+        if let Some(html) = html_fallback {
+            return Ok(html);
+        }
     }
 
     Ok(String::new())
@@ -696,10 +786,7 @@ fn collect_attachments(
 }
 
 /// Return Some(MailAttachment) if `part` is an attachment (not a body part).
-fn classify_attachment_part(
-    part: &mailparse::ParsedMail,
-    index: usize,
-) -> Option<MailAttachment> {
+fn classify_attachment_part(part: &mailparse::ParsedMail, index: usize) -> Option<MailAttachment> {
     let mime = part.ctype.mimetype.as_str();
 
     // Skip body text types and multipart containers
@@ -733,14 +820,23 @@ fn classify_attachment_part(
                 }
             }
             "content-id" => {
-                let val = hdr.get_value().trim().trim_matches('<').trim_matches('>').to_string();
-                if !val.is_empty() { content_id = Some(val); }
+                let val = hdr
+                    .get_value()
+                    .trim()
+                    .trim_matches('<')
+                    .trim_matches('>')
+                    .to_string();
+                if !val.is_empty() {
+                    content_id = Some(val);
+                }
             }
             _ => {}
         }
     }
 
-    if is_inline_text { return None; }
+    if is_inline_text {
+        return None;
+    }
 
     // Derive filename from MIME type if none found
     let filename = filename.unwrap_or_else(|| {
@@ -773,9 +869,15 @@ fn extract_param(header_value: &str, param: &str) -> Option<String> {
         Some(rest[1..end + 1].to_string())
     } else {
         // Unquoted: ends at ; or whitespace
-        let end = rest.find([';', ' ', '\t', '\r', '\n']).unwrap_or(rest.len());
+        let end = rest
+            .find([';', ' ', '\t', '\r', '\n'])
+            .unwrap_or(rest.len());
         let val = &rest[..end];
-        if val.is_empty() { None } else { Some(val.to_string()) }
+        if val.is_empty() {
+            None
+        } else {
+            Some(val.to_string())
+        }
     }
 }
 
@@ -786,17 +888,20 @@ fn strip_html(html: &str) -> String {
     for ch in html.chars() {
         match ch {
             '<' => in_tag = true,
-            '>' => { in_tag = false; out.push(' '); }
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
             _ if !in_tag => out.push(ch),
             _ => {}
         }
     }
     out.replace("&amp;", "&")
-       .replace("&lt;", "<")
-       .replace("&gt;", ">")
-       .replace("&nbsp;", " ")
-       .replace("&#39;", "'")
-       .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
 }
 
 // ── AppleScript body fallback ─────────────────────────────────────────────────
@@ -834,7 +939,11 @@ end tell"#
         .ok()?;
     if out.status.success() {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !text.is_empty() && text != "missing value" { Some(text) } else { None }
+        if !text.is_empty() && text != "missing value" {
+            Some(text)
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -886,7 +995,7 @@ end tell"#
 
     // ── Fallback: open by subject substring ───────────────────────────────────
     let safe_subject = subject.replace('\\', "\\\\").replace('"', "\\\"");
-    let safe_sender  = sender.replace('\\', "\\\\").replace('"', "\\\"");
+    let safe_sender = sender.replace('\\', "\\\\").replace('"', "\\\"");
     let script = format!(
         r#"tell application "Mail"
     activate
@@ -925,14 +1034,19 @@ end tell"#
 
 pub fn detect_language(text: &str) -> Option<String> {
     let info = whatlang::detect(text)?;
-    if !info.is_reliable() { return None; }
-    Some(match info.lang() {
-        whatlang::Lang::Slk => "sk",
-        whatlang::Lang::Ces => "cs",
-        whatlang::Lang::Eng => "en",
-        whatlang::Lang::Deu => "de",
-        _ => return None,
-    }.to_string())
+    if !info.is_reliable() {
+        return None;
+    }
+    Some(
+        match info.lang() {
+            whatlang::Lang::Slk => "sk",
+            whatlang::Lang::Ces => "cs",
+            whatlang::Lang::Eng => "en",
+            whatlang::Lang::Deu => "de",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -964,7 +1078,7 @@ mod tests {
     #[test]
     fn emlx_shard_calc_large_rowid() {
         let rowid: i64 = 315376;
-        let d1 = (rowid / 1000) % 10;  // 315 % 10 = 5
+        let d1 = (rowid / 1000) % 10; // 315 % 10 = 5
         let d2 = (rowid / 10000) % 10; // 31  % 10 = 1
         assert_eq!(d1, 5);
         assert_eq!(d2, 1);
@@ -975,12 +1089,12 @@ mod tests {
         let html = "<p>Dobrý <b>deň</b></p><br>&amp; &lt;test&gt;";
         let out = strip_html(html);
         assert!(out.contains("Dobrý"), "missing 'Dobrý': {out}");
-        assert!(out.contains("deň"),   "missing 'deň': {out}");
+        assert!(out.contains("deň"), "missing 'deň': {out}");
         // &amp; → &  and  &lt;test&gt; → <test>  (entity decode is correct)
         assert!(out.contains("& <test>"), "entity decode wrong: {out}");
         // The actual HTML tags must be gone
-        assert!(!out.contains("<p>"),  "<p> not stripped: {out}");
-        assert!(!out.contains("<b>"),  "<b> not stripped: {out}");
+        assert!(!out.contains("<p>"), "<p> not stripped: {out}");
+        assert!(!out.contains("<b>"), "<b> not stripped: {out}");
         assert!(!out.contains("<br>"), "<br> not stripped: {out}");
     }
 
@@ -1015,11 +1129,21 @@ mod tests {
         let eml = include_bytes!("../../../../fixtures/sk/mail_with_pdf_invoice.eml");
         let parsed = mailparse::parse_mail(eml).expect("parse mail_with_pdf_invoice.eml");
         let attachments = extract_attachments_from_parsed(&parsed);
-        assert!(!attachments.is_empty(), "expected ≥1 attachment in PDF invoice fixture");
+        assert!(
+            !attachments.is_empty(),
+            "expected ≥1 attachment in PDF invoice fixture"
+        );
         let pdf = attachments.iter().find(|a| a.mimetype == "application/pdf");
-        assert!(pdf.is_some(), "expected a PDF attachment, got: {attachments:?}");
+        assert!(
+            pdf.is_some(),
+            "expected a PDF attachment, got: {attachments:?}"
+        );
         let pdf = pdf.unwrap();
-        assert!(pdf.filename.contains("faktura"), "filename should contain 'faktura': {}", pdf.filename);
+        assert!(
+            pdf.filename.contains("faktura"),
+            "filename should contain 'faktura': {}",
+            pdf.filename
+        );
     }
 
     #[test]
@@ -1036,12 +1160,24 @@ mod tests {
         let eml = include_bytes!("../../../../fixtures/sk/mail_with_image_receipt.eml");
         let parsed = mailparse::parse_mail(eml).expect("parse mail_with_image_receipt.eml");
         let attachments = extract_attachments_from_parsed(&parsed);
-        assert!(!attachments.is_empty(), "expected ≥1 attachment in image receipt fixture");
-        let img = attachments.iter().find(|a| a.mimetype.starts_with("image/"));
-        assert!(img.is_some(), "expected an image attachment, got: {attachments:?}");
+        assert!(
+            !attachments.is_empty(),
+            "expected ≥1 attachment in image receipt fixture"
+        );
+        let img = attachments
+            .iter()
+            .find(|a| a.mimetype.starts_with("image/"));
+        assert!(
+            img.is_some(),
+            "expected an image attachment, got: {attachments:?}"
+        );
         let img = img.unwrap();
         assert_eq!(img.mimetype, "image/jpeg");
-        assert!(img.filename.contains("uctenka"), "filename should contain 'uctenka': {}", img.filename);
+        assert!(
+            img.filename.contains("uctenka"),
+            "filename should contain 'uctenka': {}",
+            img.filename
+        );
     }
 
     #[test]

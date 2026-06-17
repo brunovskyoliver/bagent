@@ -277,9 +277,26 @@ final class NotchWindowController: NSObject {
         chatViewModel.isVoiceNotchActive = true
 
         if hasNotch {
-            // ---- Notch path: inline bridge expansion (unchanged) ----
+            // ---- Notch path: inline bridge expansion ----
             chatViewModel.pillHovered = true
             hoverChanged(isHovered: true)
+            // Click-away monitor — clicking outside the status panel (the notch bridge
+            // area) cancels voice, same as the non-notch path.
+            voiceMouseMonitor = NSEvent.addGlobalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown]
+            ) { [weak self] _ in
+                guard let self else { return }
+                let loc = NSEvent.mouseLocation
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if !self.statusPanel.frame.contains(loc) { self.dismissVoice() }
+                }
+            }
+            voiceKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                if event.keyCode == 53 {
+                    Task { @MainActor [weak self] in self?.dismissVoice() }
+                }
+            }
         } else {
             // ---- Non-notch path: drop the voice panel below the pill ----
             if let vp = voicePanel {
@@ -355,9 +372,10 @@ final class NotchWindowController: NSObject {
         if restoreApp { previousApp = nil }
 
         if hasNotch {
+            // Remove click-away / Escape monitors added in presentVoice.
+            if let m = voiceMouseMonitor { NSEvent.removeMonitor(m); voiceMouseMonitor = nil }
+            if let m = voiceKeyMonitor   { NSEvent.removeMonitor(m); voiceKeyMonitor   = nil }
             // After content fades (150 ms), contract notch and restore focus.
-            // Always collapse regardless of mouse position — hover events will
-            // re-expand naturally if the user is still hovering.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
                 guard let self else { return }
                 if !self.isExpanded {
@@ -443,7 +461,14 @@ final class NotchWindowController: NSObject {
             if event.modifierFlags.contains(.command) {
                 let consumed: Bool
                 switch event.keyCode {
-                case 9:  consumed = NSApp.sendAction(#selector(NSText.paste(_:)),     to: nil, from: nil)
+                case 9:
+                    // Intercept ⌘V: if the pasteboard has an image, paste it as an
+                    // attachment and insert [image #n] token rather than raw-pasting bytes.
+                    if self?.chatViewModel.pasteImageFromClipboard() == true {
+                        consumed = true
+                    } else {
+                        consumed = NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+                    }
                 case 8:  consumed = NSApp.sendAction(#selector(NSText.copy(_:)),      to: nil, from: nil)
                 case 7:  consumed = NSApp.sendAction(#selector(NSText.cut(_:)),       to: nil, from: nil)
                 case 0:  consumed = NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)

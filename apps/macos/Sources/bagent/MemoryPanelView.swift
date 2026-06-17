@@ -133,6 +133,9 @@ private struct MemoryItemRow: View {
                     .foregroundStyle(.primary)
                 HStack(spacing: 4) {
                     kindBadge
+                    if let src = item.source, src != "passive" {
+                        sourceBadge(src)
+                    }
                     Text(item.namespace)
                         .font(.system(size: 9))
                         .foregroundStyle(.tertiary)
@@ -140,6 +143,16 @@ private struct MemoryItemRow: View {
                         Text("×\(item.use_count)")
                             .font(.system(size: 9))
                             .foregroundStyle(.quaternary)
+                    }
+                }
+                if let conf = item.confidence, let imp = item.importance {
+                    HStack(spacing: 6) {
+                        Label(String(format: "%.0f%%", conf * 100), systemImage: "checkmark.circle")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                        Label(String(format: "%.0f%%", imp * 100), systemImage: "star")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -153,6 +166,22 @@ private struct MemoryItemRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
+    }
+
+    private func sourceBadge(_ src: String) -> some View {
+        let (label, color): (String, Color) = switch src {
+        case "explicit":   ("expl", .blue)
+        case "user_edit":  ("edit", .teal)
+        case "import":     ("imp",  .indigo)
+        default:           (src,    .gray)
+        }
+        return Text(label)
+            .font(.system(size: 9, weight: .medium))
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.15))
+            .foregroundStyle(color)
+            .clipShape(Capsule())
     }
 
     private var kindBadge: some View {

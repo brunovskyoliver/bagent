@@ -19,8 +19,8 @@ impl AttachmentKind {
     pub fn as_str(&self) -> &str {
         match self {
             AttachmentKind::Image => "image",
-            AttachmentKind::Pdf   => "pdf",
-            AttachmentKind::Text  => "text",
+            AttachmentKind::Pdf => "pdf",
+            AttachmentKind::Text => "text",
             AttachmentKind::Other => "other",
         }
     }
@@ -28,9 +28,9 @@ impl AttachmentKind {
     pub fn from_db_str(s: &str) -> Self {
         match s {
             "image" => AttachmentKind::Image,
-            "pdf"   => AttachmentKind::Pdf,
-            "text"  => AttachmentKind::Text,
-            _       => AttachmentKind::Other,
+            "pdf" => AttachmentKind::Pdf,
+            "text" => AttachmentKind::Text,
+            _ => AttachmentKind::Other,
         }
     }
 }
@@ -70,8 +70,14 @@ pub fn extract(path: &Path, mime: &str) -> Result<ExtractResult> {
     }
 
     // Office documents — docx via textutil, xlsx via python zipfile.
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    if ext == "docx" || mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext == "docx"
+        || mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    {
         if let Some(text) = extract_docx_text(path) {
             return Ok(ExtractResult {
                 kind: AttachmentKind::Text,
@@ -80,7 +86,8 @@ pub fn extract(path: &Path, mime: &str) -> Result<ExtractResult> {
             });
         }
     }
-    if ext == "xlsx" || ext == "xls"
+    if ext == "xlsx"
+        || ext == "xls"
         || mime == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         || mime == "application/vnd.ms-excel"
     {
@@ -95,8 +102,7 @@ pub fn extract(path: &Path, mime: &str) -> Result<ExtractResult> {
 
     // Plain text / source / markdown / data files.
     if mime.starts_with("text/") || is_text_extension(path) {
-        let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|_| "[nedá sa čítať]".to_string());
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|_| "[nedá sa čítať]".to_string());
         let preview = truncate_to_chars(&raw, MAX_TEXT_CHARS);
         return Ok(ExtractResult {
             kind: AttachmentKind::Text,
@@ -130,9 +136,27 @@ fn is_text_extension(path: &Path) -> bool {
         .to_lowercase();
     matches!(
         ext.as_str(),
-        "txt" | "md" | "markdown" | "csv" | "json" | "yaml" | "yml"
-            | "rs"  | "swift" | "py"  | "js"   | "ts"  | "tsx" | "jsx"
-            | "html"| "css"   | "sql" | "toml" | "sh"  | "xml" | "log"
+        "txt"
+            | "md"
+            | "markdown"
+            | "csv"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "rs"
+            | "swift"
+            | "py"
+            | "js"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "html"
+            | "css"
+            | "sql"
+            | "toml"
+            | "sh"
+            | "xml"
+            | "log"
     )
 }
 
@@ -172,10 +196,15 @@ fn extract_pdf_text(path: &Path) -> Option<String> {
 fn extract_docx_text(path: &Path) -> Option<String> {
     let out = std::process::Command::new("textutil")
         .args(["-convert", "txt", "-stdout", &path.to_string_lossy()])
-        .output().ok()?;
-    if !out.status.success() { return None; }
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    if text.trim().is_empty() { return None; }
+    if text.trim().is_empty() {
+        return None;
+    }
     Some(truncate_to_chars(&text, MAX_TEXT_CHARS))
 }
 
@@ -210,10 +239,15 @@ print('\n'.join(texts))
 "#;
     let out = std::process::Command::new("python3")
         .args(["-c", script, &path.to_string_lossy()])
-        .output().ok()?;
-    if !out.status.success() { return None; }
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let text = String::from_utf8_lossy(&out.stdout).to_string();
-    if text.trim().is_empty() { return None; }
+    if text.trim().is_empty() {
+        return None;
+    }
     Some(truncate_to_chars(&text, MAX_TEXT_CHARS))
 }
 

@@ -132,23 +132,36 @@ CREATE INDEX approvals_pending ON approvals(decision) WHERE decision IS NULL;
 
 ### `memory_items`
 
-Agent memory: facts, preferences, extracted entities, and summaries the agent has stored.
+Agent memory: facts, preferences, extracted entities, glossary, style profiles, corrections, and contacts.
 
 ```sql
+-- V4 base schema
 CREATE TABLE memory_items (
     id            TEXT PRIMARY KEY,           -- UUID v7
-    namespace     TEXT NOT NULL,              -- 'global' | 'mail' | 'odoo' | 'user_pref' | ...
-    kind          TEXT NOT NULL,              -- 'fact' | 'entity' | 'summary' | 'preference' | 'instruction'
+    namespace     TEXT NOT NULL,              -- 'global' | 'user_pref' | 'sk_glossary' | 'style_profile'
+                                              --   | 'contacts' | 'corrections' | 'negative_rules' | ...
+    kind          TEXT NOT NULL,              -- 'fact' | 'entity' | 'preference' | 'instruction'
+                                              --   | 'correction' | 'sk_glossary' | 'style_profile'
+                                              --   | 'contact' | 'project' | 'workflow' | 'negative_rule' | 'profile'
     language      TEXT NOT NULL DEFAULT 'und',
     text          TEXT NOT NULL,              -- the memory content
     source_ref    TEXT,                       -- optional: e.g. 'message:<id>'
     metadata_json TEXT,                       -- additional structured data
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
-    expires_at    TEXT                        -- NULL = permanent
+    expires_at    TEXT,                       -- NULL = permanent
+    -- V11 ledger columns:
+    confidence    REAL    NOT NULL DEFAULT 0.8,   -- extractor confidence [0,1]
+    importance    REAL    NOT NULL DEFAULT 0.5,   -- importance score [0,1]; feeds retrieval ranking
+    status        TEXT    NOT NULL DEFAULT 'active',   -- 'active' | 'superseded' | 'deleted'
+    source        TEXT    NOT NULL DEFAULT 'passive',  -- 'passive' | 'explicit' | 'user_edit' | 'import'
+    sensitivity   TEXT    NOT NULL DEFAULT 'normal',   -- 'normal' | 'sensitive'
+    subject       TEXT,                        -- optional subject tag (person, project, entity)
+    supersedes_id TEXT                         -- id of the item this row supersedes
 );
 
-CREATE INDEX memory_items_namespace ON memory_items(namespace, kind);
+-- Retrieval always hard-filters on (status, namespace, kind)
+CREATE INDEX idx_memory_items_status_ns_kind ON memory_items (status, namespace, kind);
 CREATE INDEX memory_items_language  ON memory_items(language);
 
 CREATE VIRTUAL TABLE memory_fts USING fts5(
@@ -159,6 +172,13 @@ CREATE VIRTUAL TABLE memory_fts USING fts5(
     tokenize='unicode61'
 );
 ```
+
+**Retrieval invariants:**
+- Only `status='active'` rows are returned by `retrieve_filtered`.
+- Only `sensitivity='normal'` rows are returned (sensitive items require explicit opt-in never currently granted).
+- Passive extraction is blocked for `sensitivity='sensitive'` items regardless of confidence/importance.
+- Explicit/user_edit insertion against an active passive item in the same namespace (cosine > 0.75) → supersedes the passive item (`status='superseded'`).
+- `prune()` only hard-deletes rows with `status IN ('deleted','superseded')` older than the prune window.
 
 ---
 
@@ -300,3 +320,74 @@ Each connector writes into its own namespace. Cross-connector queries must expli
 - `refinery` runs migrations at daemon startup; rolls back on error (SQLite transactions).
 - Schema version stored in `refinery_schema_history` table (created automatically by refinery).
 - Breaking schema changes (column rename, type change): always add new column + migration; deprecate old in next version.
+
+---
+
+## Phase 8 — Codex Task Harness
+
+### Task Rating (`crates/agent/src/task_rater.rs`)
+
+Deterministic scoring against bilingual SK/EN keyword gates. No LLM involvement in the
+rating decision. Score maps to level:
+
+| Score | `TaskLevel` | `ContextScope` | Approval required |
+|---|---|---|---|
+| 0–9 | `LocalOnly` | `None` | No |
+| 10–29 | `LocalPreferred` | `None` | No |
+| 30–59 | `CodexCandidate` | `SummariesOnly` | Yes (if run) |
+| 60–84 | `CodexRecommended` | `SelectedRecords` | Yes |
+| 85+ | `CodexRequired` | `UserApprovedPacket` | Yes |
+
+`PrivacyRisk` levels: `Low` → `Medium` → `High` → `Sensitive`.
+Raised by: raw mail/WhatsApp bodies, Odoo customer records, invoices, personal data, legal disputes, credentials, private notes, memory, screenshots.
+
+### Context Packet (`CodexContextPacket`)
+
+```rust
+pub struct CodexContextPacket {
+    pub user_request: String,
+    pub allowed_context: Vec<ContextItem>,
+    pub forbidden_context_types: Vec<String>,
+    pub constraints: Vec<String>,
+    pub expected_output: CodexExpectedOutput,
+}
+
+pub struct ContextItem {
+    pub source: String,       // "apple_mail" | "apple_notes" | "odoo" | ...
+    pub title: String,
+    pub summary: String,      // truncated summary, never raw body by default
+    pub record_ref: String,   // opaque ID for citation
+    pub pii: bool,
+}
+```
+
+Default `forbidden_context_types` (always present, never overridable by Codex):
+`credentials`, `tokens`, `keychain`, `database_raw`, `memory_db`, `browser_stores`,
+`ssh_keys`, `gnupg`, `password_managers`, `raw_mail_bodies` (unless explicitly approved),
+`screenshots` (unless explicitly included), `unrelated_private_files`.
+
+### Codex Audit Log
+
+Every `/codex/run-task` attempt writes to the existing `audit_log` table with:
+```json
+{
+  "action": "codex_run_task",
+  "description": "<task description>",
+  "level": "CodexRecommended",
+  "privacy_risk": "Medium",
+  "context_sources": ["apple_mail", "odoo"],
+  "approval_id": "<uuid>",
+  "exit_code": 0,
+  "timed_out": false,
+  "output_hash": "<sha256 hex>"
+}
+```
+Raw private context bodies are **never** included in the audit payload.
+
+### Codex Configuration
+
+Stored in `UserDefaults` (SwiftUI layer) — not in the SQLite DB:
+- `bagent.codex_path` — user-specified binary path; empty = auto-discover from `$PATH`
+
+The daemon reads this on `/codex/run-task` via the `CodexConfig` passed at startup.
+Binary presence is exposed via `/codex/status` and the `connectors.codex` field in `/health`.

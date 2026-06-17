@@ -174,14 +174,18 @@ struct NotchWrapView: View {
                            lineWidth: 1)
             }
 
-            // Left icon — tracks center of wing as it expands
-            Image(systemName: "sparkles")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.white.opacity((isHovered || isVoiceActive) ? 1.0 : 0.75))
-                .contentTransition(.symbolEffect(.replace))
-                .position(leftIconPos)
+            // Left icon — only when chat open, hovered, or voice active (idle = blank notch)
+            if viewModel.isExpanded || isHovered || isVoiceActive {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity((isHovered || isVoiceActive) ? 1.0 : 0.75))
+                    .contentTransition(.symbolEffect(.replace))
+                    .position(leftIconPos)
+            }
 
-            // Right icon — animated waveform symbol in voice mode, status dot otherwise
+            // Right icon — animated waveform symbol in voice mode, status dot otherwise.
+            // Dot hidden when idle and collapsed (pure notch bg); shown when chat open,
+            // task running, approval pending, or error (so a down daemon always surfaces).
             if isVoiceActive {
                 Image(systemName: voiceIconName)
                     .font(.system(size: 12, weight: .semibold))
@@ -195,7 +199,8 @@ struct NotchWrapView: View {
                     .contentTransition(.symbolEffect(.replace))
                     .position(rightIconPos)
                     .opacity(voiceContentOpacity)
-            } else {
+            } else if viewModel.isExpanded || status != .ready {
+                // Show dot: chat open (green) OR non-idle status (thinking/approval/error)
                 StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
                     .position(rightIconPos)
             }
@@ -240,14 +245,22 @@ struct NotchWrapView: View {
         }
         .onHover { hovering in
             isHovered = hovering
-            setExpansion(expanded: hovering || isDragTargeted || viewModel.pillHovered)
+            // Don't let hover-leave shrink the bridge during voice mode — the voice
+            // dimensions are owned by setVoiceState; only hover controls expansion otherwise.
+            if !isVoiceActive {
+                setExpansion(expanded: hovering || isDragTargeted || viewModel.pillHovered)
+            }
             onHoverChanged(hovering || isDragTargeted)
         }
         .onChange(of: viewModel.pillHovered) {
-            setExpansion(expanded: viewModel.pillHovered || isHovered || isDragTargeted)
+            if !isVoiceActive {
+                setExpansion(expanded: viewModel.pillHovered || isHovered || isDragTargeted)
+            }
         }
         .onChange(of: isDragTargeted) { _, targeted in
-            setExpansion(expanded: targeted || isHovered || viewModel.pillHovered)
+            if !isVoiceActive {
+                setExpansion(expanded: targeted || isHovered || viewModel.pillHovered)
+            }
             onHoverChanged(targeted || isHovered)
         }
         .onChange(of: viewModel.isVoiceNotchActive) { _, active in
@@ -482,6 +495,8 @@ struct ExpandedChatView: View {
                     SettingsView(viewModel: viewModel)
                 } else if viewModel.showMemory {
                     MemoryPanelView(viewModel: viewModel)
+                } else if viewModel.showSkills {
+                    SkillsPanelView(viewModel: viewModel)
                 } else if viewModel.showDebug {
                     DebugPanelView(viewModel: viewModel)
                 } else {
@@ -660,6 +675,13 @@ struct ExpandedChatView: View {
             }
             .buttonStyle(.plain)
             .help("Debug")
+            Button { viewModel.toggleSkillsPanel() } label: {
+                Image(systemName: viewModel.showSkills ? "wand.and.stars" : "wand.and.stars.inverse")
+                    .font(.system(size: 14))
+                    .foregroundStyle(viewModel.showSkills ? AnyShapeStyle(Color.teal) : AnyShapeStyle(.tertiary))
+            }
+            .buttonStyle(.plain)
+            .help("Schopnosti")
             Button { viewModel.toggleMemoryPanel() } label: {
                 Image(systemName: viewModel.showMemory ? "brain.fill" : "brain")
                     .font(.system(size: 14))
@@ -976,6 +998,17 @@ struct PromptTraceDisclosure: View {
                         .buttonStyle(.plain)
                         .help("Kopírovať prompt/debug trace")
                     }
+                    contextPlanChips
+                    if let ids = message.debugSelectedMemoryIds, !ids.isEmpty {
+                        Text("Pamäť: \(ids.count) záznamov")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                    if message.debugConversationRecallInjected == true {
+                        Label("Recall histórie konverzácie", systemImage: "clock.arrow.circlepath")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
                     ScrollView {
                         Text(message.debugPayload ?? "Načítavam trace…")
                             .font(.system(size: 10, design: .monospaced))
@@ -999,7 +1032,29 @@ struct PromptTraceDisclosure: View {
         var parts = [base]
         if let count = message.debugMessageCount { parts.append("\(count) msgs") }
         if let tokens = message.debugTokenEstimate { parts.append("~\(tokens) tok") }
+        if let skills = message.debugSelectedSkills, !skills.isEmpty { parts.append("\(skills.count) skills") }
+        if message.debugConversationRecallInjected == true { parts.append("recall") }
         return parts.joined(separator: " · ")
+    }
+
+    @ViewBuilder
+    private var contextPlanChips: some View {
+        if let skills = message.debugSelectedSkills, !skills.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(skills, id: \.self) { name in
+                        Text(name)
+                            .font(.system(size: 9, weight: .medium))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.teal.opacity(0.15))
+                            .foregroundStyle(Color.teal)
+                            .clipShape(Capsule())
+                    }
+                }
+                .padding(.horizontal, 2)
+            }
+        }
     }
 }
 
@@ -1035,29 +1090,139 @@ struct MessageBubble: View {
                     }
                     MessageContentView(text: message.content, isStreaming: isStreaming)
                         .padding(.horizontal, 10)
-                        // Extra top padding when the button is present so text doesn't overlap it.
-                        .padding(.top, (message.mailRef != nil && !isStreaming) ? 38 : 7)
+                        // Extra top padding when a button is present so text doesn't overlap it.
+                        .padding(.top, ((message.mailRef != nil || message.odooRef != nil || message.whatsappRef != nil) && !isStreaming) ? 38 : 7)
                         .padding(.bottom, 7)
                         .background(Color(nsColor: .controlBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                         .overlay(alignment: .topTrailing) {
                             // Show only after streaming ends so no layout jump mid-response.
-                            if let ref = message.mailRef, !isStreaming {
-                                MailOpenButton(ref: ref) { viewModel.openMail(ref) }
-                                    .padding(.top, 6)
-                                    .padding(.trailing, 8)
-                                    .transition(.opacity)
+                            if !isStreaming {
+                                HStack(spacing: 6) {
+                                    if let ref = message.whatsappRef {
+                                        WhatsAppOpenButton(ref: ref)
+                                    }
+                                    if let ref = message.odooRef {
+                                        OdooOpenButton(ref: ref) { viewModel.openOdoo(ref) }
+                                    }
+                                    if let ref = message.mailRef {
+                                        MailOpenButton(ref: ref) { viewModel.openMail(ref) }
+                                    }
+                                }
+                                .padding(.top, 6)
+                                .padding(.trailing, 8)
+                                .transition(.opacity)
                             }
                         }
                     // Mail attachments shown below the assistant response (Phase 5C)
                     if !message.attachments.isEmpty {
                         AttachmentStrip(attachments: message.attachments)
                     }
+                    // Codex task rating badge (Phase 8) — shown after streaming ends
+                    if !isStreaming, let rating = message.taskRating {
+                        CodexRatingBadge(rating: rating)
+                    }
                 }
             }
 
             if message.role == .assistant { Spacer(minLength: 40) }
         }
+    }
+}
+
+// MARK: - Codex Task Rating Badge (Phase 8)
+
+/// Small inline chip shown below an assistant message when the daemon emitted a `task_rating` SSE event.
+/// Only shown for CodexCandidate+ levels; provides transparency about complexity classification.
+struct CodexRatingBadge: View {
+    let rating: (level: String, score: Int, reasons: [String], privacyRisk: String)
+
+    @State private var expanded: Bool = false
+
+    private var levelColor: Color {
+        switch rating.level {
+        case "LocalOnly", "LocalPreferred": return .secondary
+        case "CodexCandidate": return .orange
+        case "CodexRecommended": return Color.accentColor
+        case "CodexRequired": return .red
+        default: return .secondary
+        }
+    }
+
+    private var levelLabel: String {
+        switch rating.level {
+        case "LocalOnly": return "Lokálna úloha"
+        case "LocalPreferred": return "Lokálna (preferovaná)"
+        case "CodexCandidate": return "Kandidát pre Codex"
+        case "CodexRecommended": return "Odporúčaný Codex"
+        case "CodexRequired": return "Vyžaduje Codex"
+        default: return rating.level
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 10))
+                        .foregroundStyle(levelColor)
+                    Text(levelLabel)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(levelColor)
+                    Text("·")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                    Text("skóre \(rating.score)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                    if !rating.privacyRisk.isEmpty && rating.privacyRisk != "Low" {
+                        Text("·")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                        Text(rating.privacyRisk)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.orange)
+                    }
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if expanded && !rating.reasons.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(rating.reasons, id: \.self) { reason in
+                        HStack(alignment: .top, spacing: 4) {
+                            Text("·")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                            Text(reason)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(.leading, 4)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(levelColor.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(levelColor.opacity(0.2), lineWidth: 0.5)
+                )
+        )
     }
 }
 
@@ -1203,6 +1368,93 @@ struct MailOpenButton: View {
             .background(Capsule().fill(Color.accentColor))
         }
         .buttonStyle(.plain)
+        .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isHovered)
+        .onHover { h in
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.68)) {
+                isHovered = h
+            }
+            h ? NSCursor.pointingHand.push() : NSCursor.pop()
+        }
+    }
+}
+
+// MARK: - Odoo open button (Phase 6)
+
+/// Capsule button displayed above assistant messages that found an Odoo record.
+/// Clicking opens the record in Safari via the daemon's `/odoo/open` route.
+struct OdooOpenButton: View {
+    let ref: DaemonClient.OdooRef
+    let onOpen: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 6) {
+                if isHovered {
+                    Text("Otvoriť v Safari")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .transition(
+                            .asymmetric(
+                                insertion: .opacity.combined(with: .move(edge: .trailing)),
+                                removal: .opacity.combined(with: .move(edge: .trailing))
+                            )
+                        )
+                }
+                Image(systemName: "globe")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+            .padding(.horizontal, 9)
+            .frame(height: 28)
+            .frame(minWidth: 28)
+            .background(Capsule().fill(Color.orange))
+        }
+        .buttonStyle(.plain)
+        .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isHovered)
+        .onHover { h in
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.68)) {
+                isHovered = h
+            }
+            h ? NSCursor.pointingHand.push() : NSCursor.pop()
+        }
+    }
+}
+
+// MARK: - WhatsApp chat chip (Phase 11)
+
+/// Minimal chip shown above assistant messages that found a WhatsApp chat.
+struct WhatsAppOpenButton: View {
+    let ref: DaemonClient.WhatsappRef
+
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if isHovered {
+                Text(ref.contact_name ?? "WhatsApp")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .transition(
+                        .asymmetric(
+                            insertion: .opacity.combined(with: .move(edge: .trailing)),
+                            removal: .opacity.combined(with: .move(edge: .trailing))
+                        )
+                    )
+            }
+            Image(systemName: "bubble.left.and.bubble.right.fill")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 28)
+        .frame(minWidth: 28)
+        .background(Capsule().fill(Color.green))
         .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isHovered)
         .onHover { h in
             withAnimation(.spring(response: 0.28, dampingFraction: 0.68)) {

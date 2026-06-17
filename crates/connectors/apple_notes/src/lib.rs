@@ -36,9 +36,8 @@ pub struct NotesConnector {
 impl NotesConnector {
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("no home dir"))?;
-        let note_store = home.join(
-            "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite",
-        );
+        let note_store =
+            home.join("Library/Group Containers/group.com.apple.notes/NoteStore.sqlite");
         Ok(Self { note_store })
     }
 
@@ -202,7 +201,9 @@ impl NotesConnector {
     /// Fetch the HTML body of a note via JXA / osascript.
     /// Returns None for locked notes or when Notes.app is unavailable.
     pub async fn get_note_body(&self, coredata_id: &str) -> Result<Option<String>> {
-        if coredata_id.is_empty() { return Ok(None); }
+        if coredata_id.is_empty() {
+            return Ok(None);
+        }
 
         // Escape single quotes inside the ID so it embeds safely in JS
         let safe_id = coredata_id.replace('\'', "\\'");
@@ -239,11 +240,9 @@ impl NotesConnector {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         conn.execute_batch("PRAGMA busy_timeout = 2000;")?;
-        let store_uuid: String = conn.query_row(
-            "SELECT Z_UUID FROM Z_METADATA LIMIT 1",
-            [],
-            |r| r.get(0),
-        ).unwrap_or_default();
+        let store_uuid: String = conn
+            .query_row("SELECT Z_UUID FROM Z_METADATA LIMIT 1", [], |r| r.get(0))
+            .unwrap_or_default();
         Ok((conn, store_uuid))
     }
 }
@@ -295,12 +294,17 @@ fn note_from_row(r: NoteRow, store_uuid: &str) -> Note {
 
 pub fn detect_language(text: &str) -> Option<String> {
     let info = whatlang::detect(text)?;
-    if !info.is_reliable() { return None; }
-    Some(match info.lang() {
-        whatlang::Lang::Slk => "sk",
-        whatlang::Lang::Ces => "cs",
-        whatlang::Lang::Eng => "en",
-        whatlang::Lang::Deu => "de",
-        _ => return None,
-    }.to_string())
+    if !info.is_reliable() {
+        return None;
+    }
+    Some(
+        match info.lang() {
+            whatlang::Lang::Slk => "sk",
+            whatlang::Lang::Ces => "cs",
+            whatlang::Lang::Eng => "en",
+            whatlang::Lang::Deu => "de",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }

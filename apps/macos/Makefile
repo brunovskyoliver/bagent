@@ -5,7 +5,7 @@ REPO_ROOT  = ../..
 DAEMON_DEV = $(REPO_ROOT)/target/debug/bagentd
 DAEMON_REL = $(REPO_ROOT)/target/release/bagentd
 
-.PHONY: run build daemon bundle clean
+.PHONY: run build daemon bundle clean whatsapp-bridge-install
 
 # Dev run: builds daemon first, then the Swift app. The Info.plist is embedded in
 # the binary (see Package.swift) so microphone/TCC works without bundling. Ad-hoc
@@ -44,6 +44,7 @@ bundle: build daemon
   <key>LSUIElement</key>         <true/>\n\
   <key>NSHighResolutionCapable</key> <true/>\n\
   <key>NSMicrophoneUsageDescription</key> <string>bagent uses the microphone to transcribe your voice on-device with Whisper. Audio never leaves your Mac.</string>\n\
+  <key>NSScreenCaptureUsageDescription</key> <string>bagent captures your screen on demand to answer questions about what is displayed. Screenshots are processed in memory and never saved to disk.</string>\n\
 </dict></plist>\n' > "$(BUNDLE)/Contents/Info.plist"
 	codesign --force --sign - "$(BUNDLE)"
 	@echo "✓  $(BUNDLE) ready — open $(BUNDLE) or drag to Applications"
@@ -51,3 +52,9 @@ bundle: build daemon
 clean:
 	rm -rf .build $(BUNDLE)
 	cargo clean --manifest-path $(REPO_ROOT)/Cargo.toml
+
+# Install the WhatsApp Web bridge Node dependencies.
+# Requires Node.js ≥ 18. Chromium/Puppeteer will be downloaded on first run (~150 MB).
+# Run once before connecting WhatsApp for the first time.
+whatsapp-bridge-install:
+	cd $(REPO_ROOT)/crates/connectors/whatsapp/bridge && npm install

@@ -81,8 +81,7 @@ impl WindowIntentClassifier {
         );
 
         let raw = self.ollama.generate_raw(&self.model, &prompt, 0.0).await?;
-        let intent: WindowIntent = serde_json::from_str(clean_json(&raw))
-            .unwrap_or_default();
+        let intent: WindowIntent = serde_json::from_str(clean_json(&raw)).unwrap_or_default();
         Ok(intent)
     }
 }
