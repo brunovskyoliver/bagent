@@ -38,6 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// ⌥Space behavior:
     /// - chat open → collapse
+    /// - voice disabled → open/collapse normal chat
     /// - collapsed → open voice overlay instantly; a second ⌥Space within the
     ///   double-press window dismisses voice and opens the chat window instead.
     private var lastHotkeyAt: Date?
@@ -46,6 +47,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleHotkey() {
         guard let nc = notchController else { return }
         let now = Date()
+
+        if !nc.isVoiceModeEnabled {
+            lastHotkeyAt = nil
+            nc.toggle()
+            return
+        }
 
         if nc.isExpanded {
             lastHotkeyAt = nil

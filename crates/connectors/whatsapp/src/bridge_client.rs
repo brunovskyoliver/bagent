@@ -46,28 +46,52 @@ impl BridgeClient {
     }
 
     async fn get_json(&self, path: &str) -> Result<Value, WhatsappError> {
-        self.http
+        let response = self
+            .http
             .get(self.url(path))
             .header("Authorization", self.auth())
             .send()
             .await
-            .map_err(|e| WhatsappError::Http(e.to_string()))?
+            .map_err(|e| WhatsappError::Http(e.to_string()))?;
+        let status = response.status();
+        let value = response
             .json::<Value>()
             .await
-            .map_err(|e| WhatsappError::Parse(e.to_string()))
+            .map_err(|e| WhatsappError::Parse(e.to_string()))?;
+        if !status.is_success() {
+            let detail = value
+                .get("detail")
+                .or_else(|| value.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("bridge request failed");
+            return Err(WhatsappError::BridgeError(detail.to_string()));
+        }
+        Ok(value)
     }
 
     async fn post_json(&self, path: &str, body: Value) -> Result<Value, WhatsappError> {
-        self.http
+        let response = self
+            .http
             .post(self.url(path))
             .header("Authorization", self.auth())
             .json(&body)
             .send()
             .await
-            .map_err(|e| WhatsappError::Http(e.to_string()))?
+            .map_err(|e| WhatsappError::Http(e.to_string()))?;
+        let status = response.status();
+        let value = response
             .json::<Value>()
             .await
-            .map_err(|e| WhatsappError::Parse(e.to_string()))
+            .map_err(|e| WhatsappError::Parse(e.to_string()))?;
+        if !status.is_success() {
+            let detail = value
+                .get("detail")
+                .or_else(|| value.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("bridge request failed");
+            return Err(WhatsappError::BridgeError(detail.to_string()));
+        }
+        Ok(value)
     }
 
     // ── API calls ─────────────────────────────────────────────────────────────
@@ -80,6 +104,10 @@ impl BridgeClient {
     pub async fn qr(&self) -> Result<Option<String>, WhatsappError> {
         let v = self.get_json("/qr").await?;
         Ok(v.get("qr").and_then(|q| q.as_str()).map(|s| s.to_string()))
+    }
+
+    pub async fn debug(&self) -> Result<Value, WhatsappError> {
+        self.get_json("/debug").await
     }
 
     pub async fn list_contacts(&self, limit: usize) -> Result<Vec<WhatsappContact>, WhatsappError> {

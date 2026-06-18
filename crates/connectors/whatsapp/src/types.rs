@@ -9,6 +9,7 @@ pub enum WhatsappConnectionStatus {
     Starting,
     Qr,
     Authenticated,
+    AuthenticatedWaitingForReady,
     Ready,
     Disconnected,
     Error,
@@ -25,6 +26,7 @@ impl std::fmt::Display for WhatsappConnectionStatus {
             Self::Starting => "starting",
             Self::Qr => "qr",
             Self::Authenticated => "authenticated",
+            Self::AuthenticatedWaitingForReady => "authenticated_waiting_for_ready",
             Self::Ready => "ready",
             Self::Disconnected => "disconnected",
             Self::Error => "error",
@@ -42,6 +44,7 @@ pub struct WhatsappStatus {
     pub status: WhatsappConnectionStatus,
     pub me: Option<WhatsappAccount>,
     pub error: Option<String>,
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

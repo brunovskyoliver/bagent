@@ -27,7 +27,6 @@ const NODE_CANDIDATES: &[&str] = &["/opt/homebrew/bin/node", "/usr/local/bin/nod
 /// Order: configured path → known well-known paths → `which node`.
 /// Returns `Err(WhatsappError::NodeNotFound)` when none is found.
 pub async fn resolve_node(configured: Option<&str>) -> Result<PathBuf, WhatsappError> {
-
     if let Some(p) = configured {
         let path = PathBuf::from(p);
         if is_executable(&path) {

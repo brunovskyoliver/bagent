@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct SettingsView: View {
     @ObservedObject var viewModel: ChatViewModel
@@ -12,27 +13,43 @@ struct SettingsView: View {
     }
 
     @State private var availableMics: [String] = []
+    @State private var selectedCategory: SettingsCategory = .overview
+    @State private var showWhatsappDiagnostics = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                statusSection
-                permissionsSection
-                connectorsSection
-                ollamaSection
-                rulesSection
-                codexSection
-                odooSection
-                whatsappSection
-                shortcutsSection
-                usageSection
+        VStack(spacing: 0) {
+            SettingsCategoryBar(selection: $selectedCategory)
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    switch selectedCategory {
+                    case .overview:
+                        statusSection
+                        usageSection
+                    case .access:
+                        permissionsSection
+                    case .connectors:
+                        connectorsSection
+                        whatsappSection
+                        odooSection
+                        codexSection
+                    case .ai:
+                        ollamaSection
+                    case .advanced:
+                        rulesSection
+                        shortcutsSection
+                    }
+                }
+                .padding(16)
             }
-            .padding(16)
         }
         .task {
             availableMics = SpeechController.availableInputDeviceNames()
-            await viewModel.loadModels()
             await viewModel.refreshHealth()
+            await viewModel.loadModels()
             await viewModel.loadUsage()
         }
     }
@@ -94,6 +111,26 @@ struct SettingsView: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Divider().padding(.vertical, 2)
+
+                HStack(spacing: 8) {
+                    Image(systemName: viewModel.voiceModeEnabled ? "waveform.circle.fill" : "waveform.circle")
+                        .font(.system(size: 13))
+                        .foregroundStyle(viewModel.voiceModeEnabled ? Color.accentColor : Color.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Hlasový režim")
+                            .font(.system(size: 12))
+                        Text(viewModel.voiceModeEnabled ? "⌥Space otvorí hlasový vstup." : "⌥Space otvorí normálny chat. Whisper sa nenačíta.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $viewModel.voiceModeEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .accessibilityLabel("Hlasový režim")
                 }
 
                 Divider().padding(.vertical, 2)
@@ -168,10 +205,12 @@ struct SettingsView: View {
                     Text("Whisper model")
                         .font(.system(size: 12))
                     Spacer()
-                    Text(speech.state == .loadingModel ? "sťahuje sa…"
-                         : (speech.isModelLoaded ? "pripravený" : "stiahne sa pri prvom použití"))
+                    Text(!viewModel.voiceModeEnabled ? "vypnutý"
+                         : (speech.state == .loadingModel ? "sťahuje sa…"
+                            : (speech.isModelLoaded ? "pripravený" : "stiahne sa pri prvom použití")))
                         .font(.system(size: 11)).foregroundStyle(.secondary)
                 }
+                .opacity(viewModel.voiceModeEnabled ? 1 : 0.55)
 
                 Divider().padding(.vertical, 2)
 
@@ -184,6 +223,8 @@ struct SettingsView: View {
                 }
                 .labelsHidden()
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .disabled(!viewModel.voiceModeEnabled)
+                .opacity(viewModel.voiceModeEnabled ? 1 : 0.55)
                 Text("Ak vybraný mikrofón nie je dostupný, použije sa predvolený.")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
@@ -263,6 +304,17 @@ struct SettingsView: View {
                         Spacer()
                         Text(cm).font(.system(size: 11)).foregroundStyle(.tertiary)
                     }
+                }
+                HStack {
+                    Spacer()
+                    Button {
+                        Task { await viewModel.refreshHealth() }
+                    } label: {
+                        Label("Obnoviť stav", systemImage: "arrow.clockwise")
+                    }
+                    .font(.system(size: 11))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.accentColor)
                 }
             }
         }
@@ -511,6 +563,14 @@ struct SettingsView: View {
                     SecureField("(z Odoo → Nastavenia → API Keys)", text: $viewModel.odooAPIKey)
                         .font(.system(size: 12, design: .monospaced))
                         .textFieldStyle(.roundedBorder)
+                    Button {
+                        viewModel.loadSavedOdooAPIKey()
+                    } label: {
+                        Image(systemName: "key")
+                            .font(.system(size: 12))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Načítať uložený API kľúč z Keychain")
                 }
 
                 // Status / test button row
@@ -603,25 +663,23 @@ struct SettingsView: View {
                         .foregroundStyle(Color.accentColor)
                 }
 
-                // QR image — shown only when waiting for scan
                 if viewModel.whatsappStatus?.needs_qr == true {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Naskenuj QR kód v WhatsApp → Prepojené zariadenia → Prepojiť zariadenie")
+                    HStack(spacing: 8) {
+                        Image(systemName: "qrcode.viewfinder")
+                            .foregroundStyle(.secondary)
+                        Text("QR párovanie je pripravené na samostatnej obrazovke.")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
-                        if let qrStr = viewModel.whatsappQrString, let img = QRImage.generate(from: qrStr) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .interpolation(.none)
-                                .frame(width: 180, height: 180)
-                                .cornerRadius(6)
-                        } else {
-                            ProgressView()
-                                .scaleEffect(0.7)
+                        Spacer()
+                        Button("Otvoriť QR") {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
+                                viewModel.showSettings = false
+                                viewModel.showWhatsappPairing = true
+                            }
+                            viewModel.refreshWhatsappQr()
                         }
-                        Button("Obnoviť QR") { viewModel.refreshWhatsappQr() }
-                            .buttonStyle(.bordered)
-                            .font(.system(size: 11))
+                        .buttonStyle(.bordered)
+                        .font(.system(size: 11))
                     }
                 }
 
@@ -657,6 +715,63 @@ struct SettingsView: View {
                         .foregroundStyle(msg.hasPrefix("✓") ? Color.primary : Color.red)
                 }
 
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        showWhatsappDiagnostics.toggle()
+                    }
+                    if showWhatsappDiagnostics {
+                        Task { await viewModel.loadWhatsappDebug() }
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: showWhatsappDiagnostics ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .frame(width: 12)
+                        Text("Diagnostika")
+                            .font(.system(size: 11, weight: .medium))
+                        Spacer()
+                        if viewModel.isLoadingWhatsappDebug {
+                            ProgressView().scaleEffect(0.55)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                if showWhatsappDiagnostics {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            Button {
+                                Task { await viewModel.loadWhatsappDebug() }
+                            } label: {
+                                Label("Obnoviť", systemImage: "arrow.clockwise")
+                            }
+                            .buttonStyle(.plain)
+                            Button {
+                                copySettingsText(viewModel.whatsappDebugPayload ?? "")
+                            } label: {
+                                Label("Kopírovať JSON", systemImage: "doc.on.doc")
+                            }
+                            .buttonStyle(.plain)
+                            .disabled((viewModel.whatsappDebugPayload ?? "").isEmpty)
+                        }
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.accentColor)
+
+                        ScrollView {
+                            Text(viewModel.whatsappDebugPayload ?? "Žiadne diagnostické dáta.")
+                                .font(.system(size: 10, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                        }
+                        .frame(maxHeight: 120)
+                        .background(Color.black.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+
                 Divider()
                 Text("Vyžaduje Node.js ≥18. Spusti `make whatsapp-bridge-install` pred prvým pripojením. Token ani session path sa nikdy nezobrazujú.")
                     .font(.system(size: 10))
@@ -669,7 +784,7 @@ struct SettingsView: View {
     private func whatsappStatusColor(_ status: String) -> Color {
         switch status {
         case "ready":          return .green
-        case "qr", "starting", "authenticated": return .yellow
+        case "qr", "starting", "authenticated", "authenticated_waiting_for_ready": return .yellow
         case "disconnected", "error": return .red
         default:               return .gray
         }
@@ -681,6 +796,7 @@ struct SettingsView: View {
         case "starting":            return "Spúšťam…"
         case "qr":                  return "Čakám na QR"
         case "authenticated":       return "Autentifikovaný"
+        case "authenticated_waiting_for_ready": return "Čakám na načítanie"
         case "ready":               return "Pripojený"
         case "disconnected":        return "Odpojený"
         case "error":               return "Chyba"
@@ -698,7 +814,7 @@ struct SettingsView: View {
                 ShortcutRow(label: "Otvoriť / zatvoriť",  key: "⌥Space")
                 ShortcutRow(label: "Odoslať správu",      key: "⌘↩")
                 ShortcutRow(label: "Zatvoriť panel",      key: "Esc")
-                ShortcutRow(label: "Vymazať konverzáciu", key: "🗑 trash")
+                ShortcutRow(label: "Vymazať konverzáciu", key: "⌘⌫")
             }
         }
     }
@@ -771,6 +887,68 @@ struct SettingsView: View {
 
 // MARK: - Helpers
 
+private func copySettingsText(_ text: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+    NotificationCenter.default.post(name: .bagentCodeCopied, object: nil)
+}
+
+private enum SettingsCategory: String, CaseIterable, Identifiable {
+    case overview = "Overview"
+    case access = "Access"
+    case connectors = "Connectors"
+    case ai = "AI"
+    case advanced = "Advanced"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .overview: return "gauge"
+        case .access: return "lock.shield"
+        case .connectors: return "point.3.connected.trianglepath.dotted"
+        case .ai: return "cpu"
+        case .advanced: return "slider.horizontal.3"
+        }
+    }
+}
+
+private struct SettingsCategoryBar: View {
+    @Binding var selection: SettingsCategory
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(SettingsCategory.allCases) { category in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            selection = category
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: category.icon)
+                                .font(.system(size: 10, weight: .semibold))
+                            Text(category.rawValue)
+                                .font(.system(size: 11, weight: .medium))
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .frame(minHeight: 28)
+                        .foregroundStyle(selection == category ? Color.primary : Color.secondary)
+                        .background(selection == category ? Color.secondary.opacity(0.16) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(category.rawValue)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private struct UsageRow: View {
     let label: String
     let value: String
@@ -799,6 +977,14 @@ private struct SettingsSection<Content: View>: View {
                 .foregroundStyle(.secondary)
             content
         }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.07))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.secondary.opacity(0.10), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }
 

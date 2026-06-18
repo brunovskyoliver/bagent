@@ -108,6 +108,24 @@ struct DaemonClient: Sendable {
         return req
     }
 
+    private func validateOK(data: Data, response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw DaemonError.badStatus
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw DaemonError.serverError(serverErrorMessage(from: data))
+        }
+    }
+
+    private func serverErrorMessage(from data: Data) -> String {
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let detail = obj["detail"] as? String { return detail }
+            if let error = obj["error"] as? String { return error }
+        }
+        let raw = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? "Neznáma chyba" : raw
+    }
+
     // MARK: Health
 
     func healthStatus() async -> DaemonHealth {
@@ -121,9 +139,34 @@ struct DaemonClient: Sendable {
                                     classifierModel: "—", mailConnector: false, notesConnector: false,
                                     codexConnector: false, odooConnector: false, whatsappConnector: false)
             }
+            enum WhatsappConnectorResp: Decodable {
+                case bool(Bool)
+                case object(connected: Bool)
+
+                init(from decoder: Decoder) throws {
+                    let single = try decoder.singleValueContainer()
+                    if let value = try? single.decode(Bool.self) {
+                        self = .bool(value)
+                        return
+                    }
+                    let keyed = try decoder.container(keyedBy: CodingKeys.self)
+                    self = .object(connected: try keyed.decodeIfPresent(Bool.self, forKey: .connected) ?? false)
+                }
+
+                private enum CodingKeys: String, CodingKey {
+                    case connected
+                }
+
+                var isConnected: Bool {
+                    switch self {
+                    case .bool(let value): return value
+                    case .object(let connected): return connected
+                    }
+                }
+            }
             struct ConnectorResp: Decodable {
                 let mail: Bool; let notes: Bool; let codex: Bool?; let odoo: Bool?
-                let whatsapp: Bool?
+                let whatsapp: WhatsappConnectorResp?
             }
             struct HealthResp: Decodable {
                 let status: String; let ollama: Bool; let model: String
@@ -140,7 +183,7 @@ struct DaemonClient: Sendable {
                 notesConnector:     h.connectors?.notes     ?? false,
                 codexConnector:     h.connectors?.codex     ?? false,
                 odooConnector:      h.connectors?.odoo      ?? false,
-                whatsappConnector:  h.connectors?.whatsapp  ?? false
+                whatsappConnector:  h.connectors?.whatsapp?.isConnected  ?? false
             )
         } catch {
             return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—",
@@ -918,6 +961,14 @@ struct DaemonClient: Sendable {
         let error: String?
         let me_name: String?
         let me_phone: String?
+        let last_loading: WhatsappLoadingState?
+        let last_state: String?
+    }
+
+    struct WhatsappLoadingState: Decodable, Sendable {
+        let percent: Double?
+        let message: String?
+        let at: String?
     }
 
     struct WhatsappQrResult: Decodable, Sendable {
@@ -949,7 +1000,8 @@ struct DaemonClient: Sendable {
 
     func whatsappStatus() async throws -> WhatsappStatusResult {
         let c = try await loadCreds()
-        let (data, _) = try await URLSession.shared.data(for: authedRequest("/whatsapp/status", creds: c))
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/whatsapp/status", creds: c))
+        try validateOK(data: data, response: response)
         return try JSONDecoder().decode(WhatsappStatusResult.self, from: data)
     }
 
@@ -957,27 +1009,38 @@ struct DaemonClient: Sendable {
         let c = try await loadCreds()
         var req = authedRequest("/whatsapp/start", creds: c)
         req.httpMethod = "POST"
-        let (_, _) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try validateOK(data: data, response: response)
     }
 
     func whatsappStop() async throws {
         let c = try await loadCreds()
         var req = authedRequest("/whatsapp/stop", creds: c)
         req.httpMethod = "POST"
-        let (_, _) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try validateOK(data: data, response: response)
     }
 
     func whatsappQr() async throws -> WhatsappQrResult {
         let c = try await loadCreds()
-        let (data, _) = try await URLSession.shared.data(for: authedRequest("/whatsapp/qr", creds: c))
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/whatsapp/qr", creds: c))
+        try validateOK(data: data, response: response)
         return try JSONDecoder().decode(WhatsappQrResult.self, from: data)
+    }
+
+    func whatsappDebug() async throws -> String {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/whatsapp/debug", creds: c))
+        try validateOK(data: data, response: response)
+        return prettyJSONString(data)
     }
 
     func whatsappLogout() async throws {
         let c = try await loadCreds()
         var req = authedRequest("/whatsapp/logout", creds: c)
         req.httpMethod = "POST"
-        let (_, _) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try validateOK(data: data, response: response)
     }
 
     func whatsappContacts(limit: Int = 50) async throws -> [WhatsappContact] {

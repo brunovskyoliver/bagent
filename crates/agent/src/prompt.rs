@@ -73,6 +73,15 @@ pub struct PromptTrace {
     pub whatsapp_context_injected: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub whatsapp_send_approval_id: Option<String>,
+    // Reference resolver trace
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_resolution: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_connector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standalone_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_needs_live_fetch: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +350,10 @@ impl PromptBuilder {
             whatsapp_chat_id: None,
             whatsapp_context_injected: None,
             whatsapp_send_approval_id: None,
+            reference_resolution: None,
+            resolved_connector: None,
+            standalone_query: None,
+            reference_needs_live_fetch: None,
         };
 
         Ok(BuiltPrompt { messages, trace })

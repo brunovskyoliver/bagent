@@ -5,13 +5,16 @@ mod mail_intent;
 mod memory_extractor;
 mod odoo_intent;
 mod prompt;
+mod reference_resolver;
 mod screen_intent;
 mod task_rater;
 mod whatsapp_intent;
 mod window_intent;
 
 pub use bagent_memory::ChatTurnHit;
-pub use context_planner::{ContextPlan, ContextPlanner, ResponseLanguageHint};
+pub use context_planner::{
+    ContextPlan, ContextPlanner, PlannerRuntimeContext, ResponseLanguageHint,
+};
 pub use feedback::{
     has_explicit_trigger, CorrectionClassifier, CorrectionResult, DirectiveExtractor,
     DirectiveResult, StyleProfile,
@@ -23,6 +26,9 @@ pub use odoo_intent::{OdooAction, OdooIntent, OdooIntentClassifier};
 pub use prompt::{
     preview, BuiltPrompt, PromptBuilder, PromptLayerTrace, PromptMemoryHitTrace,
     PromptPastTurnTrace, PromptTrace, SelectedSkill,
+};
+pub use reference_resolver::{
+    select_resolver_lessons, ReferenceCandidate, ReferenceResolution, ReferenceResolver,
 };
 pub use screen_intent::{ScreenAction, ScreenIntent, ScreenIntentClassifier};
 pub use task_rater::{ContextScope, PrivacyRisk, TaskLevel, TaskRater, TaskRating};

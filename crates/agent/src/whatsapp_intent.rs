@@ -114,11 +114,17 @@ Pravidlá:
   EN: "find message about invoice", "search WhatsApp".
 - action="read_history": prečítaj históriu chatu s konkrétnym kontaktom.
   SK: "čo mi písal Peter", "čo sme si písali s Katkou".
-  EN: "what did Peter write", "show chat history with".
+  EN: "what did Peter write", "show chat history with", "what did I talk about with Slavka",
+  "latest message with Slavka", "latest text with Slavka", "most recent message with Slavka".
 - action="draft_send": používateľ chce poslať správu.
   SK: "napíš Petrovi", "pošli mu správu", "odpovedz na WhatsApp".
   EN: "send WhatsApp to", "write to Peter on WhatsApp".
 - contact_name: meno osoby (SK aj EN, zachovaj originálnu formu).
+- Ak kontext obsahuje [LastFoundWhatsapp] a používateľ sa pýta na "last messages",
+  "what did I talk about with X", "čo sme si písali s X" alebo podobné pokračovanie,
+  klasifikuj ako read_history aj bez explicitného slova WhatsApp.
+- Ak používateľ opraví kontakt po WhatsApp odpovedi, napr. "I have a chat with Slávka Múčková",
+  klasifikuj ako read_history a nastav contact_name na uvedené meno.
 - keywords: slová na hľadanie v obsahu správ (napr. ["faktúra", "platba"]).
 - date: dátum v ISO YYYY-MM-DD (SK "dnes"→{today}, "včera"→{yesterday}, "10.6.2026"→"2026-06-10").
 - message_text: PRESNÝ text na odoslanie (len pre draft_send, neinventuj obsah).

@@ -18,6 +18,7 @@
 const http = require('http');
 const os = require('os');
 const path = require('path');
+const packageInfo = require('./package.json');
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ const SESSION_DIR = process.env.BAGENT_WA_SESSION || DEFAULT_SESSION_DIR;
 
 // ── In-memory state ────────────────────────────────────────────────────────────
 
-/** @type {'stopped'|'starting'|'qr'|'authenticated'|'ready'|'disconnected'|'error'} */
+/** @type {'stopped'|'starting'|'qr'|'authenticated'|'authenticated_waiting_for_ready'|'ready'|'disconnected'|'error'} */
 let bridgeStatus = 'starting';
 let bridgeError = null;
 /** @type {string|null} */
@@ -43,11 +44,99 @@ let latestQr = null;
 let latestQrUpdatedAt = null;
 /** @type {{id:string,name:string|null,pushname:string|null,number:string|null}|null} */
 let meInfo = null;
+let authenticatedAt = null;
+let readyAt = null;
+let lastLoading = null;
+let lastState = null;
+let whatsappWebVersion = null;
+let whatsappWebJsVersion = null;
+let readyWatchTimer = null;
+let pageDiagnosticsAttached = false;
+const startedAt = Date.now();
+
+const DIAGNOSTIC_EVENT_LIMIT = 80;
+/** @type {Array<Record<string, unknown>>} */
+const diagnosticEvents = [];
 
 /** Rolling buffer of recent incoming messages (no raw bodies exposed in logs). */
 const RECENT_MSG_LIMIT = 100;
 /** @type {Array<{id:string,chatId:string,from:string,to:string|null,body:string,timestamp:number,fromMe:boolean,hasMedia:boolean}>} */
 const recentMessages = [];
+
+function sanitizedError(error) {
+    const detail = error && error.message ? error.message : String(error || 'unknown');
+    return detail.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[redacted]');
+}
+
+function recordEvent(type, fields = {}) {
+    const event = {
+        at: new Date().toISOString(),
+        type,
+        ...fields,
+    };
+    diagnosticEvents.push(event);
+    if (diagnosticEvents.length > DIAGNOSTIC_EVENT_LIMIT) {
+        diagnosticEvents.shift();
+    }
+}
+
+function setBridgeStatus(status) {
+    bridgeStatus = status;
+}
+
+function clearReadyWatch() {
+    if (readyWatchTimer) {
+        clearTimeout(readyWatchTimer);
+        readyWatchTimer = null;
+    }
+}
+
+function startReadyWatch() {
+    clearReadyWatch();
+    readyWatchTimer = setTimeout(() => {
+        if (bridgeStatus !== 'ready' && bridgeStatus !== 'error' && bridgeStatus !== 'disconnected') {
+            setBridgeStatus('authenticated_waiting_for_ready');
+            bridgeError = 'Authenticated, but WhatsApp Web has not emitted ready yet';
+            recordEvent('ready_timeout', {
+                status: bridgeStatus,
+                loading_percent: lastLoading ? lastLoading.percent : null,
+                loading_message: lastLoading ? lastLoading.message : null,
+                state: lastState,
+            });
+            console.error('[bagent-wa-bridge] authenticated but still waiting for ready');
+        }
+    }, 90000);
+}
+
+function loadWhatsappWebJsVersion() {
+    if (whatsappWebJsVersion) return whatsappWebJsVersion;
+    try {
+        whatsappWebJsVersion = require('whatsapp-web.js/package.json').version || null;
+    } catch {
+        whatsappWebJsVersion = null;
+    }
+    return whatsappWebJsVersion;
+}
+
+function publicDiagnostics() {
+    return {
+        status: bridgeStatus,
+        error: bridgeError || null,
+        latest_qr_updated_at: latestQrUpdatedAt,
+        authenticated_at: authenticatedAt,
+        ready_at: readyAt,
+        last_loading: lastLoading,
+        last_state: lastState,
+        uptime_ms: Date.now() - startedAt,
+        versions: {
+            node: process.version,
+            bridge: packageInfo.version,
+            whatsapp_web_js: loadWhatsappWebJsVersion(),
+            whatsapp_web: whatsappWebVersion,
+        },
+        events: diagnosticEvents.slice(-30),
+    };
+}
 
 function pushRecentMessage(msg) {
     recentMessages.push(msg);
@@ -80,51 +169,114 @@ function makeClient(Client, LocalAuth) {
     });
 }
 
+function attachPageDiagnostics(client) {
+    if (pageDiagnosticsAttached || !client || !client.pupPage) return false;
+    pageDiagnosticsAttached = true;
+    client.pupPage.on('pageerror', (error) => {
+        const detail = sanitizedError(error);
+        recordEvent('page_error', { detail });
+        bridgeError = detail;
+        console.error('[bagent-wa-bridge] page_error:', detail);
+    });
+    client.pupPage.on('requestfailed', (request) => {
+        const failure = request.failure();
+        const detail = failure && failure.errorText ? failure.errorText : 'request failed';
+        const url = request.url();
+        recordEvent('request_failed', {
+            detail,
+            url_host: (() => {
+                try { return new URL(url).host; } catch { return null; }
+            })(),
+        });
+    });
+    recordEvent('page_diagnostics_attached');
+    return true;
+}
+
 function attachEvents(client) {
     client.on('qr', (qr) => {
-        bridgeStatus = 'qr';
+        setBridgeStatus('qr');
         latestQr = qr;
         latestQrUpdatedAt = new Date().toISOString();
         bridgeError = null;
+        authenticatedAt = null;
+        readyAt = null;
+        clearReadyWatch();
+        recordEvent('qr', { updated_at: latestQrUpdatedAt });
         // Do NOT log the QR string — it is sensitive auth material.
         console.error('[bagent-wa-bridge] QR generated, waiting for scan');
     });
 
     client.on('authenticated', () => {
-        bridgeStatus = 'authenticated';
+        setBridgeStatus('authenticated');
         latestQr = null;
         bridgeError = null;
+        authenticatedAt = new Date().toISOString();
+        recordEvent('authenticated');
+        startReadyWatch();
         console.error('[bagent-wa-bridge] authenticated');
     });
 
     client.on('ready', async () => {
-        bridgeStatus = 'ready';
+        setBridgeStatus('ready');
         bridgeError = null;
+        readyAt = new Date().toISOString();
+        clearReadyWatch();
         try {
             const info = client.info;
             meInfo = {
                 id: info.wid._serialized,
                 name: info.pushname || null,
-                pushname: info.pushname || null,
+                push_name: info.pushname || null,
                 number: info.wid.user || null,
             };
         } catch {
             meInfo = null;
         }
+        try {
+            whatsappWebVersion = await client.getWWebVersion();
+        } catch {
+            whatsappWebVersion = null;
+        }
+        recordEvent('ready', {
+            me_present: Boolean(meInfo),
+            whatsapp_web: whatsappWebVersion,
+        });
         console.error('[bagent-wa-bridge] ready');
     });
 
     client.on('disconnected', (reason) => {
-        bridgeStatus = 'disconnected';
+        setBridgeStatus('disconnected');
         bridgeError = reason || 'disconnected';
         meInfo = null;
+        clearReadyWatch();
+        recordEvent('disconnected', { reason: reason || null });
         console.error('[bagent-wa-bridge] disconnected:', reason);
     });
 
     client.on('auth_failure', (msg) => {
-        bridgeStatus = 'error';
+        setBridgeStatus('error');
         bridgeError = 'auth_failure: ' + msg;
+        clearReadyWatch();
+        recordEvent('auth_failure', { detail: 'auth_failure' });
         console.error('[bagent-wa-bridge] auth_failure');
+    });
+
+    client.on('loading_screen', (percent, message) => {
+        lastLoading = {
+            percent: Number(percent),
+            message: String(message || ''),
+            at: new Date().toISOString(),
+        };
+        recordEvent('loading_screen', {
+            percent: lastLoading.percent,
+            message: lastLoading.message,
+        });
+    });
+
+    client.on('change_state', (state) => {
+        lastState = state || null;
+        recordEvent('change_state', { state: lastState });
     });
 
     client.on('message', (msg) => {
@@ -145,10 +297,20 @@ function attachEvents(client) {
 async function initClientWithRetry(Client, LocalAuth, attempt) {
     const MAX_ATTEMPTS = 3;
     waClient = makeClient(Client, LocalAuth);
+    pageDiagnosticsAttached = false;
     attachEvents(waClient);
+    const pageTimer = setInterval(() => {
+        if (!waClient || attachPageDiagnostics(waClient)) {
+            clearInterval(pageTimer);
+        }
+    }, 500);
     try {
         await waClient.initialize();
+        clearInterval(pageTimer);
+        attachPageDiagnostics(waClient);
+        recordEvent('initialize_resolved');
     } catch (e) {
+        clearInterval(pageTimer);
         const detail = e && e.message ? e.message : String(e);
         const isContextError = detail.includes('Execution context was destroyed') ||
                                detail.includes('Session closed') ||
@@ -161,8 +323,10 @@ async function initClientWithRetry(Client, LocalAuth, attempt) {
             await new Promise(r => setTimeout(r, 3000));
             return initClientWithRetry(Client, LocalAuth, attempt + 1);
         }
-        bridgeStatus = 'error';
+        setBridgeStatus('error');
         bridgeError = 'initialize failed: ' + detail;
+        clearReadyWatch();
+        recordEvent('initialize_error', { detail: sanitizedError(e) });
         console.error('[bagent-wa-bridge] initialize error:', detail);
         if (e && e.stack) console.error(e.stack);
     }
@@ -172,17 +336,21 @@ function initClient() {
     let Client, LocalAuth;
     try {
         ({ Client, LocalAuth } = require('whatsapp-web.js'));
+        loadWhatsappWebJsVersion();
     } catch (e) {
-        bridgeStatus = 'error';
+        setBridgeStatus('error');
         bridgeError = 'whatsapp-web.js not installed — run: npm install in bridge dir';
+        recordEvent('dependency_error', { detail: bridgeError });
         console.error('[bagent-wa-bridge] ' + bridgeError);
         return;
     }
 
     initClientWithRetry(Client, LocalAuth, 1).catch((e) => {
         const detail = e && e.message ? e.message : String(e);
-        bridgeStatus = 'error';
+        setBridgeStatus('error');
         bridgeError = 'initialize failed: ' + detail;
+        clearReadyWatch();
+        recordEvent('fatal_initialize_error', { detail: sanitizedError(e) });
         console.error('[bagent-wa-bridge] fatal initialize error:', detail);
     });
 }
@@ -237,6 +405,7 @@ async function handleHealth(req, res) {
         status: bridgeStatus,
         me: meInfo || undefined,
         error: bridgeError || undefined,
+        diagnostics: publicDiagnostics(),
     });
 }
 
@@ -246,6 +415,11 @@ async function handleQr(req, res) {
         qr: latestQr,
         updated_at: latestQrUpdatedAt,
     });
+}
+
+async function handleDebug(req, res) {
+    if (!checkAuth(req, res)) return;
+    sendJson(res, 200, publicDiagnostics());
 }
 
 async function handleContacts(req, res, query) {
@@ -385,6 +559,11 @@ async function handleLogout(req, res) {
         bridgeStatus = 'stopped';
         meInfo = null;
         latestQr = null;
+        latestQrUpdatedAt = null;
+        authenticatedAt = null;
+        readyAt = null;
+        clearReadyWatch();
+        recordEvent('logout');
         sendJson(res, 200, { ok: true });
         console.error('[bagent-wa-bridge] logged out');
     } catch (e) {
@@ -406,6 +585,10 @@ const server = http.createServer(async (req, res) => {
     // Route: GET /qr
     if (req.method === 'GET' && pathPart === '/qr') {
         return handleQr(req, res);
+    }
+    // Route: GET /debug
+    if (req.method === 'GET' && pathPart === '/debug') {
+        return handleDebug(req, res);
     }
     // Route: GET /contacts
     if (req.method === 'GET' && pathPart === '/contacts') {

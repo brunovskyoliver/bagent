@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 @MainActor
 final class DaemonLauncher {
@@ -18,6 +19,7 @@ final class DaemonLauncher {
             print("[bagentd] binary not found — run `cargo build` first")
             return
         }
+        terminateRecordedDaemon()
         startProcess(url: url)
     }
 
@@ -115,6 +117,24 @@ final class DaemonLauncher {
         } catch {
             print("[bagentd] failed to start: \(error)")
         }
+    }
+
+    private func terminateRecordedDaemon() {
+        let pidURL = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!
+            .appendingPathComponent("bagent")
+            .appendingPathComponent("daemon.pid")
+        guard let raw = try? String(contentsOf: pidURL, encoding: .utf8),
+              let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 0 else { return }
+
+        if kill(pid, 0) == 0 {
+            print("[bagentd] terminating previous pid \(pid)")
+            kill(pid, SIGTERM)
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        try? FileManager.default.removeItem(at: pidURL)
     }
 
     private func handleCrash(url: URL) {

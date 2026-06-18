@@ -129,6 +129,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private var approvalPollTask: Task<Void, Never>?
+    private var healthMonitorTask: Task<Void, Never>?
 
     @Published var selectedModel: String = UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen2.5:7b" {
         didSet { UserDefaults.standard.set(selectedModel, forKey: "bagent.model") }
@@ -216,7 +217,16 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Re-push Odoo credentials from Keychain to the daemon (called on each launch).
+    func loadSavedOdooAPIKey() {
+        if let key = KeychainStore.loadOdooAPIKey(), !key.isEmpty {
+            odooAPIKey = key
+            odooTestResult = "✓ API kľúč načítaný z Keychain"
+        } else {
+            odooTestResult = "✗ Uložený API kľúč sa nenašiel"
+        }
+    }
+
+    /// Re-push Odoo credentials from Keychain to the daemon when explicitly requested.
     func restoreOdooFromKeychain() {
         guard let creds = KeychainStore.loadOdoo() else { return }
         odooURL  = creds.url
@@ -243,36 +253,69 @@ final class ChatViewModel: ObservableObject {
     @Published var whatsappQrString: String? = nil
     @Published var isConnectingWhatsapp: Bool = false
     @Published var whatsappStatusMessage: String? = nil
+    @Published var showWhatsappPairing: Bool = false
+    @Published var whatsappDebugPayload: String? = nil
+    @Published var isLoadingWhatsappDebug: Bool = false
+    private var whatsappPollingTask: Task<Void, Never>? = nil
 
     func connectWhatsapp() {
+        whatsappPollingTask?.cancel()
         isConnectingWhatsapp = true
         whatsappStatusMessage = nil
+        whatsappQrString = nil
+        whatsappDebugPayload = nil
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
+            showMemory = false
+            showSkills = false
+            showDebug = false
+            showSettings = false
+            showWhatsappPairing = true
+        }
         Task {
             do {
                 try await client.whatsappStart()
-                await pollWhatsappStatus()
+                await MainActor.run {
+                    self.startWhatsappPairingPoll()
+                }
             } catch {
                 await MainActor.run {
                     self.whatsappStatusMessage = "✗ \(error.localizedDescription)"
                     self.isConnectingWhatsapp = false
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        self.showWhatsappPairing = false
+                        self.showSettings = true
+                    }
                 }
             }
         }
     }
 
     func disconnectWhatsapp() {
+        whatsappPollingTask?.cancel()
         Task {
             try? await client.whatsappStop()
             await pollWhatsappStatus()
+            await MainActor.run {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    self.showWhatsappPairing = false
+                    self.showSettings = true
+                }
+            }
         }
     }
 
     func logoutWhatsapp() {
+        whatsappPollingTask?.cancel()
         Task {
             try? await client.whatsappLogout()
             await pollWhatsappStatus()
             await MainActor.run {
                 self.whatsappQrString = nil
+                self.whatsappDebugPayload = nil
+                withAnimation(.easeOut(duration: 0.18)) {
+                    self.showWhatsappPairing = false
+                    self.showSettings = true
+                }
             }
         }
     }
@@ -306,15 +349,76 @@ final class ChatViewModel: ObservableObject {
         self.isConnectingWhatsapp = false
     }
 
+    @MainActor
+    private func startWhatsappPairingPoll() {
+        whatsappPollingTask?.cancel()
+        whatsappPollingTask = Task { [weak self] in
+            guard let self else { return }
+            for _ in 0..<720 {
+                if Task.isCancelled { break }
+                do {
+                    let status = try await client.whatsappStatus()
+                    self.whatsappStatus = status
+                    self.isConnectingWhatsapp = status.status == "starting"
+
+                    if status.needs_qr {
+                        if self.whatsappQrString == nil {
+                            self.whatsappQrString = (try? await client.whatsappQr())?.qr
+                        }
+                    } else if status.status == "authenticated" || status.status == "authenticated_waiting_for_ready" {
+                        self.whatsappQrString = nil
+                    }
+
+                    if status.status == "ready" {
+                        self.isConnectingWhatsapp = false
+                        self.whatsappQrString = nil
+                        self.whatsappStatusMessage = "✓ WhatsApp je pripojený"
+                        try? await Task.sleep(for: .milliseconds(650))
+                        if !Task.isCancelled {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
+                                self.showWhatsappPairing = false
+                                self.showSettings = true
+                            }
+                        }
+                        break
+                    }
+
+                    if status.status == "error" || status.status == "disconnected" || status.status == "missing_node" || status.status == "bridge_not_installed" {
+                        self.isConnectingWhatsapp = false
+                        break
+                    }
+                } catch {
+                    self.whatsappStatusMessage = "✗ \(error.localizedDescription)"
+                    self.isConnectingWhatsapp = false
+                    break
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+            self.isConnectingWhatsapp = false
+        }
+    }
+
     func refreshWhatsappStatus() {
         Task {
-            if let s = try? await client.whatsappStatus() {
-                await MainActor.run {
-                    self.whatsappStatus = s
-                    if s.needs_qr { self.refreshWhatsappQr() }
-                }
-            }
+            await refreshWhatsappStatusNow()
         }
+    }
+
+    private func refreshWhatsappStatusNow() async {
+        if let s = try? await client.whatsappStatus() {
+            whatsappStatus = s
+            if s.needs_qr { refreshWhatsappQr() }
+        }
+    }
+
+    func loadWhatsappDebug() async {
+        isLoadingWhatsappDebug = true
+        do {
+            whatsappDebugPayload = try await client.whatsappDebug()
+        } catch {
+            whatsappDebugPayload = "Chyba: \(error.localizedDescription)"
+        }
+        isLoadingWhatsappDebug = false
     }
 
     /// Preferred microphone name. Empty string = "System default" (no swap).
@@ -342,6 +446,19 @@ final class ChatViewModel: ObservableObject {
     let permissions = PermissionsManager()
 
     // MARK: - Voice input
+    @Published var voiceModeEnabled: Bool = UserDefaults.standard.object(forKey: "bagent.voiceMode.enabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(voiceModeEnabled, forKey: "bagent.voiceMode.enabled")
+            if !voiceModeEnabled {
+                speech.cancel()
+                isVoiceRecording = false
+                isVoiceNotchActive = false
+                voiceTurnActive = false
+                speechCancellables.removeAll()
+                onVoiceModeDisabled?()
+            }
+        }
+    }
     /// On-device Whisper STT. Shared by the inline mic button and the voice overlay.
     let speech = SpeechController()
     /// True while the inline (chat-input) mic is recording into `inputText`.
@@ -352,6 +469,8 @@ final class ChatViewModel: ObservableObject {
     var voiceTurnActive = false
     /// Invoked after a voice-initiated turn finishes streaming (re-presents voice).
     var onVoiceTurnComplete: (() -> Void)?
+    /// Invoked when Settings disables voice while an overlay/session may be active.
+    var onVoiceModeDisabled: (() -> Void)?
     /// Drives notch expansion into voice mode (no separate panel).
     @Published var isVoiceNotchActive: Bool = false
     /// Brief confirmation message shown in the notch after a silent background action.
@@ -376,9 +495,8 @@ final class ChatViewModel: ObservableObject {
         let savedMic = UserDefaults.standard.string(forKey: "bagent.microphone") ?? ""
         speech.preferredInputName = savedMic.isEmpty ? nil : savedMic
 
-        // Restore Odoo credentials from Keychain so the in-memory daemon connector is
-        // populated without requiring the user to re-enter creds after restart.
-        restoreOdooFromKeychain()
+        startHealthMonitor()
+        Task { await refreshHealth() }
     }
 
     // MARK: - Actions
@@ -447,12 +565,34 @@ final class ChatViewModel: ObservableObject {
     }
 
     func refreshHealth() async {
-        daemonHealth = await client.healthStatus()
+        for attempt in 0..<24 {
+            let health = await client.healthStatus()
+            daemonHealth = health
+            if health.daemonUp && health.ollamaUp { break }
+            if attempt < 23 {
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+        }
+        await refreshWhatsappStatusNow()
         permissions.refresh()
         if messages.isEmpty {
             await startFreshSession()
         } else if sessionId == nil {
             await startNewSession()
+        }
+    }
+
+    func startHealthMonitor() {
+        healthMonitorTask?.cancel()
+        healthMonitorTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let health = await client.healthStatus()
+                await MainActor.run {
+                    self.daemonHealth = health
+                }
+                try? await Task.sleep(for: .seconds(3))
+            }
         }
     }
 
@@ -516,6 +656,7 @@ final class ChatViewModel: ObservableObject {
             showSettings = false
             showSkills = false
             showDebug = false
+            showWhatsappPairing = false
             showMemory = true
             Task { await loadMemoryItems() }
         }
@@ -528,6 +669,7 @@ final class ChatViewModel: ObservableObject {
             showSettings = false
             showMemory = false
             showDebug = false
+            showWhatsappPairing = false
             showSkills = true
             Task { await loadSkills() }
         }
@@ -540,6 +682,7 @@ final class ChatViewModel: ObservableObject {
             showMemory = false
             showSkills = false
             showDebug = false
+            showWhatsappPairing = false
             showSettings = true
         }
     }
@@ -551,6 +694,7 @@ final class ChatViewModel: ObservableObject {
             showSettings = false
             showMemory = false
             showSkills = false
+            showWhatsappPairing = false
             showDebug = true
             Task { await loadDebugConversation() }
         }
@@ -719,7 +863,7 @@ final class ChatViewModel: ObservableObject {
                         if first { isThinking = false }
                         Task { await loadDebugTrace(for: messages[idx].id) }
                         // Hands-free loop: re-open voice mode after a voice-initiated reply.
-                        if wasVoiceTurn { onVoiceTurnComplete?() }
+                        if wasVoiceTurn && voiceModeEnabled { onVoiceTurnComplete?() }
                     }
                 }
                 if first { isThinking = false }
@@ -743,6 +887,7 @@ final class ChatViewModel: ObservableObject {
 
     /// Feed a finalized voice transcript through the normal chat pipeline.
     func submitTranscript(_ text: String) {
+        guard voiceModeEnabled else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         inputText = t
@@ -751,6 +896,7 @@ final class ChatViewModel: ObservableObject {
 
     /// Inline mic: toggle recording into the text field (does not open the overlay).
     func toggleInlineVoice() {
+        guard voiceModeEnabled else { return }
         if speech.isRunning {
             speech.finalize()
         } else {
@@ -759,6 +905,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func startInlineVoice() {
+        guard voiceModeEnabled else { return }
         speechCancellables.removeAll()
         isVoiceRecording = true
 

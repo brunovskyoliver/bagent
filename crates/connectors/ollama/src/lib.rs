@@ -330,6 +330,39 @@ impl OllamaClient {
             .to_string())
     }
 
+    /// Like `generate_json`, but passes a concrete JSON schema as Ollama's
+    /// `format` parameter so classifier responses are constrained at decode time.
+    pub async fn generate_json_schema(
+        &self,
+        model: &str,
+        prompt: &str,
+        schema: serde_json::Value,
+        temperature: f32,
+    ) -> Result<String> {
+        let resp: serde_json::Value = self
+            .http
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&serde_json::json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": prompt }],
+                "stream": false,
+                "keep_alive": -1,
+                "format": schema,
+                "options": { "temperature": temperature }
+            }))
+            .send()
+            .await
+            .context("generate_json_schema request")?
+            .json()
+            .await
+            .context("parse generate_json_schema response")?;
+
+        Ok(resp["message"]["content"]
+            .as_str()
+            .unwrap_or("{}")
+            .to_string())
+    }
+
     /// Single non-streaming chat call with tool definitions.
     ///
     /// Returns `ChatTurn::ToolCalls` when the model emits one or more tool calls,

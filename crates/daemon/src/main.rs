@@ -14,10 +14,11 @@ use axum::{
     Json, Router,
 };
 use bagent_agent::{
-    has_explicit_trigger, ContextPlanner, CorrectionClassifier, DirectiveExtractor,
-    MailIntentClassifier, MemoryExtractor, OdooAction, OdooIntentClassifier, PromptBuilder,
-    PromptTrace, ScreenIntentClassifier, SelectedSkill, TaskRater, WhatsappAction,
-    WhatsappIntentClassifier, WindowIntentClassifier,
+    has_explicit_trigger, select_resolver_lessons, ContextPlan, ContextPlanner,
+    CorrectionClassifier, DirectiveExtractor, MailIntentClassifier, MemoryExtractor, OdooAction,
+    OdooIntentClassifier, PlannerRuntimeContext, PromptBuilder, PromptTrace, ReferenceCandidate,
+    ReferenceResolution, ReferenceResolver, ScreenIntentClassifier, SelectedSkill, TaskRater,
+    WhatsappAction, WhatsappIntent, WhatsappIntentClassifier, WindowIntentClassifier,
 };
 use bagent_attachments::extract as extract_attachment;
 use bagent_memory::{selector as memory_selector, InsertParams, MemoryStore, RetrieveQuery};
@@ -44,7 +45,8 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 use whatsapp_connector::{
-    WhatsappConfig, WhatsappConnectionStatus, WhatsappConnector, WhatsappSendTarget,
+    WhatsappChat, WhatsappConfig, WhatsappConnectionStatus, WhatsappConnector, WhatsappContact,
+    WhatsappSendTarget,
 };
 
 mod embedded {
@@ -78,6 +80,8 @@ struct AppState {
     skills: Arc<Vec<LoadedSkill>>,
     /// Context planner for the planning layer (deterministic + LLM fallback).
     context_planner: Arc<ContextPlanner>,
+    /// Local model resolver for implicit follow-ups ("this chat", "it", "when was this").
+    reference_resolver: Arc<ReferenceResolver>,
     /// Deterministic task rater — classifies local vs Codex tasks.
     task_rater: Arc<TaskRater>,
     /// Codex external-reasoning connector (None when binary not found).
@@ -86,7 +90,8 @@ struct AppState {
     /// Swift re-pushes credentials from Keychain on each launch.
     odoo: Arc<RwLock<Option<OdooConnector>>>,
     /// WhatsApp Web bridge connector. Always present; owns the bridge subprocess.
-    /// Bridge is started/stopped explicitly via `/whatsapp/start` and `/whatsapp/stop`.
+    /// Bridge can autostart when a prior LocalAuth session exists, and is also
+    /// controlled explicitly via `/whatsapp/start` and `/whatsapp/stop`.
     whatsapp: Arc<WhatsappConnector>,
 }
 
@@ -235,6 +240,16 @@ struct MailRef {
     auto_open: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WhatsappRef {
+    chat_id: String,
+    contact_name: Option<String>,
+    snippet: Option<String>,
+    source: String,
+    #[serde(default)]
+    last_message_timestamp: Option<i64>,
+}
+
 /// Request body for `POST /mail/open`.
 #[derive(Deserialize)]
 struct MailOpenReq {
@@ -279,6 +294,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&attachments_dir)?;
     let debug_dir = data_dir.join("debug");
     std::fs::create_dir_all(&debug_dir)?;
+    std::fs::write(data_dir.join("daemon.pid"), std::process::id().to_string())?;
 
     let mut conn = Connection::open(data_dir.join("bagent.db"))?;
     embedded::migrations::runner()
@@ -556,6 +572,10 @@ async fn main() -> Result<()> {
         ollama.clone(),
         classifier_model.clone(),
     ));
+    let reference_resolver = Arc::new(ReferenceResolver::new(
+        ollama.clone(),
+        classifier_model.clone(),
+    ));
 
     let task_rater = Arc::new(TaskRater::new());
 
@@ -582,8 +602,17 @@ async fn main() -> Result<()> {
     // Odoo connector — starts unconfigured; Swift pushes creds from Keychain via POST /odoo/config.
     let odoo: Arc<RwLock<Option<OdooConnector>>> = Arc::new(RwLock::new(None));
 
-    // WhatsApp connector — always present; bridge not started until POST /whatsapp/start.
+    // WhatsApp connector — always present; autostarts only for prior paired sessions.
     let whatsapp = Arc::new(WhatsappConnector::new(WhatsappConfig::default()));
+    if whatsapp.has_persisted_session() {
+        let wa_autostart = whatsapp.clone();
+        tokio::spawn(async move {
+            tracing::info!("WhatsApp persisted session found; starting bridge");
+            if let Err(e) = wa_autostart.start().await {
+                tracing::warn!("WhatsApp autostart failed: {e}");
+            }
+        });
+    }
 
     let state = AppState {
         db,
@@ -604,6 +633,7 @@ async fn main() -> Result<()> {
         pending_approvals,
         skills,
         context_planner,
+        reference_resolver,
         task_rater,
         codex,
         odoo,
@@ -684,6 +714,7 @@ async fn main() -> Result<()> {
         .route("/whatsapp/start", post(whatsapp_start_handler))
         .route("/whatsapp/stop", post(whatsapp_stop_handler))
         .route("/whatsapp/qr", get(whatsapp_qr_handler))
+        .route("/whatsapp/debug", get(whatsapp_debug_handler))
         .route("/whatsapp/logout", post(whatsapp_logout_handler))
         .route("/whatsapp/contacts", get(whatsapp_contacts_handler))
         .route("/whatsapp/chats", get(whatsapp_chats_handler))
@@ -701,6 +732,7 @@ async fn main() -> Result<()> {
     tracing::info!("bagentd listening on 127.0.0.1:{}", port);
 
     axum::serve(listener, app).await?;
+    let _ = std::fs::remove_file(data_dir.join("daemon.pid"));
     Ok(())
 }
 
@@ -1354,6 +1386,10 @@ struct ContextPlanRequest {
     language: String,
     #[serde(default)]
     has_mail_ctx: bool,
+    #[serde(default)]
+    recent_context: String,
+    #[serde(default)]
+    reference_candidates: Vec<ReferenceCandidate>,
 }
 
 async fn debug_context_plan(
@@ -1370,10 +1406,40 @@ async fn debug_context_plan(
         &req.language
     };
 
-    let plan = state
+    let reference_resolution = state
+        .reference_resolver
+        .resolve(
+            &req.message,
+            &req.recent_context,
+            &req.reference_candidates,
+            &resolver_lessons_for_turn(&state.memory, &req.message).await,
+            &chrono::Local::now().to_rfc3339(),
+        )
+        .await
+        .unwrap_or_default();
+
+    let mut plan = state
         .context_planner
-        .plan(&req.message, lang, req.has_mail_ctx)
+        .plan(
+            &req.message,
+            lang,
+            req.has_mail_ctx,
+            &PlannerRuntimeContext {
+                recent_context: format!(
+                    "{}\n\nResolved reference: {}",
+                    req.recent_context,
+                    serde_json::to_string(&reference_resolution).unwrap_or_default()
+                ),
+                available_skill_names: state
+                    .skills
+                    .iter()
+                    .map(|s| s.manifest.name.clone())
+                    .collect(),
+                ..Default::default()
+            },
+        )
         .await;
+    apply_reference_resolution_to_plan(&mut plan, &reference_resolution);
 
     // Run skill selection for the response
     let selected_skills =
@@ -1418,6 +1484,10 @@ async fn debug_context_plan(
             "selected_skill_names": selected_skill_names,
             "selected_memory_ids": selected_memory_ids,
             "confidence": plan.confidence,
+            "intent_source": plan.intent_source,
+            "selected_connector": plan.selected_connector,
+            "clarification_needed": plan.clarification_needed,
+            "reference_resolution": reference_resolution,
         })),
     )
 }
@@ -1562,6 +1632,145 @@ fn debug_trace_preview(trace: &PromptTrace) -> String {
     preview_text(&format!("{layers}; {recall}"), 180)
 }
 
+fn build_reference_candidates(
+    mail_ref: Option<&MailRef>,
+    file_ref: Option<&FileRef>,
+    odoo_ref: Option<&OdooRecordRef>,
+    whatsapp_ref: Option<&WhatsappRef>,
+) -> Vec<ReferenceCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(r) = mail_ref {
+        candidates.push(ReferenceCandidate {
+            connector: "mail".to_string(),
+            entity_type: "mail".to_string(),
+            entity_id: Some(r.rowid.to_string()),
+            label: Some(r.subject.clone()),
+            timestamp: None,
+            summary: Some(format!("from {}", r.sender)),
+        });
+    }
+    if let Some(r) = file_ref {
+        candidates.push(ReferenceCandidate {
+            connector: "filesystem".to_string(),
+            entity_type: r.kind.clone(),
+            entity_id: Some(r.path.clone()),
+            label: Some(r.display_name.clone()),
+            timestamp: None,
+            summary: None,
+        });
+    }
+    if let Some(r) = odoo_ref {
+        candidates.push(ReferenceCandidate {
+            connector: "odoo".to_string(),
+            entity_type: "record".to_string(),
+            entity_id: Some(format!("{}:{}", r.model, r.id)),
+            label: Some(r.name.clone()),
+            timestamp: None,
+            summary: Some(r.url.clone()),
+        });
+    }
+    if let Some(r) = whatsapp_ref {
+        candidates.push(ReferenceCandidate {
+            connector: "whatsapp".to_string(),
+            entity_type: "chat".to_string(),
+            entity_id: Some(r.chat_id.clone()),
+            label: r.contact_name.clone(),
+            timestamp: r.last_message_timestamp,
+            summary: r.snippet.clone(),
+        });
+    }
+    candidates
+}
+
+async fn resolver_lessons_for_turn(memory: &Arc<MemoryStore>, user_message: &str) -> Vec<String> {
+    let hits = memory
+        .retrieve_filtered(RetrieveQuery {
+            query: user_message,
+            namespaces: &["resolver_lessons"],
+            kinds: &["routing_lesson"],
+            k: 3,
+            max_per_namespace: 3,
+            score_threshold: 0.08,
+            allow_sensitive: false,
+        })
+        .await
+        .unwrap_or_default();
+    select_resolver_lessons(&hits, 3)
+}
+
+fn apply_reference_resolution_to_plan(plan: &mut ContextPlan, resolution: &ReferenceResolution) {
+    if resolution.confidence < 0.55 {
+        return;
+    }
+    match resolution.resolved_connector.as_deref() {
+        Some("whatsapp") => {
+            plan.task_type = "whatsapp".to_string();
+            plan.selected_connector = Some("whatsapp".to_string());
+            if !plan.candidate_skill_names.iter().any(|s| s == "whatsapp") {
+                plan.candidate_skill_names.insert(0, "whatsapp".to_string());
+            }
+            plan.candidate_skill_names.retain(|s| s == "whatsapp");
+            plan.needs_conversation_recall = false;
+            if matches!(
+                resolution.requested_operation.as_str(),
+                "answer_from_current_context"
+                    | "fetch_timestamp"
+                    | "fetch_more_history"
+                    | "analyze_tone"
+            ) {
+                plan.needs_memory = false;
+                plan.memory_namespaces.clear();
+                plan.memory_kinds.clear();
+            }
+            plan.intent_source = "reference_resolver".to_string();
+        }
+        Some("mail") => {
+            plan.task_type = "mail_search".to_string();
+            plan.selected_connector = Some("mail".to_string());
+            if !plan
+                .candidate_skill_names
+                .iter()
+                .any(|s| s == "mail-search")
+            {
+                plan.candidate_skill_names
+                    .insert(0, "mail-search".to_string());
+            }
+            plan.candidate_skill_names
+                .retain(|s| s == "mail-search" || s == "sk-business-email");
+            plan.needs_conversation_recall = false;
+            plan.intent_source = "reference_resolver".to_string();
+        }
+        Some("filesystem") => {
+            plan.task_type = "file_search".to_string();
+            plan.selected_connector = Some("filesystem".to_string());
+            if !plan
+                .candidate_skill_names
+                .iter()
+                .any(|s| s == "file-search")
+            {
+                plan.candidate_skill_names
+                    .insert(0, "file-search".to_string());
+            }
+            plan.intent_source = "reference_resolver".to_string();
+        }
+        Some("odoo") => {
+            plan.task_type = "odoo_lookup".to_string();
+            plan.selected_connector = Some("odoo".to_string());
+            if !plan
+                .candidate_skill_names
+                .iter()
+                .any(|s| s == "odoo-readonly")
+            {
+                plan.candidate_skill_names
+                    .insert(0, "odoo-readonly".to_string());
+            }
+            plan.intent_source = "reference_resolver".to_string();
+        }
+        _ => {}
+    }
+    plan.candidate_skill_names.truncate(3);
+}
+
 fn preview_text(s: &str, max: usize) -> String {
     let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.len() <= max {
@@ -1569,6 +1778,51 @@ fn preview_text(s: &str, max: usize) -> String {
     } else {
         let end = compact.floor_char_boundary(max);
         format!("{}…", &compact[..end])
+    }
+}
+
+fn resolver_lesson_from_correction(
+    result: &bagent_agent::CorrectionResult,
+) -> Option<&'static str> {
+    if !result.is_correction || result.confidence <= 0.7 {
+        return None;
+    }
+    let combined = format!(
+        "{} {}",
+        result.what_was_wrong.as_deref().unwrap_or(""),
+        result.correct_behavior.as_deref().unwrap_or("")
+    )
+    .to_lowercase();
+    let indicates_source_gap = [
+        "source",
+        "detail",
+        "details",
+        "content",
+        "body",
+        "record",
+        "metadata",
+        "summary",
+        "summar",
+        "fetch",
+        "full",
+        "table",
+        "row",
+        "line item",
+        "obsah",
+        "telo",
+        "riad",
+        "tabuľ",
+        "tabul",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle));
+
+    if indicates_source_gap {
+        Some(
+            "When a follow-up asks for content details after a prior metadata, summary, or list answer, fetch the target connector's full source record before answering; prior summaries are not sufficient evidence.",
+        )
+    } else {
+        None
     }
 }
 
@@ -1657,6 +1911,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             status: WhatsappConnectionStatus::Stopped,
             me: None,
             error: Some("status unavailable".into()),
+            diagnostics: None,
         });
     Json(HealthResponse {
         status: "ok",
@@ -1813,6 +2068,7 @@ async fn chat(
     let selected_text = req.selected_text.clone();
     let skills = state.skills.clone();
     let context_planner = state.context_planner.clone();
+    let reference_resolver = state.reference_resolver.clone();
     let task_rater = state.task_rater.clone();
     let fs = state.fs.clone();
     let fs_exec = state.fs.clone(); // kept for action execution in handler post-classify
@@ -1865,8 +2121,15 @@ async fn chat(
             "chat timing: directive check {}ms",
             t0.elapsed().as_millis()
         );
-        // Load server-side history + session summary + last mail ref + last file ref + last odoo ref in parallel
-        let (history, session_summary, last_mail_ref, last_file_ref, last_odoo_ref) = tokio::join!(
+        // Load server-side history + session summary + connector refs in parallel.
+        let (
+            history,
+            session_summary,
+            last_mail_ref,
+            last_file_ref,
+            last_odoo_ref,
+            last_whatsapp_ref,
+        ) = tokio::join!(
             async {
                 if req.history.is_empty() {
                     load_session_history(&db, &session_id).await
@@ -1878,6 +2141,7 @@ async fn chat(
             load_last_mail_ref(&db, &session_id),
             load_last_file_ref(&db, &session_id),
             load_last_odoo_ref(&db, &session_id),
+            load_last_whatsapp_ref(&db, &session_id),
         );
         tracing::info!("chat timing: history loaded {}ms", t0.elapsed().as_millis());
 
@@ -1888,32 +2152,117 @@ async fn chat(
             "en"
         };
 
+        // ── Planning layer ────────────────────────────────────────────────────
+        // Run intent routing before tool approval/context so selected skills can
+        // drive connector loading. This is intentionally before live tool fetch.
+        let mut last_connector_refs = Vec::new();
+        if last_mail_ref.is_some() {
+            last_connector_refs.push("mail".to_string());
+        }
+        if last_file_ref.is_some() {
+            last_connector_refs.push("filesystem".to_string());
+        }
+        if last_odoo_ref.is_some() {
+            last_connector_refs.push("odoo".to_string());
+        }
+        if last_whatsapp_ref.is_some() {
+            last_connector_refs.push("whatsapp".to_string());
+        }
+        let recent_context = format_history_snippet(&history, 6);
+        let reference_candidates = build_reference_candidates(
+            last_mail_ref.as_ref(),
+            last_file_ref.as_ref(),
+            last_odoo_ref.as_ref(),
+            last_whatsapp_ref.as_ref(),
+        );
+        let resolver_lessons = resolver_lessons_for_turn(&memory, &user_message).await;
+        let reference_resolution = reference_resolver
+            .resolve(
+                &user_message,
+                &recent_context,
+                &reference_candidates,
+                &resolver_lessons,
+                &chrono::Local::now().to_rfc3339(),
+            )
+            .await
+            .unwrap_or_default();
+        let runtime_context = PlannerRuntimeContext {
+            recent_context: format!(
+                "{}\n\nResolved reference: {}",
+                format_history_snippet(&history, 4),
+                serde_json::to_string(&reference_resolution).unwrap_or_default()
+            ),
+            last_connector_refs,
+            connector_statuses: vec![
+                format!("mail:{}", mail.is_some()),
+                format!("notes:{}", notes.is_some()),
+                format!("filesystem:{}", fs.is_some()),
+                "whatsapp:configured".to_string(),
+            ],
+            available_skill_names: skills.iter().map(|s| s.manifest.name.clone()).collect(),
+        };
+        let has_prior_mail_ctx = last_mail_ref.is_some();
+        let mut context_plan = context_planner
+            .plan(&user_message, lang, has_prior_mail_ctx, &runtime_context)
+            .await;
+        apply_reference_resolution_to_plan(&mut context_plan, &reference_resolution);
+        tracing::info!(
+            "chat timing: context plan ready {}ms — task={} source={} needs_memory={} skills={:?} ref={:?}",
+            t0.elapsed().as_millis(),
+            context_plan.task_type,
+            context_plan.intent_source,
+            context_plan.needs_memory,
+            context_plan.candidate_skill_names,
+            reference_resolution
+        );
+
         // Determine which tools are needed and gate via rules engine
         let low = user_message.to_lowercase();
-        let needs_mail = [
-            "email",
-            "mail",
-            "správ",
-            "inbox",
-            "schránk",
-            "doručen",
-            "posledn",
-            "prečítaj",
-            "read",
-            "sender",
-            "odosielate",
-            "nazvom",
-            "názvom",
-            "mailbox",
-            "prilohu",
-            "prílohu",
-        ]
-        .iter()
-        .any(|kw| low.contains(kw));
+        let selected_whatsapp = context_plan.task_type == "whatsapp"
+            || context_plan
+                .candidate_skill_names
+                .iter()
+                .any(|s| s == "whatsapp");
+        let mentions_whatsapp = selected_whatsapp
+            || [
+                "whatsapp",
+                "whatspp",
+                "whatsap",
+                "whatapp",
+                " wa ",
+                "wa:",
+                "na whatsappe",
+                "cez whatsapp",
+            ]
+            .iter()
+            .any(|kw| low.contains(kw));
+        let needs_mail = context_plan.task_type == "mail_search"
+            || (!mentions_whatsapp
+                && [
+                    "email",
+                    "mail",
+                    "správ",
+                    "inbox",
+                    "schránk",
+                    "doručen",
+                    "posledn",
+                    "prečítaj",
+                    "read",
+                    "sender",
+                    "odosielate",
+                    "nazvom",
+                    "názvom",
+                    "mailbox",
+                    "prilohu",
+                    "prílohu",
+                ]
+                .iter()
+                .any(|kw| low.contains(kw)));
         let needs_notes = ["poznámk", "note", "zápis", "zapisal", "napísal"]
             .iter()
             .any(|kw| low.contains(kw));
-        let needs_file = fs.is_some() && [
+        let needs_file = fs.is_some()
+            && (context_plan.task_type == "file_search" || [
             "nájdi", "vyhľadaj", "kde mám", "kde je súbor", "súbor", "priečinok",
             "finder", "preview", "faktúr", "zmluv", "zmluvu", "zmluva",
             "find file", "find document", "find invoice", "find contract",
@@ -1925,7 +2274,7 @@ async fn chat(
             || (last_file_ref.is_some() && [
                 "otvor ho", "otvor ju", "otvor to", "open it", "reveal it",
                 "show it", "ukáž", "ten súbor", "that file",
-            ].iter().any(|kw| low.contains(kw)));
+            ].iter().any(|kw| low.contains(kw))));
 
         let mut allowed_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1971,12 +2320,16 @@ async fn chat(
         tracing::info!("chat timing: rules checked {}ms", t0.elapsed().as_millis());
         // Fetch live tool context (mail/notes/window) only for approved tools.
         // Filesystem turns are now handled by the agentic tool loop below.
-        let (tool_ctx, mail_pdf_paths, mail_ref_opt, action_taken, odoo_ref_opt) =
+        let (tool_ctx, mail_pdf_paths, mail_ref_opt, action_taken, odoo_ref_opt, whatsapp_ref_opt) =
             fetch_tool_context(
                 &user_message,
                 &history,
                 last_mail_ref.as_ref(),
                 last_odoo_ref.as_ref(),
+                last_whatsapp_ref.as_ref(),
+                &reference_resolution,
+                &context_plan.task_type,
+                &context_plan.candidate_skill_names,
                 &allowed_tools,
                 ctx_db,
                 mail,
@@ -2041,6 +2394,22 @@ async fn chat(
                 )))
                 .await;
             save_last_odoo_ref(&db, &session_id, odoo_ref).await;
+        }
+
+        if let Some(ref whatsapp_ref) = whatsapp_ref_opt {
+            let _ = tx
+                .send(Ok(Event::default().data(
+                    serde_json::json!({
+                        "type": "whatsapp_found",
+                        "chat_id": whatsapp_ref.chat_id,
+                        "contact_name": whatsapp_ref.contact_name,
+                        "snippet": whatsapp_ref.snippet,
+                        "last_message_timestamp": whatsapp_ref.last_message_timestamp,
+                    })
+                    .to_string(),
+                )))
+                .await;
+            save_last_whatsapp_ref(&db, &session_id, whatsapp_ref).await;
         }
 
         // Load attachment records from DB and build context + image data for Ollama.
@@ -2197,20 +2566,6 @@ async fn chat(
             t0.elapsed().as_millis()
         );
 
-        // ── Planning layer ────────────────────────────────────────────────────
-        // ContextPlanner → SkillSelector → MemorySelector (all before prompt build)
-        let has_mail_ctx = tool_ctx.is_some();
-        let context_plan = context_planner
-            .plan(&user_message, lang, has_mail_ctx)
-            .await;
-        tracing::info!(
-            "chat timing: context plan ready {}ms — task={} needs_memory={} skills={:?}",
-            t0.elapsed().as_millis(),
-            context_plan.task_type,
-            context_plan.needs_memory,
-            context_plan.candidate_skill_names
-        );
-
         // ── Task rating (Phase 8) ─────────────────────────────────────────────
         // Rate the task deterministically and emit a lightweight SSE event.
         // This does NOT route the task to Codex automatically — it is used for
@@ -2325,6 +2680,35 @@ async fn chat(
             .await
         {
             Ok(mut built) => {
+                let reference_json = serde_json::to_value(&reference_resolution).ok();
+                if reference_resolution.confidence >= 0.60
+                    || reference_resolution.resolved_connector.is_some()
+                {
+                    let reference_block = format!(
+                        "## Resolved current reference\n{}",
+                        serde_json::to_string_pretty(&reference_resolution).unwrap_or_default()
+                    );
+                    built
+                        .messages
+                        .push(Message::system(reference_block.clone()));
+                    built.trace.layers.push(bagent_agent::PromptLayerTrace {
+                        name: "resolved_reference".to_string(),
+                        role: "system".to_string(),
+                        included: true,
+                        chars: reference_block.len(),
+                        preview: preview_text(&reference_block, 240),
+                    });
+                }
+                built.trace.reference_resolution = reference_json;
+                built.trace.resolved_connector = reference_resolution.resolved_connector.clone();
+                built.trace.standalone_query =
+                    if reference_resolution.standalone_query.trim().is_empty() {
+                        None
+                    } else {
+                        Some(reference_resolution.standalone_query.clone())
+                    };
+                built.trace.reference_needs_live_fetch =
+                    Some(reference_resolution.needs_live_fetch);
                 if att_data.images_b64.is_empty() {
                     built.messages.push(Message::user(&user_message));
                 } else {
@@ -2340,6 +2724,15 @@ async fn chat(
                     chars: user_message.len(),
                     preview: preview_text(&user_message, 240),
                 });
+                if let Some(ref whatsapp_ref) = whatsapp_ref_opt {
+                    built.trace.whatsapp_contact = whatsapp_ref.contact_name.clone();
+                    built.trace.whatsapp_chat_id = Some(whatsapp_ref.chat_id.clone());
+                    built.trace.whatsapp_context_injected = Some(true);
+                    built.trace.whatsapp_intent = Some(serde_json::json!({
+                        "source": whatsapp_ref.source,
+                        "snippet_present": whatsapp_ref.snippet.is_some(),
+                    }));
+                }
                 let prompt_chars: usize = built.messages.iter().map(|m| m.content.len()).sum();
                 let _ = tx
                     .send(Ok(Event::default().data(
@@ -3058,6 +3451,22 @@ async fn chat(
                                 result.what_was_wrong.as_deref().unwrap_or("?"),
                                 result.correct_behavior.as_deref().unwrap_or("?")
                             );
+                            if let Some(lesson) = resolver_lesson_from_correction(&result) {
+                                let _ = mem
+                                    .insert_full(InsertParams {
+                                        namespace: "resolver_lessons",
+                                        kind: "routing_lesson",
+                                        language: "und",
+                                        text: lesson,
+                                        source: "explicit",
+                                        source_ref: Some("correction"),
+                                        confidence: result.confidence,
+                                        importance: 0.85,
+                                        sensitivity: "normal",
+                                        ..Default::default()
+                                    })
+                                    .await;
+                            }
                             let namespace = if result.scope == "sk_lang" {
                                 "sk_glossary"
                             } else {
@@ -4378,13 +4787,34 @@ async fn odoo_open_handler(Json(body): Json<OdooOpenReq>) -> impl IntoResponse {
 /// `GET /whatsapp/status`
 async fn whatsapp_status_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.whatsapp.status().await {
-        Ok(s) => Json(serde_json::json!({
-            "status": s.status.to_string(),
-            "connected": s.status == WhatsappConnectionStatus::Ready,
-            "needs_qr": s.status == WhatsappConnectionStatus::Qr,
-            "me": s.me,
-            "error": s.error,
-        })),
+        Ok(s) => {
+            let me_name =
+                s.me.as_ref()
+                    .and_then(|me| me.name.clone().or_else(|| me.push_name.clone()));
+            let me_phone = s.me.as_ref().and_then(|me| me.number.clone());
+            let last_loading = s
+                .diagnostics
+                .as_ref()
+                .and_then(|d| d.get("last_loading"))
+                .cloned();
+            let last_state = s
+                .diagnostics
+                .as_ref()
+                .and_then(|d| d.get("last_state"))
+                .cloned();
+            Json(serde_json::json!({
+                "status": s.status.to_string(),
+                "connected": s.status == WhatsappConnectionStatus::Ready,
+                "needs_qr": s.status == WhatsappConnectionStatus::Qr,
+                "me": s.me,
+                "me_name": me_name,
+                "me_phone": me_phone,
+                "error": s.error,
+                "last_loading": last_loading,
+                "last_state": last_state,
+                "diagnostics": s.diagnostics,
+            }))
+        }
         Err(e) => Json(serde_json::json!({
             "status": "error",
             "connected": false,
@@ -4423,6 +4853,17 @@ async fn whatsapp_qr_handler(State(state): State<AppState>) -> impl IntoResponse
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "qr": null, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `GET /whatsapp/debug`
+async fn whatsapp_debug_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.whatsapp.debug().await {
+        Ok(debug) => (StatusCode::OK, Json(debug)),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": e.to_string() })),
         ),
     }
 }
@@ -4770,6 +5211,51 @@ fn parse_date_to_range(iso: &str) -> Option<(i64, i64)> {
     Some((start, end))
 }
 
+fn local_date_range(day_offset: i64) -> Option<(i64, i64)> {
+    use chrono::{Duration, Local, TimeZone};
+    let date = Local::now().date_naive() + Duration::days(day_offset);
+    let start = Local
+        .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
+        .earliest()?
+        .timestamp();
+    let next = date + Duration::days(1);
+    let end = Local
+        .from_local_datetime(&next.and_hms_opt(0, 0, 0)?)
+        .earliest()?
+        .timestamp();
+    Some((start, end))
+}
+
+fn asks_today_mailbox(low: &str) -> bool {
+    let has_today = [
+        "today", "today's", "todays", "dnes", "dneš", "dnesny", "dnešný",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw));
+    let has_mailbox = [
+        "mailbox", "inbox", "mail", "email", "schránk", "posta", "pošt",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw));
+    has_today && has_mailbox
+}
+
+fn resolver_requests_full_mail_record(reference_resolution: &ReferenceResolution) -> bool {
+    reference_resolution
+        .target_connector
+        .as_deref()
+        .or(reference_resolution.resolved_connector.as_deref())
+        == Some("mail")
+        && reference_resolution.source_needed == "full_record"
+}
+
+fn format_unix_local(unix: i64) -> String {
+    use chrono::{DateTime, Local, Utc};
+    DateTime::<Utc>::from_timestamp(unix, 0)
+        .map(|d| d.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string())
+        .unwrap_or_else(|| unix.to_string())
+}
+
 fn push_search_term(terms: &mut Vec<String>, term: Option<&str>) {
     let Some(term) = term.map(str::trim).filter(|s| !s.is_empty()) else {
         return;
@@ -4857,6 +5343,71 @@ async fn fetch_recent_mails(
     merged.sort_by(|a, b| b.received_at.cmp(&a.received_at));
     merged.truncate(limit);
     merged
+}
+
+fn compact_mail_body_preserving_line_items(body: &str, normal_limit: usize) -> String {
+    if body.len() <= normal_limit {
+        return body.to_string();
+    }
+
+    let head_end = body.floor_char_boundary(normal_limit.min(body.len()));
+    let head = &body[..head_end];
+    let mut preserved = Vec::new();
+    let mut preserved_chars = 0usize;
+    let max_preserved_chars = normal_limit;
+
+    for line in body[head_end..].lines() {
+        let trimmed = line.trim();
+        if !is_table_like_or_line_item(trimmed) {
+            continue;
+        }
+        let line_chars = line.chars().count();
+        if preserved_chars + line_chars > max_preserved_chars {
+            break;
+        }
+        preserved.push(line.to_string());
+        preserved_chars += line_chars + 1;
+    }
+
+    if preserved.is_empty() {
+        format!("{}…[skrátené]", head)
+    } else {
+        format!(
+            "{}…[skrátené; zachované štruktúrované riadky nižšie]\n{}",
+            head,
+            preserved.join("\n")
+        )
+    }
+}
+
+fn is_table_like_or_line_item(trimmed: &str) -> bool {
+    if trimmed.len() < 4 {
+        return false;
+    }
+    let has_digit = trimmed.chars().any(|c| c.is_ascii_digit());
+    let has_repeated_space = trimmed.contains("  ");
+    let separator_count = [
+        trimmed.contains('\t'),
+        trimmed.contains('|'),
+        trimmed.contains(';'),
+        has_repeated_space,
+        trimmed.contains(':'),
+    ]
+    .into_iter()
+    .filter(|b| *b)
+    .count();
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    let list_marker = trimmed.starts_with('-')
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('•')
+        || first.ends_with('.')
+        || first.ends_with(')');
+    let columns = trimmed.split_whitespace().count();
+
+    (has_digit && separator_count >= 2)
+        || (list_marker && separator_count >= 1)
+        || (list_marker && has_digit)
+        || (has_digit && has_repeated_space && columns >= 4)
 }
 
 /// Read body + all supported attachments for a single message.
@@ -4969,11 +5520,7 @@ async fn enrich_message(
     } else {
         // No attachment requested — show body
         if let Some(ref body) = full_msg.body {
-            let truncated = if body.len() > 2000 {
-                format!("{}…[skrátené]", &body[..body.floor_char_boundary(2000)])
-            } else {
-                body.clone()
-            };
+            let truncated = compact_mail_body_preserving_line_items(body, 2000);
             lines.push(format!("\n\n**Obsah:**\n\n{truncated}"));
         } else {
             lines.push("\n\n**Obsah:** TELO EMAILU SA NEPODARILO NAČÍTAŤ. Toto nie je šablóna — nič nevymýšľaj ani nedoplňaj.".to_string());
@@ -5016,11 +5563,149 @@ fn format_history_snippet(history: &[Message], max_turns: usize) -> String {
         .join("\n")
 }
 
+fn normalize_contact_match(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'á' | 'à' | 'ä' | 'â' => 'a',
+            'č' => 'c',
+            'ď' => 'd',
+            'é' | 'ě' | 'è' | 'ë' | 'ê' => 'e',
+            'í' | 'ì' | 'ï' | 'î' => 'i',
+            'ľ' | 'ĺ' => 'l',
+            'ň' => 'n',
+            'ó' | 'ô' | 'ö' | 'ò' | 'õ' => 'o',
+            'ŕ' => 'r',
+            'š' => 's',
+            'ť' => 't',
+            'ú' | 'ů' | 'ü' | 'ù' | 'û' => 'u',
+            'ý' | 'ÿ' => 'y',
+            'ž' => 'z',
+            other => other,
+        })
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn infer_whatsapp_contact_from_text(message: &str) -> Option<String> {
+    let low = message.to_lowercase();
+    let markers = [
+        "most recent message with ",
+        "most recent messages with ",
+        "most recent text with ",
+        "latest message with ",
+        "latest messages with ",
+        "latest text with ",
+        "last message with ",
+        "last messages with ",
+        "last text with ",
+        "chat history with ",
+        "i have a chat with ",
+        "have a chat with ",
+        "chat with ",
+        "písali s ",
+        "pisali s ",
+        "písal ",
+        "pisal ",
+    ];
+    let (pos, marker) = markers
+        .iter()
+        .filter_map(|marker| low.find(marker).map(|pos| (pos, *marker)))
+        .min_by_key(|(pos, _)| *pos)?;
+    let mut contact = message[pos + marker.len()..].trim().to_string();
+    for suffix in [
+        " on whatsapp",
+        " in whatsapp",
+        " on whatspp",
+        " in whatspp",
+        " cez whatsapp",
+        " na whatsappe",
+        " na whatsapp",
+    ] {
+        let contact_low = contact.to_lowercase();
+        if let Some(idx) = contact_low.find(suffix) {
+            contact.truncate(idx);
+        }
+    }
+    let contact = contact
+        .trim_matches(|c: char| c.is_whitespace() || c == '?' || c == '.' || c == ',' || c == ':')
+        .to_string();
+    if contact.is_empty() {
+        None
+    } else {
+        Some(contact)
+    }
+}
+
+fn normalize_whatsapp_intent(mut intent: WhatsappIntent, message: &str) -> WhatsappIntent {
+    if let Some(contact) = infer_whatsapp_contact_from_text(message) {
+        if matches!(
+            intent.action,
+            WhatsappAction::None | WhatsappAction::ListRecent | WhatsappAction::Search
+        ) || intent.contact_name.is_none()
+        {
+            intent.action = WhatsappAction::ReadHistory;
+            intent.contact_name = Some(contact);
+            intent.keywords.clear();
+        }
+    }
+    intent
+}
+
+fn find_matching_whatsapp_chat<'a>(
+    chats: &'a [WhatsappChat],
+    contact_query: &str,
+) -> Option<&'a WhatsappChat> {
+    let query_norm = normalize_contact_match(contact_query);
+    if query_norm.is_empty() {
+        return None;
+    }
+    chats.iter().find(|c| {
+        c.name
+            .as_deref()
+            .map(|name| {
+                let name_norm = normalize_contact_match(name);
+                name_norm.contains(&query_norm) || query_norm.contains(&name_norm)
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn find_matching_whatsapp_contact<'a>(
+    contacts: &'a [WhatsappContact],
+    contact_query: &str,
+) -> Option<&'a WhatsappContact> {
+    let query_norm = normalize_contact_match(contact_query);
+    if query_norm.is_empty() {
+        return None;
+    }
+    contacts.iter().find(|c| {
+        [
+            c.name.as_deref(),
+            c.push_name.as_deref(),
+            c.phone.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| {
+            let value_norm = normalize_contact_match(value);
+            value_norm.contains(&query_norm) || query_norm.contains(&value_norm)
+        })
+    })
+}
+
 async fn fetch_tool_context(
     message: &str,
     history: &[Message],
     last_mail_ref: Option<&MailRef>,
     last_odoo_ref: Option<&OdooRecordRef>,
+    last_whatsapp_ref: Option<&WhatsappRef>,
+    reference_resolution: &ReferenceResolution,
+    task_type: &str,
+    candidate_skill_names: &[String],
     allowed_tools: &std::collections::HashSet<String>,
     db: Arc<Mutex<Connection>>,
     mail: Option<MailConnector>,
@@ -5038,22 +5723,74 @@ async fn fetch_tool_context(
     Option<MailRef>,
     Option<String>,        // action_taken: Some(msg) skips LLM
     Option<OdooRecordRef>, // top Odoo record found this turn
+    Option<WhatsappRef>,   // top WhatsApp chat/context found this turn
 ) {
     let low = message.to_lowercase();
+    let planner_selected_whatsapp =
+        task_type == "whatsapp" || candidate_skill_names.iter().any(|s| s == "whatsapp");
+    let mentions_whatsapp = planner_selected_whatsapp
+        || [
+            "whatsapp",
+            "whatspp",
+            "whatsap",
+            "whatapp",
+            " wa ",
+            "wa:",
+            "na whatsappe",
+            "cez whatsapp",
+        ]
+        .iter()
+        .any(|kw| low.contains(kw));
 
     // Cheap keyword gate — only run the LLM classifier when the turn looks mail-related.
+    let mail_keyword_match = [
+        "email",
+        "mail",
+        "správ",
+        "inbox",
+        "schránk",
+        "doručen",
+        "posledn",
+        "prečítaj",
+        "read",
+        "sender",
+        "odosielate",
+        "nazvom",
+        "názvom",
+        "mailbox",
+        "prilohu",
+        "prílohu",
+        "predmet",
+        "pošt",
+        "message",
+        "odoslan",
+        "poslany",
+        "prijat",
+    ]
+    .iter()
+    .any(|kw| low.contains(kw));
+    let mail_followup_match = last_mail_ref.is_some()
+        && [
+            "tento mail",
+            "táto správa",
+            "ten mail",
+            "tú správu",
+            "this mail",
+            "this email",
+            "its attachment",
+            "tej správy",
+            "prilohy",
+            "prílohy",
+            "has it",
+            "má prílohy",
+            "ma prilohy",
+        ]
+        .iter()
+        .any(|kw| low.contains(kw));
     let looks_like_mail = allowed_tools.contains("mail_inbox")
-        && (["email", "mail", "správ", "inbox", "schránk", "doručen",
-             "posledn", "prečítaj", "read", "sender", "odosielate",
-             "nazvom", "názvom", "mailbox", "prilohu", "prílohu",
-             "predmet", "pošt", "message", "odoslan", "poslany", "prijat"]
-             .iter().any(|kw| low.contains(kw))
-            // Also trigger when user references the last found mail
-            || (last_mail_ref.is_some()
-                && ["tento mail", "táto správa", "ten mail", "tú správu",
-                    "this mail", "this email", "its attachment", "tej správy",
-                    "prilohy", "prílohy", "has it", "má prílohy", "ma prilohy"]
-                    .iter().any(|kw| low.contains(kw))));
+        && (task_type == "mail_search"
+            || reference_resolution.resolved_connector.as_deref() == Some("mail")
+            || (!mentions_whatsapp && (mail_keyword_match || mail_followup_match)));
 
     // On battery: sync on-demand when user asks about mail (background sync is paused)
     if looks_like_mail && !is_on_ac_power() {
@@ -5077,12 +5814,23 @@ async fn fetch_tool_context(
             ),
             None => base,
         };
-        match last_odoo_ref {
+        let with_odoo = match last_odoo_ref {
             Some(r) => format!(
                 "[LastFoundOdooRecord]: model=\"{}\" id={} name=\"{}\"\n{}",
                 r.model, r.id, r.name, with_mail
             ),
             None => with_mail,
+        };
+        match last_whatsapp_ref {
+            Some(r) => format!(
+                "[LastFoundWhatsapp]: chat_id=\"{}\" contact=\"{}\" source=\"{}\" snippet=\"{}\"\n{}",
+                r.chat_id,
+                r.contact_name.as_deref().unwrap_or(""),
+                r.source,
+                r.snippet.as_deref().unwrap_or(""),
+                with_odoo
+            ),
+            None => with_odoo,
         }
     };
 
@@ -5090,375 +5838,445 @@ async fn fetch_tool_context(
     let mut pdf_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
     let mut found_mail_ref: Option<MailRef> = None;
     let mut found_odoo_ref: Option<OdooRecordRef> = None;
+    let mut found_whatsapp_ref: Option<WhatsappRef> = None;
 
     // ── Mail ─────────────────────────────────────────────────────────────────
     if looks_like_mail {
-        let intent = MailIntentClassifier::new(ollama.clone(), model.clone())
-            .classify(message, &history_snippet)
-            .await
-            .unwrap_or_default();
-
-        tracing::debug!("mail_intent: {:?}", intent);
-
-        // Safety-net: if classifier said list_recent but filters are present → treat as search.
-        // This catches the common mis-classification of "recent mails from <sender>".
-        let effective_action = if intent.action == "list_recent"
-            && (intent.sender.is_some() || intent.subject.is_some() || !intent.keywords.is_empty())
-        {
-            "search"
-        } else {
-            intent.action.as_str()
-        };
-
-        match effective_action {
-            "none" => {}
-
-            "list_recent" => {
-                let msgs = fetch_recent_mails(&db, &mail, 10).await;
-                if !msgs.is_empty() {
-                    let lines: Vec<String> = msgs
-                        .iter()
-                        .map(|m| {
-                            let from = m.sender_display.as_deref().unwrap_or(&m.sender);
-                            let status = if m.is_read { "✓" } else { "●" };
-                            format!(
-                                "  {status} [{}] Od: {} | Predmet: {}",
-                                relative_date(m.received_at),
-                                from,
-                                m.subject
-                            )
-                        })
-                        .collect();
-                    parts.push(format!(
-                        "Posledné emaily (Apple Mail):\n{}",
-                        lines.join("\n")
-                    ));
-                } else {
-                    parts
-                        .push("Posledné emaily (Apple Mail): žiadne správy nenájdené.".to_string());
+        let mut mail_already_handled = false;
+        if resolver_requests_full_mail_record(reference_resolution) {
+            let target_rowid = reference_resolution
+                .target_ref
+                .as_deref()
+                .and_then(|s| s.parse::<i64>().ok())
+                .or_else(|| last_mail_ref.map(|r| r.rowid));
+            if let Some(rowid) = target_rowid {
+                let mut lines = Vec::new();
+                let found = enrich_message(rowid, &mail, false, &mut lines).await;
+                pdf_paths.extend(found);
+                if !lines.is_empty() {
+                    parts.push(format!("Nájdený email (Apple Mail):\n{}", lines.join("\n")));
+                    if let Some(lmr) = last_mail_ref {
+                        found_mail_ref = Some(MailRef {
+                            rowid,
+                            message_id: lmr.message_id.clone(),
+                            subject: lmr.subject.clone(),
+                            sender: lmr.sender.clone(),
+                            auto_open: false,
+                        });
+                    }
+                    mail_already_handled = true;
                 }
             }
+        }
 
-            "search" | "read_attachment" | "open" => {
-                let is_attachment = intent.action == "read_attachment" || intent.wants_attachment;
-                let wants_open = intent.action == "open"
-                    || ["otvor", "otvoriť", "open it", "show me", "ukáž mi"]
-                        .iter()
-                        .any(|kw| low.contains(kw));
+        if !mail_already_handled {
+            let intent = MailIntentClassifier::new(ollama.clone(), model.clone())
+                .classify(message, &history_snippet)
+                .await
+                .unwrap_or_default();
 
-                // Short-circuit: "má tento mail prílohy?" with no new search filters
-                // → use the last found mail's rowid directly, skip re-search.
-                let no_search_filters = intent.sender.is_none()
-                    && intent.subject.is_none()
-                    && intent.date.is_none()
-                    && intent.keywords.is_empty();
-                if is_attachment && no_search_filters {
-                    if let Some(ref lmr) = last_mail_ref {
-                        tracing::info!(
-                            "attachment short-circuit via last_mail_ref rowid={}",
-                            lmr.rowid
-                        );
-                        if let Some(ref mc) = mail {
-                            let mc2 = mc.clone();
-                            let rowid = lmr.rowid;
-                            // get_message populates attachments from emlx parsing
-                            let full_msg =
-                                tokio::task::spawn_blocking(move || mc2.get_message(rowid))
-                                    .await
-                                    .ok()
-                                    .and_then(|r| r.ok())
-                                    .flatten();
+            tracing::debug!("mail_intent: {:?}", intent);
 
-                            let attach_list = full_msg
-                                .as_ref()
-                                .map(|m| m.attachments.clone())
-                                .unwrap_or_default();
+            // Safety-net: if classifier said list_recent but filters are present → treat as search.
+            // This catches the common mis-classification of "recent mails from <sender>".
+            let effective_action = if intent.action == "list_recent"
+                && (intent.sender.is_some()
+                    || intent.subject.is_some()
+                    || !intent.keywords.is_empty())
+            {
+                "search"
+            } else {
+                intent.action.as_str()
+            };
 
-                            if attach_list.is_empty() {
-                                parts.push(format!(
-                                    "Email \"{}\" (od: {}) nemá žiadne prílohy.",
-                                    lmr.subject, lmr.sender
-                                ));
-                            } else {
-                                let att_lines: Vec<String> = attach_list
-                                    .iter()
-                                    .map(|a| {
-                                        format!("  • {} ({}, {} B)", a.filename, a.mimetype, a.size)
-                                    })
-                                    .collect();
-                                parts.push(format!(
-                                    "Prílohy emailu \"{}\" (od: {}):\n{}",
-                                    lmr.subject,
-                                    lmr.sender,
-                                    att_lines.join("\n")
-                                ));
-                                // Stage PDF attachment paths for chips
-                                for (idx, a) in attach_list.iter().enumerate() {
-                                    if a.mimetype.contains("pdf") {
-                                        if let Some(ref mc3) = mail {
-                                            let mc3 = mc3.clone();
-                                            let rid = lmr.rowid;
-                                            if let Ok(Some((_, bytes))) =
-                                                tokio::task::spawn_blocking(move || {
-                                                    mc3.get_message_attachment(rid, idx).ok()
-                                                })
-                                                .await
-                                            {
-                                                let tmp = std::env::temp_dir().join(format!(
-                                                    "bagent_att_{}_{}.pdf",
-                                                    rid, idx
-                                                ));
-                                                if std::fs::write(&tmp, &bytes).is_ok() {
-                                                    pdf_paths.push((a.filename.clone(), tmp));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                found_mail_ref = Some(MailRef {
-                                    rowid: lmr.rowid,
-                                    message_id: lmr.message_id.clone(),
-                                    subject: lmr.subject.clone(),
-                                    sender: lmr.sender.clone(),
-                                    auto_open: false,
-                                });
-                            }
-                        }
-                        // Done — skip the normal search path
-                    }
-                }
+            match effective_action {
+                "none" => {}
 
-                // Only run the full search if we didn't short-circuit above
-                let already_handled = is_attachment && no_search_filters && last_mail_ref.is_some();
-                if !already_handled {
-                    let (date_from, date_to) = intent
-                        .date
-                        .as_deref()
-                        .and_then(parse_date_to_range)
-                        .map(|(s, e)| (Some(s), Some(e)))
-                        .unwrap_or((None, None));
-
-                    // When user says "recent"/"posledné"/"nové" but no explicit date, add a
-                    // 30-day window so we don't scan the entire inbox history.
-                    let date_from = date_from.or_else(|| {
-                        let has_recent_word =
-                            ["recent", "posledn", "nové", "najnov", "latest", "new"]
-                                .iter()
-                                .any(|kw| low.contains(kw));
-                        if has_recent_word && intent.date.is_none() {
-                            Some(chrono::Utc::now().timestamp() - 30 * 24 * 3600)
-                        } else {
-                            None
-                        }
-                    });
-
-                    // Stop-words that should never be used as SQL search filters.
-                    let mail_stopwords = [
-                        "recent", "mail", "email", "new", "latest", "inbox", "nové", "posledn",
-                        "správ", "schránk",
-                    ];
-                    let meaningful_keywords: Vec<String> = intent
-                        .keywords
-                        .iter()
-                        .filter(|kw| {
-                            !mail_stopwords
-                                .iter()
-                                .any(|sw| kw.to_lowercase().contains(sw))
-                        })
-                        .cloned()
-                        .collect();
-
-                    // If LLM put the search term in keywords instead of sender/subject,
-                    // promote the first meaningful keyword to sender as a fallback.
-                    let effective_sender = intent.sender.clone().or_else(|| {
-                        if intent.subject.is_none() && !meaningful_keywords.is_empty() {
-                            Some(meaningful_keywords[0].clone())
-                        } else {
-                            None
-                        }
-                    });
-
-                    // Only use keywords as SQL filters when sender AND subject are both known
-                    // (avoids false-positive AND clauses filtering out valid results).
-                    let filter_keywords: Vec<String> =
-                        if effective_sender.is_some() || intent.subject.is_some() {
-                            vec![]
-                        } else {
-                            meaningful_keywords.clone()
-                        };
-
-                    let filter = MailSearchFilter {
-                        sender: effective_sender,
-                        subject: intent.subject.clone(),
-                        date_from,
-                        date_to,
-                        limit: 10,
-                        keywords: filter_keywords,
-                    };
-
-                    let had_date_filter = filter.date_from.is_some() || filter.date_to.is_some();
-                    let mut broad_terms = Vec::new();
-                    push_search_term(&mut broad_terms, filter.sender.as_deref());
-                    push_search_term(&mut broad_terms, filter.subject.as_deref());
-                    for kw in &meaningful_keywords {
-                        push_search_term(&mut broad_terms, Some(kw));
-                    }
-
-                    let mut msgs = search_mail_messages(&mail, filter.clone()).await;
-
-                    // Fallback 1: retry ambiguous company/person terms across sender and subject.
-                    // Example: "moneys3" may be classified as sender, while Apple Mail stores
-                    // "Money S3" in display name or subject.
-                    if msgs.is_empty() && !broad_terms.is_empty() {
-                        let broad = MailSearchFilter {
-                            sender: None,
-                            subject: None,
-                            date_from: filter.date_from,
-                            date_to: filter.date_to,
-                            limit: 10,
-                            keywords: broad_terms.clone(),
-                        };
-                        msgs = search_mail_messages(&mail, broad).await;
-                    }
-
-                    // Fallback 2: if no results and we had a date filter, retry without it.
-                    if msgs.is_empty() && had_date_filter {
-                        let wider = MailSearchFilter {
-                            sender: filter.sender.clone(),
-                            subject: filter.subject.clone(),
-                            date_from: None,
-                            date_to: None,
-                            limit: 10,
-                            keywords: filter.keywords.clone(),
-                        };
-                        msgs = search_mail_messages(&mail, wider).await;
-                    }
-
-                    // Fallback 3: combine both relaxations when each one alone failed.
-                    if msgs.is_empty() && had_date_filter && !broad_terms.is_empty() {
-                        let wider_broad = MailSearchFilter {
-                            sender: None,
-                            subject: None,
-                            date_from: None,
-                            date_to: None,
-                            limit: 10,
-                            keywords: broad_terms,
-                        };
-                        msgs = search_mail_messages(&mail, wider_broad).await;
-                    }
-
-                    let msgs = msgs;
-
-                    if msgs.is_empty() {
-                        let mut why = Vec::new();
-                        if let Some(ref s) = intent.sender {
-                            why.push(format!("odosielateľ: {s}"));
-                        }
-                        if let Some(ref s) = intent.subject {
-                            why.push(format!("predmet: {s}"));
-                        }
-                        if let Some(ref d) = intent.date {
-                            why.push(format!("dátum: {d}"));
-                        }
-                        parts.push(format!(
-                            "Vyhľadávanie v Apple Mail ({}) — žiadny email nenájdený. \
-                         Email neexistuje v lokálnej schránke alebo nebol stiahnutý cez IMAP.",
-                            if why.is_empty() {
-                                "bez filtrov".to_string()
-                            } else {
-                                why.join(", ")
-                            }
-                        ));
+                "list_recent" => {
+                    let today_mailbox = asks_today_mailbox(&low);
+                    let msgs = if today_mailbox {
+                        let (date_from, date_to) = local_date_range(0)
+                            .map(|(s, e)| (Some(s), Some(e)))
+                            .unwrap_or((None, None));
+                        search_mail_messages(
+                            &mail,
+                            MailSearchFilter {
+                                sender: None,
+                                subject: None,
+                                date_from,
+                                date_to,
+                                limit: 20,
+                                keywords: vec![],
+                            },
+                        )
+                        .await
                     } else {
-                        let mut lines: Vec<String> = msgs
+                        fetch_recent_mails(&db, &mail, 10).await
+                    };
+                    if !msgs.is_empty() {
+                        let lines: Vec<String> = msgs
                             .iter()
                             .map(|m| {
                                 let from = m.sender_display.as_deref().unwrap_or(&m.sender);
                                 let status = if m.is_read { "✓" } else { "●" };
                                 format!(
-                                    "  {status} [{}] Od: {} <{}> | Predmet: {}",
+                                    "  {status} [{}] Od: {} | Predmet: {}",
                                     relative_date(m.received_at),
                                     from,
-                                    m.sender,
                                     m.subject
                                 )
                             })
                             .collect();
+                        parts.push(format!(
+                            "{}:\n{}",
+                            if today_mailbox {
+                                "Dnešné emaily (Apple Mail)"
+                            } else {
+                                "Posledné emaily (Apple Mail)"
+                            },
+                            lines.join("\n")
+                        ));
+                    } else {
+                        parts.push(if today_mailbox {
+                            "Dnešné emaily (Apple Mail): žiadne správy nenájdené.".to_string()
+                        } else {
+                            "Posledné emaily (Apple Mail): žiadne správy nenájdené.".to_string()
+                        });
+                    }
+                }
 
-                        // Find best match: prefer message whose body contains a keyword.
-                        let mut best_rowid = msgs[0].rowid;
-                        if !intent.keywords.is_empty() {
-                            'outer: for msg_item in &msgs {
-                                if let Some(ref mc) = mail {
-                                    let mc2 = mc.clone();
-                                    let rid = msg_item.rowid;
-                                    if let Some(full) =
-                                        tokio::task::spawn_blocking(move || mc2.get_message(rid))
-                                            .await
-                                            .ok()
-                                            .and_then(|r| r.ok())
-                                            .flatten()
-                                    {
-                                        if let Some(ref body) = full.body {
-                                            let body_low = body.to_lowercase();
-                                            if intent
-                                                .keywords
-                                                .iter()
-                                                .any(|kw| body_low.contains(kw.as_str()))
-                                            {
-                                                best_rowid = msg_item.rowid;
-                                                break 'outer;
+                "search" | "read_attachment" | "open" => {
+                    let is_attachment =
+                        intent.action == "read_attachment" || intent.wants_attachment;
+                    let wants_open = intent.action == "open"
+                        || ["otvor", "otvoriť", "open it", "show me", "ukáž mi"]
+                            .iter()
+                            .any(|kw| low.contains(kw));
+
+                    // Short-circuit: "má tento mail prílohy?" with no new search filters
+                    // → use the last found mail's rowid directly, skip re-search.
+                    let no_search_filters = intent.sender.is_none()
+                        && intent.subject.is_none()
+                        && intent.date.is_none()
+                        && intent.keywords.is_empty();
+                    if is_attachment && no_search_filters {
+                        if let Some(ref lmr) = last_mail_ref {
+                            tracing::info!(
+                                "attachment short-circuit via last_mail_ref rowid={}",
+                                lmr.rowid
+                            );
+                            if let Some(ref mc) = mail {
+                                let mc2 = mc.clone();
+                                let rowid = lmr.rowid;
+                                // get_message populates attachments from emlx parsing
+                                let full_msg =
+                                    tokio::task::spawn_blocking(move || mc2.get_message(rowid))
+                                        .await
+                                        .ok()
+                                        .and_then(|r| r.ok())
+                                        .flatten();
+
+                                let attach_list = full_msg
+                                    .as_ref()
+                                    .map(|m| m.attachments.clone())
+                                    .unwrap_or_default();
+
+                                if attach_list.is_empty() {
+                                    parts.push(format!(
+                                        "Email \"{}\" (od: {}) nemá žiadne prílohy.",
+                                        lmr.subject, lmr.sender
+                                    ));
+                                } else {
+                                    let att_lines: Vec<String> = attach_list
+                                        .iter()
+                                        .map(|a| {
+                                            format!(
+                                                "  • {} ({}, {} B)",
+                                                a.filename, a.mimetype, a.size
+                                            )
+                                        })
+                                        .collect();
+                                    parts.push(format!(
+                                        "Prílohy emailu \"{}\" (od: {}):\n{}",
+                                        lmr.subject,
+                                        lmr.sender,
+                                        att_lines.join("\n")
+                                    ));
+                                    // Stage PDF attachment paths for chips
+                                    for (idx, a) in attach_list.iter().enumerate() {
+                                        if a.mimetype.contains("pdf") {
+                                            if let Some(ref mc3) = mail {
+                                                let mc3 = mc3.clone();
+                                                let rid = lmr.rowid;
+                                                if let Ok(Some((_, bytes))) =
+                                                    tokio::task::spawn_blocking(move || {
+                                                        mc3.get_message_attachment(rid, idx).ok()
+                                                    })
+                                                    .await
+                                                {
+                                                    let tmp = std::env::temp_dir().join(format!(
+                                                        "bagent_att_{}_{}.pdf",
+                                                        rid, idx
+                                                    ));
+                                                    if std::fs::write(&tmp, &bytes).is_ok() {
+                                                        pdf_paths.push((a.filename.clone(), tmp));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    found_mail_ref = Some(MailRef {
+                                        rowid: lmr.rowid,
+                                        message_id: lmr.message_id.clone(),
+                                        subject: lmr.subject.clone(),
+                                        sender: lmr.sender.clone(),
+                                        auto_open: false,
+                                    });
+                                }
+                            }
+                            // Done — skip the normal search path
+                        }
+                    }
+
+                    // Only run the full search if we didn't short-circuit above
+                    let already_handled =
+                        is_attachment && no_search_filters && last_mail_ref.is_some();
+                    if !already_handled {
+                        let (date_from, date_to) = intent
+                            .date
+                            .as_deref()
+                            .and_then(parse_date_to_range)
+                            .map(|(s, e)| (Some(s), Some(e)))
+                            .unwrap_or((None, None));
+
+                        // When user says "recent"/"posledné"/"nové" but no explicit date, add a
+                        // 30-day window so we don't scan the entire inbox history.
+                        let date_from = date_from.or_else(|| {
+                            let has_recent_word =
+                                ["recent", "posledn", "nové", "najnov", "latest", "new"]
+                                    .iter()
+                                    .any(|kw| low.contains(kw));
+                            if has_recent_word && intent.date.is_none() {
+                                Some(chrono::Utc::now().timestamp() - 30 * 24 * 3600)
+                            } else {
+                                None
+                            }
+                        });
+
+                        // Stop-words that should never be used as SQL search filters.
+                        let mail_stopwords = [
+                            "recent", "mail", "email", "new", "latest", "inbox", "nové", "posledn",
+                            "správ", "schránk",
+                        ];
+                        let meaningful_keywords: Vec<String> = intent
+                            .keywords
+                            .iter()
+                            .filter(|kw| {
+                                !mail_stopwords
+                                    .iter()
+                                    .any(|sw| kw.to_lowercase().contains(sw))
+                            })
+                            .cloned()
+                            .collect();
+
+                        // If LLM put the search term in keywords instead of sender/subject,
+                        // promote the first meaningful keyword to sender as a fallback.
+                        let effective_sender = intent.sender.clone().or_else(|| {
+                            if intent.subject.is_none() && !meaningful_keywords.is_empty() {
+                                Some(meaningful_keywords[0].clone())
+                            } else {
+                                None
+                            }
+                        });
+
+                        // Only use keywords as SQL filters when sender AND subject are both known
+                        // (avoids false-positive AND clauses filtering out valid results).
+                        let filter_keywords: Vec<String> =
+                            if effective_sender.is_some() || intent.subject.is_some() {
+                                vec![]
+                            } else {
+                                meaningful_keywords.clone()
+                            };
+
+                        let filter = MailSearchFilter {
+                            sender: effective_sender,
+                            subject: intent.subject.clone(),
+                            date_from,
+                            date_to,
+                            limit: 10,
+                            keywords: filter_keywords,
+                        };
+
+                        let had_date_filter =
+                            filter.date_from.is_some() || filter.date_to.is_some();
+                        let mut broad_terms = Vec::new();
+                        push_search_term(&mut broad_terms, filter.sender.as_deref());
+                        push_search_term(&mut broad_terms, filter.subject.as_deref());
+                        for kw in &meaningful_keywords {
+                            push_search_term(&mut broad_terms, Some(kw));
+                        }
+
+                        let mut msgs = search_mail_messages(&mail, filter.clone()).await;
+
+                        // Fallback 1: retry ambiguous company/person terms across sender and subject.
+                        // Example: "moneys3" may be classified as sender, while Apple Mail stores
+                        // "Money S3" in display name or subject.
+                        if msgs.is_empty() && !broad_terms.is_empty() {
+                            let broad = MailSearchFilter {
+                                sender: None,
+                                subject: None,
+                                date_from: filter.date_from,
+                                date_to: filter.date_to,
+                                limit: 10,
+                                keywords: broad_terms.clone(),
+                            };
+                            msgs = search_mail_messages(&mail, broad).await;
+                        }
+
+                        // Fallback 2: if no results and we had a date filter, retry without it.
+                        if msgs.is_empty() && had_date_filter && intent.date.is_none() {
+                            let wider = MailSearchFilter {
+                                sender: filter.sender.clone(),
+                                subject: filter.subject.clone(),
+                                date_from: None,
+                                date_to: None,
+                                limit: 10,
+                                keywords: filter.keywords.clone(),
+                            };
+                            msgs = search_mail_messages(&mail, wider).await;
+                        }
+
+                        // Fallback 3: combine both relaxations when each one alone failed.
+                        if msgs.is_empty()
+                            && had_date_filter
+                            && intent.date.is_none()
+                            && !broad_terms.is_empty()
+                        {
+                            let wider_broad = MailSearchFilter {
+                                sender: None,
+                                subject: None,
+                                date_from: None,
+                                date_to: None,
+                                limit: 10,
+                                keywords: broad_terms,
+                            };
+                            msgs = search_mail_messages(&mail, wider_broad).await;
+                        }
+
+                        let msgs = msgs;
+
+                        if msgs.is_empty() {
+                            let mut why = Vec::new();
+                            if let Some(ref s) = intent.sender {
+                                why.push(format!("odosielateľ: {s}"));
+                            }
+                            if let Some(ref s) = intent.subject {
+                                why.push(format!("predmet: {s}"));
+                            }
+                            if let Some(ref d) = intent.date {
+                                why.push(format!("dátum: {d}"));
+                            }
+                            parts.push(format!(
+                                "Vyhľadávanie v Apple Mail ({}) — žiadny email nenájdený. \
+                         Email neexistuje v lokálnej schránke alebo nebol stiahnutý cez IMAP.",
+                                if why.is_empty() {
+                                    "bez filtrov".to_string()
+                                } else {
+                                    why.join(", ")
+                                }
+                            ));
+                        } else {
+                            let mut lines: Vec<String> = msgs
+                                .iter()
+                                .map(|m| {
+                                    let from = m.sender_display.as_deref().unwrap_or(&m.sender);
+                                    let status = if m.is_read { "✓" } else { "●" };
+                                    format!(
+                                        "  {status} [{}] Od: {} <{}> | Predmet: {}",
+                                        relative_date(m.received_at),
+                                        from,
+                                        m.sender,
+                                        m.subject
+                                    )
+                                })
+                                .collect();
+
+                            // Find best match: prefer message whose body contains a keyword.
+                            let mut best_rowid = msgs[0].rowid;
+                            if !intent.keywords.is_empty() {
+                                'outer: for msg_item in &msgs {
+                                    if let Some(ref mc) = mail {
+                                        let mc2 = mc.clone();
+                                        let rid = msg_item.rowid;
+                                        if let Some(full) = tokio::task::spawn_blocking(move || {
+                                            mc2.get_message(rid)
+                                        })
+                                        .await
+                                        .ok()
+                                        .and_then(|r| r.ok())
+                                        .flatten()
+                                        {
+                                            if let Some(ref body) = full.body {
+                                                let body_low = body.to_lowercase();
+                                                if intent
+                                                    .keywords
+                                                    .iter()
+                                                    .any(|kw| body_low.contains(kw.as_str()))
+                                                {
+                                                    best_rowid = msg_item.rowid;
+                                                    break 'outer;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
+
+                            let found =
+                                enrich_message(best_rowid, &mail, is_attachment, &mut lines).await;
+                            pdf_paths.extend(found);
+
+                            let best_msg = msgs
+                                .iter()
+                                .find(|m| m.rowid == best_rowid)
+                                .unwrap_or(&msgs[0]);
+                            found_mail_ref = Some(MailRef {
+                                rowid: best_rowid,
+                                message_id: None,
+                                subject: best_msg.subject.clone(),
+                                sender: best_msg.sender.clone(),
+                                auto_open: wants_open,
+                            });
+
+                            parts.push(format!(
+                                "Nájdené emaily (Apple Mail):\n{}",
+                                lines.join("\n")
+                            ));
                         }
+                    } // end if !already_handled
+                }
 
-                        let found =
-                            enrich_message(best_rowid, &mail, is_attachment, &mut lines).await;
-                        pdf_paths.extend(found);
-
-                        let best_msg = msgs
+                _ => {
+                    let msgs = fetch_recent_mails(&db, &mail, 10).await;
+                    if !msgs.is_empty() {
+                        let lines: Vec<String> = msgs
                             .iter()
-                            .find(|m| m.rowid == best_rowid)
-                            .unwrap_or(&msgs[0]);
-                        found_mail_ref = Some(MailRef {
-                            rowid: best_rowid,
-                            message_id: None,
-                            subject: best_msg.subject.clone(),
-                            sender: best_msg.sender.clone(),
-                            auto_open: wants_open,
-                        });
-
+                            .map(|m| {
+                                let from = m.sender_display.as_deref().unwrap_or(&m.sender);
+                                let status = if m.is_read { "✓" } else { "●" };
+                                format!(
+                                    "  {status} [{}] Od: {} | Predmet: {}",
+                                    relative_date(m.received_at),
+                                    from,
+                                    m.subject
+                                )
+                            })
+                            .collect();
                         parts.push(format!(
-                            "Nájdené emaily (Apple Mail):\n{}",
+                            "Posledné emaily (Apple Mail):\n{}",
                             lines.join("\n")
                         ));
                     }
-                } // end if !already_handled
-            }
-
-            _ => {
-                let msgs = fetch_recent_mails(&db, &mail, 10).await;
-                if !msgs.is_empty() {
-                    let lines: Vec<String> = msgs
-                        .iter()
-                        .map(|m| {
-                            let from = m.sender_display.as_deref().unwrap_or(&m.sender);
-                            let status = if m.is_read { "✓" } else { "●" };
-                            format!(
-                                "  {status} [{}] Od: {} | Predmet: {}",
-                                relative_date(m.received_at),
-                                from,
-                                m.subject
-                            )
-                        })
-                        .collect();
-                    parts.push(format!(
-                        "Posledné emaily (Apple Mail):\n{}",
-                        lines.join("\n")
-                    ));
                 }
             }
         }
@@ -5514,7 +6332,7 @@ async fn fetch_tool_context(
                     // Background action completed — signal caller to skip LLM streaming
                     // and show a brief confirmation in the voice notch instead.
                     tracing::info!("window action taken: {}", note);
-                    return (None, Vec::new(), None, Some(note), None);
+                    return (None, Vec::new(), None, Some(note), None, None);
                 }
             }
         }
@@ -5743,7 +6561,16 @@ async fn fetch_tool_context(
     {
         // Keyword gate — only run classifier when turn looks WhatsApp-related.
         let looks_like_whatsapp = {
-            let explicit = ["whatsapp", " wa ", "na whatsappe", "cez whatsapp"];
+            let explicit = [
+                "whatsapp",
+                "whatspp",
+                "whatsap",
+                "whatapp",
+                " wa ",
+                "na whatsappe",
+                "cez whatsapp",
+                "na wa",
+            ];
             let send_signals = [
                 "napíš mu",
                 "napíš jej",
@@ -5762,11 +6589,40 @@ async fn fetch_tool_context(
                 "čo sme si písali",
                 "nájdi správu od",
                 "find message from",
+                "chat history",
+                "last messages with",
+                "last message with",
+                "latest messages with",
+                "latest message with",
+                "most recent messages with",
+                "most recent message with",
+                "most recent text with",
+                "latest text with",
+                "last text with",
+                "what did i talk about with",
+                "what did we talk about with",
+                "what did i discuss with",
             ];
             let has_mail = low.contains("mail") || low.contains("email");
+            let followup_signals = [
+                "what did i talk about with",
+                "what did we talk about with",
+                "what did i discuss with",
+                "last messages",
+                "last chat",
+                "čo sme riešili",
+                "čo sme si písali",
+                "posledné správy",
+                "posledne spravy",
+            ];
             explicit.iter().any(|k| low.contains(k))
+                || planner_selected_whatsapp
+                || reference_resolution.resolved_connector.as_deref() == Some("whatsapp")
                 || (send_signals.iter().any(|k| low.contains(k)) && !has_mail)
                 || (find_signals.iter().any(|k| low.contains(k)) && !has_mail)
+                || (last_whatsapp_ref.is_some()
+                    && followup_signals.iter().any(|k| low.contains(k))
+                    && !has_mail)
         };
 
         if looks_like_whatsapp {
@@ -5806,304 +6662,468 @@ async fn fetch_tool_context(
                     "## WhatsApp\nWhatsApp nie je pripojený — v Nastaveniach sa pripojiť.".into(),
                 );
             } else {
-                // Classify intent
-                let wa_intent = WhatsappIntentClassifier::new(ollama.clone(), model.clone())
-                    .classify(message, &history_snippet)
-                    .await
-                    .unwrap_or_default();
-
-                tracing::debug!("whatsapp_intent: {:?}", wa_intent);
-
-                match wa_intent.action {
-                    WhatsappAction::ListRecent => match whatsapp.list_chats(10).await {
-                        Ok(chats) if !chats.is_empty() => {
-                            let lines: Vec<String> = chats
-                                .iter()
-                                .map(|c| {
-                                    let name = c.name.as_deref().unwrap_or("—");
-                                    let unread = if c.unread_count > 0 {
-                                        format!(" [{}]", c.unread_count)
-                                    } else {
-                                        String::new()
-                                    };
-                                    let preview = c
-                                        .last_message_preview
-                                        .as_deref()
-                                        .unwrap_or("")
-                                        .chars()
-                                        .take(60)
-                                        .collect::<String>();
-                                    format!("  • {name}{unread}: {preview}")
-                                })
-                                .collect();
-                            parts.push(format!(
-                                "## WhatsApp — posledné chaty (PII)\n{}",
-                                lines.join("\n")
-                            ));
-                        }
-                        Ok(_) => parts.push("WhatsApp: žiadne chaty nenájdené.".into()),
-                        Err(e) => {
-                            tracing::warn!("WhatsApp list_chats error: {e}");
-                            parts.push("WhatsApp chaty nedostupné.".into());
-                        }
-                    },
-
-                    WhatsappAction::Search => {
-                        // Search cached messages (LIKE + recency)
-                        let keywords = if wa_intent.keywords.is_empty() {
-                            message
-                                .split_whitespace()
-                                .filter(|w| w.len() > 3)
-                                .take(5)
-                                .map(|s| s.to_string())
-                                .collect::<Vec<_>>()
-                        } else {
-                            wa_intent.keywords.clone()
+                let timestamp_handled = reference_resolution.resolved_connector.as_deref()
+                    == Some("whatsapp")
+                    && reference_resolution.requested_operation == "fetch_timestamp";
+                if timestamp_handled {
+                    if let Some(last_ref) = last_whatsapp_ref {
+                        let latest_ts = match last_ref.last_message_timestamp {
+                            Some(ts) => Some(ts),
+                            None => whatsapp
+                                .chat_messages(&last_ref.chat_id, 1, None)
+                                .await
+                                .ok()
+                                .and_then(|msgs| msgs.into_iter().max_by_key(|m| m.timestamp))
+                                .map(|m| m.timestamp),
                         };
-                        let results = search_whatsapp_cache(&db, &keywords, 8).await;
-                        if !results.is_empty() {
-                            let lines: Vec<String> = results
+                        let contact = last_ref
+                            .contact_name
+                            .as_deref()
+                            .unwrap_or("posledný WhatsApp chat");
+                        match latest_ts {
+                            Some(ts) => {
+                                parts.push(format!(
+                                    "## WhatsApp — čas posledného chatu s {contact} (PII)\nPosledná dostupná správa v tomto chate je z: {}.",
+                                    format_unix_local(ts)
+                                ));
+                                found_whatsapp_ref = Some(WhatsappRef {
+                                    chat_id: last_ref.chat_id.clone(),
+                                    contact_name: last_ref.contact_name.clone(),
+                                    snippet: last_ref.snippet.clone(),
+                                    source: "reference_timestamp".to_string(),
+                                    last_message_timestamp: Some(ts),
+                                });
+                            }
+                            None => parts.push(format!(
+                                "## WhatsApp — čas posledného chatu s {contact} (PII)\nČas správy nie je dostupný."
+                            )),
+                        }
+                    } else {
+                        parts.push(
+                            "## WhatsApp\nNemám uložený posledný WhatsApp chat, na ktorý by sa dalo odkázať."
+                                .into(),
+                        );
+                    }
+                }
+                if !timestamp_handled {
+                    // Classify intent
+                    let wa_intent = WhatsappIntentClassifier::new(ollama.clone(), model.clone())
+                        .classify(message, &history_snippet)
+                        .await
+                        .unwrap_or_default();
+                    let mut wa_intent = normalize_whatsapp_intent(wa_intent, message);
+                    if reference_resolution.resolved_connector.as_deref() == Some("whatsapp")
+                        && reference_resolution.confidence >= 0.60
+                        && matches!(
+                            reference_resolution.requested_operation.as_str(),
+                            "answer_from_current_context" | "fetch_more_history" | "analyze_tone"
+                        )
+                        && matches!(wa_intent.action, WhatsappAction::None)
+                    {
+                        if let Some(last_ref) = last_whatsapp_ref {
+                            wa_intent.action = WhatsappAction::ReadHistory;
+                            wa_intent.chat_id = Some(last_ref.chat_id.clone());
+                            wa_intent.contact_name = last_ref.contact_name.clone();
+                            wa_intent.limit = Some(if reference_resolution.needs_live_fetch {
+                                50
+                            } else {
+                                10
+                            });
+                        }
+                    }
+
+                    tracing::debug!("whatsapp_intent: {:?}", wa_intent);
+
+                    match wa_intent.action {
+                        WhatsappAction::ListRecent => match whatsapp.list_chats(10).await {
+                            Ok(chats) if !chats.is_empty() => {
+                                let wants_unread = [
+                                    "unread",
+                                    "not read",
+                                    "neprečít",
+                                    "neprecit",
+                                    "nové správy",
+                                    "nove spravy",
+                                ]
                                 .iter()
-                                .map(|r| {
-                                    let body_preview = r.body.chars().take(300).collect::<String>();
-                                    format!(
-                                        "  [{sender}] {body}",
-                                        sender = r.sender,
-                                        body = body_preview
-                                    )
-                                })
-                                .collect();
-                            parts.push(format!(
-                                "## WhatsApp — hľadanie (PII)\n{}",
-                                lines.join("\n")
-                            ));
-                        } else {
-                            // Fallback: live bridge recent chats
-                            match whatsapp.list_chats(5).await {
-                                Ok(chats) if !chats.is_empty() => {
-                                    let lines: Vec<String> = chats
+                                .any(|k| low.contains(k));
+                                let visible_chats = chats
+                                    .iter()
+                                    .filter(|c| !wants_unread || c.unread_count > 0)
+                                    .collect::<Vec<_>>();
+                                if visible_chats.is_empty() {
+                                    parts.push(
+                                    "## WhatsApp — neprečítané chaty (PII)\nŽiadne neprečítané WhatsApp chaty nenájdené."
+                                        .into(),
+                                );
+                                } else {
+                                    if let Some(first_chat) = visible_chats.first() {
+                                        found_whatsapp_ref = Some(WhatsappRef {
+                                            chat_id: first_chat.id.clone(),
+                                            contact_name: first_chat.name.clone(),
+                                            snippet: first_chat.last_message_preview.clone(),
+                                            source: if wants_unread {
+                                                "list_unread".to_string()
+                                            } else {
+                                                "list_recent".to_string()
+                                            },
+                                            last_message_timestamp: first_chat.timestamp,
+                                        });
+                                    }
+                                    let lines: Vec<String> = visible_chats
                                         .iter()
-                                        .filter_map(|c| {
-                                            c.last_message_preview.as_deref().map(|p| {
-                                                let name = c.name.as_deref().unwrap_or("—");
-                                                format!(
-                                                    "  • {name}: {}",
-                                                    p.chars().take(80).collect::<String>()
-                                                )
-                                            })
+                                        .map(|c| {
+                                            let name = c.name.as_deref().unwrap_or("—");
+                                            let unread = if c.unread_count > 0 {
+                                                format!(" [{}]", c.unread_count)
+                                            } else {
+                                                String::new()
+                                            };
+                                            let preview = c
+                                                .last_message_preview
+                                                .as_deref()
+                                                .unwrap_or("")
+                                                .chars()
+                                                .take(60)
+                                                .collect::<String>();
+                                            format!("  • {name}{unread}: {preview}")
                                         })
                                         .collect();
-                                    if !lines.is_empty() {
-                                        parts.push(format!(
-                                            "## WhatsApp — posledné správy (PII)\n{}",
-                                            lines.join("\n")
-                                        ));
-                                    } else {
+                                    parts.push(format!(
+                                        "## WhatsApp — {} (PII)\n{}",
+                                        if wants_unread {
+                                            "neprečítané chaty"
+                                        } else {
+                                            "posledné chaty"
+                                        },
+                                        lines.join("\n")
+                                    ));
+                                }
+                            }
+                            Ok(_) => parts.push("WhatsApp: žiadne chaty nenájdené.".into()),
+                            Err(e) => {
+                                tracing::warn!("WhatsApp list_chats error: {e}");
+                                parts.push("WhatsApp chaty nedostupné.".into());
+                            }
+                        },
+
+                        WhatsappAction::Search => {
+                            // Search cached messages (LIKE + recency)
+                            let keywords = if wa_intent.keywords.is_empty() {
+                                message
+                                    .split_whitespace()
+                                    .filter(|w| w.len() > 3)
+                                    .take(5)
+                                    .map(|s| s.to_string())
+                                    .collect::<Vec<_>>()
+                            } else {
+                                wa_intent.keywords.clone()
+                            };
+                            let results = search_whatsapp_cache(&db, &keywords, 8).await;
+                            if !results.is_empty() {
+                                let lines: Vec<String> = results
+                                    .iter()
+                                    .map(|r| {
+                                        let body_preview =
+                                            r.body.chars().take(300).collect::<String>();
+                                        format!(
+                                            "  [{sender}] {body}",
+                                            sender = r.sender,
+                                            body = body_preview
+                                        )
+                                    })
+                                    .collect();
+                                parts.push(format!(
+                                    "## WhatsApp — hľadanie (PII)\n{}",
+                                    lines.join("\n")
+                                ));
+                            } else {
+                                // Fallback: live bridge recent chats
+                                match whatsapp.list_chats(5).await {
+                                    Ok(chats) if !chats.is_empty() => {
+                                        let lines: Vec<String> = chats
+                                            .iter()
+                                            .filter_map(|c| {
+                                                c.last_message_preview.as_deref().map(|p| {
+                                                    let name = c.name.as_deref().unwrap_or("—");
+                                                    format!(
+                                                        "  • {name}: {}",
+                                                        p.chars().take(80).collect::<String>()
+                                                    )
+                                                })
+                                            })
+                                            .collect();
+                                        if !lines.is_empty() {
+                                            parts.push(format!(
+                                                "## WhatsApp — posledné správy (PII)\n{}",
+                                                lines.join("\n")
+                                            ));
+                                        } else {
+                                            parts.push(format!(
+                                                "WhatsApp: žiadne správy nenájdené pre: {}.",
+                                                keywords.join(", ")
+                                            ));
+                                        }
+                                    }
+                                    _ => {
                                         parts.push(format!(
                                             "WhatsApp: žiadne správy nenájdené pre: {}.",
                                             keywords.join(", ")
                                         ));
                                     }
                                 }
-                                _ => {
-                                    parts.push(format!(
-                                        "WhatsApp: žiadne správy nenájdené pre: {}.",
-                                        keywords.join(", ")
-                                    ));
-                                }
                             }
                         }
-                    }
 
-                    WhatsappAction::ReadHistory => {
-                        // Try to resolve contact → chat
-                        let contact_query = wa_intent
-                            .contact_name
-                            .as_deref()
-                            .or(wa_intent.phone.as_deref())
-                            .unwrap_or("");
-                        if !contact_query.is_empty() {
-                            // Search chats for name match
-                            match whatsapp.list_chats(50).await {
-                                Ok(chats) => {
-                                    let matched = chats.iter().find(|c| {
-                                        c.name
-                                            .as_deref()
-                                            .map(|n| {
-                                                n.to_lowercase()
-                                                    .contains(&contact_query.to_lowercase())
-                                            })
-                                            .unwrap_or(false)
-                                    });
-                                    if let Some(chat) = matched {
-                                        match whatsapp.chat_messages(&chat.id, 10, None).await {
-                                            Ok(msgs) if !msgs.is_empty() => {
-                                                let lines: Vec<String> = msgs
-                                                    .iter()
-                                                    .rev()
-                                                    .take(8)
-                                                    .map(|m| {
-                                                        let sender = if m.from_me {
-                                                            "Ja"
-                                                        } else {
-                                                            chat.name.as_deref().unwrap_or(&m.from)
-                                                        };
-                                                        let body = m
-                                                            .body
-                                                            .chars()
-                                                            .take(300)
-                                                            .collect::<String>();
-                                                        format!("  [{sender}]: {body}")
-                                                    })
-                                                    .collect();
-                                                let chat_name =
-                                                    chat.name.as_deref().unwrap_or(contact_query);
-                                                parts.push(format!("## WhatsApp — história s {chat_name} (PII)\n{}", lines.join("\n")));
-
-                                                // Cache messages in DB for future searches
-                                                let msgs_to_cache = msgs.clone();
-                                                let db_cache = db.clone();
-                                                let chat_name_str =
-                                                    chat.name.clone().unwrap_or_default();
-                                                tokio::spawn(async move {
-                                                    cache_whatsapp_messages(
-                                                        &db_cache,
-                                                        &msgs_to_cache,
-                                                        &chat_name_str,
+                        WhatsappAction::ReadHistory => {
+                            // Try to resolve contact → chat
+                            let contact_query = wa_intent
+                                .contact_name
+                                .as_deref()
+                                .or(wa_intent.phone.as_deref())
+                                .unwrap_or("");
+                            let resolved_chat_from_ref =
+                                wa_intent.chat_id.as_ref().map(|chat_id| {
+                                    (
+                                        chat_id.clone(),
+                                        wa_intent
+                                            .contact_name
+                                            .clone()
+                                            .unwrap_or_else(|| "WhatsApp chat".to_string()),
+                                    )
+                                });
+                            if !contact_query.is_empty() || resolved_chat_from_ref.is_some() {
+                                // Search chats for name match
+                                let resolved_from_chats = if resolved_chat_from_ref.is_some() {
+                                    Ok(resolved_chat_from_ref)
+                                } else {
+                                    match whatsapp.list_chats(200).await {
+                                        Ok(chats) => Ok(
+                                            if let Some(chat) =
+                                                find_matching_whatsapp_chat(&chats, contact_query)
+                                            {
+                                                Some((
+                                                    chat.id.clone(),
+                                                    chat.name.clone().unwrap_or_else(|| {
+                                                        contact_query.to_string()
+                                                    }),
+                                                ))
+                                            } else {
+                                                match whatsapp.list_contacts(500).await {
+                                                    Ok(contacts) => find_matching_whatsapp_contact(
+                                                        &contacts,
+                                                        contact_query,
                                                     )
-                                                    .await;
-                                                });
+                                                    .map(|contact| {
+                                                        (
+                                                            contact.id.clone(),
+                                                            contact
+                                                                .name
+                                                                .clone()
+                                                                .or_else(|| {
+                                                                    contact.push_name.clone()
+                                                                })
+                                                                .unwrap_or_else(|| {
+                                                                    contact_query.to_string()
+                                                                }),
+                                                        )
+                                                    }),
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                    "WhatsApp list_contacts fallback error: {e}"
+                                                );
+                                                        None
+                                                    }
+                                                }
+                                            },
+                                        ),
+                                        Err(e) => Err(e),
+                                    }
+                                };
+                                match resolved_from_chats {
+                                    Ok(resolved) => {
+                                        if let Some((chat_id, chat_name)) = resolved {
+                                            let limit = wa_intent.limit.unwrap_or(10) as usize;
+                                            match whatsapp
+                                                .chat_messages(&chat_id, limit, None)
+                                                .await
+                                            {
+                                                Ok(msgs) if !msgs.is_empty() => {
+                                                    let lines: Vec<String> = msgs
+                                                        .iter()
+                                                        .rev()
+                                                        .take(8)
+                                                        .map(|m| {
+                                                            let sender = if m.from_me {
+                                                                "Ja"
+                                                            } else {
+                                                                &chat_name
+                                                            };
+                                                            let body = m
+                                                                .body
+                                                                .chars()
+                                                                .take(300)
+                                                                .collect::<String>();
+                                                            format!(
+                                                                "  [{}] [{sender}]: {body}",
+                                                                format_unix_local(m.timestamp)
+                                                            )
+                                                        })
+                                                        .collect();
+                                                    parts.push(format!("## WhatsApp — história s {chat_name} (PII)\n{}", lines.join("\n")));
+                                                    let latest_ts =
+                                                        msgs.iter().map(|m| m.timestamp).max();
+                                                    found_whatsapp_ref = Some(WhatsappRef {
+                                                        chat_id: chat_id.clone(),
+                                                        contact_name: Some(chat_name.clone()),
+                                                        snippet: lines.first().cloned(),
+                                                        source: "read_history".to_string(),
+                                                        last_message_timestamp: latest_ts,
+                                                    });
+
+                                                    // Cache messages in DB for future searches
+                                                    let msgs_to_cache = msgs.clone();
+                                                    let db_cache = db.clone();
+                                                    let chat_name_str = chat_name.clone();
+                                                    tokio::spawn(async move {
+                                                        cache_whatsapp_messages(
+                                                            &db_cache,
+                                                            &msgs_to_cache,
+                                                            &chat_name_str,
+                                                        )
+                                                        .await;
+                                                    });
+                                                }
+                                                Ok(_) => parts.push(format!(
+                                                    "WhatsApp: žiadne správy s {}.",
+                                                    contact_query
+                                                )),
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "WhatsApp chat_messages error: {e}"
+                                                    );
+                                                    parts.push(
+                                                        "WhatsApp história nedostupná.".into(),
+                                                    );
+                                                }
                                             }
-                                            Ok(_) => parts.push(format!(
-                                                "WhatsApp: žiadne správy s {}.",
+                                        } else {
+                                            parts.push(format!(
+                                                "WhatsApp: kontakt \"{}\" nenájdený.",
                                                 contact_query
-                                            )),
-                                            Err(e) => {
-                                                tracing::warn!("WhatsApp chat_messages error: {e}");
-                                                parts.push("WhatsApp história nedostupná.".into());
-                                            }
+                                            ));
                                         }
-                                    } else {
-                                        parts.push(format!(
-                                            "WhatsApp: kontakt \"{}\" nenájdený.",
-                                            contact_query
-                                        ));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("WhatsApp list_chats error: {e}");
+                                        parts.push("WhatsApp chaty nedostupné.".into());
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!("WhatsApp list_chats error: {e}");
-                                    parts.push("WhatsApp chaty nedostupné.".into());
-                                }
+                            } else {
+                                parts.push("WhatsApp: uveď meno kontaktu.".into());
                             }
-                        } else {
-                            parts.push("WhatsApp: uveď meno kontaktu.".into());
                         }
-                    }
 
-                    WhatsappAction::DraftSend => {
-                        let contact = wa_intent
-                            .contact_name
-                            .as_deref()
-                            .or(wa_intent.phone.as_deref());
-                        let text = wa_intent.message_text.as_deref().unwrap_or("");
+                        WhatsappAction::DraftSend => {
+                            let contact = wa_intent
+                                .contact_name
+                                .as_deref()
+                                .or(wa_intent.phone.as_deref());
+                            let text = wa_intent.message_text.as_deref().unwrap_or("");
 
-                        if text.is_empty() {
-                            parts.push("WhatsApp: text správy chýba.".into());
-                        } else if contact.is_none() {
-                            parts.push("WhatsApp: príjemca správy chýba.".into());
-                        } else {
-                            let contact_str = contact.unwrap().to_string();
-                            let text_str = text.to_string();
+                            if text.is_empty() {
+                                parts.push("WhatsApp: text správy chýba.".into());
+                            } else if contact.is_none() {
+                                parts.push("WhatsApp: príjemca správy chýba.".into());
+                            } else {
+                                let contact_str = contact.unwrap().to_string();
+                                let text_str = text.to_string();
 
-                            // Resolve chat JID from contact name
-                            let chat_id_opt = match whatsapp.list_chats(50).await {
-                                Ok(chats) => chats
-                                    .iter()
-                                    .find(|c| {
-                                        c.name
-                                            .as_deref()
-                                            .map(|n| {
-                                                n.to_lowercase()
-                                                    .contains(&contact_str.to_lowercase())
-                                            })
-                                            .unwrap_or(false)
-                                    })
-                                    .map(|c| c.id.clone()),
-                                Err(_) => None,
-                            };
+                                // Resolve chat JID from contact name
+                                let chat_id_opt = match whatsapp.list_chats(200).await {
+                                    Ok(chats) => find_matching_whatsapp_chat(&chats, &contact_str)
+                                        .map(|c| c.id.clone()),
+                                    Err(_) => None,
+                                };
 
-                            let target_opt: Option<WhatsappSendTarget> = match chat_id_opt {
-                                Some(id) => Some(WhatsappSendTarget::ChatId(id)),
-                                None => wa_intent.phone.clone().map(WhatsappSendTarget::Phone),
-                            };
-                            if target_opt.is_none() {
-                                parts.push(format!(
-                                    "WhatsApp: kontakt \"{}\" nenájdený. Uveď telefónne číslo.",
-                                    contact_str
-                                ));
-                            }
-                            if let Some(target) = target_opt {
-                                let recipient_display = &contact_str;
-                                // Check rules gate — Forbidden blocks immediately
-                                let rules_level = rules.check("whatsapp.send_message", "{}");
-                                if matches!(rules_level, ApprovalLevel::Forbidden) {
-                                    parts.push(
-                                        "WhatsApp: posielanie správ je zakázané pravidlami.".into(),
-                                    );
-                                } else {
-                                    // Approval flow (trap #1: always request regardless of Auto/Ask)
-                                    let text_preview = if text_str.len() > 60 {
-                                        format!("{}… ({} znakov)", &text_str[..60], text_str.len())
+                                let target_opt: Option<WhatsappSendTarget> = match chat_id_opt {
+                                    Some(id) => Some(WhatsappSendTarget::ChatId(id)),
+                                    None => wa_intent.phone.clone().map(WhatsappSendTarget::Phone),
+                                };
+                                if target_opt.is_none() {
+                                    parts.push(format!(
+                                        "WhatsApp: kontakt \"{}\" nenájdený. Uveď telefónne číslo.",
+                                        contact_str
+                                    ));
+                                }
+                                if let Some(target) = target_opt {
+                                    let recipient_display = &contact_str;
+                                    // Check rules gate — Forbidden blocks immediately
+                                    let rules_level = rules.check("whatsapp.send_message", "{}");
+                                    if matches!(rules_level, ApprovalLevel::Forbidden) {
+                                        parts.push(
+                                            "WhatsApp: posielanie správ je zakázané pravidlami."
+                                                .into(),
+                                        );
                                     } else {
-                                        text_str.clone()
-                                    };
-                                    let audit_description = format!(
-                                        "WhatsApp správa — Príjemca: {} | Náhľad: {}",
-                                        recipient_display, text_preview
-                                    );
+                                        // Approval flow (trap #1: always request regardless of Auto/Ask)
+                                        let text_preview = if text_str.len() > 60 {
+                                            format!(
+                                                "{}… ({} znakov)",
+                                                &text_str[..60],
+                                                text_str.len()
+                                            )
+                                        } else {
+                                            text_str.clone()
+                                        };
+                                        let audit_description = format!(
+                                            "WhatsApp správa — Príjemca: {} | Náhľad: {}",
+                                            recipient_display, text_preview
+                                        );
 
-                                    // We don't have a tx sender here (called outside SSE stream context
-                                    // in the REST-style tool-context path). Use None → Swift polls /approvals/pending.
-                                    let approved = request_approval_core(
-                                        &db,
-                                        &pending_approvals,
-                                        "whatsapp.send_message",
-                                        &audit_description,
-                                        None,
-                                    )
-                                    .await;
+                                        // We don't have a tx sender here (called outside SSE stream context
+                                        // in the REST-style tool-context path). Use None → Swift polls /approvals/pending.
+                                        let approved = request_approval_core(
+                                            &db,
+                                            &pending_approvals,
+                                            "whatsapp.send_message",
+                                            &audit_description,
+                                            None,
+                                        )
+                                        .await;
 
-                                    if !approved {
-                                        parts.push(format!(
+                                        if !approved {
+                                            parts.push(format!(
                                         "WhatsApp: odoslanie správy pre \"{}\" bolo zamietnuté.",
                                         recipient_display
                                     ));
-                                    } else {
-                                        match whatsapp.send_message(target, &text_str).await {
-                                            Ok(msg_ref) => {
-                                                tracing::info!(message_id = %msg_ref.message_id, "WhatsApp message sent via tool context");
-                                                parts.push(format!(
+                                        } else {
+                                            match whatsapp.send_message(target, &text_str).await {
+                                                Ok(msg_ref) => {
+                                                    tracing::info!(message_id = %msg_ref.message_id, "WhatsApp message sent via tool context");
+                                                    parts.push(format!(
                                                 "WhatsApp: správa pre \"{}\" bola odoslaná (id: {}).",
                                                 recipient_display, msg_ref.message_id
                                             ));
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "WhatsApp send error in tool ctx: {e}"
-                                                );
-                                                parts.push(format!(
-                                                    "WhatsApp: odoslanie zlyhalo — {}",
-                                                    e
-                                                ));
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "WhatsApp send error in tool ctx: {e}"
+                                                    );
+                                                    parts.push(format!(
+                                                        "WhatsApp: odoslanie zlyhalo — {}",
+                                                        e
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                    } // end DraftSend
+                        } // end DraftSend
 
-                    WhatsappAction::None => {}
+                        WhatsappAction::None => {}
+                    }
                 }
             }
         }
@@ -6120,7 +7140,14 @@ async fn fetch_tool_context(
         ))
     };
 
-    (ctx, pdf_paths, found_mail_ref, None, found_odoo_ref)
+    (
+        ctx,
+        pdf_paths,
+        found_mail_ref,
+        None,
+        found_odoo_ref,
+        found_whatsapp_ref,
+    )
 }
 
 // ── WhatsApp DB helpers ───────────────────────────────────────────────────────
@@ -6528,6 +7555,33 @@ async fn load_last_odoo_ref(
     serde_json::from_value(val["last_odoo_ref"].clone()).ok()
 }
 
+async fn save_last_whatsapp_ref(
+    db: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    whatsapp_ref: &WhatsappRef,
+) {
+    let val = serde_json::to_value(whatsapp_ref).unwrap_or(serde_json::Value::Null);
+    merge_session_metadata(db, session_id, "last_whatsapp_ref", val).await;
+}
+
+async fn load_last_whatsapp_ref(
+    db: &Arc<Mutex<Connection>>,
+    session_id: &str,
+) -> Option<WhatsappRef> {
+    let json: Option<String> = db
+        .lock()
+        .await
+        .query_row(
+            "SELECT metadata_json FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let val: serde_json::Value = serde_json::from_str(&json?).ok()?;
+    serde_json::from_value(val["last_whatsapp_ref"].clone()).ok()
+}
+
 async fn load_session_history(db: &Arc<Mutex<Connection>>, session_id: &str) -> Vec<Message> {
     let db = db.lock().await;
     let mut stmt = match db.prepare(
@@ -6581,4 +7635,126 @@ async fn prepare_history(
 
 fn err_event(msg: &str) -> Event {
     Event::default().data(serde_json::json!({"type":"error","message":msg}).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infers_contact_from_latest_whatsapp_message_request() {
+        assert_eq!(
+            infer_whatsapp_contact_from_text("whats my latest message with Slavka on whatsapp")
+                .as_deref(),
+            Some("Slavka")
+        );
+        assert_eq!(
+            infer_whatsapp_contact_from_text("i have a chat with Slávka Múčková").as_deref(),
+            Some("Slávka Múčková")
+        );
+    }
+
+    #[test]
+    fn normalizes_whatsapp_intent_to_read_history_when_contact_is_present() {
+        let intent = WhatsappIntent {
+            action: WhatsappAction::ListRecent,
+            ..Default::default()
+        };
+        let normalized =
+            normalize_whatsapp_intent(intent, "whats my latest message with Slavka on whatsapp");
+        assert_eq!(normalized.action, WhatsappAction::ReadHistory);
+        assert_eq!(normalized.contact_name.as_deref(), Some("Slavka"));
+    }
+
+    #[test]
+    fn whatsapp_chat_match_is_diacritic_insensitive() {
+        let chats = vec![WhatsappChat {
+            id: "1@c.us".to_string(),
+            name: Some("Slávka Múčková".to_string()),
+            is_group: false,
+            unread_count: 0,
+            timestamp: None,
+            last_message_preview: Some("ahoj".to_string()),
+        }];
+        let matched = find_matching_whatsapp_chat(&chats, "Slavka").unwrap();
+        assert_eq!(matched.id, "1@c.us");
+    }
+
+    #[test]
+    fn whatsapp_contact_match_is_diacritic_insensitive() {
+        let contacts = vec![WhatsappContact {
+            id: "421900000000@c.us".to_string(),
+            name: Some("Slávka Múčková".to_string()),
+            push_name: None,
+            phone: Some("+421900000000".to_string()),
+            is_business: false,
+        }];
+        let matched = find_matching_whatsapp_contact(&contacts, "Slavka Muckova").unwrap();
+        assert_eq!(matched.id, "421900000000@c.us");
+    }
+
+    #[test]
+    fn today_mailbox_query_is_detected() {
+        assert!(asks_today_mailbox("whats in my todays mailbox"));
+        assert!(asks_today_mailbox("čo mám dnes v pošte"));
+        assert!(!asks_today_mailbox("what is today"));
+    }
+
+    #[test]
+    fn mail_detail_source_needed_full_record_targets_mail() {
+        let resolution = ReferenceResolution {
+            resolved_connector: None,
+            resolved_entity_type: Some("mail".to_string()),
+            source_needed: "full_record".to_string(),
+            target_connector: Some("mail".to_string()),
+            target_ref: Some("42".to_string()),
+            confidence: 0.61,
+            ..Default::default()
+        };
+        assert!(resolver_requests_full_mail_record(&resolution));
+    }
+
+    #[test]
+    fn mail_detail_preserves_table_like_rows_after_truncation_boundary() {
+        let mut body = String::new();
+        body.push_str(&"Introductory prose without structured rows. ".repeat(80));
+        body.push_str("\n\n");
+        for idx in 1..=6 {
+            body.push_str(&format!(
+                "{idx}. Generic line item  {} ks  {:>.2} EUR\n",
+                idx,
+                idx as f32 * 3.5
+            ));
+        }
+
+        let compacted = compact_mail_body_preserving_line_items(&body, 600);
+        assert!(compacted.contains("zachované štruktúrované riadky"));
+        assert!(compacted.contains("Generic line item"));
+        assert!(compacted.contains("6. Generic line item"));
+    }
+
+    #[test]
+    fn reference_resolution_selects_whatsapp_and_disables_memory_for_tone() {
+        let mut plan = ContextPlan::default();
+        let resolution = ReferenceResolution {
+            is_followup: true,
+            resolved_connector: Some("whatsapp".to_string()),
+            resolved_entity_type: Some("chat".to_string()),
+            resolved_entity_id: Some("abc@lid".to_string()),
+            requested_operation: "analyze_tone".to_string(),
+            source_needed: "more_history".to_string(),
+            target_connector: Some("whatsapp".to_string()),
+            target_ref: Some("abc@lid".to_string()),
+            confidence: 0.91,
+            needs_live_fetch: true,
+            standalone_query: "Are there signs of flirting in the latest WhatsApp chat?"
+                .to_string(),
+            ..Default::default()
+        };
+        apply_reference_resolution_to_plan(&mut plan, &resolution);
+        assert_eq!(plan.task_type, "whatsapp");
+        assert_eq!(plan.selected_connector.as_deref(), Some("whatsapp"));
+        assert!(!plan.needs_memory);
+        assert_eq!(plan.candidate_skill_names, vec!["whatsapp"]);
+    }
 }

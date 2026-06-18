@@ -491,8 +491,17 @@ struct ExpandedChatView: View {
             VStack(spacing: 0) {
                 header
                 Divider()
-                if viewModel.showSettings {
+                if viewModel.showWhatsappPairing {
+                    WhatsAppPairingView(viewModel: viewModel)
+                        .transition(
+                            .asymmetric(
+                                insertion: .move(edge: .trailing).combined(with: .opacity),
+                                removal: .move(edge: .leading).combined(with: .opacity)
+                            )
+                        )
+                } else if viewModel.showSettings {
                     SettingsView(viewModel: viewModel)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 } else if viewModel.showMemory {
                     MemoryPanelView(viewModel: viewModel)
                 } else if viewModel.showSkills {
@@ -874,6 +883,272 @@ private func copyToPasteboard(_ text: String) {
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(text, forType: .string)
     NotificationCenter.default.post(name: .bagentCodeCopied, object: nil)
+}
+
+struct WhatsAppPairingView: View {
+    @ObservedObject var viewModel: ChatViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var showDiagnostics = false
+
+    private var status: DaemonClient.WhatsappStatusResult? {
+        viewModel.whatsappStatus
+    }
+
+    private var statusText: String {
+        switch status?.status ?? "starting" {
+        case "starting": return "Starting local bridge"
+        case "qr": return "Waiting for scan"
+        case "authenticated": return "Scan accepted, loading WhatsApp Web"
+        case "authenticated_waiting_for_ready": return "Authenticated, still waiting for WhatsApp Web"
+        case "ready": return "Connected"
+        case "disconnected": return "Disconnected"
+        case "error": return "Connection error"
+        case "missing_node": return "Node.js not found"
+        case "bridge_not_installed": return "Bridge dependencies missing"
+        default: return status?.status ?? "Starting"
+        }
+    }
+
+    private var detailText: String {
+        if let loading = status?.last_loading {
+            let percent = loading.percent.map { "\(Int($0))%" } ?? "loading"
+            if let message = loading.message, !message.isEmpty {
+                return "\(percent) · \(message)"
+            }
+            return percent
+        }
+        if let state = status?.last_state, !state.isEmpty {
+            return "WhatsApp state: \(state)"
+        }
+        if let error = status?.error, !error.isEmpty {
+            return error
+        }
+        return "Open WhatsApp on your phone, choose Linked devices, then scan this code."
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            ScrollView {
+                VStack(alignment: .center, spacing: 18) {
+                    VStack(spacing: 6) {
+                        Text("Scan QR code in WhatsApp")
+                            .font(.system(size: 20, weight: .semibold))
+                        Text("Linked devices → Link a device")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.top, 18)
+                    .accessibilityElement(children: .combine)
+
+                    qrSurface
+
+                    VStack(spacing: 6) {
+                        HStack(spacing: 8) {
+                            statusDot
+                            Text(statusText)
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        Text(detailText)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(3)
+                            .frame(maxWidth: 300)
+                    }
+                    .accessibilityElement(children: .combine)
+
+                    actions
+                    diagnostics
+                }
+                .frame(maxWidth: .infinity)
+                .padding(18)
+            }
+        }
+        .background(.ultraThinMaterial)
+        .task {
+            viewModel.refreshWhatsappStatus()
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Button {
+                withAnimation(reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.24, dampingFraction: 0.8)) {
+                    viewModel.showWhatsappPairing = false
+                    viewModel.showSettings = true
+                }
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .help("Späť do nastavení")
+
+            Label("WhatsApp pairing", systemImage: "qrcode.viewfinder")
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+            Button {
+                viewModel.disconnectWhatsapp()
+            } label: {
+                Image(systemName: "xmark.circle")
+                    .font(.system(size: 13))
+            }
+            .buttonStyle(.plain)
+            .help("Zastaviť párovanie")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private var qrSurface: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.85))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
+                )
+                .frame(width: 236, height: 236)
+
+            if let qrStr = viewModel.whatsappQrString, let img = QRImage.generate(from: qrStr) {
+                Image(nsImage: img)
+                    .resizable()
+                    .interpolation(.none)
+                    .frame(width: 204, height: 204)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    .accessibilityLabel("WhatsApp QR code")
+            } else if status?.status == "authenticated" || status?.status == "authenticated_waiting_for_ready" {
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 26))
+                        .foregroundStyle(Color.green)
+                    Text("Scan accepted")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .transition(.opacity)
+            } else {
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                    Text("Generating QR code")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .transition(.opacity)
+            }
+        }
+        .animation(reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.28, dampingFraction: 0.82), value: viewModel.whatsappQrString)
+        .animation(reduceMotion ? .easeOut(duration: 0.12) : .easeInOut(duration: 0.18), value: status?.status)
+    }
+
+    private var actions: some View {
+        HStack(spacing: 10) {
+            Button {
+                viewModel.refreshWhatsappQr()
+            } label: {
+                Label("Refresh QR", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .disabled(status?.needs_qr != true)
+
+            Button {
+                viewModel.disconnectWhatsapp()
+            } label: {
+                Label("Stop", systemImage: "stop.circle")
+            }
+            .buttonStyle(.bordered)
+        }
+        .font(.system(size: 12))
+    }
+
+    private var diagnostics: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    showDiagnostics.toggle()
+                }
+                if showDiagnostics {
+                    Task { await viewModel.loadWhatsappDebug() }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: showDiagnostics ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .frame(width: 12)
+                    Text("Diagnostics")
+                        .font(.system(size: 11, weight: .medium))
+                    Spacer()
+                    if viewModel.isLoadingWhatsappDebug {
+                        ProgressView()
+                            .scaleEffect(0.55)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if showDiagnostics {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Button {
+                            Task { await viewModel.loadWhatsappDebug() }
+                        } label: {
+                            Label("Reload", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            copyToPasteboard(viewModel.whatsappDebugPayload ?? "")
+                        } label: {
+                            Label("Copy JSON", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(.plain)
+                        .disabled((viewModel.whatsappDebugPayload ?? "").isEmpty)
+                    }
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.accentColor)
+
+                    ScrollView {
+                        Text(viewModel.whatsappDebugPayload ?? "No diagnostics loaded.")
+                            .font(.system(size: 10, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(maxHeight: 130)
+                    .background(Color.black.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .frame(maxWidth: 340)
+        .padding(10)
+        .background(Color.secondary.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var statusDot: some View {
+        Circle()
+            .fill(statusColor)
+            .frame(width: 8, height: 8)
+            .accessibilityHidden(true)
+    }
+
+    private var statusColor: Color {
+        switch status?.status {
+        case "ready": return .green
+        case "error", "disconnected", "missing_node", "bridge_not_installed": return .red
+        case "qr", "starting", "authenticated", "authenticated_waiting_for_ready": return .yellow
+        default: return .gray
+        }
+    }
 }
 
 struct DebugPanelView: View {
@@ -1323,12 +1598,18 @@ struct VoiceAttachControl: View {
             Button { viewModel.toggleInlineVoice() } label: {
                 Image(systemName: viewModel.isVoiceRecording ? "waveform" : "mic")
                     .font(.system(size: 18))
-                    .foregroundStyle(viewModel.isVoiceRecording ? Color.accentColor : Color.secondary)
+                    .foregroundStyle(
+                        !viewModel.voiceModeEnabled
+                            ? Color.secondary.opacity(0.45)
+                            : (viewModel.isVoiceRecording ? Color.accentColor : Color.secondary)
+                    )
                     // `.repeating` is the macOS 14 equivalent of `.repeat(.continuous)`.
                     .symbolEffect(.pulse.byLayer, options: .repeating,
                                   isActive: viewModel.isVoiceRecording)
             }
             .buttonStyle(.plain)
+            .disabled(!viewModel.voiceModeEnabled)
+            .accessibilityLabel(viewModel.voiceModeEnabled ? "Hlasový vstup" : "Hlasový vstup je vypnutý")
         }
     }
 }

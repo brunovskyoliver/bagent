@@ -69,7 +69,7 @@ assert(validateSend({ text: sk, phone: '+421901234567' }) === null, 'valid phone
 // ── 4. Status serialization ────────────────────────────────────────────────────
 
 console.log('\n4. Status serialization');
-const validStatuses = ['stopped', 'starting', 'qr', 'authenticated', 'ready', 'disconnected', 'error'];
+const validStatuses = ['stopped', 'starting', 'qr', 'authenticated', 'authenticated_waiting_for_ready', 'ready', 'disconnected', 'error'];
 for (const s of validStatuses) {
     const json = JSON.stringify({ status: s, me: null, error: undefined });
     const obj = JSON.parse(json);

@@ -25,6 +25,7 @@ final class NotchWindowController: NSObject {
     private let chatViewModel: ChatViewModel
     private(set) var isExpanded = false
     private(set) var isVoiceShowing = false
+    var isVoiceModeEnabled: Bool { chatViewModel.voiceModeEnabled }
     private var hasNotch = false
     private var localKeyMonitor: Any?
     private var globalMouseMonitor: Any?
@@ -69,6 +70,7 @@ final class NotchWindowController: NSObject {
         // the chat and re-open the voice overlay for the next utterance.
         chatViewModel.onVoiceTurnComplete = { [weak self] in
             guard let self else { return }
+            guard self.chatViewModel.voiceModeEnabled else { return }
             // Give the user time to read/absorb the response before re-opening voice.
             // Delay is proportional to response word count (≈150 WPM reading pace),
             // clamped to a sensible range so very short or very long replies don't
@@ -76,7 +78,14 @@ final class NotchWindowController: NSObject {
             let readDelay = self.chatViewModel.voiceTurnResumeDelay()
             self.collapse()
             DispatchQueue.main.asyncAfter(deadline: .now() + readDelay) { [weak self] in
-                self?.presentVoice()
+                guard let self, self.chatViewModel.voiceModeEnabled else { return }
+                self.presentVoice()
+            }
+        }
+        chatViewModel.onVoiceModeDisabled = { [weak self] in
+            guard let self else { return }
+            if self.isVoiceShowing {
+                self.teardownVoiceNotch(restoreApp: true)
             }
         }
 
@@ -265,6 +274,7 @@ final class NotchWindowController: NSObject {
     /// - Non-notch display: shows the `voicePanel` below the centered pill; the pill's icon and
     ///   label react to `isVoiceNotchActive` in SwiftUI.
     func presentVoice() {
+        guard chatViewModel.voiceModeEnabled else { return }
         guard !isExpanded, !isVoiceShowing else { return }
         isVoiceShowing = true
         previousApp = NSWorkspace.shared.frontmostApplication
@@ -347,6 +357,10 @@ final class NotchWindowController: NSObject {
 
     private func voiceToChatHandoff(text: String) {
         guard isVoiceShowing else { return }
+        guard chatViewModel.voiceModeEnabled else {
+            teardownVoiceNotch(restoreApp: true)
+            return
+        }
         if isStopIntent(text) {
             teardownVoiceNotch(restoreApp: true)
             return

@@ -110,6 +110,31 @@ impl WhatsappConnector {
         )
     }
 
+    /// True when a previous WhatsApp Web LocalAuth profile exists on disk.
+    ///
+    /// This does not prove the session is still valid; it only means startup may
+    /// restore without showing a QR code. The bridge itself reports `qr` if the
+    /// phone needs to be paired again.
+    pub fn has_persisted_session(&self) -> bool {
+        let session_dir = self
+            .config
+            .session_dir
+            .clone()
+            .unwrap_or_else(process::default_session_dir);
+        let profile = session_dir.join("session").join("Default");
+        if !profile.is_dir() {
+            return false;
+        }
+        [
+            "IndexedDB",
+            "Local Storage",
+            "Session Storage",
+            "Preferences",
+        ]
+        .iter()
+        .any(|name| profile.join(name).exists())
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     /// Start the bridge subprocess.
@@ -189,12 +214,14 @@ impl WhatsappConnector {
                             status: WhatsappConnectionStatus::Disconnected,
                             me: None,
                             error: Some(e.to_string()),
+                            diagnostics: None,
                         })
                     }
                     Err(_) => Ok(WhatsappStatus {
                         status: WhatsappConnectionStatus::Disconnected,
                         me: None,
                         error: Some("bridge health check timed out".into()),
+                        diagnostics: None,
                     }),
                 }
             }
@@ -205,6 +232,7 @@ impl WhatsappConnector {
                         status: WhatsappConnectionStatus::MissingNode,
                         me: None,
                         error: Some("Node.js not found — install Node ≥18 via Homebrew".into()),
+                        diagnostics: None,
                     }),
                     Ok(_) => {
                         let b_dir = self.config.bridge_dir.clone().or_else(process::bridge_dir);
@@ -220,12 +248,14 @@ impl WhatsappConnector {
                                     "Run `make whatsapp-bridge-install` to install bridge deps"
                                         .into(),
                                 ),
+                                diagnostics: None,
                             })
                         } else {
                             Ok(WhatsappStatus {
                                 status: WhatsappConnectionStatus::Stopped,
                                 me: None,
                                 error: None,
+                                diagnostics: None,
                             })
                         }
                     }
@@ -242,6 +272,23 @@ impl WhatsappConnector {
             .as_ref()
             .ok_or_else(|| WhatsappError::NotReady(WhatsappConnectionStatus::Stopped))?;
         client.qr().await
+    }
+
+    pub async fn debug(&self) -> Result<serde_json::Value, WhatsappError> {
+        let inner = self.inner.lock().await;
+        let client = inner.client.clone();
+        drop(inner);
+        match client {
+            Some(client) => client.debug().await,
+            None => {
+                let status = self.status().await?;
+                Ok(serde_json::json!({
+                    "status": status.status.to_string(),
+                    "error": status.error,
+                    "events": [],
+                }))
+            }
+        }
     }
 
     pub async fn list_contacts(&self, limit: usize) -> Result<Vec<WhatsappContact>, WhatsappError> {
@@ -354,6 +401,22 @@ mod tests {
             s.contains("whatsapp"),
             "session dir should mention whatsapp: {s}"
         );
+    }
+
+    #[test]
+    fn persisted_session_detection_requires_browser_profile() {
+        let root = std::env::temp_dir().join(format!("bagent-wa-test-{}", rand_u64()));
+        let connector = WhatsappConnector::new(WhatsappConfig {
+            session_dir: Some(root.clone()),
+            ..Default::default()
+        });
+        assert!(!connector.has_persisted_session());
+
+        let profile = root.join("session").join("Default");
+        std::fs::create_dir_all(profile.join("IndexedDB")).unwrap();
+        assert!(connector.has_persisted_session());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // ── Intent deserialisation (mirroring spec §14) ───────────────────────────

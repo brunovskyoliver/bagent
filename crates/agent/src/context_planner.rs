@@ -55,8 +55,17 @@ pub struct ContextPlan {
     pub needs_conversation_recall: bool,
     /// Candidate skill names for SkillSelector to consider.
     pub candidate_skill_names: Vec<String>,
-    /// 0.0–1.0 planner confidence (< 0.6 → LLM fallback was attempted).
+    /// 0.0–1.0 planner confidence for the winning intent.
     pub confidence: f32,
+    /// Where the winning intent came from: `llm`, `deterministic`, or `merged`.
+    #[serde(default)]
+    pub intent_source: String,
+    /// Connector selected by the intent router, when the task is connector-backed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_connector: Option<String>,
+    /// True when the router thinks the assistant should ask a clarification before acting.
+    #[serde(default)]
+    pub clarification_needed: bool,
 }
 
 impl Default for ContextPlan {
@@ -71,8 +80,23 @@ impl Default for ContextPlan {
             needs_conversation_recall: false,
             candidate_skill_names: vec![],
             confidence: 0.5,
+            intent_source: "deterministic".to_string(),
+            selected_connector: None,
+            clarification_needed: false,
         }
     }
+}
+
+/// Extra turn context available to the intent router.
+///
+/// Kept stringly-typed on purpose: the planner only needs compact hints, not
+/// connector data. This avoids coupling the agent crate to daemon connector types.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlannerRuntimeContext {
+    pub recent_context: String,
+    pub last_connector_refs: Vec<String>,
+    pub connector_statuses: Vec<String>,
+    pub available_skill_names: Vec<String>,
 }
 
 // ── Planner ──────────────────────────────────────────────────────────────────
@@ -94,28 +118,48 @@ impl ContextPlanner {
     ///
     /// `language`: `"sk"` or `"en"` from the daemon's diacritic heuristic.
     /// `has_mail_ctx`: true when the turn already triggered mail tool approval.
-    pub async fn plan(&self, user_turn: &str, language: &str, has_mail_ctx: bool) -> ContextPlan {
-        let mut plan = deterministic_plan(user_turn, language, has_mail_ctx);
+    pub async fn plan(
+        &self,
+        user_turn: &str,
+        language: &str,
+        has_mail_ctx: bool,
+        runtime: &PlannerRuntimeContext,
+    ) -> ContextPlan {
+        let det = deterministic_plan(user_turn, language, has_mail_ctx);
 
-        // If confidence is too low, attempt LLM classifier refinement.
-        if plan.confidence < 0.6 {
-            if let Ok(llm_plan) = self.llm_plan(user_turn, language).await {
-                plan = merge_plans(plan, llm_plan);
-            }
-            // On parse/request failure: keep the deterministic plan (already fail-closed).
+        // LLM-first: every normal turn gets a local classifier pass. If it fails
+        // or returns a weak/general answer, merge back to deterministic signals.
+        match self.llm_plan(user_turn, language, runtime).await {
+            Ok(llm_plan) => merge_plans(det, llm_plan),
+            Err(_) => det,
         }
-
-        plan
     }
 
     // ── LLM fallback ─────────────────────────────────────────────────────────
 
-    async fn llm_plan(&self, user_turn: &str, language: &str) -> Result<LlmPlanResult> {
+    async fn llm_plan(
+        &self,
+        user_turn: &str,
+        language: &str,
+        runtime: &PlannerRuntimeContext,
+    ) -> Result<LlmPlanResult> {
+        let runtime_block = if runtime == &PlannerRuntimeContext::default() {
+            String::new()
+        } else {
+            format!(
+                "\n## Runtime context\nRecent context:\n{}\nLast connector refs: {:?}\nConnector statuses: {:?}\nAvailable skills: {:?}\n",
+                runtime.recent_context,
+                runtime.last_connector_refs,
+                runtime.connector_statuses,
+                runtime.available_skill_names
+            )
+        };
         let prompt = format!(
             r#"You are a task classifier for a personal macOS assistant. Classify the user turn below.
 
 User turn: "{user_turn}"
 Detected language: {language}
+{runtime_block}
 
 ## CRITICAL — Odoo vs local file search disambiguation
 
@@ -134,30 +178,42 @@ Score BOTH intents independently on a 0.0–1.0 scale, then pick the higher-scor
 
 ## Return ONLY a JSON object (no markdown):
 {{
-  "task_type": "sk_business_email|mail_search|invoice_analysis|odoo_lookup|window_control|file_search|screen_context|explicit_memory|conversation_recall|general",
+  "task_type": "sk_business_email|mail_search|invoice_analysis|odoo_lookup|window_control|file_search|screen_context|whatsapp|explicit_memory|conversation_recall|general",
+  "confidence": 0.0,
+  "selected_connector": null,
+  "clarification_needed": false,
   "intent_scores": {{
     "odoo_lookup": 0.0,
-    "file_search": 0.0
+    "file_search": 0.0,
+    "whatsapp": 0.0,
+    "mail_search": 0.0
   }},
   "needs_memory": true|false,
   "memory_namespaces": ["user_pref","style_profile","sk_glossary","contacts","corrections","negative_rules","global"],
   "needs_conversation_recall": true|false,
-  "candidate_skill_names": ["sk-business-email","mail-search","invoice-analysis","odoo-readonly","aerospace-window-control","file-search","file-open","app-open-control","screen-context"],
+  "candidate_skill_names": ["sk-business-email","mail-search","invoice-analysis","odoo-readonly","aerospace-window-control","file-search","file-open","app-open-control","screen-context","whatsapp"],
   "response_language": "english_default|match_user|match_source|slovak_required"
 }}
 
 Rules:
+- LLM-FIRST routing: infer intent from text, typos, and context. Do not require exact keywords.
 - needs_memory=true only for tasks where user preferences, corrections, or glossary would help.
 - "what did I say / čo som hovoril / what did we decide" → needs_conversation_recall=true, needs_memory=false.
 - Simple facts ("what is 2+2", "what time is it") → needs_memory=false.
 - Slovak email drafting/rewriting → sk-business-email + needs_memory=true with user_pref,style_profile,sk_glossary.
 - Invoice / DPH / faktúra / splatnosť → invoice-analysis.
 - Mail search / inbox / nájdi mail → mail-search.
+- WhatsApp / WA / chat history / unread WhatsApp messages / send WhatsApp → whatsapp.
+- Common misspellings like "whatspp", "whatsap", and "whatapp" mean WhatsApp.
+- "most recent text/message with X", "latest text/message with X", or "last chat with X" means WhatsApp if the user mentions WhatsApp/WA or a close typo.
+- If WhatsApp is explicitly mentioned, prefer whatsapp over mail_search even when the turn says "read", "message", "last", or "unread".
 - Workspace / window / plocha / AeroSpace → aerospace-window-control.
 - Local file search/open/reveal/app launch → file-search, file-open, app-open-control.
 - Odoo ERP data lookup → odoo-readonly.
 - candidate_skill_names max 3.
-- intent_scores: provide both odoo_lookup and file_search scores for every query, even if one is 0.0."#
+- selected_connector: one of "mail", "notes", "odoo", "filesystem", "screen", "whatsapp", or null.
+- confidence: your confidence in task_type, 0.0-1.0.
+- intent_scores: provide odoo_lookup, file_search, whatsapp, and mail_search scores for every query, even if one is 0.0."#
         );
 
         let raw = self
@@ -190,6 +246,7 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             needs_conversation_recall: true,
             candidate_skill_names: vec![],
             confidence: 0.9,
+            ..Default::default()
         };
     }
 
@@ -208,6 +265,7 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             needs_conversation_recall: false,
             candidate_skill_names: vec![],
             confidence: 0.95,
+            ..Default::default()
         };
     }
 
@@ -222,6 +280,7 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             needs_conversation_recall: false,
             candidate_skill_names: vec!["aerospace-window-control".to_string()],
             confidence: 0.9,
+            ..Default::default()
         };
     }
 
@@ -244,6 +303,7 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             // Ambiguous: drop below 0.6 threshold so llm_plan is invoked to score
             // odoo_lookup vs file_search intents explicitly.
             confidence: if ambiguous { 0.4 } else { 0.85 },
+            ..Default::default()
         };
     }
 
@@ -272,6 +332,7 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             needs_conversation_recall: false,
             candidate_skill_names: vec!["invoice-analysis".to_string()],
             confidence: 0.88,
+            ..Default::default()
         };
     }
 
@@ -298,6 +359,28 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             needs_conversation_recall: false,
             candidate_skill_names: vec!["sk-business-email".to_string()],
             confidence: 0.9,
+            ..Default::default()
+        };
+    }
+
+    // WhatsApp messaging. Check before mail: generic words like "read",
+    // "message", "last", and "unread" often appear in WhatsApp requests too.
+    if is_whatsapp(&low) {
+        return ContextPlan {
+            task_type: "whatsapp".to_string(),
+            response_language_hint: if is_sk {
+                ResponseLanguageHint::MatchUser
+            } else {
+                ResponseLanguageHint::EnglishDefault
+            },
+            needs_memory: true,
+            memory_namespaces: vec!["contacts".to_string(), "user_pref".to_string()],
+            memory_kinds: vec!["contact".to_string(), "preference".to_string()],
+            needs_conversation_recall: false,
+            candidate_skill_names: vec!["whatsapp".to_string()],
+            confidence: 0.9,
+            selected_connector: Some("whatsapp".to_string()),
+            ..Default::default()
         };
     }
 
@@ -331,6 +414,8 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             needs_conversation_recall: false,
             candidate_skill_names: skills,
             confidence: 0.85,
+            selected_connector: Some("mail".to_string()),
+            ..Default::default()
         };
     }
 
@@ -350,24 +435,8 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             needs_conversation_recall: false,
             candidate_skill_names: vec!["screen-context".to_string()],
             confidence: 0.9,
-        };
-    }
-
-    // WhatsApp messaging (checked before file_search and general)
-    if is_whatsapp(&low) {
-        return ContextPlan {
-            task_type: "whatsapp".to_string(),
-            response_language_hint: if is_sk {
-                ResponseLanguageHint::MatchUser
-            } else {
-                ResponseLanguageHint::EnglishDefault
-            },
-            needs_memory: true,
-            memory_namespaces: vec!["contacts".to_string(), "user_pref".to_string()],
-            memory_kinds: vec!["contact".to_string(), "preference".to_string()],
-            needs_conversation_recall: false,
-            candidate_skill_names: vec!["whatsapp".to_string()],
-            confidence: 0.88,
+            selected_connector: Some("screen".to_string()),
+            ..Default::default()
         };
     }
 
@@ -390,6 +459,8 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
                 "app-open-control".to_string(),
             ],
             confidence: 0.88,
+            selected_connector: Some("filesystem".to_string()),
+            ..Default::default()
         };
     }
 
@@ -408,6 +479,7 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             needs_conversation_recall: false,
             candidate_skill_names: vec![],
             confidence: 0.75,
+            ..Default::default()
         };
     }
 
@@ -430,6 +502,7 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
             needs_conversation_recall: false,
             candidate_skill_names: vec![],
             confidence: 0.65,
+            ..Default::default()
         };
     }
 
@@ -443,6 +516,7 @@ fn deterministic_plan(user_turn: &str, language: &str, has_mail_ctx: bool) -> Co
         needs_conversation_recall: false,
         candidate_skill_names: vec![],
         confidence: 0.5, // triggers LLM fallback
+        ..Default::default()
     }
 }
 
@@ -686,16 +760,15 @@ fn is_screen_context(low: &str) -> bool {
 }
 
 fn is_mail_search(low: &str) -> bool {
+    if is_whatsapp(low) {
+        return false;
+    }
     let kw = [
         "email",
         "mail",
-        "správ",
         "inbox",
         "schránk",
         "doručen",
-        "posledn",
-        "prečítaj",
-        "read",
         "sender",
         "odosielate",
         "nazvom",
@@ -708,7 +781,26 @@ fn is_mail_search(low: &str) -> bool {
         "otvor mail",
         "show mail",
     ];
-    kw.iter().any(|k| low.contains(k))
+    let explicit_mail = kw.iter().any(|k| low.contains(k));
+    let generic_read = [
+        "posledné email",
+        "posledne email",
+        "posledné mail",
+        "posledne mail",
+        "recent email",
+        "recent mail",
+        "latest email",
+        "latest mail",
+        "read email",
+        "read mail",
+        "prečítaj email",
+        "prečítaj mail",
+        "prečítaj správu v mail",
+        "správu v mail",
+    ]
+    .iter()
+    .any(|k| low.contains(k));
+    explicit_mail || generic_read
 }
 
 fn has_sk_business_terms(low: &str) -> bool {
@@ -733,6 +825,9 @@ fn has_sk_business_terms(low: &str) -> bool {
 fn is_whatsapp(low: &str) -> bool {
     let explicit = [
         "whatsapp",
+        "whatspp",
+        "whatsap",
+        "whatapp",
         " wa ",
         "wa:",
         "na whatsappe",
@@ -762,6 +857,20 @@ fn is_whatsapp(low: &str) -> bool {
         "čo sme si písali",
         "nájdi správu od",
         "find message from",
+        "chat history",
+        "last messages with",
+        "last message with",
+        "latest messages with",
+        "latest message with",
+        "most recent messages with",
+        "most recent message with",
+        "most recent text with",
+        "latest text with",
+        "recent text with",
+        "last text with",
+        "what did i talk about with",
+        "what did we talk about with",
+        "what did i discuss with",
     ];
     if explicit.iter().any(|k| low.contains(k)) {
         return true;
@@ -806,6 +915,12 @@ fn is_trivial(low: &str) -> bool {
 #[derive(Deserialize)]
 struct LlmPlanResult {
     task_type: String,
+    #[serde(default)]
+    confidence: Option<f32>,
+    #[serde(default)]
+    selected_connector: Option<String>,
+    #[serde(default)]
+    clarification_needed: bool,
     /// Explicit per-intent confidence scores. Present when the LLM detects competing
     /// intents (e.g. odoo_lookup vs file_search). The highest-scoring intent overrides
     /// task_type so the LLM's own scoring is the authoritative decision.
@@ -826,6 +941,7 @@ struct LlmPlanResult {
 /// LLM wins on task_type, skills, recall. Deterministic wins on confidence value.
 /// When `intent_scores` is present, the highest-scoring intent overrides task_type.
 fn merge_plans(det: ContextPlan, llm: LlmPlanResult) -> ContextPlan {
+    let llm_confidence = llm.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
     let response_language_hint = match llm.response_language.as_str() {
         "match_user" => ResponseLanguageHint::MatchUser,
         "match_source" => ResponseLanguageHint::MatchSourceContent,
@@ -837,14 +953,21 @@ fn merge_plans(det: ContextPlan, llm: LlmPlanResult) -> ContextPlan {
     // This handles the odoo-folder vs odoo-ERP ambiguity: the LLM rates both and
     // whichever score is higher becomes the final task_type regardless of what
     // task_type field the LLM also emitted.
-    let task_type = if llm.intent_scores.is_empty() {
-        llm.task_type.clone()
+    let scored_task_type = llm
+        .intent_scores
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .filter(|(_, score)| **score >= 0.55)
+        .map(|(k, _)| k.clone())
+        .unwrap_or_else(|| llm.task_type.clone());
+
+    // LLM-first, with guardrails: if the LLM is weak/general but deterministic
+    // routing found a concrete connector task, keep the concrete task.
+    let llm_is_weak_general = scored_task_type == "general" && det.task_type != "general";
+    let task_type = if llm_confidence < 0.55 || llm_is_weak_general {
+        det.task_type.clone()
     } else {
-        llm.intent_scores
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(k, _)| k.clone())
-            .unwrap_or(llm.task_type.clone())
+        scored_task_type
     };
 
     let memory_namespaces = if llm.memory_namespaces.is_empty() {
@@ -860,14 +983,29 @@ fn merge_plans(det: ContextPlan, llm: LlmPlanResult) -> ContextPlan {
         det.memory_kinds
     };
 
-    // Candidate skills: union, max 3
-    let mut skills: Vec<String> = llm.candidate_skill_names;
-    for s in &det.candidate_skill_names {
+    // Candidate skills: canonical task skill first, then classifier + deterministic
+    // suggestions. This prevents an LLM plan like task_type=whatsapp from keeping
+    // stale unrelated skills such as mail-search.
+    let mut skills: Vec<String> = default_skills_for_task(&task_type);
+    let llm_skills: Vec<String> = if task_type == det.task_type && llm_confidence < 0.55 {
+        det.candidate_skill_names.clone()
+    } else {
+        llm.candidate_skill_names
+    };
+    for s in llm_skills.iter().chain(det.candidate_skill_names.iter()) {
+        if !skill_compatible_with_task(&task_type, s) {
+            continue;
+        }
         if !skills.contains(s) {
             skills.push(s.clone());
         }
     }
     skills.truncate(3);
+
+    let selected_connector = llm
+        .selected_connector
+        .or_else(|| infer_connector_for_task(&task_type))
+        .or(det.selected_connector);
 
     ContextPlan {
         task_type,
@@ -877,7 +1015,59 @@ fn merge_plans(det: ContextPlan, llm: LlmPlanResult) -> ContextPlan {
         memory_kinds,
         needs_conversation_recall: llm.needs_conversation_recall,
         candidate_skill_names: skills,
-        confidence: 0.7, // merged = above threshold but still uncertain
+        confidence: llm_confidence.max(det.confidence),
+        intent_source: if llm_confidence < 0.55 || llm_is_weak_general {
+            "deterministic".to_string()
+        } else if !det.candidate_skill_names.is_empty() {
+            "merged".to_string()
+        } else {
+            "llm".to_string()
+        },
+        selected_connector,
+        clarification_needed: llm.clarification_needed,
+    }
+}
+
+fn infer_connector_for_task(task_type: &str) -> Option<String> {
+    match task_type {
+        "mail_search" => Some("mail".to_string()),
+        "odoo_lookup" => Some("odoo".to_string()),
+        "file_search" => Some("filesystem".to_string()),
+        "screen_context" => Some("screen".to_string()),
+        "whatsapp" => Some("whatsapp".to_string()),
+        _ => None,
+    }
+}
+
+fn default_skills_for_task(task_type: &str) -> Vec<String> {
+    match task_type {
+        "sk_business_email" => vec!["sk-business-email".to_string()],
+        "mail_search" => vec!["mail-search".to_string()],
+        "invoice_analysis" => vec!["invoice-analysis".to_string()],
+        "odoo_lookup" => vec!["odoo-readonly".to_string()],
+        "window_control" => vec!["aerospace-window-control".to_string()],
+        "file_search" => vec![
+            "file-search".to_string(),
+            "file-open".to_string(),
+            "app-open-control".to_string(),
+        ],
+        "screen_context" => vec!["screen-context".to_string()],
+        "whatsapp" => vec!["whatsapp".to_string()],
+        _ => vec![],
+    }
+}
+
+fn skill_compatible_with_task(task_type: &str, skill: &str) -> bool {
+    match task_type {
+        "sk_business_email" => skill == "sk-business-email",
+        "mail_search" => skill == "mail-search" || skill == "sk-business-email",
+        "invoice_analysis" => skill == "invoice-analysis" || skill == "sk-business-email",
+        "odoo_lookup" => skill == "odoo-readonly",
+        "window_control" => skill == "aerospace-window-control",
+        "file_search" => matches!(skill, "file-search" | "file-open" | "app-open-control"),
+        "screen_context" => skill == "screen-context",
+        "whatsapp" => skill == "whatsapp",
+        _ => true,
     }
 }
 
@@ -978,6 +1168,29 @@ mod tests {
     }
 
     #[test]
+    fn explicit_whatsapp_beats_generic_mail_words() {
+        let p = plan("can you list my last unread messages on whatsapp", "en");
+        assert_eq!(p.task_type, "whatsapp");
+        assert!(p.candidate_skill_names.contains(&"whatsapp".to_string()));
+        assert!(!p.candidate_skill_names.contains(&"mail-search".to_string()));
+    }
+
+    #[test]
+    fn misspelled_whatsapp_recent_text_routes_to_whatsapp() {
+        let p = plan("whats the most recent text with Slavka in whatspp", "en");
+        assert_eq!(p.task_type, "whatsapp");
+        assert!(p.candidate_skill_names.contains(&"whatsapp".to_string()));
+        assert_eq!(p.selected_connector.as_deref(), Some("whatsapp"));
+    }
+
+    #[test]
+    fn mail_read_still_routes_to_mail_when_mail_is_explicit() {
+        let p = plan("can you read my latest email", "en");
+        assert_eq!(p.task_type, "mail_search");
+        assert!(p.candidate_skill_names.contains(&"mail-search".to_string()));
+    }
+
+    #[test]
     fn invoice_loads_invoice_analysis_skill() {
         let p = plan("pozri faktúru a skontroluj DPH a splatnosť", "sk");
         assert_eq!(p.task_type, "invoice_analysis");
@@ -1063,6 +1276,9 @@ mod tests {
         };
         let llm = LlmPlanResult {
             task_type: "sk_business_email".to_string(),
+            confidence: Some(0.82),
+            selected_connector: None,
+            clarification_needed: false,
             intent_scores: std::collections::HashMap::new(),
             needs_memory: true,
             memory_namespaces: vec!["user_pref".to_string(), "sk_glossary".to_string()],
@@ -1079,6 +1295,65 @@ mod tests {
     }
 
     #[test]
+    fn merge_keeps_deterministic_connector_when_llm_is_general() {
+        let det = plan("whats the most recent text with Slavka in whatspp", "en");
+        let llm = LlmPlanResult {
+            task_type: "general".to_string(),
+            confidence: Some(0.9),
+            selected_connector: None,
+            clarification_needed: false,
+            intent_scores: [
+                ("odoo_lookup".to_string(), 0.0),
+                ("file_search".to_string(), 0.0),
+                ("whatsapp".to_string(), 0.0),
+                ("mail_search".to_string(), 0.0),
+            ]
+            .into_iter()
+            .collect(),
+            needs_memory: false,
+            memory_namespaces: vec![],
+            needs_conversation_recall: false,
+            candidate_skill_names: vec![],
+            response_language: "english_default".to_string(),
+        };
+        let merged = merge_plans(det, llm);
+        assert_eq!(merged.task_type, "whatsapp");
+        assert!(merged
+            .candidate_skill_names
+            .contains(&"whatsapp".to_string()));
+    }
+
+    #[test]
+    fn whatsapp_task_gets_whatsapp_skill_even_if_llm_returns_wrong_skills() {
+        let det = plan("whats my latest message with Slavka on whatsapp", "en");
+        let llm = LlmPlanResult {
+            task_type: "whatsapp".to_string(),
+            confidence: Some(1.0),
+            selected_connector: Some("whatsapp".to_string()),
+            clarification_needed: false,
+            intent_scores: [("whatsapp".to_string(), 1.0)].into_iter().collect(),
+            needs_memory: false,
+            memory_namespaces: vec![],
+            needs_conversation_recall: false,
+            candidate_skill_names: vec![
+                "sk-business-email".to_string(),
+                "mail-search".to_string(),
+                "invoice-analysis".to_string(),
+            ],
+            response_language: "english_default".to_string(),
+        };
+        let merged = merge_plans(det, llm);
+        assert_eq!(merged.task_type, "whatsapp");
+        assert_eq!(
+            merged.candidate_skill_names.first().map(String::as_str),
+            Some("whatsapp")
+        );
+        assert!(!merged
+            .candidate_skill_names
+            .contains(&"mail-search".to_string()));
+    }
+
+    #[test]
     #[ignore = "requires Ollama + qwen2.5:0.5b"]
     fn llm_fallback_parses_json() {
         // Run with: cargo test -p bagent-agent -- --include-ignored
@@ -1091,6 +1366,7 @@ mod tests {
                     "draft a formal reply to this Slovak invoice reminder",
                     "en",
                     false,
+                    &PlannerRuntimeContext::default(),
                 )
                 .await;
             assert!(p.needs_memory);
