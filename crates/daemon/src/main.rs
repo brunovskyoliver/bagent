@@ -33,7 +33,7 @@ use filesystem_connector::{
     ReadTextRequest,
 };
 use futures_util::StreamExt;
-use odoo_connector::{OdooConfig, OdooConnector, OdooRecordRef};
+use odoo_connector::{OdooConfig, OdooConnector, OdooError, OdooRecordRef};
 use ollama_connector::{
     ChatTurn as OllamaChatTurn, Message, OllamaClient, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL,
 };
@@ -121,6 +121,10 @@ struct ChatRequest {
     /// Accessibility selected-text at capture time (password fields excluded).
     #[serde(default)]
     selected_text: Option<String>,
+    /// Optional UI-selected source mode from the Spotlight-like input.
+    /// Values: mail, filesystem, whatsapp, odoo.
+    #[serde(default)]
+    source_mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1439,7 +1443,7 @@ async fn debug_context_plan(
             },
         )
         .await;
-    apply_reference_resolution_to_plan(&mut plan, &reference_resolution);
+    apply_reference_resolution_to_plan(&mut plan, &reference_resolution, &req.message);
 
     // Run skill selection for the response
     let selected_skills =
@@ -1698,9 +1702,60 @@ async fn resolver_lessons_for_turn(memory: &Arc<MemoryStore>, user_message: &str
     select_resolver_lessons(&hits, 3)
 }
 
-fn apply_reference_resolution_to_plan(plan: &mut ContextPlan, resolution: &ReferenceResolution) {
+/// Return the connector that the user explicitly named in their turn, if any.
+/// Used to prevent the resolver override from replacing an explicitly-named connector
+/// (e.g. "whatsapp") with a contradicting one produced by the LLM (e.g. "mail").
+fn explicit_connector_in_turn(turn: &str) -> Option<&'static str> {
+    let low = turn.to_lowercase();
+    // WhatsApp — check first so "mail" substring does not override it
+    if [
+        "whatsapp",
+        "whatspp",
+        "whatsap",
+        "whatapp",
+        "na whatsappe",
+        "cez whatsapp",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return Some("whatsapp");
+    }
+    if low.contains("odoo") {
+        return Some("odoo");
+    }
+    if low.contains("finder")
+        || low.contains("s\u{fa}bor")   // Slovak "súbor"
+        || low.contains("subor")
+        || low.contains(" file")
+    {
+        return Some("filesystem");
+    }
+    if low.contains("mail") || low.contains("email") || low.contains("inbox") || low.contains("mailbox") {
+        return Some("mail");
+    }
+    None
+}
+
+fn apply_reference_resolution_to_plan(
+    plan: &mut ContextPlan,
+    resolution: &ReferenceResolution,
+    user_turn: &str,
+) {
     if resolution.confidence < 0.55 {
         return;
+    }
+    // If the user explicitly named a connector in their turn and the resolver
+    // produced a *different* connector, trust the deterministic planner and skip
+    // the override entirely (guards against the LLM synthesising "mail" for
+    // queries that clearly reference whatsapp/odoo/etc.).
+    if let (Some(explicit), Some(resolved)) = (
+        explicit_connector_in_turn(user_turn),
+        resolution.resolved_connector.as_deref(),
+    ) {
+        if explicit != resolved {
+            return;
+        }
     }
     match resolution.resolved_connector.as_deref() {
         Some("whatsapp") => {
@@ -1767,6 +1822,29 @@ fn apply_reference_resolution_to_plan(plan: &mut ContextPlan, resolution: &Refer
             plan.intent_source = "reference_resolver".to_string();
         }
         _ => {}
+    }
+    plan.candidate_skill_names.truncate(3);
+}
+
+fn apply_source_mode_to_plan(plan: &mut ContextPlan, source_mode: Option<&str>) {
+    let Some(mode) = source_mode.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+
+    let (task_type, connector, skill) = match mode {
+        "mail" => ("mail_search", "mail", "mail-search"),
+        "filesystem" | "files" => ("file_search", "filesystem", "file-search"),
+        "whatsapp" => ("whatsapp", "whatsapp", "whatsapp"),
+        "odoo" => ("odoo_lookup", "odoo", "odoo-readonly"),
+        _ => return,
+    };
+
+    plan.task_type = task_type.to_string();
+    plan.selected_connector = Some(connector.to_string());
+    plan.intent_source = "ui_source_mode".to_string();
+    plan.confidence = plan.confidence.max(0.95);
+    if !plan.candidate_skill_names.iter().any(|s| s == skill) {
+        plan.candidate_skill_names.insert(0, skill.to_string());
     }
     plan.candidate_skill_names.truncate(3);
 }
@@ -2066,6 +2144,7 @@ async fn chat(
     let screen_ocr_text = req.screen_ocr_text.clone();
     let active_app = req.active_app.clone();
     let selected_text = req.selected_text.clone();
+    let source_mode = req.source_mode.clone();
     let skills = state.skills.clone();
     let context_planner = state.context_planner.clone();
     let reference_resolver = state.reference_resolver.clone();
@@ -2205,7 +2284,8 @@ async fn chat(
         let mut context_plan = context_planner
             .plan(&user_message, lang, has_prior_mail_ctx, &runtime_context)
             .await;
-        apply_reference_resolution_to_plan(&mut context_plan, &reference_resolution);
+        apply_reference_resolution_to_plan(&mut context_plan, &reference_resolution, &user_message);
+        apply_source_mode_to_plan(&mut context_plan, source_mode.as_deref());
         tracing::info!(
             "chat timing: context plan ready {}ms — task={} source={} needs_memory={} skills={:?} ref={:?}",
             t0.elapsed().as_millis(),
@@ -4717,18 +4797,38 @@ async fn codex_run_task_handler(
     )
 }
 
-// ── Odoo handlers (Phase 6) ──────────────────────────────────────────────────
+// ── Odoo handlers (Phase 6B) ─────────────────────────────────────────────────
 
-/// `POST /odoo/config` — authenticate and store the connector in-memory.
-/// Doubles as the Settings "Test" button: returns version + uid on success.
+/// Request body for `POST /odoo/config`.
+#[derive(Deserialize)]
+struct OdooConfigReq {
+    base_url: String,
+    db: String,
+    username: String,
+    api_key: String,
+    /// Optional path to the `uvx` binary for non-standard installs.
+    uvx_path: Option<String>,
+}
+
+/// `POST /odoo/config` — spawn MCP child, authenticate, and store the connector.
+/// Doubles as the Settings "Test" button: returns version + uid + mcp_available on success.
 async fn odoo_config_handler(
     State(state): State<AppState>,
-    Json(cfg): Json<OdooConfig>,
+    Json(req): Json<OdooConfigReq>,
 ) -> impl IntoResponse {
-    match OdooConnector::connect(cfg).await {
+    let cfg = OdooConfig {
+        base_url: req.base_url,
+        db: req.db,
+        username: req.username,
+        api_key: req.api_key,
+    };
+    let uvx_override = req.uvx_path.as_deref();
+
+    match OdooConnector::connect_with_uvx(cfg, uvx_override).await {
         Ok(conn) => {
             let version = conn.server_version.clone();
             let uid = conn.uid;
+            let tool_count = conn.tool_count;
             *state.odoo.write().await = Some(conn);
             (
                 StatusCode::OK,
@@ -4736,13 +4836,24 @@ async fn odoo_config_handler(
                     "ok": true,
                     "version": version,
                     "uid": uid,
+                    "mcp_available": true,
+                    "tool_count": tool_count,
                 })),
             )
         }
+        Err(OdooError::McpUnavailable(msg)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "mcp_available": false,
+                "error": msg,
+            })),
+        ),
         Err(e) => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
                 "ok": false,
+                "mcp_available": true,
                 "error": e.to_string(),
             })),
         ),
@@ -4756,12 +4867,15 @@ async fn odoo_status_handler(State(state): State<AppState>) -> impl IntoResponse
         Some(conn) => Json(serde_json::json!({
             "configured": true,
             "connected": true,
+            "mcp_available": true,
             "version": conn.server_version,
             "uid": conn.uid,
+            "tool_count": conn.tool_count,
         })),
         None => Json(serde_json::json!({
             "configured": false,
             "connected": false,
+            "mcp_available": false,
         })),
     }
 }
@@ -6393,42 +6507,18 @@ async fn fetch_tool_context(
                     OdooAction::SearchContacts => {
                         let query = intent.query.as_deref().unwrap_or("");
                         match conn.search_partners(query, 5).await {
-                            Ok(partners) if !partners.is_empty() => {
-                                let lines: Vec<String> = partners
-                                    .iter()
-                                    .map(|p| {
-                                        let mut line = format!(
-                                            "  • {} (id:{})",
-                                            p.name.as_deref().unwrap_or("—"),
-                                            p.id
-                                        );
-                                        if let Some(e) = &p.email {
-                                            line.push_str(&format!(", email: {e}"));
-                                        }
-                                        if let Some(ph) = &p.phone {
-                                            line.push_str(&format!(", tel: {ph}"));
-                                        }
-                                        if let Some(v) = &p.vat {
-                                            line.push_str(&format!(", IČO/DIČ: {v}"));
-                                        }
-                                        if let Some(c) = &p.city {
-                                            line.push_str(&format!(", {c}"));
-                                        }
-                                        line
-                                    })
-                                    .collect();
+                            Ok(r) => {
                                 parts.push(format!(
                                     "## Živé dáta z Odoo — partneri\n{}",
-                                    lines.join("\n")
+                                    r.text
                                 ));
-                                if let Some(p) = partners.first() {
-                                    let name = p.name.as_deref().unwrap_or("Partner");
+                                if let (Some(id), Some(name)) =
+                                    (r.first_id, r.first_name.as_deref())
+                                {
                                     found_odoo_ref =
-                                        Some(conn.record_ref("res.partner", p.id, name));
+                                        Some(conn.record_ref("res.partner", id, name));
                                 }
                             }
-                            Ok(_) => parts
-                                .push(format!("Odoo: žiadny partner nenájdený pre \"{query}\".")),
                             Err(e) => {
                                 tracing::warn!("Odoo search_partners error: {e}");
                                 parts.push("Odoo partner vyhľadávanie nedostupné.".into());
@@ -6438,16 +6528,7 @@ async fn fetch_tool_context(
 
                     OdooAction::GetInvoices => {
                         match conn.my_invoices(intent.open_only, 10).await {
-                            Ok(invoices) if !invoices.is_empty() => {
-                                let lines: Vec<String> = invoices.iter().map(|inv| {
-                                    let num = inv.name.as_deref().unwrap_or("—");
-                                    let partner = inv.partner_id.display();
-                                    let amt = inv.amount_total.map(|a| format!("{a:.2}")).unwrap_or_else(|| "—".into());
-                                    let cur = inv.currency_id.display();
-                                    let state = inv.payment_state.as_deref().unwrap_or("—");
-                                    let date = inv.invoice_date.as_deref().unwrap_or("—");
-                                    format!("  • {num} | {partner} | {amt} {cur} | {state} | {date}")
-                                }).collect();
+                            Ok(r) => {
                                 let header = if intent.open_only {
                                     "neuhradené faktúry"
                                 } else {
@@ -6455,15 +6536,15 @@ async fn fetch_tool_context(
                                 };
                                 parts.push(format!(
                                     "## Živé dáta z Odoo — {header}\n{}",
-                                    lines.join("\n")
+                                    r.text
                                 ));
-                                if let Some(inv) = invoices.first() {
-                                    let name = inv.name.as_deref().unwrap_or("Faktúra");
+                                if let (Some(id), Some(name)) =
+                                    (r.first_id, r.first_name.as_deref())
+                                {
                                     found_odoo_ref =
-                                        Some(conn.record_ref("account.move", inv.id, name));
+                                        Some(conn.record_ref("account.move", id, name));
                                 }
                             }
-                            Ok(_) => parts.push("Odoo: žiadne faktúry nenájdené.".into()),
                             Err(e) => {
                                 tracing::warn!("Odoo my_invoices error: {e}");
                                 parts.push("Odoo faktúry nedostupné.".into());
@@ -6473,17 +6554,7 @@ async fn fetch_tool_context(
 
                     OdooAction::ListTickets => {
                         match conn.my_helpdesk_tickets(intent.open_only, 10).await {
-                            Ok(tickets) if !tickets.is_empty() => {
-                                let lines: Vec<String> = tickets
-                                    .iter()
-                                    .map(|t| {
-                                        let name = t.name.as_deref().unwrap_or("—");
-                                        let stage = t.stage_id.display();
-                                        let partner = t.partner_id.display();
-                                        let date = t.create_date.as_deref().unwrap_or("—");
-                                        format!("  • [{stage}] {name} | {partner} | {date}")
-                                    })
-                                    .collect();
+                            Ok(r) => {
                                 let header = if intent.open_only {
                                     "otvorené helpdesk tikety"
                                 } else {
@@ -6491,15 +6562,15 @@ async fn fetch_tool_context(
                                 };
                                 parts.push(format!(
                                     "## Živé dáta z Odoo — {header}\n{}",
-                                    lines.join("\n")
+                                    r.text
                                 ));
-                                if let Some(t) = tickets.first() {
-                                    let name = t.name.as_deref().unwrap_or("Tiket");
+                                if let (Some(id), Some(name)) =
+                                    (r.first_id, r.first_name.as_deref())
+                                {
                                     found_odoo_ref =
-                                        Some(conn.record_ref("helpdesk.ticket", t.id, name));
+                                        Some(conn.record_ref("helpdesk.ticket", id, name));
                                 }
                             }
-                            Ok(_) => parts.push("Odoo: žiadne helpdesk tikety nenájdené.".into()),
                             Err(e) => {
                                 tracing::warn!("Odoo my_helpdesk_tickets error: {e}");
                                 parts.push("Odoo helpdesk nedostupný.".into());
@@ -6512,17 +6583,15 @@ async fn fetch_tool_context(
                             (intent.query.as_deref(), intent.record_id)
                         {
                             match conn.get_record(model_str, id).await {
-                                Ok(Some(rec)) => {
-                                    let name = rec["name"]
-                                        .as_str()
-                                        .or_else(|| rec["display_name"].as_str())
-                                        .unwrap_or("Záznam")
-                                        .to_string();
-                                    parts.push(format!("## Živé dáta z Odoo — záznam\n{rec}"));
-                                    found_odoo_ref = Some(conn.record_ref(model_str, id, &name));
+                                Ok(Some(r)) => {
+                                    parts.push(format!("## Živé dáta z Odoo — záznam\n{}", r.text));
+                                    let name = r.first_name.as_deref().unwrap_or("Záznam");
+                                    found_odoo_ref = Some(conn.record_ref(model_str, id, name));
                                 }
                                 Ok(None) => {
-                                    parts.push(format!("Odoo: záznam {model_str} #{id} nenájdený."))
+                                    parts.push(format!(
+                                        "Odoo: záznam {model_str} #{id} nenájdený."
+                                    ));
                                 }
                                 Err(e) => {
                                     tracing::warn!("Odoo get_record error: {e}");
@@ -7751,10 +7820,43 @@ mod tests {
                 .to_string(),
             ..Default::default()
         };
-        apply_reference_resolution_to_plan(&mut plan, &resolution);
+        apply_reference_resolution_to_plan(
+            &mut plan,
+            &resolution,
+            "Are there signs of flirting in the latest WhatsApp chat?",
+        );
         assert_eq!(plan.task_type, "whatsapp");
         assert_eq!(plan.selected_connector.as_deref(), Some("whatsapp"));
         assert!(!plan.needs_memory);
+        assert_eq!(plan.candidate_skill_names, vec!["whatsapp"]);
+    }
+
+    #[test]
+    fn whatsapp_query_not_overridden_to_mail_by_resolver() {
+        // Planner correctly chose whatsapp; resolver returned mail (e.g. synthesised
+        // from entity_type=message). The guard should preserve the whatsapp plan.
+        let mut plan = ContextPlan {
+            task_type: "whatsapp".to_string(),
+            selected_connector: Some("whatsapp".to_string()),
+            candidate_skill_names: vec!["whatsapp".to_string()],
+            ..Default::default()
+        };
+        let resolution = ReferenceResolution {
+            is_followup: false,
+            resolved_connector: Some("mail".to_string()),
+            target_connector: Some("mail".to_string()),
+            confidence: 0.60,
+            standalone_query: "when did i decide to go out with Slavka on whatsapp".to_string(),
+            ..Default::default()
+        };
+        apply_reference_resolution_to_plan(
+            &mut plan,
+            &resolution,
+            "when did i decide to go out with Slavka on whatsapp",
+        );
+        // Resolver's mail override must be suppressed because the turn names whatsapp
+        assert_eq!(plan.task_type, "whatsapp");
+        assert_eq!(plan.selected_connector.as_deref(), Some("whatsapp"));
         assert_eq!(plan.candidate_skill_names, vec!["whatsapp"]);
     }
 }

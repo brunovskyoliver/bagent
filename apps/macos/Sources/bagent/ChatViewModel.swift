@@ -71,12 +71,59 @@ enum AgentStatus {
     }
 }
 
+enum ChatSurfaceMode: Equatable {
+    case collapsed
+    case inputOnly
+    case thinkingHidden
+    case outputExpanded
+}
+
+enum SourceMode: String, CaseIterable, Equatable, Identifiable {
+    case mail
+    case filesystem
+    case whatsapp
+    case odoo
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .mail:       return "Mail"
+        case .filesystem: return "Files"
+        case .whatsapp:   return "WhatsApp"
+        case .odoo:       return "Odoo"
+        }
+    }
+
+    var placeholder: String {
+        switch self {
+        case .mail:       return "Mail"
+        case .filesystem: return "Files"
+        case .whatsapp:   return "WhatsApp"
+        case .odoo:       return "Odoo"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .mail:       return "envelope"
+        case .filesystem: return "folder"
+        case .whatsapp:   return "message"
+        case .odoo:       return "building.2"
+        }
+    }
+}
+
 @MainActor
 final class ChatViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var inputText: String = ""
     @Published var isThinking = false
     @Published var isExpanded = false
+    @Published var chatSurfaceMode: ChatSurfaceMode = .collapsed
+    @Published var selectedSourceMode: SourceMode? = nil
+    @Published var hoveredSourceMode: SourceMode? = nil
+    @Published var isSourcePickerForced = false
     @Published var hasNotch = false
     @Published var showSettings = false
     @Published var showMemory = false
@@ -172,7 +219,7 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Odoo (Phase 6)
+    // MARK: - Odoo (Phase 6B — MCP)
 
     /// Odoo connection settings — URL, DB, user stored in UserDefaults (not secrets).
     @Published var odooURL:  String = UserDefaults.standard.string(forKey: "bagent.odoo.url")  ?? ""
@@ -180,29 +227,41 @@ final class ChatViewModel: ObservableObject {
     @Published var odooUser: String = UserDefaults.standard.string(forKey: "bagent.odoo.user") ?? ""
     /// API key is loaded from Keychain; the `@Published` field holds the live session value only.
     @Published var odooAPIKey: String = ""
+    /// Optional override path to the `uvx` binary (for non-standard installs).
+    @Published var odooUvxPath: String = UserDefaults.standard.string(forKey: "bagent.odoo.uvx_path") ?? ""
 
     @Published var odooTestResult: String? = nil
     @Published var isTestingOdoo: Bool = false
+    @Published var odooMcpAvailable: Bool = false
+    @Published var odooToolCount: Int = 0
 
-    /// Save creds to Keychain + UserDefaults and authenticate with the daemon.
+    /// Save creds to Keychain + UserDefaults and authenticate with the daemon via MCP.
     func configureOdoo() {
-        // Persist non-secret fields in UserDefaults (URL, DB, user).
-        UserDefaults.standard.set(odooURL,  forKey: "bagent.odoo.url")
-        UserDefaults.standard.set(odooDB,   forKey: "bagent.odoo.db")
-        UserDefaults.standard.set(odooUser, forKey: "bagent.odoo.user")
+        // Persist non-secret fields in UserDefaults (URL, DB, user, uvx path).
+        UserDefaults.standard.set(odooURL,     forKey: "bagent.odoo.url")
+        UserDefaults.standard.set(odooDB,      forKey: "bagent.odoo.db")
+        UserDefaults.standard.set(odooUser,    forKey: "bagent.odoo.user")
+        UserDefaults.standard.set(odooUvxPath, forKey: "bagent.odoo.uvx_path")
         // API key goes to Keychain only.
         KeychainStore.saveOdoo(url: odooURL, db: odooDB, user: odooUser, apiKey: odooAPIKey)
 
         isTestingOdoo = true
         odooTestResult = nil
+        let uvxOverride = odooUvxPath.trimmingCharacters(in: .whitespaces)
         Task {
             do {
                 let result = try await client.odooConfigure(
-                    url: odooURL, db: odooDB, user: odooUser, apiKey: odooAPIKey
+                    url: odooURL, db: odooDB, user: odooUser, apiKey: odooAPIKey,
+                    uvxPath: uvxOverride.isEmpty ? nil : uvxOverride
                 )
                 await MainActor.run {
+                    self.odooMcpAvailable = result.mcp_available ?? true
+                    self.odooToolCount = result.tool_count ?? 0
                     if result.ok {
-                        self.odooTestResult = "✓ Odoo \(result.version ?? "pripojený"), uid=\(result.uid ?? 0)"
+                        let tools = result.tool_count.map { " (\($0) tools)" } ?? ""
+                        self.odooTestResult = "✓ Odoo MCP \(result.version ?? "")  uid=\(result.uid ?? 0)\(tools)"
+                    } else if result.mcp_available == false {
+                        self.odooTestResult = "✗ MCP nedostupný — nainštalujte uv/uvx: \(result.error ?? "")"
                     } else {
                         self.odooTestResult = "✗ \(result.error ?? "chyba autentifikácie")"
                     }
@@ -226,17 +285,26 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Re-push Odoo credentials from Keychain to the daemon when explicitly requested.
+    /// Re-push Odoo credentials from Keychain to the daemon.
+    /// Called automatically on daemon-ready (Phase 6B fix — was defined but never called).
     func restoreOdooFromKeychain() {
         guard let creds = KeychainStore.loadOdoo() else { return }
+        // Update live fields so Settings shows the saved values.
         odooURL  = creds.url
         odooDB   = creds.db
         odooUser = creds.user
         odooAPIKey = creds.apiKey
+        let uvxOverride = odooUvxPath.trimmingCharacters(in: .whitespaces)
         Task {
-            _ = try? await client.odooConfigure(
-                url: creds.url, db: creds.db, user: creds.user, apiKey: creds.apiKey
-            )
+            if let result = try? await client.odooConfigure(
+                url: creds.url, db: creds.db, user: creds.user, apiKey: creds.apiKey,
+                uvxPath: uvxOverride.isEmpty ? nil : uvxOverride
+            ) {
+                await MainActor.run {
+                    self.odooMcpAvailable = result.mcp_available ?? true
+                    self.odooToolCount = result.tool_count ?? 0
+                }
+            }
         }
     }
 
@@ -442,6 +510,59 @@ final class ChatViewModel: ObservableObject {
         return CGFloat(v > 0 ? v : Double(fallback))
     }
 
+    var topSourceModes: [SourceMode] {
+        SourceMode.allCases.sorted { lhs, rhs in
+            let lc = sourceModeUseCount(lhs)
+            let rc = sourceModeUseCount(rhs)
+            if lc == rc {
+                return SourceMode.allCases.firstIndex(of: lhs)! < SourceMode.allCases.firstIndex(of: rhs)!
+            }
+            return lc > rc
+        }
+    }
+
+    var activeSourcePlaceholder: String {
+        if let hoveredSourceMode { return hoveredSourceMode.placeholder }
+        if let selectedSourceMode { return selectedSourceMode.placeholder }
+        return "Ask bagent"
+    }
+
+    func selectSourceMode(_ mode: SourceMode) {
+        selectedSourceMode = mode
+        hoveredSourceMode = nil
+        isSourcePickerForced = false
+    }
+
+    func clearSourceMode() {
+        selectedSourceMode = nil
+        hoveredSourceMode = nil
+    }
+
+    func promoteSpotlightDraft(_ draft: String) {
+        print("[promote] ViewModel.promoteSpotlightDraft: draft='\(draft)', onPromoteToChat=\(onPromoteToChat != nil)")
+        isPromotingSpotlightDraft = true
+        inputText = draft
+        if let onPromoteToChat {
+            onPromoteToChat(draft)
+        } else {
+            print("[promote] ViewModel: onPromoteToChat not set — promotion aborted")
+            isPromotingSpotlightDraft = false
+        }
+    }
+
+    func finishSpotlightDraftPromotion() {
+        isPromotingSpotlightDraft = false
+    }
+
+    private func sourceModeUseCount(_ mode: SourceMode) -> Int {
+        UserDefaults.standard.integer(forKey: "bagent.sourceMode.\(mode.rawValue).useCount")
+    }
+
+    private func recordSourceModeUse(_ mode: SourceMode) {
+        let key = "bagent.sourceMode.\(mode.rawValue).useCount"
+        UserDefaults.standard.set(UserDefaults.standard.integer(forKey: key) + 1, forKey: key)
+    }
+
     private let client = DaemonClient()
     let permissions = PermissionsManager()
 
@@ -471,12 +592,22 @@ final class ChatViewModel: ObservableObject {
     var onVoiceTurnComplete: (() -> Void)?
     /// Invoked when Settings disables voice while an overlay/session may be active.
     var onVoiceModeDisabled: (() -> Void)?
+    /// Invoked after an input-only turn is submitted so AppKit can collapse the panel.
+    var onInputOnlySubmitted: (() -> Void)?
+    /// Invoked when the first assistant token arrives so AppKit can reveal output.
+    var onFirstAssistantToken: (() -> Void)?
     /// Drives notch expansion into voice mode (no separate panel).
     @Published var isVoiceNotchActive: Bool = false
     /// Brief confirmation message shown in the notch after a silent background action.
     @Published var voiceActionMessage: String? = nil
     /// Called when the daemon executed a background action instead of streaming LLM.
     var onVoiceActionTaken: ((String) -> Void)?
+    /// Invoked from SpotlightInputPanel when text overflows one line — AppKit
+    /// promotes the input surface to the full expanded chat window.
+    var onPromoteToChat: ((String) -> Void)?
+    /// True only while the Spotlight text field is being replaced by the full
+    /// chat input. Blocks focus-loss submit events from sending the draft.
+    private(set) var isPromotingSpotlightDraft = false
 
     // Session ID persisted in UserDefaults so it survives app restarts
     private var sessionId: String? {
@@ -508,6 +639,8 @@ final class ChatViewModel: ObservableObject {
         showSettings = false
         showDebug = false
         pendingAttachments = []
+        selectedSourceMode = nil
+        hoveredSourceMode = nil
         savedScrollAnchorId = nil
         savedScrollWasAtBottom = true
         // Start a new session on explicit clear
@@ -572,6 +705,11 @@ final class ChatViewModel: ObservableObject {
             if attempt < 23 {
                 try? await Task.sleep(for: .milliseconds(500))
             }
+        }
+        // Re-push Odoo credentials from Keychain whenever the daemon becomes available.
+        // `restoreOdooFromKeychain()` was defined but never called — wired here (Phase 6B).
+        if daemonHealth?.daemonUp == true {
+            restoreOdooFromKeychain()
         }
         await refreshWhatsappStatusNow()
         permissions.refresh()
@@ -738,9 +876,12 @@ final class ChatViewModel: ObservableObject {
     }
 
     func send() {
+        guard !isPromotingSpotlightDraft else { return }
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !pendingAttachments.isEmpty else { return }
         guard !isThinking else { return }
+        let sourceMode = selectedSourceMode
+        let wasInputOnly = chatSurfaceMode == .inputOnly
         if messages.isEmpty {
             sessionId = nil
         }
@@ -754,6 +895,12 @@ final class ChatViewModel: ObservableObject {
         userMsg.attachments = attachments
         messages.append(userMsg)
         isThinking = true
+        if let sourceMode {
+            recordSourceModeUse(sourceMode)
+        }
+        if wasInputOnly {
+            onInputOnlySubmitted?()
+        }
 
         // Only the turn immediately following a voice handoff loops back to voice.
         let wasVoiceTurn = voiceTurnActive
@@ -787,7 +934,7 @@ final class ChatViewModel: ObservableObject {
                     }
                 }
 
-                let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds, screenContext: screenCtx)
+                let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds, screenContext: screenCtx, sourceMode: sourceMode)
                 var first = true
                 var didAutoOpen = false
                 for try await event in stream {
@@ -803,7 +950,11 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].debugConversationRecallInjected = trace.conversation_recall_injected
                         if let sid = trace.session_id { sessionId = sid }
                     case .token(let t):
-                        if first { isThinking = false; first = false }
+                        if first {
+                            onFirstAssistantToken?()
+                            isThinking = false
+                            first = false
+                        }
                         messages[idx].content += t
                         streamingChunk += 1
                         // Auto-open Mail after the first sentence has appeared in the response.
@@ -861,14 +1012,25 @@ final class ChatViewModel: ObservableObject {
                     case .done(let returnedSessionId):
                         if let sid = returnedSessionId { sessionId = sid }
                         if first { isThinking = false }
+                        if first && chatSurfaceMode == .thinkingHidden {
+                            chatSurfaceMode = .collapsed
+                        }
                         Task { await loadDebugTrace(for: messages[idx].id) }
                         // Hands-free loop: re-open voice mode after a voice-initiated reply.
                         if wasVoiceTurn && voiceModeEnabled { onVoiceTurnComplete?() }
                     }
                 }
-                if first { isThinking = false }
+                if first {
+                    isThinking = false
+                    if chatSurfaceMode == .thinkingHidden {
+                        chatSurfaceMode = .collapsed
+                    }
+                }
             } catch {
                 isThinking = false
+                if chatSurfaceMode == .thinkingHidden {
+                    chatSurfaceMode = .collapsed
+                }
                 messages[idx].content = "Chyba: \(error.localizedDescription)"
             }
         }

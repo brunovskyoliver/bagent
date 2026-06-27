@@ -115,11 +115,28 @@ Reserve the bridge area for transient content only — it should never carry per
 
 ---
 
+## Spotlight input surface
+
+When the user opens bagent while no assistant output is being generated, the first surface is
+an input-only command field rather than the full chat panel.
+
+- **Idle open** — notch/status click opens a wide Spotlight-like input below the notch.
+- **Voice mode enabled** — single `⌥Space` opens voice; double `⌥Space` opens this input.
+- **Voice mode disabled** — single `⌥Space` opens this input.
+- **Send** — input collapses back into the notch; the existing blue status dot signals pre-token work.
+- **First token** — full chat opens automatically once assistant output begins.
+- **Thinking manual open** — during pre-token work, notch/status click or shortcut may open the full chat manually.
+- **Source modes** — the input can shrink from the right to reveal the four most-used source bubbles. Defaults are Mail, Files, WhatsApp, Odoo; `⌘1`-`⌘4` select the visible modes.
+
+The input uses a liquid-glass-style material on current macOS builds. Native Liquid Glass should replace the fallback material when the app is built with an SDK that exposes those APIs.
+
+---
+
 ## What NOT to put in the wrap
 
 The notch wrap is a **1-second UI surface**: glanceable, tappable, always visible. Do not put:
 
-- Free-form text input (→ belongs in `ExpandedChatView` input bar)
+- Long-lived free-form text input inside the always-visible wrap itself (idle entry belongs in the separate Spotlight input surface)
 - Long labels or multi-word messages
 - Anything requiring > 1 s of user attention
 - Scrollable content

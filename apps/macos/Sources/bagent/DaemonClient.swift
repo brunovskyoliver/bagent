@@ -403,7 +403,8 @@ struct DaemonClient: Sendable {
         sessionId: String?,
         model: String,
         attachmentIds: [String] = [],
-        screenContext: ScreenContextFields? = nil
+        screenContext: ScreenContextFields? = nil,
+        sourceMode: SourceMode? = nil
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -424,6 +425,7 @@ struct DaemonClient: Sendable {
                         let screen_ocr_text: String?
                         let active_app: String?
                         let selected_text: String?
+                        let source_mode: String?
                     }
                     req.httpBody = try JSONEncoder().encode(Body(
                         message: text,
@@ -433,7 +435,8 @@ struct DaemonClient: Sendable {
                         screen_image_b64: screenContext?.imagePNGBase64,
                         screen_ocr_text: screenContext?.ocrText.isEmpty == false ? screenContext?.ocrText : nil,
                         active_app: screenContext?.activeApp,
-                        selected_text: screenContext?.selectedText
+                        selected_text: screenContext?.selectedText,
+                        source_mode: sourceMode?.rawValue
                     ))
 
                     let (bytes, response) = try await URLSession.shared.bytes(for: req)
@@ -904,13 +907,16 @@ struct DaemonClient: Sendable {
         return try JSONDecoder().decode(CodexRunResult.self, from: data)
     }
 
-    // MARK: - Odoo (Phase 6)
+    // MARK: - Odoo (Phase 6B — MCP)
 
     struct OdooConfigResult: Decodable, Sendable {
         let ok: Bool
         let version: String?
         let uid: Int?
         let error: String?
+        /// `false` means uvx/uv is not installed — show install hint.
+        let mcp_available: Bool?
+        let tool_count: Int?
     }
 
     struct OdooStatusResult: Decodable, Sendable {
@@ -919,19 +925,30 @@ struct DaemonClient: Sendable {
         let version: String?
         let uid: Int?
         let error: String?
+        let mcp_available: Bool?
+        let tool_count: Int?
     }
 
-    /// Authenticate and store the connector in-memory.
-    /// Also used as the Settings "Testovať Odoo" action — returns version on success.
-    func odooConfigure(url: String, db: String, user: String, apiKey: String) async throws -> OdooConfigResult {
+    /// Authenticate via MCP and store the connector in-memory.
+    /// Also used as the Settings "Testovať Odoo" action — returns version + mcp_available on success.
+    func odooConfigure(
+        url: String, db: String, user: String, apiKey: String,
+        uvxPath: String? = nil
+    ) async throws -> OdooConfigResult {
         let c = try await loadCreds()
         var req = authedRequest("/odoo/config", creds: c)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         struct Body: Encodable {
-            let base_url: String; let db: String; let username: String; let api_key: String
+            let base_url: String
+            let db: String
+            let username: String
+            let api_key: String
+            let uvx_path: String?
         }
-        req.httpBody = try JSONEncoder().encode(Body(base_url: url, db: db, username: user, api_key: apiKey))
+        req.httpBody = try JSONEncoder().encode(
+            Body(base_url: url, db: db, username: user, api_key: apiKey, uvx_path: uvxPath)
+        )
         let (data, _) = try await URLSession.shared.data(for: req)
         return try JSONDecoder().decode(OdooConfigResult.self, from: data)
     }

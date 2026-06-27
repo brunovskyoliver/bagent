@@ -96,6 +96,19 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
 
 ---
 
+## Phase 1B — Spotlight Input + Source Modes ✅ IMPLEMENTED
+
+- [x] Input-only chat surface opens from notch/status click when no assistant output is generating
+- [x] Voice shortcut behavior: voice enabled keeps single `⌥Space` for voice; double `⌥Space` opens input; voice disabled opens input directly
+- [x] Send collapses input back to notch and keeps blue thinking status until first assistant token
+- [x] First assistant token opens full chat panel automatically; thinking-stage notch click can open chat manually
+- [x] Source bubbles: Mail, Files, WhatsApp, Odoo; local use-count ordering; hover placeholder updates; `⌘1`-`⌘4` selection
+- [x] `source_mode` request hint reaches daemon planning before tool approval/routing
+- [x] Liquid-glass-style fallback material for current macOS SDK; native Liquid Glass remains gated for future SDK adoption
+- [ ] Manual QA on notch and non-notch displays: idle open, send collapse, first-token expansion, Cmd source reveal, reduced motion
+
+---
+
 ## Phase 2 — Rust Backend + IPC ✅ COMPLETE
 
 - [x] Cargo workspace at repo root (`Cargo.toml`)
@@ -546,29 +559,54 @@ Memory extended with ledger fields; skills become loadable `SKILL.md` files; Eng
 
 ---
 
-## Phase 6 — Odoo Connector ✅ COMPLETE
+## Phase 6 — Odoo Connector (JSON-RPC) ✅ SUPERSEDED BY PHASE 6B
 
-- [x] `crates/connectors/odoo/` — JSON-RPC transport (Odoo 18):
-  - [x] `src/json_rpc.rs` — `build_call_payload` / `extract_result` (pure, unit-tested)
-  - [x] `src/types.rs` — `OdooConfig` (Debug-redacts api_key), `OdooError`, `false_or_string`/`false_or_f64` deserializers, `M2O` Many2one newtype, `Partner`, `Invoice`, `HelpdeskTicket`, `OdooRecordRef`
-  - [x] `src/lib.rs` — `OdooConnector::connect` (auth via `common.authenticate`), `execute_kw`, `search_partners`, `my_invoices`, `my_helpdesk_tickets`, `get_record`, `web_url`
-  - [x] Tool: `odoo_search_contacts` (`res.partner` ilike search)
-  - [x] Tool: `odoo_get_invoices` (`account.move` with open/all filter)
-  - [x] Tool: `odoo_list_tickets` (`helpdesk.ticket` assigned to authenticated user)
-  - [x] Tool: `odoo_get_record` (single-record read for any model)
-  - [x] All write tools (`odoo.create_record`, `odoo.write_record`, `odoo.unlink_record`, `odoo.send_email`) registered as `Forbidden` in rules engine
-  - [x] 9 unit tests pass; 3 live `#[ignore]` tests for auth round-trip
-- [x] `crates/agent/src/odoo_intent.rs` — `OdooAction` enum + `OdooIntentClassifier` (SK/EN few-shots, coreference)
-- [x] Daemon integration — `AppState.odoo: Arc<RwLock<Option<OdooConnector>>>` (in-memory only); routes `POST /odoo/config`, `GET /odoo/status`, `POST /odoo/open`; SSE `odoo_found` event; `save/load_last_odoo_ref` coreference persistence
-- [x] `apps/macos/Sources/bagent/KeychainStore.swift` — first Keychain code in project; `SecItemAdd`/`SecItemCopyMatching`/`SecItemDelete`; `saveOdoo`/`loadOdoo`/`deleteOdoo` helpers
-- [x] Keychain storage for Odoo credentials — API key **never** written to daemon disk; Swift re-pushes from Keychain on each launch via `restoreOdooFromKeychain()`
-- [x] Settings → Odoo section: URL/DB/user TextFields, SecureField for API key, status dot, "Testovať Odoo" button
-- [x] `OdooOpenButton` in `ChatView.swift` — globe icon, "Otvoriť v Safari", orange accent
-- [x] `open_url_in_safari` in `crates/connectors/filesystem/src/open.rs` — validates `http(s)` scheme only, bypasses PathPolicy
+Original JSON-RPC implementation complete and unit-tested (see git history).
+Superseded by Phase 6B — MCP transport. All items below were checked before the switch.
+
+- [x] `crates/connectors/odoo/` — JSON-RPC transport (Odoo 18, now replaced)
+- [x] `crates/agent/src/odoo_intent.rs` — `OdooAction` enum + `OdooIntentClassifier` (unchanged, reused in 6B)
+- [x] Daemon integration — routes, SSE, coreference (updated in 6B)
+- [x] `apps/macos/Sources/bagent/KeychainStore.swift` — Keychain helpers (unchanged)
 - [x] Slovak field values preserved verbatim (IČO, DIČ, DPH, faktúra, tiket)
-- [x] `skills/odoo-readonly/SKILL.md` — read-only allowed tools; all writes forbidden; SK term preservation note
-- [ ] End-to-end manual verification with live Odoo 18 instance (steps in plan)
-- [ ] `docs/spikes/odoo.md` — JSON-RPC handshake, version detection, models used (deferred)
+- [x] `skills/odoo-readonly/SKILL.md` — read-only; Forbidden write rules kept in 6B
+- [ ] `docs/spikes/odoo.md` — MCP topology docs (moved to Phase 6B)
+
+---
+
+## Phase 6B — Odoo via MCP server (rmcp client) ✅ IMPLEMENTED
+
+Rewired the Odoo connector to use the installed `mcp_server` Odoo module instead of direct JSON-RPC.
+Daemon spawns `uvx mcp-server-odoo` as a child process and speaks MCP over stdio via `rmcp 1.8`.
+
+### Connector (`crates/connectors/odoo/`)
+- [x] `rmcp = "1.8"` dependency added (`features = ["client", "transport-child-process"]`)
+- [x] `src/mcp.rs` (new): `find_uvx()` (PATH + common macOS locations), `spawn_mcp()`, `extract_text()`, `extract_first_id()`, `extract_first_name()` helpers; 6 unit tests
+- [x] `src/lib.rs` rewritten: `OdooConnector` owns `McpClient` (running subprocess); `connect_with_uvx()` — find uvx → spawn (90 s timeout) → verify creds via `search_records(res.users)` → uid; `search_partners`, `my_invoices`, `my_helpdesk_tickets`, `get_record` all route through `call_mcp()` → return `OdooMcpResult { text, model, first_id, first_name }`
+- [x] `src/types.rs`: added `OdooError::McpUnavailable` (distinct from `Auth` — shows "install uv/uvx" hint); added `OdooMcpResult`; kept `Partner`/`Invoice`/`HelpdeskTicket`/`M2O`/`false_or_*` for deserialization tests
+- [x] `src/json_rpc.rs` deleted (JSON-RPC envelope no longer needed)
+- [x] API key flows exclusively via child env — **never** written to disk or command line
+- [x] uid is resolved via MCP (`search_records res.users`) — used in `my_invoices` + `my_helpdesk_tickets` domains
+- [x] 11 unit tests pass (6 mcp.rs + 5 lib.rs)
+
+### Daemon (`crates/daemon/src/main.rs`)
+- [x] `OdooConfigReq` (new) — accepts optional `uvx_path` field alongside credentials
+- [x] `odoo_config_handler`: uses `connect_with_uvx()`; returns `mcp_available` + `tool_count`; `McpUnavailable` → HTTP 503 (not 401)
+- [x] `odoo_status_handler`: returns `mcp_available: bool` + `tool_count`
+- [x] `fetch_tool_context` match arms simplified: inject MCP text directly, extract ref from `first_id`/`first_name`
+- [x] Known v1 gap documented: if stdio child dies, calls fail until reconfigure (no auto-respawn)
+
+### Swift (`apps/macos/Sources/bagent/`)
+- [x] `DaemonClient.swift`: `OdooConfigResult` + `OdooStatusResult` extended with `mcp_available` + `tool_count`; `odooConfigure()` accepts optional `uvxPath`
+- [x] `ChatViewModel.swift`: `odooUvxPath` @Published property (UserDefaults); `odooMcpAvailable` + `odooToolCount` state; `configureOdoo()` passes uvxPath + shows MCP-specific error messages; **`restoreOdooFromKeychain()` wired** at daemon-ready in `refreshHealth()` (was dead code — now called on every launch)
+- [x] `SettingsView.swift`: MCP status row (server.rack icon + tool count); uvx path TextField; updated test result message format; "first run may take a minute" hint
+
+### Pending / Verification
+- [ ] **Step 1 (do first):** run `uvx mcp-server-odoo` against the live MCP-enabled Odoo instance, inspect `CallToolResult` shape (text vs structured), verify uid extraction, confirm field richness — decides whether text injection is enough or typed parsing needed
+- [ ] End-to-end chat test (Slovak): "nájdi kontakt", "ukáž moje faktúry", "moje tikety" → live data + "Otvoriť v Safari" button
+- [ ] Restart test: creds restored from Keychain without re-entering (via `restoreOdooFromKeychain` wiring)
+- [ ] API key not on disk: `grep -r api_key ~/Library/Application\ Support/bagent/` → empty
+- [ ] `docs/spikes/odoo.md` — MCP topology, env vars, tools, uvx-PATH gotcha
 
 ---
 

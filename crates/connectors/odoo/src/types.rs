@@ -34,12 +34,15 @@ impl std::fmt::Debug for OdooConfig {
 pub enum OdooError {
     /// Connector was never configured (no creds pushed yet).
     NotConfigured,
-    /// Authentication failed (bad db/user/api_key or wrong Odoo URL).
+    /// Authentication failed (bad credentials or wrong Odoo URL / DB).
     Auth(String),
-    /// HTTP / network error.
+    /// HTTP / network error (REST version-check calls only).
     Network(String),
-    /// Odoo returned a JSON-RPC `error` object.
+    /// MCP tool returned an error or could not be parsed.
     Rpc(String),
+    /// `uvx` binary not found or MCP subprocess failed to start.
+    /// Distinct from `Auth` so Settings can show the right hint ("install uv/uvx").
+    McpUnavailable(String),
 }
 
 impl std::fmt::Display for OdooError {
@@ -51,9 +54,32 @@ impl std::fmt::Display for OdooError {
             ),
             Self::Auth(msg) => write!(f, "Odoo authentication failed: {msg}"),
             Self::Network(msg) => write!(f, "Odoo network error: {msg}"),
-            Self::Rpc(msg) => write!(f, "Odoo RPC error: {msg}"),
+            Self::Rpc(msg) => write!(f, "Odoo MCP error: {msg}"),
+            Self::McpUnavailable(msg) => write!(
+                f,
+                "MCP server unavailable — install uv/uvx and ensure it's in PATH: {msg}"
+            ),
         }
     }
+}
+
+// ── MCP result ────────────────────────────────────────────────────────────────
+
+/// Result from an MCP tool call.
+///
+/// mcp-server-odoo returns *formatted text* optimised for LLM consumption, not raw JSON.
+/// The text is injected directly into the agent context. We also attempt to extract
+/// the first record's `id` and `name` for `OdooRecordRef` (the "Open in Safari" button).
+#[derive(Debug, Clone)]
+pub struct OdooMcpResult {
+    /// Formatted text from the MCP server — inject as LLM context.
+    pub text: String,
+    /// Odoo model, e.g. `"res.partner"`.
+    pub model: String,
+    /// ID of the first record returned (best-effort; `None` if unparseable).
+    pub first_id: Option<i64>,
+    /// Display name of the first record (best-effort; `None` if unparseable).
+    pub first_name: Option<String>,
 }
 
 impl std::error::Error for OdooError {}

@@ -2,12 +2,48 @@ import AppKit
 import Combine
 import SwiftUI
 
+private func sourceModeCommandDigitIndex(for event: NSEvent) -> Int? {
+    let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    guard flags.contains(.command),
+          !flags.contains(.shift),
+          !flags.contains(.option),
+          !flags.contains(.control)
+    else { return nil }
+
+    switch event.keyCode {
+    case 18: return 0
+    case 19: return 1
+    case 20: return 2
+    case 21: return 3
+    default: return nil
+    }
+}
+
 // Borderless NSPanel by default returns canBecomeKey = false, which silently
 // prevents makeKeyAndOrderFront from making the panel a key window, so keyboard
 // events never reach the text field. Subclass to fix.
 private final class BagentPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    // Called by the controller for ⌘1–⌘4 before the field editor can swallow them.
+    // Return true if the event was consumed.
+    var onCommandDigit: ((Int) -> Bool)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.command) {
+            print("[perf] performKeyEquivalent cmd+keyCode=\(event.keyCode) chars='\(event.characters ?? "")'")
+        }
+        if let index = sourceModeCommandDigitIndex(for: event) {
+            print("[CMD+\(index+1)] performKeyEquivalent fired, onCommandDigit=\(onCommandDigit != nil)")
+            if let handler = onCommandDigit, handler(index) {
+                return true
+            }
+            print("[CMD+\(index+1)] handler returned false or missing")
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 @MainActor
@@ -24,6 +60,7 @@ final class NotchWindowController: NSObject {
     private var voicePanel: BagentPanel?
     private let chatViewModel: ChatViewModel
     private(set) var isExpanded = false
+    private(set) var isInputShowing = false
     private(set) var isVoiceShowing = false
     var isVoiceModeEnabled: Bool { chatViewModel.voiceModeEnabled }
     private var hasNotch = false
@@ -35,6 +72,7 @@ final class NotchWindowController: NSObject {
 
     private var pillFrame: NSRect = .zero
     private var chatFrame: NSRect = .zero
+    private var inputFrame: NSRect = .zero
     private var voiceFrame: NSRect = .zero
     private var notchWidth: CGFloat = 0
     private var notchHeight: CGFloat = 0
@@ -87,6 +125,15 @@ final class NotchWindowController: NSObject {
             if self.isVoiceShowing {
                 self.teardownVoiceNotch(restoreApp: true)
             }
+        }
+        chatViewModel.onInputOnlySubmitted = { [weak self] in
+            self?.collapseInputForThinking()
+        }
+        chatViewModel.onFirstAssistantToken = { [weak self] in
+            self?.presentOutputChat()
+        }
+        chatViewModel.onPromoteToChat = { [weak self] draft in
+            self?.promoteInputToChat(preserving: draft)
         }
 
         // Silent background action: show confirmation in notch for 2.5s then collapse.
@@ -185,6 +232,18 @@ final class NotchWindowController: NSObject {
             width: chatW,
             height: chatH
         )
+
+        let inputW = min(820, max(640, screen.frame.width * 0.42))
+        // Extra height gives the glass shadow room to render without clipping at the
+        // transparent window edge (especially relevant for the wider, softer Liquid Glass
+        // shadow on macOS 26).
+        let inputH: CGFloat = 96
+        inputFrame = NSRect(
+            x: notchCenterX - inputW / 2,
+            y: chatAnchorY - inputH - 12,
+            width: inputW,
+            height: inputH
+        )
     }
 
     private func updateChatSize(w: CGFloat, h: CGFloat) {
@@ -197,6 +256,8 @@ final class NotchWindowController: NSObject {
         )
         if isExpanded {
             chatPanel.setFrame(chatFrame, display: true, animate: false)
+        } else if isInputShowing {
+            chatPanel.setFrame(inputFrame, display: true, animate: false)
         }
     }
 
@@ -253,6 +314,13 @@ final class NotchWindowController: NSObject {
         panel.contentView = hostingView
         // Stays hidden until expand() is called.
         self.chatPanel = panel
+
+        // ⌘1–⌘4: route through performKeyEquivalent (reliable even when a
+        // TextField field editor is first responder) rather than a local keyDown
+        // monitor, which command key-equivalents bypass.
+        panel.onCommandDigit = { [weak self] index in
+            self?.selectVisibleSourceMode(at: index) ?? false
+        }
     }
 
     private func buildVoicePanel() {
@@ -351,7 +419,7 @@ final class NotchWindowController: NSObject {
         chatViewModel.speech.cancel()
         let original = previousApp
         teardownVoiceNotch(restoreApp: false)
-        expand()
+        presentInputOnly()
         previousApp = original
     }
 
@@ -370,7 +438,6 @@ final class NotchWindowController: NSObject {
         // Brief pause so voice content fades before chat begins expanding.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self else { return }
-            self.expand()
             self.previousApp = savedApp
             self.chatViewModel.voiceTurnActive = true
             self.chatViewModel.submitTranscript(text)
@@ -428,15 +495,41 @@ final class NotchWindowController: NSObject {
     // MARK: - Toggle
 
     func toggle() {
-        isExpanded ? collapse() : expand()
+        (isExpanded || isInputShowing) ? collapse() : presentInputOnly()
     }
 
     func expand() {
+        presentOutputChat()
+    }
+
+    func presentInputOnly() {
+        guard !isExpanded, !isInputShowing else { return }
+        if chatViewModel.isThinking {
+            presentOutputChat()
+            return
+        }
+        isInputShowing = true
+
+        previousApp = NSWorkspace.shared.frontmostApplication
+
+        chatViewModel.pillHovered = true
+        if hasNotch { hoverChanged(isHovered: true) }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.isInputShowing else { return }
+            self.showInputPanel()
+        }
+    }
+
+    func presentOutputChat() {
         guard !isExpanded else { return }
+        isInputShowing = false
         isExpanded = true
 
         // Save the app that was active before bagent takes focus
-        previousApp = NSWorkspace.shared.frontmostApplication
+        if previousApp == nil {
+            previousApp = NSWorkspace.shared.frontmostApplication
+        }
 
         // Step 1 — animate notch to hover state so it "charges up" before the panel appears.
         chatViewModel.pillHovered = true
@@ -449,6 +542,24 @@ final class NotchWindowController: NSObject {
         }
     }
 
+    private func showInputPanel() {
+        chatPanel.styleMask = [.borderless]
+        // On macOS 26+ the Liquid Glass surface renders its own shadow; disabling the
+        // AppKit window shadow avoids a muddy double-shadow beneath the spotlight bar.
+        // The expanded chat panel (showChatPanel) keeps hasShadow = true unchanged.
+        if #available(macOS 26, *) {
+            chatPanel.hasShadow = false
+        } else {
+            chatPanel.hasShadow = true
+        }
+        chatPanel.setFrame(inputFrame, display: false)
+        chatViewModel.isExpanded = false
+        chatViewModel.chatSurfaceMode = .inputOnly
+        chatPanel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        installPanelMonitors()
+    }
+
     private func showChatPanel() {
         chatPanel.styleMask = [.borderless]
         chatPanel.hasShadow = true
@@ -456,7 +567,12 @@ final class NotchWindowController: NSObject {
         chatPanel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         chatViewModel.isExpanded = true
+        chatViewModel.chatSurfaceMode = .outputExpanded
+        installPanelMonitors()
+    }
 
+    private func installPanelMonitors() {
+        if localKeyMonitor != nil || globalMouseMonitor != nil { return }
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]
         ) { [weak self] _ in
@@ -470,15 +586,29 @@ final class NotchWindowController: NSObject {
             }
         }
 
-        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 53 { self?.collapse(); return nil }
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            guard let self else { return event }
+            if event.type == .flagsChanged {
+                let forced = event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
+                if self.isInputShowing {
+                    self.chatViewModel.isSourcePickerForced = forced
+                }
+                return event
+            }
+            // Log all keyDown events so we can see which path CMD+digit takes
+            print("[keymon] keyDown keyCode=\(event.keyCode) flags=\(event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue) chars='\(event.characters ?? "")'")
+            if event.keyCode == 53 { self.collapse(); return nil }
+            if let index = sourceModeCommandDigitIndex(for: event),
+               self.selectVisibleSourceMode(at: index) {
+                return nil
+            }
             if event.modifierFlags.contains(.command) {
                 let consumed: Bool
                 switch event.keyCode {
                 case 9:
                     // Intercept ⌘V: if the pasteboard has an image, paste it as an
                     // attachment and insert [image #n] token rather than raw-pasting bytes.
-                    if self?.chatViewModel.pasteImageFromClipboard() == true {
+                    if self.chatViewModel.pasteImageFromClipboard() == true {
                         consumed = true
                     } else {
                         consumed = NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
@@ -497,10 +627,83 @@ final class NotchWindowController: NSObject {
         }
     }
 
+    private func selectVisibleSourceMode(at index: Int) -> Bool {
+        print("[CMD+\(index+1)] selectVisibleSourceMode: isInputShowing=\(isInputShowing)")
+        guard isInputShowing else { return false }
+        let modes = Array(chatViewModel.topSourceModes.prefix(4))
+        print("[CMD+\(index+1)] modes=\(modes.map(\.rawValue)), indexValid=\(modes.indices.contains(index))")
+        guard modes.indices.contains(index) else { return false }
+        chatViewModel.selectedSourceMode = modes[index]
+        chatViewModel.hoveredSourceMode = nil
+        print("[CMD+\(index+1)] selected \(modes[index].rawValue)")
+        return true
+    }
+
+    private func collapseInputForThinking() {
+        guard isInputShowing else { return }
+        isInputShowing = false
+        chatViewModel.chatSurfaceMode = .thinkingHidden
+        if let m = localKeyMonitor { NSEvent.removeMonitor(m); localKeyMonitor = nil }
+        if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
+        chatPanel.styleMask = [.borderless, .nonactivatingPanel]
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { [weak self] in
+            guard let self, !self.isInputShowing, !self.isExpanded else { return }
+            self.chatPanel.hasShadow = false
+            self.chatPanel.orderOut(nil)
+            self.chatPanel.resignKey()
+            self.previousApp?.activate(options: [])
+        }
+    }
+
+    /// Promotes the spotlight input bar to the full expanded chat panel without
+    /// losing focus or keystrokes. The panel is already key; we animate its frame
+    /// from inputFrame → chatFrame and flip SwiftUI state so `ExpandedChatView`
+    /// appears. Do NOT call makeKeyAndOrderFront — that would cause a focus blip.
+    func promoteInputToChat(preserving draft: String) {
+        print("[promote] called: isInputShowing=\(isInputShowing), isExpanded=\(isExpanded), draft='\(draft)'")
+        guard isInputShowing, !isExpanded else {
+            print("[promote] guard failed — bailing, finishSpotlightDraftPromotion")
+            chatViewModel.finishSpotlightDraftPromotion()
+            return
+        }
+        if chatViewModel.inputText != draft {
+            print("[promote] correcting inputText from '\(chatViewModel.inputText)' to '\(draft)'")
+            chatViewModel.inputText = draft
+        }
+        isInputShowing = false
+        isExpanded = true
+        chatViewModel.isExpanded = true
+        chatViewModel.chatSurfaceMode = .outputExpanded
+        if chatViewModel.inputText != draft {
+            print("[promote] post-state inputText mismatch, re-setting to '\(draft)'")
+            chatViewModel.inputText = draft
+        }
+        chatPanel.hasShadow = true
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.35
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            chatPanel.animator().setFrame(chatFrame, display: true)
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            print("[promote] async: inputText='\(self.chatViewModel.inputText)', draft='\(draft)'")
+            if self.chatViewModel.inputText != draft {
+                print("[promote] async: re-setting inputText")
+                self.chatViewModel.inputText = draft
+            }
+            self.chatViewModel.finishSpotlightDraftPromotion()
+        }
+    }
+
     func collapse() {
-        guard isExpanded else { return }
+        guard isExpanded || isInputShowing else { return }
+        let wasInputOnly = isInputShowing
         isExpanded = false
+        isInputShowing = false
         chatViewModel.isExpanded = false  // triggers SwiftUI spring-out animation
+        chatViewModel.chatSurfaceMode = .collapsed
+        chatViewModel.isSourcePickerForced = false
 
         if let m = localKeyMonitor    { NSEvent.removeMonitor(m); localKeyMonitor    = nil }
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
@@ -509,7 +712,7 @@ final class NotchWindowController: NSObject {
         // Hide chat panel after spring settles (~0.35 s), then contract notch back to idle.
         let appToRestore = previousApp
         previousApp = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + (wasInputOnly ? 0.22 : 0.35)) { [weak self] in
             guard let self else { return }
             self.chatPanel.hasShadow = false
             self.chatPanel.orderOut(nil)
@@ -564,7 +767,7 @@ final class NotchWindowController: NSObject {
         if shouldHide {
             if statusPanel.isVisible { statusPanel.orderOut(nil) }
             if isVoiceShowing { dismissVoice() }
-            if isExpanded    { collapse() }
+            if isExpanded || isInputShowing { collapse() }
         } else {
             if !statusPanel.isVisible { statusPanel.orderFront(nil) }
         }
@@ -646,6 +849,8 @@ final class NotchWindowController: NSObject {
         statusPanel.setFrame(pillFrame, display: true)
         if isExpanded {
             chatPanel.setFrame(chatFrame, display: true)
+        } else if isInputShowing {
+            chatPanel.setFrame(inputFrame, display: true)
         }
         // Rebuild voice panel on non-notch displays to pick up new frame.
         if !hasNotch {

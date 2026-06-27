@@ -9,9 +9,10 @@ name = "odoo_connector"
 [dependencies]
 anyhow    = "1"
 reqwest   = { version = "0.12", features = ["json"] }
+rmcp      = { version = "1.8", features = ["client", "transport-child-process"] }
 serde     = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio     = { version = "1", features = ["rt"] }
+tokio     = { version = "1", features = ["rt", "process", "io-util", "time", "macros"] }
 tracing   = "0.1"
 
 [dev-dependencies]

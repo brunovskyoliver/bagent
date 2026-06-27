@@ -446,7 +446,13 @@ struct ChatPanelContent: View {
 
     var body: some View {
         ZStack {
-            if viewModel.isExpanded {
+            if viewModel.chatSurfaceMode == .inputOnly {
+                SpotlightInputPanel(viewModel: viewModel, onCollapse: onCollapse)
+                    .transition(
+                        .scale(scale: 0.82, anchor: UnitPoint(x: 0.5, y: 0))
+                        .combined(with: .opacity)
+                    )
+            } else if viewModel.isExpanded {
                 ExpandedChatView(viewModel: viewModel, onCollapse: onCollapse)
                     .transition(
                         .scale(scale: 0.82, anchor: UnitPoint(x: 0.5, y: 0))
@@ -456,6 +462,337 @@ struct ChatPanelContent: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .animation(.spring(response: 0.30, dampingFraction: 0.62), value: viewModel.isExpanded)
+        .animation(.spring(response: 0.30, dampingFraction: 0.68), value: viewModel.chatSurfaceMode)
+    }
+}
+
+// MARK: - Spotlight-style input panel
+
+private struct LiquidGlassFallbackSurface: ViewModifier {
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .background(.ultraThinMaterial)
+            .overlay(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                .white.opacity(0.18),
+                                .white.opacity(0.04),
+                                .clear,
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .blendMode(.screen)
+                    .allowsHitTesting(false)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(.white.opacity(0.16), lineWidth: 1)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .shadow(color: .black.opacity(0.34), radius: 22, x: 0, y: 18)
+    }
+}
+
+private extension View {
+    func liquidGlassFallback(cornerRadius: CGFloat) -> some View {
+        modifier(LiquidGlassFallbackSurface(cornerRadius: cornerRadius))
+    }
+
+    /// Capsule glass surface. On macOS 26+ uses real Liquid Glass; falls back to
+    /// the hand-rolled material surface on earlier systems.
+    @ViewBuilder
+    func liquidGlassInputSurface() -> some View {
+        if #available(macOS 26, *) {
+            self.glassEffect(.regular, in: .capsule)
+        } else {
+            self.liquidGlassFallback(cornerRadius: 18)
+        }
+    }
+
+    /// Circle glass surface for source-mode bubbles. Matches the capsule's `.regular`
+    /// glass on macOS 26+; falls back to the hand-rolled material on earlier systems.
+    @ViewBuilder
+    func liquidGlassBubbleSurface(selected: Bool) -> some View {
+        if #available(macOS 26, *) {
+            self.glassEffect(
+                selected ? .regular.tint(Color.accentColor) : .regular,
+                in: .circle
+            )
+        } else {
+            self
+                .background(selected ? Color.accentColor.opacity(0.86) : Color.white.opacity(0.05))
+                .liquidGlassFallback(cornerRadius: 22)
+        }
+    }
+}
+
+struct SpotlightInputPanel: View {
+    @ObservedObject var viewModel: ChatViewModel
+    let onCollapse: () -> Void
+
+    @FocusState private var inputFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var fieldWidth: CGFloat = 220
+    @State private var verticalOffset: CGFloat = -34
+    @State private var fieldOpacity: CGFloat = 0
+    @State private var localPickerVisible = false
+    /// True once the open animation has fully settled — gates overflow detection
+    /// so short text typed immediately after opening never triggers a promotion.
+    @State private var openSettled = false
+    /// Set true immediately before triggering promotion so that the macOS TextField
+    /// focus-loss path (which fires onSubmit) doesn't accidentally call send().
+    @State private var isPromoting = false
+
+    private let fullFieldWidth: CGFloat = 540
+    private let compactFieldWidth: CGFloat = 356
+    private let inputHeight: CGFloat = 56
+    /// Text wider than this (measured with NSFont at size 22) overflows one line.
+    /// Computed from fullFieldWidth (540) minus horizontal padding (2×20), icon
+    /// (24), HStack spacing (10), and a safety margin — ≈420 pt.
+    private let textOverflowThreshold: CGFloat = 420
+
+    private var pickerVisible: Bool {
+        localPickerVisible || viewModel.isSourcePickerForced
+    }
+
+    private var currentFieldWidth: CGFloat {
+        pickerVisible ? compactFieldWidth : fieldWidth
+    }
+
+    var body: some View {
+        glassPillLayout
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .offset(y: verticalOffset)
+            .opacity(fieldOpacity)
+            .onHover { hovering in
+                localPickerVisible = hovering
+            }
+            .onAppear {
+                viewModel.hoveredSourceMode = nil
+                inputFocused = true
+                if reduceMotion {
+                    fieldOpacity = 1
+                    verticalOffset = 0
+                    fieldWidth = fullFieldWidth
+                } else {
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.66)) {
+                        fieldOpacity = 1
+                        verticalOffset = 0
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                        withAnimation(.easeOut(duration: 0.22)) {
+                            fieldWidth = fullFieldWidth
+                        }
+                    }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    inputFocused = true
+                }
+                // Gate overflow detection until the open animation fully settles
+                // (0.18 s delay + 0.22 s animation + small buffer = 0.45 s).
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                    openSettled = true
+                }
+            }
+            .onDisappear {
+                viewModel.hoveredSourceMode = nil
+                viewModel.isSourcePickerForced = false
+                openSettled = false
+            }
+            .onChange(of: viewModel.inputText) { _, text in
+                guard openSettled, !isPromoting else { return }
+                // Paste can insert a newline directly.
+                if text.contains("\n") {
+                    promoteToChat(preserving: text)
+                    return
+                }
+                // Measure the proportional text width. Promote if it no longer fits
+                // one line in the input capsule (threshold ≈ fullFieldWidth minus
+                // padding, icon, and spacing). Always measure against the full-width
+                // threshold so showing the source picker never triggers promotion.
+                guard !text.isEmpty else { return }
+                let font = NSFont.systemFont(ofSize: 22, weight: .regular)
+                let measured = (text as NSString).size(withAttributes: [.font: font]).width
+                if measured > textOverflowThreshold {
+                    promoteToChat(preserving: text)
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("bagent input")
+    }
+
+    /// The pill layout container.
+    ///
+    /// On macOS 26+ wraps the search bar and icon row inside a `GlassEffectContainer`
+    /// so both elements share a sampling region and the icon row can morph in/out
+    /// as a proper glass transition. The picker stays mounted so repeated Cmd
+    /// presses do not recreate each bubble mid-animation.
+    ///
+    /// On earlier systems keeps the original opacity/scale/frame trick unchanged.
+    @ViewBuilder
+    private var glassPillLayout: some View {
+        // Picker is conditionally rendered (not just hidden) so GlassEffectContainer
+        // never registers the glass circles when the picker is not visible — otherwise
+        // the dark glass shapes show through even at opacity(0).
+        let pickerTransition: AnyTransition = reduceMotion
+            ? .opacity
+            : .opacity.combined(with: .scale(scale: 0.88, anchor: .leading))
+
+        if #available(macOS 26, *) {
+            GlassEffectContainer(spacing: 12) {
+                HStack(spacing: 12) {
+                    inputField
+                        .frame(width: currentFieldWidth, height: inputHeight)
+                        .animation(
+                            reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.30, dampingFraction: 0.72),
+                            value: pickerVisible
+                        )
+                        .animation(.easeOut(duration: 0.20), value: fieldWidth)
+
+                    if pickerVisible {
+                        SourceModePicker(viewModel: viewModel, visible: true)
+                            .frame(width: 208, height: inputHeight)
+                            .transition(pickerTransition)
+                    }
+                }
+                .animation(
+                    reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.30, dampingFraction: 0.68),
+                    value: pickerVisible
+                )
+            }
+        } else {
+            HStack(spacing: 12) {
+                inputField
+                    .frame(width: currentFieldWidth, height: inputHeight)
+                    .animation(
+                        reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.30, dampingFraction: 0.72),
+                        value: pickerVisible
+                    )
+                    .animation(.easeOut(duration: 0.20), value: fieldWidth)
+
+                if pickerVisible {
+                    SourceModePicker(viewModel: viewModel, visible: true)
+                        .frame(width: 208, height: inputHeight)
+                        .transition(pickerTransition)
+                }
+            }
+            .animation(
+                reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.30, dampingFraction: 0.68),
+                value: pickerVisible
+            )
+        }
+    }
+
+    private var inputField: some View {
+        HStack(spacing: 10) {
+            Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "magnifyingglass")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 24)
+
+            TextField(viewModel.activeSourcePlaceholder, text: $viewModel.inputText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 22, weight: .regular))
+                .focused($inputFocused)
+                .onSubmit {
+                    if !isPromoting && !viewModel.isPromotingSpotlightDraft {
+                        viewModel.send()
+                    }
+                }
+
+            if viewModel.selectedSourceMode != nil {
+                Button { viewModel.clearSourceMode() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear source")
+                .accessibilityLabel("Clear source")
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .liquidGlassInputSurface()
+    }
+
+    private func promoteToChat(preserving text: String) {
+        print("[promote] SpotlightInputPanel.promoteToChat: isPromoting=\(isPromoting), text='\(text)'")
+        guard !isPromoting else { return }
+        isPromoting = true
+        viewModel.promoteSpotlightDraft(text)
+    }
+}
+
+struct SourceModePicker: View {
+    @ObservedObject var viewModel: ChatViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let visible: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(Array(viewModel.topSourceModes.prefix(4).enumerated()), id: \.element.id) { idx, mode in
+                SourceModeBubble(
+                    mode: mode,
+                    index: idx,
+                    selected: viewModel.selectedSourceMode == mode,
+                    visible: visible,
+                    reduceMotion: reduceMotion,
+                    onSelect: { viewModel.selectSourceMode(mode) },
+                    onHover: { hovering in
+                        viewModel.hoveredSourceMode = hovering ? mode : nil
+                    }
+                )
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Source modes")
+    }
+}
+
+struct SourceModeBubble: View {
+    let mode: SourceMode
+    let index: Int
+    let selected: Bool
+    let visible: Bool
+    let reduceMotion: Bool
+    let onSelect: () -> Void
+    let onHover: (Bool) -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            // Use a neutral Color.clear base so the glass circle is sized from a
+            // true 44×44 square rather than from the SF Symbol's font layout box
+            // (which includes baseline/side-bearing space and shifts the circle).
+            // The icon is then independently centered via .overlay.
+            Image(systemName: mode.symbolName)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(selected ? .white : .primary)
+                .frame(width: 44, height: 44)
+                .liquidGlassBubbleSurface(selected: selected)
+        }
+        .buttonStyle(.plain)
+        .help("\(mode.title) (⌘\(index + 1))")
+        .accessibilityLabel(mode.title)
+        .scaleEffect(reduceMotion || visible ? 1 : 0.82)
+        .opacity(visible ? 1 : 0)
+        .offset(x: reduceMotion || visible ? 0 : -4)
+        .animation(
+            reduceMotion
+                ? .easeOut(duration: 0.10)
+                : .spring(response: 0.22, dampingFraction: 0.82).delay(visible ? Double(index) * 0.024 : 0),
+            value: visible
+        )
+        .allowsHitTesting(visible)
+        .onHover(perform: onHover)
     }
 }
 

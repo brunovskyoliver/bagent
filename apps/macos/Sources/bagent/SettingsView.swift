@@ -512,12 +512,12 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Odoo (Phase 6)
+    // MARK: - Odoo (Phase 6B — MCP)
 
     private var odooSection: some View {
         SettingsSection(title: "Odoo (CRM / Helpdesk)") {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Pripojenie k Odoo 18 — len na čítanie (tikety, faktúry, partneri). Credentials sa ukladajú do Keychain.")
+                Text("Pripojenie k Odoo 18 cez MCP server — len na čítanie (tikety, faktúry, partneri). Credentials sa ukladajú do Keychain.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
 
@@ -573,11 +573,37 @@ struct SettingsView: View {
                     .help("Načítať uložený API kľúč z Keychain")
                 }
 
+                // MCP / uvx status + optional override path
+                HStack(spacing: 6) {
+                    Image(systemName: viewModel.odooMcpAvailable ? "server.rack" : "exclamationmark.triangle")
+                        .foregroundStyle(viewModel.odooMcpAvailable ? Color.green : Color.orange)
+                        .font(.system(size: 11))
+                    if viewModel.odooMcpAvailable && viewModel.odooToolCount > 0 {
+                        Text("MCP server aktívny (\(viewModel.odooToolCount) tools)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("MCP server (uvx) — vyžaduje nainštalovaný uv/uvx")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    Text("uvx cesta")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 80, alignment: .leading)
+                    TextField("/opt/homebrew/bin/uvx  (voliteľné)", text: $viewModel.odooUvxPath)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textFieldStyle(.roundedBorder)
+                }
+
                 // Status / test button row
                 HStack(spacing: 8) {
                     if viewModel.isTestingOdoo {
                         ProgressView().scaleEffect(0.65)
-                        Text("Testujem…")
+                        Text("Testujem… (prvé spustenie môže trvať minútu)")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                     } else if let msg = viewModel.odooTestResult {
@@ -587,10 +613,10 @@ struct SettingsView: View {
                         Text(msg)
                             .font(.system(size: 11))
                             .foregroundStyle(msg.hasPrefix("✓") ? Color.primary : Color.red)
-                            .lineLimit(1)
+                            .lineLimit(2)
                     } else {
                         ConnectorRow(
-                            label: "Odoo",
+                            label: "Odoo MCP",
                             icon: "building.2",
                             accessible: viewModel.daemonHealth?.odooConnector
                         )
@@ -616,7 +642,7 @@ struct SettingsView: View {
                 }
 
                 Divider()
-                Text("API kľúč sa nikdy nezapíše na disk — uchováva sa iba v Keychain a v pamäti daemona.")
+                Text("API kľúč sa nikdy nezapíše na disk — uchováva sa iba v Keychain a v env premennej MCP child procesu.")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             }
