@@ -4,10 +4,10 @@ import SwiftUI
 
 private func sourceModeCommandDigitIndex(for event: NSEvent) -> Int? {
     let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-    guard flags.contains(.command),
+    guard flags.contains(.control),
           !flags.contains(.shift),
           !flags.contains(.option),
-          !flags.contains(.control)
+          !flags.contains(.command)
     else { return nil }
 
     switch event.keyCode {
@@ -26,22 +26,8 @@ private final class BagentPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
-    // Called by the controller for ⌘1–⌘4 before the field editor can swallow them.
-    // Return true if the event was consumed.
-    var onCommandDigit: ((Int) -> Bool)?
-
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if flags.contains(.command) {
-            print("[perf] performKeyEquivalent cmd+keyCode=\(event.keyCode) chars='\(event.characters ?? "")'")
-        }
-        if let index = sourceModeCommandDigitIndex(for: event) {
-            print("[CMD+\(index+1)] performKeyEquivalent fired, onCommandDigit=\(onCommandDigit != nil)")
-            if let handler = onCommandDigit, handler(index) {
-                return true
-            }
-            print("[CMD+\(index+1)] handler returned false or missing")
-        }
+        // Control+1–4 go through keyDown, not performKeyEquivalent — handled by localKeyMonitor.
         return super.performKeyEquivalent(with: event)
     }
 }
@@ -314,13 +300,6 @@ final class NotchWindowController: NSObject {
         panel.contentView = hostingView
         // Stays hidden until expand() is called.
         self.chatPanel = panel
-
-        // ⌘1–⌘4: route through performKeyEquivalent (reliable even when a
-        // TextField field editor is first responder) rather than a local keyDown
-        // monitor, which command key-equivalents bypass.
-        panel.onCommandDigit = { [weak self] index in
-            self?.selectVisibleSourceMode(at: index) ?? false
-        }
     }
 
     private func buildVoicePanel() {
@@ -589,14 +568,12 @@ final class NotchWindowController: NSObject {
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
             if event.type == .flagsChanged {
-                let forced = event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
+                let forced = event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.control)
                 if self.isInputShowing {
                     self.chatViewModel.isSourcePickerForced = forced
                 }
                 return event
             }
-            // Log all keyDown events so we can see which path CMD+digit takes
-            print("[keymon] keyDown keyCode=\(event.keyCode) flags=\(event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue) chars='\(event.characters ?? "")'")
             if event.keyCode == 53 { self.collapse(); return nil }
             if let index = sourceModeCommandDigitIndex(for: event),
                self.selectVisibleSourceMode(at: index) {
@@ -628,14 +605,12 @@ final class NotchWindowController: NSObject {
     }
 
     private func selectVisibleSourceMode(at index: Int) -> Bool {
-        print("[CMD+\(index+1)] selectVisibleSourceMode: isInputShowing=\(isInputShowing)")
         guard isInputShowing else { return false }
         let modes = Array(chatViewModel.topSourceModes.prefix(4))
-        print("[CMD+\(index+1)] modes=\(modes.map(\.rawValue)), indexValid=\(modes.indices.contains(index))")
         guard modes.indices.contains(index) else { return false }
-        chatViewModel.selectedSourceMode = modes[index]
+        let mode = modes[index]
+        chatViewModel.selectedSourceMode = chatViewModel.selectedSourceMode == mode ? nil : mode
         chatViewModel.hoveredSourceMode = nil
-        print("[CMD+\(index+1)] selected \(modes[index].rawValue)")
         return true
     }
 
@@ -661,24 +636,14 @@ final class NotchWindowController: NSObject {
     /// from inputFrame → chatFrame and flip SwiftUI state so `ExpandedChatView`
     /// appears. Do NOT call makeKeyAndOrderFront — that would cause a focus blip.
     func promoteInputToChat(preserving draft: String) {
-        print("[promote] called: isInputShowing=\(isInputShowing), isExpanded=\(isExpanded), draft='\(draft)'")
         guard isInputShowing, !isExpanded else {
-            print("[promote] guard failed — bailing, finishSpotlightDraftPromotion")
             chatViewModel.finishSpotlightDraftPromotion()
             return
-        }
-        if chatViewModel.inputText != draft {
-            print("[promote] correcting inputText from '\(chatViewModel.inputText)' to '\(draft)'")
-            chatViewModel.inputText = draft
         }
         isInputShowing = false
         isExpanded = true
         chatViewModel.isExpanded = true
         chatViewModel.chatSurfaceMode = .outputExpanded
-        if chatViewModel.inputText != draft {
-            print("[promote] post-state inputText mismatch, re-setting to '\(draft)'")
-            chatViewModel.inputText = draft
-        }
         chatPanel.hasShadow = true
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.35
@@ -686,13 +651,7 @@ final class NotchWindowController: NSObject {
             chatPanel.animator().setFrame(chatFrame, display: true)
         }
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            print("[promote] async: inputText='\(self.chatViewModel.inputText)', draft='\(draft)'")
-            if self.chatViewModel.inputText != draft {
-                print("[promote] async: re-setting inputText")
-                self.chatViewModel.inputText = draft
-            }
-            self.chatViewModel.finishSpotlightDraftPromotion()
+            self?.chatViewModel.finishSpotlightDraftPromotion()
         }
     }
 

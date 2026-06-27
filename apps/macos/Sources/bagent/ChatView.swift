@@ -725,7 +725,6 @@ struct SpotlightInputPanel: View {
     }
 
     private func promoteToChat(preserving text: String) {
-        print("[promote] SpotlightInputPanel.promoteToChat: isPromoting=\(isPromoting), text='\(text)'")
         guard !isPromoting else { return }
         isPromoting = true
         viewModel.promoteSpotlightDraft(text)
@@ -780,7 +779,7 @@ struct SourceModeBubble: View {
                 .liquidGlassBubbleSurface(selected: selected)
         }
         .buttonStyle(.plain)
-        .help("\(mode.title) (⌘\(index + 1))")
+        .help("\(mode.title) (⌃\(index + 1))")
         .accessibilityLabel(mode.title)
         .scaleEffect(reduceMotion || visible ? 1 : 0.82)
         .opacity(visible ? 1 : 0)
@@ -883,7 +882,21 @@ struct ExpandedChatView: View {
             Text("Na analýzu obrázkov je potrebný model qwen2.5vl:7b.\nSpusti v termináli: ollama pull qwen2.5vl:7b")
         }
         .onAppear {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { inputFocused = true }
+            if let promoted = viewModel.pendingPromotedText {
+                // Clear the signal immediately so it isn't re-applied if the view re-appears.
+                viewModel.pendingPromotedText = nil
+                // Force a genuine binding delta: "" → promoted.
+                // SwiftUI's TextField doesn't propagate programmatic binding changes to the
+                // NSTextField field editor once it's focused; clearing first ensures the
+                // value is visibly different when we restore and set focus next tick.
+                viewModel.inputText = ""
+                DispatchQueue.main.async {
+                    viewModel.inputText = promoted
+                    inputFocused = true
+                }
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { inputFocused = true }
+            }
             viewModel.startApprovalPolling()
             // Restore scroll viewport is handled inside messageList via ScrollViewProxy.
         }

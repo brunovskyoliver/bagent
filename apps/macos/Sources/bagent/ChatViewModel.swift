@@ -539,14 +539,14 @@ final class ChatViewModel: ObservableObject {
     }
 
     func promoteSpotlightDraft(_ draft: String) {
-        print("[promote] ViewModel.promoteSpotlightDraft: draft='\(draft)', onPromoteToChat=\(onPromoteToChat != nil)")
         isPromotingSpotlightDraft = true
         inputText = draft
+        pendingPromotedText = draft
         if let onPromoteToChat {
             onPromoteToChat(draft)
         } else {
-            print("[promote] ViewModel: onPromoteToChat not set — promotion aborted")
             isPromotingSpotlightDraft = false
+            pendingPromotedText = nil
         }
     }
 
@@ -608,6 +608,9 @@ final class ChatViewModel: ObservableObject {
     /// True only while the Spotlight text field is being replaced by the full
     /// chat input. Blocks focus-loss submit events from sending the draft.
     private(set) var isPromotingSpotlightDraft = false
+    /// Set by promoteSpotlightDraft so ExpandedChatView.onAppear can reliably
+    /// seed the text field — cleared by onAppear after use.
+    @Published var pendingPromotedText: String? = nil
 
     // Session ID persisted in UserDefaults so it survives app restarts
     private var sessionId: String? {
