@@ -78,6 +78,13 @@ enum ChatSurfaceMode: Equatable {
     case outputExpanded
 }
 
+enum NotchInteractionMode: Equatable {
+    case collapsed
+    case input
+    case thinking
+    case output
+}
+
 enum SourceMode: String, CaseIterable, Equatable, Identifiable {
     case mail
     case filesystem
@@ -121,6 +128,8 @@ final class ChatViewModel: ObservableObject {
     @Published var isThinking = false
     @Published var isExpanded = false
     @Published var chatSurfaceMode: ChatSurfaceMode = .collapsed
+    @Published var notchInteractionMode: NotchInteractionMode = .collapsed
+    @Published var notchHoverResetID = UUID()
     @Published var selectedSourceMode: SourceMode? = nil
     @Published var hoveredSourceMode: SourceMode? = nil
     @Published var isSourcePickerForced = false
@@ -173,6 +182,14 @@ final class ChatViewModel: ObservableObject {
         if isThinking { return .thinking }
         if let h = daemonHealth, (!h.daemonUp || !h.ollamaUp) { return .error }
         return .ready
+    }
+
+    var latestAssistantText: String {
+        messages.last(where: { $0.role == .assistant })?.content ?? ""
+    }
+
+    var latestUserText: String {
+        messages.last(where: { $0.role == .user })?.content ?? ""
     }
 
     private var approvalPollTask: Task<Void, Never>?
@@ -1008,13 +1025,20 @@ final class ChatViewModel: ObservableObject {
                         break // no UI action for now; daemon already opened the file
                     case .actionTaken(let message):
                         isThinking = false
+                        messages[idx].content = message
                         voiceActionMessage = message
+                        if notchInteractionMode == .thinking {
+                            notchInteractionMode = .output
+                        }
                         onVoiceActionTaken?(message)
                     case .taskRating(let level, let score, let reasons, let privacyRisk):
                         messages[idx].taskRating = (level: level, score: score, reasons: reasons, privacyRisk: privacyRisk)
                     case .done(let returnedSessionId):
                         if let sid = returnedSessionId { sessionId = sid }
                         if first { isThinking = false }
+                        if first && notchInteractionMode == .thinking {
+                            notchInteractionMode = .output
+                        }
                         if first && chatSurfaceMode == .thinkingHidden {
                             chatSurfaceMode = .collapsed
                         }
@@ -1025,6 +1049,9 @@ final class ChatViewModel: ObservableObject {
                 }
                 if first {
                     isThinking = false
+                    if notchInteractionMode == .thinking {
+                        notchInteractionMode = .output
+                    }
                     if chatSurfaceMode == .thinkingHidden {
                         chatSurfaceMode = .collapsed
                     }
@@ -1035,6 +1062,9 @@ final class ChatViewModel: ObservableObject {
                     chatSurfaceMode = .collapsed
                 }
                 messages[idx].content = "Chyba: \(error.localizedDescription)"
+                if notchInteractionMode == .thinking {
+                    notchInteractionMode = .output
+                }
             }
         }
     }

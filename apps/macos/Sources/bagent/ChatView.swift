@@ -4,16 +4,115 @@ import SwiftUI
 
 enum NotchWrapMetrics {
     static let idleWingWidth: CGFloat     = 32
-    static let hoverWingWidth: CGFloat    = 52   // proportional — not too wide
+    static let hoverWingWidth: CGFloat    = 72   // wider hover target, still proportional
     static let idleBridgeHeight: CGFloat  = 0
     static let hoverBridgeHeight: CGFloat = 22   // wraps under the notch
     static let cornerRadius: CGFloat      = 10   // bottom corners only
     static let innerCornerRadius: CGFloat = 8    // notch border
     static let expandedBridgeHeight: CGFloat = 520  // matches chatH
     static let expandedWingWidth: CGFloat   = 200   // chatW / 2
+    static let inlineWingWidth: CGFloat   = 260
+    static let inlineBridgeHeight: CGFloat = 72
+    static let inlineContentScale: CGFloat = 0.90
     static let voiceWingWidth: CGFloat    = 100  // voice mode — wide enough for sentence
     static let voiceBridgeHeight: CGFloat = 120  // voice mode — fits wave + 2 text lines
+    static let maxWingWidth: CGFloat      = 260
+    static let maxBridgeHeight: CGFloat   = 120
+    static let surfaceDuration: Double     = 0.58
     static let notchBorderColor           = Color(white: 0.30)
+}
+
+private struct NotchWrapSurfaceShape: Shape {
+    var wingWidth: CGFloat
+    var bridgeHeight: CGFloat
+    let notchOffset: CGFloat
+    let notchWidth: CGFloat
+    let notchHeight: CGFloat
+    let cornerRadius: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(wingWidth, bridgeHeight) }
+        set {
+            wingWidth = newValue.first
+            bridgeHeight = newValue.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let r = cornerRadius
+        let br = max(0, bridgeHeight)
+        let x = notchOffset - wingWidth
+        let w = 2 * wingWidth + notchWidth
+        let h = notchHeight + br
+
+        var path = Path()
+        path.move(to: CGPoint(x: x, y: 0))
+        path.addLine(to: CGPoint(x: x + w, y: 0))
+        path.addLine(to: CGPoint(x: x + w, y: h - r))
+        path.addArc(
+            center: CGPoint(x: x + w - r, y: h - r),
+            radius: r,
+            startAngle: .degrees(0),
+            endAngle: .degrees(90),
+            clockwise: false
+        )
+        path.addLine(to: CGPoint(x: x + r, y: h))
+        path.addArc(
+            center: CGPoint(x: x + r, y: h - r),
+            radius: r,
+            startAngle: .degrees(90),
+            endAngle: .degrees(180),
+            clockwise: false
+        )
+        path.closeSubpath()
+        return path
+    }
+}
+
+private struct NotchWrapBorderShape: Shape {
+    var wingWidth: CGFloat
+    var bridgeHeight: CGFloat
+    let notchOffset: CGFloat
+    let notchWidth: CGFloat
+    let notchHeight: CGFloat
+    let cornerRadius: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(wingWidth, bridgeHeight) }
+        set {
+            wingWidth = newValue.first
+            bridgeHeight = newValue.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let r = cornerRadius
+        let br = max(0, bridgeHeight)
+        let x = notchOffset - wingWidth
+        let w = 2 * wingWidth + notchWidth
+        let h = notchHeight + br
+
+        var path = Path()
+        path.move(to: CGPoint(x: x + w, y: 0))
+        path.addLine(to: CGPoint(x: x + w, y: h - r))
+        path.addArc(
+            center: CGPoint(x: x + w - r, y: h - r),
+            radius: r,
+            startAngle: .degrees(0),
+            endAngle: .degrees(90),
+            clockwise: false
+        )
+        path.addLine(to: CGPoint(x: x + r, y: h))
+        path.addArc(
+            center: CGPoint(x: x + r, y: h - r),
+            radius: r,
+            startAngle: .degrees(90),
+            endAngle: .degrees(180),
+            clockwise: false
+        )
+        path.addLine(to: CGPoint(x: x, y: 0))
+        return path
+    }
 }
 
 // MARK: - Status panel content (always visible, never moves)
@@ -36,7 +135,7 @@ struct StatusPillView: View {
                 onHoverChanged: onHoverChanged
             )
         } else {
-            MenuBarPillView(viewModel: viewModel)
+            MenuBarPillView(viewModel: viewModel, menuBarHeight: notchHeight)
                 .contentShape(Rectangle())
                 .onTapGesture { onTap() }
         }
@@ -55,23 +154,31 @@ struct NotchWrapView: View {
     // Explicit @State so withAnimation directly tweens the shape's animatableData.
     @State private var wingWidth: CGFloat    = NotchWrapMetrics.idleWingWidth
     @State private var bridgeHeight: CGFloat = NotchWrapMetrics.idleBridgeHeight
+    @State private var targetWingWidth: CGFloat = NotchWrapMetrics.idleWingWidth
+    @State private var targetBridgeHeight: CGFloat = NotchWrapMetrics.idleBridgeHeight
     @State private var isHovered = false
     @State private var pulsing = false
     @State private var copyFlashed = false
     @State private var isDragTargeted = false
     @State private var isVoiceActive = false
     @State private var voiceContentOpacity: CGFloat = 0
+    @State private var inlineContentOpacity: CGFloat = 0
+    @State private var hoverIconRevealID = UUID()
+    @State private var inlineRevealID = UUID()
     @State private var borderPulseOpacity: CGFloat = 0.35
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     // Panel is sized for voice mode (the widest/tallest state) so the frame never needs
     // AppKit resizing. notchOffset = voiceWingWidth = left edge of the physical notch.
-    private let notchOffset = NotchWrapMetrics.voiceWingWidth
+    private let notchOffset = NotchWrapMetrics.maxWingWidth
 
-    private var spring: Animation {
-        reduceMotion ? .easeInOut(duration: 0.18) : .spring(response: 0.28, dampingFraction: 0.78)
+    private var surfaceAnimation: Animation {
+        reduceMotion
+            ? .easeInOut(duration: 0.18)
+            : .easeInOut(duration: NotchWrapMetrics.surfaceDuration)
     }
     private var status: AgentStatus { viewModel.agentStatus }
+    private var isInlineActive: Bool { viewModel.notchInteractionMode != .collapsed }
 
     /// SF Symbol name for the right-wing voice indicator.
     private var voiceIconName: String {
@@ -85,23 +192,50 @@ struct NotchWrapView: View {
     }
     private var maxSize: CGSize {
         CGSize(
-            width: 2 * NotchWrapMetrics.voiceWingWidth + notchWidth,
-            height: notchHeight + NotchWrapMetrics.voiceBridgeHeight
+            width: 2 * NotchWrapMetrics.maxWingWidth + notchWidth,
+            height: notchHeight + NotchWrapMetrics.maxBridgeHeight
         )
     }
 
-    private func setExpansion(expanded: Bool) {
-        withAnimation(spring) {
-            wingWidth    = expanded ? NotchWrapMetrics.hoverWingWidth    : NotchWrapMetrics.idleWingWidth
-            bridgeHeight = expanded ? NotchWrapMetrics.hoverBridgeHeight : NotchWrapMetrics.idleBridgeHeight
+    private func refreshSurface() {
+        let hoverExpanded = isHovered || isDragTargeted || viewModel.pillHovered
+        let targetWing: CGFloat
+        let targetBridge: CGFloat
+        if isVoiceActive {
+            targetWing = NotchWrapMetrics.voiceWingWidth
+            targetBridge = NotchWrapMetrics.voiceBridgeHeight
+        } else if isInlineActive {
+            targetWing = NotchWrapMetrics.inlineWingWidth
+            targetBridge = NotchWrapMetrics.inlineBridgeHeight
+        } else if hoverExpanded {
+            targetWing = NotchWrapMetrics.hoverWingWidth
+            targetBridge = NotchWrapMetrics.hoverBridgeHeight
+        } else {
+            targetWing = NotchWrapMetrics.idleWingWidth
+            targetBridge = NotchWrapMetrics.idleBridgeHeight
         }
+
+        let surfaceTargetChanged = targetWingWidth != targetWing || targetBridgeHeight != targetBridge
+        var instantTargetUpdate = Transaction()
+        instantTargetUpdate.disablesAnimations = true
+        withTransaction(instantTargetUpdate) {
+            targetWingWidth = targetWing
+            targetBridgeHeight = targetBridge
+            if surfaceTargetChanged {
+                hoverIconRevealID = UUID()
+                inlineRevealID = UUID()
+            }
+        }
+
+        withAnimation(surfaceAnimation) {
+            wingWidth = targetWing
+            bridgeHeight = targetBridge
+        }
+        updateInlineOpacity(active: isInlineActive && !isVoiceActive)
     }
 
     private func setVoiceState(active: Bool) {
-        withAnimation(spring) {
-            wingWidth    = active ? NotchWrapMetrics.voiceWingWidth    : (viewModel.pillHovered ? NotchWrapMetrics.hoverWingWidth    : NotchWrapMetrics.idleWingWidth)
-            bridgeHeight = active ? NotchWrapMetrics.voiceBridgeHeight : (viewModel.pillHovered ? NotchWrapMetrics.hoverBridgeHeight : NotchWrapMetrics.idleBridgeHeight)
-        }
+        refreshSurface()
         if active {
             if !reduceMotion {
                 withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
@@ -119,68 +253,100 @@ struct NotchWrapView: View {
         }
     }
 
-    // Icon x tracks wing center. Icon y is clamped to the notch/hover area so it
-    // doesn't drift into the bridge content during voice mode (bridge = 120 pt).
+    private func updateInlineOpacity(active: Bool) {
+        if active {
+            let delay = reduceMotion ? 0.0 : NotchWrapMetrics.surfaceDuration * 0.62
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard viewModel.notchInteractionMode != .collapsed, !isVoiceActive else { return }
+                withAnimation(.easeOut(duration: reduceMotion ? 0.10 : 0.24)) {
+                    inlineContentOpacity = 1
+                }
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.14)) {
+                inlineContentOpacity = 0
+            }
+        }
+    }
+
+    // Icon y is clamped to the notch/hover area so it doesn't drift into bridge content.
     private var iconY: CGFloat {
         let clampedBridge = min(bridgeHeight, NotchWrapMetrics.hoverBridgeHeight)
         return (notchHeight + clampedBridge) / 2
     }
-    private var leftIconPos: CGPoint {
-        CGPoint(x: notchOffset - wingWidth / 2, y: iconY)
+    private var targetLeftIconPos: CGPoint {
+        let clampedBridge = min(targetBridgeHeight, NotchWrapMetrics.hoverBridgeHeight)
+        let y = (notchHeight + clampedBridge) / 2
+        return CGPoint(x: notchOffset - targetWingWidth / 2, y: y)
     }
     private var rightIconPos: CGPoint {
         CGPoint(x: notchOffset + notchWidth + wingWidth / 2, y: iconY)
     }
+    private var inlineStatusPos: CGPoint {
+        let visibleW = notchWidth + 2 * NotchWrapMetrics.inlineWingWidth
+        let contentW = visibleW * NotchWrapMetrics.inlineContentScale
+        return CGPoint(
+            x: notchOffset + notchWidth / 2 + contentW / 2 - 10,
+            y: notchHeight + NotchWrapMetrics.inlineBridgeHeight / 2
+        )
+    }
+
+    private func isNearVisibleSurface(_ point: CGPoint) -> Bool {
+        let margin: CGFloat = isInlineActive || isVoiceActive ? 3 : 6
+        let x = notchOffset - wingWidth
+        let w = 2 * wingWidth + notchWidth
+        let h = notchHeight + max(0, bridgeHeight)
+        return CGRect(
+            x: x - margin,
+            y: 0,
+            width: w + margin * 2,
+            height: h + margin
+        ).contains(point)
+    }
+
+    private func setPointerHover(_ active: Bool) {
+        guard isHovered != active else { return }
+        isHovered = active
+        if !isVoiceActive { refreshSurface() }
+        onHoverChanged(active || isDragTargeted)
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            // Single Canvas — fill + border computed in one closure call from the same
-            // @State values, so fill and border are always pixel-identical per frame.
-            Canvas { ctx, size in
-                let r  = NotchWrapMetrics.cornerRadius
-                let br = max(0, bridgeHeight)
-                let x  = notchOffset - wingWidth
-                let w  = 2 * wingWidth + notchWidth
-                let h  = notchHeight + br
+            NotchWrapSurfaceShape(
+                wingWidth: wingWidth,
+                bridgeHeight: bridgeHeight,
+                notchOffset: notchOffset,
+                notchWidth: notchWidth,
+                notchHeight: notchHeight,
+                cornerRadius: NotchWrapMetrics.cornerRadius
+            )
+            .fill(.black)
 
-                // Closed fill path — top corners sharp, bottom corners rounded r=10
-                var fill = Path()
-                fill.move(to:    CGPoint(x: x,         y: 0))
-                fill.addLine(to: CGPoint(x: x + w,     y: 0))
-                fill.addLine(to: CGPoint(x: x + w,     y: h - r))
-                fill.addArc(center: CGPoint(x: x+w-r, y: h-r), radius: r,
-                            startAngle: .degrees(0),   endAngle: .degrees(90),  clockwise: false)
-                fill.addLine(to: CGPoint(x: x + r,     y: h))
-                fill.addArc(center: CGPoint(x: x+r,   y: h-r), radius: r,
-                            startAngle: .degrees(90),  endAngle: .degrees(180), clockwise: false)
-                fill.closeSubpath()
-
-                // Open border path — same arcs, no top edge
-                var border = Path()
-                border.move(to:    CGPoint(x: x + w,   y: 0))
-                border.addLine(to: CGPoint(x: x + w,   y: h - r))
-                border.addArc(center: CGPoint(x: x+w-r, y: h-r), radius: r,
-                              startAngle: .degrees(0),   endAngle: .degrees(90),  clockwise: false)
-                border.addLine(to: CGPoint(x: x + r,   y: h))
-                border.addArc(center: CGPoint(x: x+r,  y: h-r), radius: r,
-                              startAngle: .degrees(90),  endAngle: .degrees(180), clockwise: false)
-                border.addLine(to: CGPoint(x: x,       y: 0))
-
-                ctx.fill(fill, with: .color(.black))
-                ctx.stroke(border,
-                           with: .color(NotchWrapMetrics.notchBorderColor.opacity(
-                               isVoiceActive ? borderPulseOpacity : (isHovered ? 0.80 : 0.35)
-                           )),
-                           lineWidth: 1)
-            }
+            NotchWrapBorderShape(
+                wingWidth: wingWidth,
+                bridgeHeight: bridgeHeight,
+                notchOffset: notchOffset,
+                notchWidth: notchWidth,
+                notchHeight: notchHeight,
+                cornerRadius: NotchWrapMetrics.cornerRadius
+            )
+            .stroke(
+                NotchWrapMetrics.notchBorderColor.opacity(
+                    isVoiceActive ? borderPulseOpacity : (isHovered || isInlineActive ? 0.80 : 0.35)
+                ),
+                lineWidth: 1
+            )
 
             // Left icon — only when chat open, hovered, or voice active (idle = blank notch)
-            if viewModel.isExpanded || isHovered || isVoiceActive {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity((isHovered || isVoiceActive) ? 1.0 : 0.75))
-                    .contentTransition(.symbolEffect(.replace))
-                    .position(leftIconPos)
+            if !isInlineActive && (viewModel.isExpanded || isHovered || isVoiceActive) {
+                DrawInSymbol(
+                    systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles",
+                    trigger: hoverIconRevealID,
+                    duration: NotchWrapMetrics.surfaceDuration,
+                    reduceMotion: reduceMotion
+                )
+                .position(x: targetLeftIconPos.x, y: targetLeftIconPos.y)
             }
 
             // Right icon — animated waveform symbol in voice mode, status dot otherwise.
@@ -199,7 +365,15 @@ struct NotchWrapView: View {
                     .contentTransition(.symbolEffect(.replace))
                     .position(rightIconPos)
                     .opacity(voiceContentOpacity)
-            } else if viewModel.isExpanded || status != .ready {
+            } else if isInlineActive && status != .ready {
+                LightbulbStatusDotView(
+                    status: status,
+                    reduceMotion: reduceMotion,
+                    copyFlashed: copyFlashed,
+                    isDragTargeted: isDragTargeted
+                )
+                .position(x: inlineStatusPos.x, y: inlineStatusPos.y)
+            } else if (viewModel.isExpanded && !isInlineActive) || status != .ready {
                 // Show dot: chat open (green) OR non-idle status (thinking/approval/error)
                 StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
                     .position(rightIconPos)
@@ -215,6 +389,18 @@ struct NotchWrapView: View {
                     .position(x: notchOffset + notchWidth / 2,
                               y: notchHeight + NotchWrapMetrics.voiceBridgeHeight / 2)
                     .opacity(voiceContentOpacity)
+            }
+
+            if isInlineActive && !isVoiceActive {
+                InlineNotchContent(viewModel: viewModel)
+                    .frame(
+                        width: (notchWidth + 2 * NotchWrapMetrics.inlineWingWidth) * NotchWrapMetrics.inlineContentScale,
+                        height: NotchWrapMetrics.inlineBridgeHeight - 14
+                    )
+                    .position(x: notchOffset + notchWidth / 2,
+                              y: notchHeight + NotchWrapMetrics.inlineBridgeHeight / 2)
+                    .opacity(inlineContentOpacity)
+                    .id(inlineRevealID)
             }
         }
         .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
@@ -243,29 +429,33 @@ struct NotchWrapView: View {
             }
             return true
         }
-        .onHover { hovering in
-            isHovered = hovering
-            // Don't let hover-leave shrink the bridge during voice mode — the voice
-            // dimensions are owned by setVoiceState; only hover controls expansion otherwise.
-            if !isVoiceActive {
-                setExpansion(expanded: hovering || isDragTargeted || viewModel.pillHovered)
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let location):
+                setPointerHover(isNearVisibleSurface(location))
+            case .ended:
+                setPointerHover(false)
             }
-            onHoverChanged(hovering || isDragTargeted)
         }
         .onChange(of: viewModel.pillHovered) {
-            if !isVoiceActive {
-                setExpansion(expanded: viewModel.pillHovered || isHovered || isDragTargeted)
-            }
+            if !isVoiceActive { refreshSurface() }
         }
         .onChange(of: isDragTargeted) { _, targeted in
-            if !isVoiceActive {
-                setExpansion(expanded: targeted || isHovered || viewModel.pillHovered)
-            }
+            if !isVoiceActive { refreshSurface() }
             onHoverChanged(targeted || isHovered)
         }
         .onChange(of: viewModel.isVoiceNotchActive) { _, active in
             isVoiceActive = active
             setVoiceState(active: active)
+        }
+        .onChange(of: viewModel.notchInteractionMode) {
+            if !isVoiceActive { refreshSurface() }
+        }
+        .onChange(of: viewModel.notchHoverResetID) {
+            isHovered = false
+            isDragTargeted = false
+            if !isVoiceActive { refreshSurface() }
+            onHoverChanged(false)
         }
         .onChange(of: status) {
             pulsing = (status == .thinking)
@@ -287,7 +477,273 @@ struct NotchWrapView: View {
     }
 }
 
+// MARK: - Inline notch input / output
+
+private struct DrawInSymbol: View {
+    let systemName: String
+    let trigger: UUID
+    let duration: Double
+    let reduceMotion: Bool
+    @State private var progress: CGFloat = 0
+
+    var body: some View {
+        Image(systemName: systemName)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(Color.white.opacity(0.92))
+            .contentTransition(.symbolEffect(.replace))
+            .scaleEffect(0.82 + progress * 0.18)
+            .opacity(0.20 + progress * 0.80)
+            .mask(alignment: .leading) {
+                GeometryReader { geo in
+                    Rectangle()
+                        .frame(width: geo.size.width * progress)
+                }
+            }
+            .onAppear { runReveal() }
+            .onChange(of: trigger) { runReveal() }
+    }
+
+    private func runReveal() {
+        progress = reduceMotion ? 1 : 0
+        let currentTrigger = trigger
+        DispatchQueue.main.async {
+            guard currentTrigger == trigger else { return }
+            withAnimation(.easeInOut(duration: reduceMotion ? 0.01 : duration)) {
+                progress = 1
+            }
+        }
+    }
+}
+
+struct InlineNotchContent: View {
+    @ObservedObject var viewModel: ChatViewModel
+    @FocusState private var inputFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var placeholderRevealID = UUID()
+
+    private var canSend: Bool {
+        (!viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !viewModel.pendingAttachments.isEmpty)
+            && !viewModel.isThinking
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            switch viewModel.notchInteractionMode {
+            case .input:
+                inputRow
+            case .thinking:
+                thinkingRow
+            case .output:
+                outputView
+            case .collapsed:
+                EmptyView()
+            }
+        }
+        .font(.system(size: 15, weight: .regular))
+        .foregroundStyle(Color.white.opacity(0.92))
+        .onAppear { focusIfNeeded() }
+        .onChange(of: viewModel.notchInteractionMode) {
+            placeholderRevealID = UUID()
+            focusIfNeeded()
+        }
+        .onChange(of: viewModel.inputText.isEmpty) { _, isEmpty in
+            if isEmpty { placeholderRevealID = UUID() }
+        }
+    }
+
+    private var inputRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(0.82))
+                .frame(width: 18, height: 18)
+
+            ZStack(alignment: .leading) {
+                if viewModel.inputText.isEmpty {
+                    LeftToRightRevealText(
+                        text: "What's on your mind?",
+                        trigger: placeholderRevealID,
+                        delay: NotchWrapMetrics.surfaceDuration * 0.82,
+                        reduceMotion: reduceMotion
+                    )
+                        .foregroundStyle(Color.white.opacity(0.56))
+                        .allowsHitTesting(false)
+                        .id(placeholderRevealID)
+                }
+
+                TextField("", text: $viewModel.inputText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14, weight: .regular))
+                    .foregroundStyle(Color.white)
+                    .focused($inputFocused)
+                    .onSubmit {
+                        if canSend { viewModel.send() }
+                    }
+                    .opacity(viewModel.inputText.isEmpty ? 0.02 : 1)
+                    .animation(.easeOut(duration: 0.18), value: viewModel.inputText.isEmpty)
+            }
+            .frame(height: 24)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var thinkingRow: some View {
+        HStack(spacing: 10) {
+            ThinkingIndicator()
+                .scaleEffect(0.74)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Thinking")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.90))
+                if !viewModel.latestUserText.isEmpty {
+                    Text(viewModel.latestUserText)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(Color.white.opacity(0.50))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var outputView: some View {
+        let text = viewModel.latestAssistantText.isEmpty
+            ? (viewModel.isThinking ? "Thinking" : "Done")
+            : viewModel.latestAssistantText
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(text)
+                .font(.system(size: 13, weight: .regular))
+                .foregroundStyle(Color.white.opacity(0.92))
+                .lineLimit(4)
+                .fixedSize(horizontal: false, vertical: true)
+                .mask(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .white, location: 0.0),
+                            .init(color: .white, location: 0.78),
+                            .init(color: .white.opacity(0.15), location: 1.0),
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+
+            if viewModel.isThinking {
+                HStack(spacing: 6) {
+                    ThinkingIndicator()
+                        .scaleEffect(0.48)
+                    Text("Streaming")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.46))
+                }
+                .frame(height: 14)
+            }
+        }
+    }
+
+    private func focusIfNeeded() {
+        guard viewModel.notchInteractionMode == .input else {
+            inputFocused = false
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            inputFocused = true
+        }
+    }
+}
+
+private struct LeftToRightRevealText: View {
+    let text: String
+    let trigger: UUID
+    let delay: Double
+    let reduceMotion: Bool
+    @State private var reveal: CGFloat = 0
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 14, weight: .regular))
+            .lineLimit(1)
+            .mask(alignment: .leading) {
+                GeometryReader { geo in
+                    Rectangle()
+                        .frame(width: geo.size.width * reveal)
+                }
+            }
+            .onAppear {
+                runReveal()
+            }
+            .onChange(of: trigger) {
+                runReveal()
+            }
+    }
+
+    private func runReveal() {
+        reveal = reduceMotion ? 1 : 0
+        let currentTrigger = trigger
+        DispatchQueue.main.asyncAfter(deadline: .now() + (reduceMotion ? 0 : delay)) {
+            guard currentTrigger == trigger else { return }
+            withAnimation(.easeOut(duration: reduceMotion ? 0.01 : 0.46)) {
+                reveal = 1
+            }
+        }
+    }
+}
+
 // MARK: - Status dot
+
+struct LightbulbStatusDotView: View {
+    let status: AgentStatus
+    let reduceMotion: Bool
+    var copyFlashed: Bool = false
+    var isDragTargeted: Bool = false
+
+    @State private var bulbOpacity: CGFloat = 1
+    @State private var bulbScale: CGFloat = 1
+    @State private var ignitionID = UUID()
+
+    var body: some View {
+        Circle()
+            .fill(status.color)
+            .frame(width: 8, height: 8)
+            .scaleEffect((copyFlashed || isDragTargeted) ? 0.2 : bulbScale)
+            .opacity((copyFlashed || isDragTargeted) ? 0 : bulbOpacity)
+            .shadow(color: status.color.opacity(bulbOpacity * 0.65), radius: 3, x: 0, y: 0)
+            .onAppear { runIgnition() }
+            .onChange(of: status) { runIgnition() }
+    }
+
+    private func runIgnition() {
+        ignitionID = UUID()
+        let currentID = ignitionID
+        guard !reduceMotion else {
+            bulbOpacity = 1
+            bulbScale = 1
+            return
+        }
+
+        let frames: [(delay: Double, opacity: CGFloat, scale: CGFloat)] = [
+            (0.00, 0.10, 0.84),
+            (0.10, 0.92, 1.08),
+            (0.21, 0.24, 0.92),
+            (0.39, 1.00, 1.13),
+            (0.54, 0.36, 0.96),
+            (0.77, 0.88, 1.05),
+            (0.98, 1.00, 1.00),
+        ]
+
+        for frame in frames {
+            DispatchQueue.main.asyncAfter(deadline: .now() + frame.delay) {
+                guard currentID == ignitionID else { return }
+                withAnimation(.easeInOut(duration: 0.08)) {
+                    bulbOpacity = frame.opacity
+                    bulbScale = frame.scale
+                }
+            }
+        }
+    }
+}
 
 struct StatusDotView: View {
     let status: AgentStatus
@@ -384,24 +840,54 @@ struct StatusDotView: View {
 
 struct MenuBarPillView: View {
     @ObservedObject var viewModel: ChatViewModel
+    let menuBarHeight: CGFloat
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var isVoice: Bool { viewModel.isVoiceNotchActive }
+    private var isInlineActive: Bool { viewModel.notchInteractionMode != .collapsed }
+    private var targetWidth: CGFloat { isInlineActive ? 620 : 128 }
+    private var targetHeight: CGFloat { isInlineActive ? menuBarHeight + NotchWrapMetrics.inlineBridgeHeight : menuBarHeight }
+    private var surfaceAnimation: Animation {
+        reduceMotion
+            ? .easeInOut(duration: 0.18)
+            : .timingCurve(0.22, 0.0, 0.18, 1.0, duration: 0.90)
+    }
 
     var body: some View {
-        Color.clear
-            .overlay {
-                HStack(spacing: 5) {
-                    // Non-notch pill always stays "bagent" + sparkles.
-                    // (Voice feedback is shown in the dropdown VoiceOverlayView panel below.)
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 11, weight: .semibold))
+        ZStack(alignment: .top) {
+            RoundedRectangle(cornerRadius: isInlineActive ? 14 : 11, style: .continuous)
+                .fill(Color.black)
+                .overlay {
+                    RoundedRectangle(cornerRadius: isInlineActive ? 14 : 11, style: .continuous)
+                        .stroke(NotchWrapMetrics.notchBorderColor.opacity(isInlineActive ? 0.72 : 0.35), lineWidth: 1)
+                }
+                .frame(width: targetWidth, height: targetHeight)
+                .animation(surfaceAnimation, value: isInlineActive)
 
+            HStack(spacing: 6) {
+                Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.90))
+                    .symbolEffect(.bounce, value: viewModel.notchInteractionMode)
+
+                if !isInlineActive {
                     Text("bagent")
                         .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.80))
+                        .transition(.opacity)
                 }
-                .foregroundStyle(.primary)
             }
+            .frame(width: targetWidth, height: menuBarHeight, alignment: .center)
+            .animation(surfaceAnimation, value: isInlineActive)
+
+            if isInlineActive && !isVoice {
+                InlineNotchContent(viewModel: viewModel)
+                    .frame(width: targetWidth * NotchWrapMetrics.inlineContentScale, height: NotchWrapMetrics.inlineBridgeHeight - 14)
+                    .offset(y: menuBarHeight + 7)
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }
 

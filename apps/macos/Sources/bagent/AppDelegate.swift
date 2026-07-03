@@ -37,41 +37,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// ⌥Space behavior:
-    /// - voice disabled, chat closed → first ⌥Space opens Spotlight-style input;
-    ///   a second ⌥Space within the double-press window opens the full chat window.
-    /// - voice disabled, chat open → collapse (any subsequent tap).
-    /// - voice enabled, collapsed → open voice overlay instantly; a second ⌥Space
-    ///   within the double-press window dismisses voice and opens the chat window instead.
-    /// - voice enabled, chat open → collapse.
+    /// - voice disabled, collapsed → open inline notch input.
+    /// - inline notch active → collapse.
+    /// - voice enabled, collapsed → open voice overlay; second tap while listening
+    ///   opens inline text input instead.
     private var lastHotkeyAt: Date?
     private let doublePressWindow: TimeInterval = 0.35
 
     private func handleHotkey() {
         guard let nc = notchController else { return }
-        let now = Date()
-
         if !nc.isVoiceModeEnabled {
-            // Second ⌥Space within the window while input bar is showing → upgrade to full chat.
-            if (nc.isInputShowing || nc.isExpanded),
-               let last = lastHotkeyAt,
-               now.timeIntervalSince(last) < doublePressWindow {
-                lastHotkeyAt = nil
-                nc.presentOutputChat()
-                return
-            }
-            // Slow second tap or chat already expanded → collapse.
-            if nc.isExpanded || nc.isInputShowing {
+            if nc.isExpanded || nc.isInputShowing || nc.isNotchInteractionShowing {
                 lastHotkeyAt = nil
                 nc.collapse()
                 return
             }
-            // First ⌥Space → open the Spotlight-style input bar.
-            lastHotkeyAt = now
             nc.presentInputOnly()
             return
         }
 
-        if nc.isExpanded || nc.isInputShowing {
+        let now = Date()
+
+        if nc.isExpanded || nc.isInputShowing || nc.isNotchInteractionShowing {
             lastHotkeyAt = nil
             nc.collapse()
             return
