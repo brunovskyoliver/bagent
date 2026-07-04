@@ -121,9 +121,6 @@ final class NotchWindowController: NSObject {
         chatViewModel.onFirstAssistantToken = { [weak self] in
             self?.presentOutputChat()
         }
-        chatViewModel.onPromoteToChat = { [weak self] draft in
-            self?.promoteInputToChat(preserving: draft)
-        }
 
         // Silent background action: show confirmation in notch for 2.5s then collapse.
         chatViewModel.onVoiceActionTaken = { [weak self] _ in
@@ -696,30 +693,6 @@ final class NotchWindowController: NSObject {
             self.chatPanel.orderOut(nil)
             self.chatPanel.resignKey()
             self.previousApp?.activate(options: [])
-        }
-    }
-
-    /// Promotes the spotlight input bar to the full expanded chat panel without
-    /// losing focus or keystrokes. The panel is already key; we animate its frame
-    /// from inputFrame → chatFrame and flip SwiftUI state so `ExpandedChatView`
-    /// appears. Do NOT call makeKeyAndOrderFront — that would cause a focus blip.
-    func promoteInputToChat(preserving draft: String) {
-        guard isInputShowing, !isExpanded else {
-            chatViewModel.finishSpotlightDraftPromotion()
-            return
-        }
-        isInputShowing = false
-        isExpanded = true
-        chatViewModel.isExpanded = true
-        chatViewModel.chatSurfaceMode = .outputExpanded
-        chatPanel.hasShadow = true
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.35
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            chatPanel.animator().setFrame(chatFrame, display: true)
-        }
-        DispatchQueue.main.async { [weak self] in
-            self?.chatViewModel.finishSpotlightDraftPromotion()
         }
     }
 

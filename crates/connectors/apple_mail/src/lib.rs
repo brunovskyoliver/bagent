@@ -114,7 +114,7 @@ impl MailConnector {
 
     /// True when Full Disk Access is granted and the Envelope Index is readable.
     pub fn is_accessible(&self) -> bool {
-        self.envelope_index.exists()
+        self.open_db().is_ok()
     }
 
     // ── Queries ──────────────────────────────────────────────────────────────
@@ -949,6 +949,226 @@ end tell"#
     }
 }
 
+/// Search Mail.app through AppleScript Automation.
+///
+/// This is slower than the Envelope Index path, but works when Full Disk Access
+/// blocks direct SQLite reads and Automation access to Mail.app is available.
+/// It is intentionally targeted: an empty filter returns no rows.
+pub async fn search_messages_via_applescript(f: &MailSearchFilter) -> Result<Vec<MailMessage>> {
+    let mut terms = Vec::new();
+    push_term(&mut terms, f.sender.as_deref());
+    push_term(&mut terms, f.subject.as_deref());
+    for kw in &f.keywords {
+        push_term(&mut terms, Some(kw));
+    }
+    if terms.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let limit = if f.limit == 0 { 10 } else { f.limit };
+    let max_records = (limit * 8).clamp(10, 80);
+    let terms_script = terms
+        .iter()
+        .map(|term| format!("\"{}\"", escape_applescript_string(term)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let script = format!(
+        r#"set fieldSep to ASCII character 31
+set recSep to ASCII character 30
+set epochDate to date "Thursday, 1 January 1970 at 00:00:00"
+set searchTerms to {{{terms_script}}}
+set outputText to ""
+set foundCount to 0
+tell application "Mail"
+    repeat with acct in accounts
+        repeat with mbx in mailboxes of acct
+            repeat with termText in searchTerms
+                try
+                    set hits to (every message of mbx whose sender contains (termText as text) or subject contains (termText as text))
+                    repeat with m in hits
+                        set foundCount to foundCount + 1
+                        set mid to ""
+                        set subj to ""
+                        set snd to ""
+                        set rcpt to ""
+                        set readFlag to false
+                        try
+                            set mid to (message id of m) as text
+                        end try
+                        try
+                            set subj to (subject of m) as text
+                        end try
+                        try
+                            set snd to (sender of m) as text
+                        end try
+                        try
+                            set recipientBits to {{}}
+                            repeat with r in to recipients of m
+                                try
+                                    set end of recipientBits to (address of r) as text
+                                end try
+                            end repeat
+                            set oldDelims to AppleScript's text item delimiters
+                            set AppleScript's text item delimiters to ", "
+                            set rcpt to recipientBits as text
+                            set AppleScript's text item delimiters to oldDelims
+                        end try
+                        try
+                            set readFlag to (read status of m) as boolean
+                        end try
+                        set unixTs to (((date received of m) - epochDate) as real) as text
+                        set outputText to outputText & (foundCount as text) & fieldSep & mid & fieldSep & snd & fieldSep & subj & fieldSep & unixTs & fieldSep & (readFlag as text) & fieldSep & rcpt & recSep
+                        if foundCount >= {max_records} then return outputText
+                    end repeat
+                end try
+            end repeat
+        end repeat
+    end repeat
+end tell
+return outputText"#
+    );
+
+    let out = tokio::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "AppleScript Mail search failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut seen = std::collections::HashSet::new();
+    let mut messages = Vec::new();
+    for record in stdout.split('\u{1e}') {
+        let Some(msg) = parse_applescript_mail_record(record) else {
+            continue;
+        };
+
+        if let Some(from) = f.date_from {
+            if msg.received_at < from {
+                continue;
+            }
+        }
+        if let Some(to) = f.date_to {
+            if msg.received_at >= to {
+                continue;
+            }
+        }
+
+        let dedupe_key = msg.message_id.clone().unwrap_or_else(|| {
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                msg.sender, msg.subject, msg.received_at
+            )
+        });
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+
+        messages.push(msg);
+    }
+
+    messages.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+    messages.truncate(limit);
+    Ok(messages)
+}
+
+fn push_term(terms: &mut Vec<String>, term: Option<&str>) {
+    let Some(term) = term.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if !terms
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(term))
+    {
+        terms.push(term.to_string());
+    }
+}
+
+fn escape_applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn empty_to_none(value: &str) -> Option<String> {
+    if value.is_empty() || value == "missing value" {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_applescript_timestamp(value: &str) -> Option<i64> {
+    let normalized = value.trim().replace(',', ".");
+    let parsed = normalized.parse::<f64>().ok()?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return None;
+    }
+    Some(parsed.round() as i64)
+}
+
+fn parse_applescript_mail_record(record: &str) -> Option<MailMessage> {
+    let record = record.trim_matches(['\r', '\n']);
+    if record.trim().is_empty() {
+        return None;
+    }
+    let fields = record.split('\u{1f}').collect::<Vec<_>>();
+    if fields.len() < 6 {
+        return None;
+    }
+    let idx = fields[0].trim().parse::<i64>().unwrap_or(0);
+    let message_id = empty_to_none(fields[1].trim());
+    let sender_raw = fields[2].trim().to_string();
+    let subject = fields[3].trim().to_string();
+    let received_at = parse_applescript_timestamp(fields[4].trim()).unwrap_or(0);
+    let is_read = fields[5].trim().eq_ignore_ascii_case("true");
+    let recipient = fields.get(6).and_then(|value| empty_to_none(value.trim()));
+
+    let (sender_display, sender) = split_sender_display(&sender_raw);
+    Some(MailMessage {
+        // Synthetic negative rowid: the message came from Mail.app, not Envelope Index.
+        rowid: -idx.max(1),
+        subject,
+        sender,
+        sender_display,
+        recipient,
+        received_at,
+        is_read,
+        mailbox_url: "mail-app://automation-search".to_string(),
+        body: None,
+        body_available: false,
+        language: None,
+        attachments: vec![],
+        message_id,
+    })
+}
+
+fn split_sender_display(sender: &str) -> (Option<String>, String) {
+    let Some(start) = sender.rfind('<') else {
+        return (None, sender.to_string());
+    };
+    let Some(end) = sender[start..].find('>').map(|offset| start + offset) else {
+        return (None, sender.to_string());
+    };
+    let display = sender[..start].trim().trim_matches('"').trim();
+    let address = sender[start + 1..end].trim();
+    (
+        if display.is_empty() {
+            None
+        } else {
+            Some(display.to_string())
+        },
+        if address.is_empty() {
+            sender.to_string()
+        } else {
+            address.to_string()
+        },
+    )
+}
+
 /// Open a specific email message in Apple Mail.app.
 ///
 /// Primary path: AppleScript `whose message id is "…"` → `open`.
@@ -1116,6 +1336,47 @@ mod tests {
                   The total amount includes VAT at 20 percent. Please settle the \
                   payment before the due date. Kind regards, your supplier.";
         assert_eq!(detect_language(en).as_deref(), Some("en"), "text: {en}");
+    }
+
+    #[test]
+    fn applescript_timestamp_accepts_common_number_formats() {
+        assert_eq!(parse_applescript_timestamp("1780556527"), Some(1780556527));
+        assert_eq!(
+            parse_applescript_timestamp("1780556527.0"),
+            Some(1780556527)
+        );
+        assert_eq!(
+            parse_applescript_timestamp("1780556527,0"),
+            Some(1780556527)
+        );
+        assert_eq!(
+            parse_applescript_timestamp("1.780556527E+9"),
+            Some(1780556527)
+        );
+        assert_eq!(parse_applescript_timestamp("0"), None);
+        assert_eq!(parse_applescript_timestamp("missing value"), None);
+    }
+
+    #[test]
+    fn applescript_record_preserves_recipient() {
+        let record = [
+            "1",
+            "DB9PR10MB5572EAC11C1694817E4CC41991F42@DB9PR10MB5572.EURPRD10.PROD.OUTLOOK.COM",
+            "Radoslava Némethová <radoslava.nemethova@tenenet.sk>",
+            "AMB VSL SC a VG",
+            "1780556527,0",
+            "true",
+            "oliver@example.com",
+        ]
+        .join("\u{1f}");
+
+        let msg = parse_applescript_mail_record(&record).expect("parse AppleScript record");
+        assert_eq!(msg.rowid, -1);
+        assert_eq!(msg.sender_display.as_deref(), Some("Radoslava Némethová"));
+        assert_eq!(msg.sender, "radoslava.nemethova@tenenet.sk");
+        assert_eq!(msg.recipient.as_deref(), Some("oliver@example.com"));
+        assert_eq!(msg.received_at, 1780556527);
+        assert!(msg.is_read);
     }
 
     // ── Phase 5C — attachment extraction from raw .eml ───────────────────────

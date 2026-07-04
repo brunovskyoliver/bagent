@@ -165,6 +165,7 @@ final class ChatViewModel: ObservableObject {
     @Published var usageStats: DaemonClient.UsageStats? = nil
     @Published var isLoadingUsage = false
     @Published var isClearingCache = false
+    @Published var streamingAssistantMessageId: UUID? = nil
 
     /// Set to true by NotchWindowController before expanding so the pill
     /// animates to its hover state before the chat panel appears.
@@ -186,6 +187,19 @@ final class ChatViewModel: ObservableObject {
 
     var latestAssistantText: String {
         messages.last(where: { $0.role == .assistant })?.content ?? ""
+    }
+
+    var latestAssistantMessage: ChatMessage? {
+        messages.last(where: { $0.role == .assistant })
+    }
+
+    var latestAssistantMessageId: UUID? {
+        messages.last(where: { $0.role == .assistant })?.id
+    }
+
+    var isLatestAssistantStreaming: Bool {
+        guard let latestAssistantMessageId else { return false }
+        return streamingAssistantMessageId == latestAssistantMessageId
     }
 
     var latestUserText: String {
@@ -555,22 +569,6 @@ final class ChatViewModel: ObservableObject {
         hoveredSourceMode = nil
     }
 
-    func promoteSpotlightDraft(_ draft: String) {
-        isPromotingSpotlightDraft = true
-        inputText = draft
-        pendingPromotedText = draft
-        if let onPromoteToChat {
-            onPromoteToChat(draft)
-        } else {
-            isPromotingSpotlightDraft = false
-            pendingPromotedText = nil
-        }
-    }
-
-    func finishSpotlightDraftPromotion() {
-        isPromotingSpotlightDraft = false
-    }
-
     private func sourceModeUseCount(_ mode: SourceMode) -> Int {
         UserDefaults.standard.integer(forKey: "bagent.sourceMode.\(mode.rawValue).useCount")
     }
@@ -619,16 +617,6 @@ final class ChatViewModel: ObservableObject {
     @Published var voiceActionMessage: String? = nil
     /// Called when the daemon executed a background action instead of streaming LLM.
     var onVoiceActionTaken: ((String) -> Void)?
-    /// Invoked from SpotlightInputPanel when text overflows one line — AppKit
-    /// promotes the input surface to the full expanded chat window.
-    var onPromoteToChat: ((String) -> Void)?
-    /// True only while the Spotlight text field is being replaced by the full
-    /// chat input. Blocks focus-loss submit events from sending the draft.
-    private(set) var isPromotingSpotlightDraft = false
-    /// Set by promoteSpotlightDraft so ExpandedChatView.onAppear can reliably
-    /// seed the text field — cleared by onAppear after use.
-    @Published var pendingPromotedText: String? = nil
-
     // Session ID persisted in UserDefaults so it survives app restarts
     private var sessionId: String? {
         get { UserDefaults.standard.string(forKey: "bagent.session_id") }
@@ -656,6 +644,7 @@ final class ChatViewModel: ObservableObject {
         messages = []
         inputText = ""
         isThinking = false
+        streamingAssistantMessageId = nil
         showSettings = false
         showDebug = false
         pendingAttachments = []
@@ -895,8 +884,52 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    func latestDebugClipboardPayload() async -> String {
+        guard let latest = latestAssistantMessage,
+              let traceId = latest.debugTraceId
+        else {
+            return "No debug trace is available for the latest assistant message."
+        }
+
+        await loadDebugTrace(for: latest.id)
+        let tracePayload = messages
+            .first(where: { $0.id == latest.id })?
+            .debugPayload ?? "Trace payload unavailable."
+
+        let conversationPayload: String
+        if let sessionId {
+            do {
+                conversationPayload = try await client.debugConversation(id: sessionId)
+            } catch {
+                conversationPayload = "Conversation debug unavailable: \(error.localizedDescription)"
+            }
+        } else {
+            conversationPayload = "No conversation id yet."
+        }
+
+        let sessionLine = sessionId ?? "(none)"
+        let assistantText = messages
+            .first(where: { $0.id == latest.id })?
+            .content ?? latest.content
+
+        return """
+        bagent debug payload
+        generated_at: \(Date().ISO8601Format())
+        session_id: \(sessionLine)
+        prompt_trace_id: \(traceId)
+
+        latest_assistant_response:
+        \(assistantText)
+
+        debug_trace:
+        \(tracePayload)
+
+        conversation_debug:
+        \(conversationPayload)
+        """
+    }
+
     func send() {
-        guard !isPromotingSpotlightDraft else { return }
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !pendingAttachments.isEmpty else { return }
         guard !isThinking else { return }
@@ -929,6 +962,7 @@ final class ChatViewModel: ObservableObject {
         Task {
             let assistantMsg = ChatMessage(role: .assistant, content: "")
             messages.append(assistantMsg)
+            streamingAssistantMessageId = assistantMsg.id
             let idx = messages.count - 1
 
             do {
@@ -1025,6 +1059,7 @@ final class ChatViewModel: ObservableObject {
                         break // no UI action for now; daemon already opened the file
                     case .actionTaken(let message):
                         isThinking = false
+                        streamingAssistantMessageId = nil
                         messages[idx].content = message
                         voiceActionMessage = message
                         if notchInteractionMode == .thinking {
@@ -1036,6 +1071,7 @@ final class ChatViewModel: ObservableObject {
                     case .done(let returnedSessionId):
                         if let sid = returnedSessionId { sessionId = sid }
                         if first { isThinking = false }
+                        streamingAssistantMessageId = nil
                         if first && notchInteractionMode == .thinking {
                             notchInteractionMode = .output
                         }
@@ -1049,6 +1085,7 @@ final class ChatViewModel: ObservableObject {
                 }
                 if first {
                     isThinking = false
+                    streamingAssistantMessageId = nil
                     if notchInteractionMode == .thinking {
                         notchInteractionMode = .output
                     }
@@ -1058,6 +1095,7 @@ final class ChatViewModel: ObservableObject {
                 }
             } catch {
                 isThinking = false
+                streamingAssistantMessageId = nil
                 if chatSurfaceMode == .thinkingHidden {
                     chatSurfaceMode = .collapsed
                 }

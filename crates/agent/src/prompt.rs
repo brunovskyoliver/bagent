@@ -49,6 +49,10 @@ pub struct PromptTrace {
     pub selected_memory_ids: Vec<String>,
     pub conversation_recall_injected: bool,
     pub memory_query: String,
+    // Mail search diagnostics emitted by the daemon. Kept as JSON so the agent
+    // crate does not depend on the Apple Mail adapter's concrete types.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mail_search_trace: Option<serde_json::Value>,
     // Phase 13A — File intent trace
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_intent: Option<serde_json::Value>,
@@ -339,6 +343,7 @@ impl PromptBuilder {
             conversation_recall_injected: needs_conversation_recall
                 && !recall_candidates.is_empty(),
             memory_query: memory_query.to_string(),
+            mail_search_trace: None,
             file_intent: None,
             file_tool_called: None,
             file_result_count: None,

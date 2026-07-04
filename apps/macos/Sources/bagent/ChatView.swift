@@ -11,61 +11,73 @@ enum NotchWrapMetrics {
     static let innerCornerRadius: CGFloat = 8    // notch border
     static let expandedBridgeHeight: CGFloat = 520  // matches chatH
     static let expandedWingWidth: CGFloat   = 200   // chatW / 2
-    static let inlineWingWidth: CGFloat   = 260
+    static let inlineWingWidth: CGFloat   = 221
     static let inlineBridgeHeight: CGFloat = 72
+    static let outputWingWidth: CGFloat   = 154
+    static let outputBridgeHeight: CGFloat = 96
+    static let outputMinBridgeHeight: CGFloat = 88
+    static let outputMaxBridgeHeight: CGFloat = 280
     static let inlineContentScale: CGFloat = 0.90
     static let voiceWingWidth: CGFloat    = 100  // voice mode — wide enough for sentence
     static let voiceBridgeHeight: CGFloat = 120  // voice mode — fits wave + 2 text lines
     static let maxWingWidth: CGFloat      = 260
-    static let maxBridgeHeight: CGFloat   = 120
+    static let maxBridgeHeight: CGFloat   = 280
     static let surfaceDuration: Double     = 0.58
     static let notchBorderColor           = Color(white: 0.30)
 }
 
-private struct NotchWrapSurfaceShape: Shape {
-    var wingWidth: CGFloat
-    var bridgeHeight: CGFloat
-    let notchOffset: CGFloat
-    let notchWidth: CGFloat
-    let notchHeight: CGFloat
-    let cornerRadius: CGFloat
+private enum NotchOutputLayout {
+    static let lineSpacing: CGFloat = 1.5
+    static let bottomSlack: CGFloat = 12
+    static let chromePadding: CGFloat = 26
+    static let minTextWidth: CGFloat = 120
+    static let resizeThreshold: CGFloat = 14
+    static func font() -> NSFont { NSFont.systemFont(ofSize: 13, weight: .regular) }
 
-    var animatableData: AnimatablePair<CGFloat, CGFloat> {
-        get { AnimatablePair(wingWidth, bridgeHeight) }
-        set {
-            wingWidth = newValue.first
-            bridgeHeight = newValue.second
-        }
+    static func responseText(
+        latestText: String,
+        isStreaming: Bool,
+        isThinking: Bool
+    ) -> String {
+        latestText.isEmpty
+            ? (isStreaming || isThinking ? "Thinking" : "Done")
+            : latestText
     }
 
-    func path(in rect: CGRect) -> Path {
-        let r = cornerRadius
-        let br = max(0, bridgeHeight)
-        let x = notchOffset - wingWidth
-        let w = 2 * wingWidth + notchWidth
-        let h = notchHeight + br
+    static func reservedWidth(for message: ChatMessage?) -> CGFloat {
+        (message?.debugTraceId == nil ? CGFloat(0) : CGFloat(34))
+            + (message?.hasOutputActions == true ? CGFloat(92) : CGFloat(0))
+    }
 
-        var path = Path()
-        path.move(to: CGPoint(x: x, y: 0))
-        path.addLine(to: CGPoint(x: x + w, y: 0))
-        path.addLine(to: CGPoint(x: x + w, y: h - r))
-        path.addArc(
-            center: CGPoint(x: x + w - r, y: h - r),
-            radius: r,
-            startAngle: .degrees(0),
-            endAngle: .degrees(90),
-            clockwise: false
+    static func textHeight(_ text: String, width: CGFloat) -> CGFloat {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = lineSpacing
+        paragraph.lineBreakMode = .byWordWrapping
+        let attributed = NSAttributedString(
+            string: text.isEmpty ? " " : text,
+            attributes: [
+                .font: font(),
+                .paragraphStyle: paragraph,
+            ]
         )
-        path.addLine(to: CGPoint(x: x + r, y: h))
-        path.addArc(
-            center: CGPoint(x: x + r, y: h - r),
-            radius: r,
-            startAngle: .degrees(90),
-            endAngle: .degrees(180),
-            clockwise: false
+        let rect = attributed.boundingRect(
+            with: NSSize(width: width, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
         )
-        path.closeSubpath()
-        return path
+        return ceil(rect.height)
+    }
+
+    static func bridgeHeight(
+        text: String,
+        visibleWidth: CGFloat,
+        message: ChatMessage?
+    ) -> CGFloat {
+        let textWidth = max(minTextWidth, visibleWidth - reservedWidth(for: message))
+        let wanted = ceil(textHeight(text, width: textWidth) + chromePadding + bottomSlack)
+        return min(
+            NotchWrapMetrics.outputMaxBridgeHeight,
+            max(NotchWrapMetrics.outputMinBridgeHeight, wanted)
+        )
     }
 }
 
@@ -197,6 +209,43 @@ struct NotchWrapView: View {
         )
     }
 
+    private func inlineWingWidth(for mode: NotchInteractionMode) -> CGFloat {
+        mode == .output ? NotchWrapMetrics.outputWingWidth : NotchWrapMetrics.inlineWingWidth
+    }
+
+    private func inlineBridgeHeight(for mode: NotchInteractionMode) -> CGFloat {
+        mode == .output ? outputBridgeHeight() : NotchWrapMetrics.inlineBridgeHeight
+    }
+
+    private func outputBridgeHeight() -> CGFloat {
+        let text = NotchOutputLayout.responseText(
+            latestText: viewModel.latestAssistantText,
+            isStreaming: viewModel.isLatestAssistantStreaming,
+            isThinking: viewModel.isThinking
+        )
+        let visibleWidth = (notchWidth + 2 * NotchWrapMetrics.outputWingWidth) * NotchWrapMetrics.inlineContentScale
+        return NotchOutputLayout.bridgeHeight(
+            text: text,
+            visibleWidth: visibleWidth,
+            message: viewModel.latestAssistantMessage
+        )
+    }
+
+    private func estimatedNotchTextHeight(_ text: String, width: CGFloat) -> CGFloat {
+        NotchOutputLayout.textHeight(text, width: width)
+    }
+
+    private func refreshOutputSurfaceIfNeeded(force: Bool = false) {
+        guard viewModel.notchInteractionMode == .output, !isVoiceActive else { return }
+        let nextBridge = outputBridgeHeight()
+        let shouldResize = force
+            || !viewModel.isLatestAssistantStreaming
+            || abs(nextBridge - targetBridgeHeight) >= NotchOutputLayout.resizeThreshold
+            || nextBridge == NotchWrapMetrics.outputMaxBridgeHeight
+        guard shouldResize else { return }
+        refreshSurface()
+    }
+
     private func refreshSurface() {
         let hoverExpanded = isHovered || isDragTargeted || viewModel.pillHovered
         let targetWing: CGFloat
@@ -205,8 +254,8 @@ struct NotchWrapView: View {
             targetWing = NotchWrapMetrics.voiceWingWidth
             targetBridge = NotchWrapMetrics.voiceBridgeHeight
         } else if isInlineActive {
-            targetWing = NotchWrapMetrics.inlineWingWidth
-            targetBridge = NotchWrapMetrics.inlineBridgeHeight
+            targetWing = inlineWingWidth(for: viewModel.notchInteractionMode)
+            targetBridge = inlineBridgeHeight(for: viewModel.notchInteractionMode)
         } else if hoverExpanded {
             targetWing = NotchWrapMetrics.hoverWingWidth
             targetBridge = NotchWrapMetrics.hoverBridgeHeight
@@ -283,11 +332,12 @@ struct NotchWrapView: View {
         CGPoint(x: notchOffset + notchWidth + wingWidth / 2, y: iconY)
     }
     private var inlineStatusPos: CGPoint {
-        let visibleW = notchWidth + 2 * NotchWrapMetrics.inlineWingWidth
+        let bridge = inlineBridgeHeight(for: viewModel.notchInteractionMode)
+        let visibleW = notchWidth + 2 * inlineWingWidth(for: viewModel.notchInteractionMode)
         let contentW = visibleW * NotchWrapMetrics.inlineContentScale
         return CGPoint(
             x: notchOffset + notchWidth / 2 + contentW / 2 - 10,
-            y: notchHeight + NotchWrapMetrics.inlineBridgeHeight / 2
+            y: notchHeight + bridge / 2
         )
     }
 
@@ -313,7 +363,7 @@ struct NotchWrapView: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            NotchWrapSurfaceShape(
+            NotchWrapShape(
                 wingWidth: wingWidth,
                 bridgeHeight: bridgeHeight,
                 notchOffset: notchOffset,
@@ -392,15 +442,20 @@ struct NotchWrapView: View {
             }
 
             if isInlineActive && !isVoiceActive {
+                let contentWing = inlineWingWidth(for: viewModel.notchInteractionMode)
+                let contentBridge = viewModel.notchInteractionMode == .output
+                    ? bridgeHeight
+                    : inlineBridgeHeight(for: viewModel.notchInteractionMode)
                 InlineNotchContent(viewModel: viewModel)
                     .frame(
-                        width: (notchWidth + 2 * NotchWrapMetrics.inlineWingWidth) * NotchWrapMetrics.inlineContentScale,
-                        height: NotchWrapMetrics.inlineBridgeHeight - 14
+                        width: (notchWidth + 2 * contentWing) * NotchWrapMetrics.inlineContentScale,
+                        height: contentBridge - 14
                     )
                     .position(x: notchOffset + notchWidth / 2,
-                              y: notchHeight + NotchWrapMetrics.inlineBridgeHeight / 2)
+                              y: notchHeight + contentBridge / 2)
                     .opacity(inlineContentOpacity)
                     .id(inlineRevealID)
+                    .animation(surfaceAnimation, value: viewModel.notchInteractionMode)
             }
         }
         .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
@@ -450,6 +505,15 @@ struct NotchWrapView: View {
         }
         .onChange(of: viewModel.notchInteractionMode) {
             if !isVoiceActive { refreshSurface() }
+        }
+        .onChange(of: viewModel.streamingChunk) {
+            refreshOutputSurfaceIfNeeded()
+        }
+        .onChange(of: viewModel.latestAssistantMessageId) {
+            refreshOutputSurfaceIfNeeded(force: true)
+        }
+        .onChange(of: viewModel.isLatestAssistantStreaming) {
+            refreshOutputSurfaceIfNeeded(force: true)
         }
         .onChange(of: viewModel.notchHoverResetID) {
             isHovered = false
@@ -517,9 +581,16 @@ private struct DrawInSymbol: View {
 
 struct InlineNotchContent: View {
     @ObservedObject var viewModel: ChatViewModel
+    let showsInputLeadingIcon: Bool
     @FocusState private var inputFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var placeholderRevealID = UUID()
+    @State private var inlineFocusRetryID = UUID()
+
+    init(viewModel: ChatViewModel, showsInputLeadingIcon: Bool = true) {
+        self.viewModel = viewModel
+        self.showsInputLeadingIcon = showsInputLeadingIcon
+    }
 
     private var canSend: Bool {
         (!viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -547,6 +618,10 @@ struct InlineNotchContent: View {
             placeholderRevealID = UUID()
             focusIfNeeded()
         }
+        .onChange(of: inputFocused) { _, focused in
+            guard !focused else { return }
+            keepInlineInputFocused(reason: "focus-lost")
+        }
         .onChange(of: viewModel.inputText.isEmpty) { _, isEmpty in
             if isEmpty { placeholderRevealID = UUID() }
         }
@@ -554,10 +629,12 @@ struct InlineNotchContent: View {
 
     private var inputRow: some View {
         HStack(spacing: 10) {
-            Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(0.82))
-                .frame(width: 18, height: 18)
+            if showsInputLeadingIcon {
+                Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.82))
+                    .frame(width: 18, height: 18)
+            }
 
             ZStack(alignment: .leading) {
                 if viewModel.inputText.isEmpty {
@@ -609,48 +686,381 @@ struct InlineNotchContent: View {
     }
 
     private var outputView: some View {
-        let text = viewModel.latestAssistantText.isEmpty
-            ? (viewModel.isThinking ? "Thinking" : "Done")
-            : viewModel.latestAssistantText
+        let text = NotchOutputLayout.responseText(
+            latestText: viewModel.latestAssistantText,
+            isStreaming: viewModel.isLatestAssistantStreaming,
+            isThinking: viewModel.isThinking
+        )
+        let latestMessage = viewModel.latestAssistantMessage
         return VStack(alignment: .leading, spacing: 6) {
-            Text(text)
-                .font(.system(size: 13, weight: .regular))
-                .foregroundStyle(Color.white.opacity(0.92))
-                .lineLimit(4)
-                .fixedSize(horizontal: false, vertical: true)
-                .mask(
-                    LinearGradient(
-                        stops: [
-                            .init(color: .white, location: 0.0),
-                            .init(color: .white, location: 0.78),
-                            .init(color: .white.opacity(0.15), location: 1.0),
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
+            ZStack(alignment: .topTrailing) {
+                LatestAssistantOutputScrollView(
+                    text: text,
+                    messageId: viewModel.latestAssistantMessageId,
+                    isStreaming: viewModel.isLatestAssistantStreaming,
+                    reduceMotion: reduceMotion
                 )
+                .padding(.leading, latestMessage?.debugTraceId == nil ? 0 : 34)
+                .padding(.trailing, latestMessage?.hasOutputActions == true ? 92 : 0)
+                .frame(maxWidth: .infinity)
+                .frame(maxHeight: .infinity)
+                .accessibilityLabel("Latest assistant response")
+                .accessibilityValue(text)
 
-            if viewModel.isThinking {
-                HStack(spacing: 6) {
-                    ThinkingIndicator()
-                        .scaleEffect(0.48)
-                    Text("Streaming")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.46))
+                if let latestMessage {
+                    NotchOutputActionButtons(message: latestMessage, viewModel: viewModel)
+                        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .topTrailing)))
                 }
-                .frame(height: 14)
+
+                if latestMessage?.debugTraceId != nil {
+                    NotchDebugCopyButton(viewModel: viewModel)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .topLeading)))
+                }
             }
+
         }
     }
 
     private func focusIfNeeded() {
         guard viewModel.notchInteractionMode == .input else {
+            inlineFocusRetryID = UUID()
             inputFocused = false
             return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            inputFocused = true
+        keepInlineInputFocused(reason: "input-mode")
+    }
+
+    private func keepInlineInputFocused(reason: String) {
+        _ = reason
+        let retryID = UUID()
+        inlineFocusRetryID = retryID
+        for attempt in 0..<5 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 + Double(attempt) * 0.06) {
+                guard inlineFocusRetryID == retryID,
+                      viewModel.notchInteractionMode == .input
+                else { return }
+                NSApp.activate(ignoringOtherApps: true)
+                inputFocused = true
+            }
         }
+    }
+}
+
+private struct LatestAssistantOutputScrollView: NSViewRepresentable {
+    let text: String
+    let messageId: UUID?
+    let isStreaming: Bool
+    let reduceMotion: Bool
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.verticalScrollElasticity = .allowed
+        scrollView.horizontalScrollElasticity = .none
+        scrollView.contentView.postsBoundsChangedNotifications = true
+
+        let textView = NSTextView()
+        textView.drawsBackground = false
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.heightTracksTextView = false
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.backgroundColor = .clear
+        textView.insertionPointColor = .white
+
+        scrollView.documentView = textView
+        context.coordinator.scrollView = scrollView
+        context.coordinator.textView = textView
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.boundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = context.coordinator.textView else { return }
+        let coordinator = context.coordinator
+        let messageChanged = coordinator.messageId != messageId
+        let textChanged = coordinator.lastText != text
+        let wasNearBottom = coordinator.isNearBottom()
+
+        if messageChanged {
+            coordinator.messageId = messageId
+            coordinator.userScrolledAway = false
+            coordinator.lastText = nil
+        }
+
+        if textChanged || messageChanged {
+            coordinator.lastText = text
+            textView.textStorage?.setAttributedString(attributedText(text))
+        }
+
+        coordinator.resizeTextView()
+
+        let shouldStickToBottom = messageChanged || wasNearBottom || (isStreaming && !coordinator.userScrolledAway)
+        guard shouldStickToBottom else { return }
+
+        coordinator.requestBottomPin(animated: !reduceMotion && !messageChanged && !isStreaming)
+    }
+
+    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        NotificationCenter.default.removeObserver(
+            coordinator,
+            name: NSView.boundsDidChangeNotification,
+            object: nsView.contentView
+        )
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    private func attributedText(_ text: String) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = NotchOutputLayout.lineSpacing
+        paragraph.lineBreakMode = .byWordWrapping
+        return NSAttributedString(
+            string: text,
+            attributes: [
+                .font: NotchOutputLayout.font(),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.92),
+                .paragraphStyle: paragraph,
+            ]
+        )
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        weak var scrollView: NSScrollView?
+        weak var textView: NSTextView?
+        var messageId: UUID?
+        var lastText: String?
+        var userScrolledAway = false
+        var suppressScrollObservation = false
+        var bottomPinScheduled = false
+        var pendingAnimatedBottomPin = false
+
+        @objc func boundsDidChange(_ note: Notification) {
+            guard !suppressScrollObservation else { return }
+            userScrolledAway = !isNearBottom()
+        }
+
+        func resizeTextView() {
+            guard let scrollView, let textView, let textContainer = textView.textContainer else { return }
+            let width = max(1, scrollView.contentSize.width)
+            textContainer.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+            textView.frame.size.width = width
+            textView.layoutManager?.ensureLayout(for: textContainer)
+            let usedRect = textView.layoutManager?.usedRect(for: textContainer) ?? .zero
+            let height = max(scrollView.contentSize.height, ceil(usedRect.height) + NotchOutputLayout.bottomSlack)
+            textView.setFrameSize(NSSize(width: width, height: height))
+        }
+
+        func isNearBottom(threshold: CGFloat = 10) -> Bool {
+            guard let scrollView, let documentView = scrollView.documentView else { return true }
+            let maxY = max(0, documentView.bounds.height - scrollView.contentView.bounds.height)
+            let distance = maxY - scrollView.contentView.bounds.origin.y
+            return distance <= threshold
+        }
+
+        func requestBottomPin(animated: Bool) {
+            pendingAnimatedBottomPin = pendingAnimatedBottomPin || animated
+            guard !bottomPinScheduled else { return }
+            bottomPinScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let animated = self.pendingAnimatedBottomPin
+                self.bottomPinScheduled = false
+                self.pendingAnimatedBottomPin = false
+                self.suppressScrollObservation = true
+                self.resizeTextView()
+                self.scrollToBottom(animated: animated)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.suppressScrollObservation = false
+                    self.userScrolledAway = !self.isNearBottom()
+                }
+            }
+        }
+
+        func scrollToBottom(animated: Bool) {
+            guard let scrollView, let documentView = scrollView.documentView else { return }
+            let clipView = scrollView.contentView
+            let targetY = max(0, documentView.bounds.height - clipView.bounds.height)
+            let target = NSPoint(x: 0, y: targetY)
+            if animated {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.12
+                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    clipView.animator().setBoundsOrigin(target)
+                }
+            } else {
+                clipView.setBoundsOrigin(target)
+            }
+            scrollView.reflectScrolledClipView(clipView)
+        }
+    }
+}
+
+private extension ChatMessage {
+    var hasOutputActions: Bool {
+        mailRef != nil || odooRef != nil || whatsappRef != nil
+    }
+}
+
+private struct NotchOutputActionButtons: View {
+    let message: ChatMessage
+    @ObservedObject var viewModel: ChatViewModel
+
+    var body: some View {
+        if message.hasOutputActions {
+            HStack(spacing: 5) {
+                if let ref = message.whatsappRef {
+                    NotchOutputActionChip(
+                        systemName: "bubble.left.and.bubble.right.fill",
+                        label: ref.contact_name ?? "WhatsApp",
+                        tint: .green,
+                        action: nil
+                    )
+                }
+                if let ref = message.odooRef {
+                    NotchOutputActionChip(
+                        systemName: "globe",
+                        label: "Open",
+                        tint: .orange
+                    ) {
+                        viewModel.openOdoo(ref)
+                    }
+                }
+                if let ref = message.mailRef {
+                    NotchOutputActionChip(
+                        systemName: "envelope.fill",
+                        label: "Mail",
+                        tint: .accentColor
+                    ) {
+                        viewModel.openMail(ref)
+                    }
+                }
+            }
+            .padding(3)
+            .background(
+                Capsule()
+                    .fill(Color.black.opacity(0.42))
+                    .overlay(Capsule().stroke(Color.white.opacity(0.10), lineWidth: 0.5))
+            )
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Output actions")
+        }
+    }
+}
+
+private struct NotchDebugCopyButton: View {
+    @ObservedObject var viewModel: ChatViewModel
+    @State private var isHovered = false
+    @State private var isLoading = false
+
+    var body: some View {
+        Button {
+            guard !isLoading else { return }
+            isLoading = true
+            Task {
+                let payload = await viewModel.latestDebugClipboardPayload()
+                copyToPasteboard(payload)
+                isLoading = false
+            }
+        } label: {
+            Image(systemName: isLoading ? "arrow.triangle.2.circlepath" : "wrench.and.screwdriver.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(isHovered ? 0.95 : 0.72))
+                .frame(width: 24, height: 24)
+                .background(
+                    Circle()
+                        .fill(Color.black.opacity(isHovered ? 0.52 : 0.38))
+                        .overlay(Circle().stroke(Color.cyan.opacity(isHovered ? 0.58 : 0.32), lineWidth: 0.6))
+                )
+        }
+        .buttonStyle(.plain)
+        .help("Copy latest session and debug trace")
+        .accessibilityLabel("Copy latest session and debug trace")
+        .disabled(isLoading)
+        .onHover { hovering in
+            withAnimation(.spring(response: 0.22, dampingFraction: 0.78)) {
+                isHovered = hovering
+            }
+            hovering ? NSCursor.pointingHand.push() : NSCursor.pop()
+        }
+    }
+}
+
+private struct NotchOutputActionChip: View {
+    let systemName: String
+    let label: String
+    let tint: Color
+    let action: (() -> Void)?
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Group {
+            if let action {
+                Button(action: action) {
+                    chipBody
+                }
+                .buttonStyle(.plain)
+            } else {
+                chipBody
+            }
+        }
+        .help(label)
+        .accessibilityLabel(label)
+        .onHover { hovering in
+            withAnimation(.spring(response: 0.22, dampingFraction: 0.78)) {
+                isHovered = hovering
+            }
+            guard action != nil else { return }
+            hovering ? NSCursor.pointingHand.push() : NSCursor.pop()
+        }
+    }
+
+    private var chipBody: some View {
+        HStack(spacing: 5) {
+            if isHovered {
+                Text(label)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.88))
+                    .lineLimit(1)
+                    .fixedSize()
+                    .transition(.opacity.combined(with: .move(edge: .trailing)))
+            }
+            Image(systemName: systemName)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(action == nil ? 0.58 : 0.92))
+                .frame(width: 15, height: 15)
+        }
+        .padding(.horizontal, isHovered ? 7 : 4)
+        .frame(height: 24)
+        .frame(minWidth: 24)
+        .background(
+            Capsule()
+                .fill(Color.white.opacity(isHovered ? 0.14 : 0.08))
+                .overlay(Capsule().stroke(tint.opacity(isHovered ? 0.46 : 0.26), lineWidth: 0.6))
+        )
+        .contentShape(Capsule())
     }
 }
 
@@ -842,52 +1252,117 @@ struct MenuBarPillView: View {
     @ObservedObject var viewModel: ChatViewModel
     let menuBarHeight: CGFloat
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var inlineContentOpacity: CGFloat = 0
+    @State private var inlineContentRevealID = UUID()
 
     private var isVoice: Bool { viewModel.isVoiceNotchActive }
     private var isInlineActive: Bool { viewModel.notchInteractionMode != .collapsed }
-    private var targetWidth: CGFloat { isInlineActive ? 620 : 128 }
-    private var targetHeight: CGFloat { isInlineActive ? menuBarHeight + NotchWrapMetrics.inlineBridgeHeight : menuBarHeight }
+    private var inlineBridgeHeight: CGFloat {
+        viewModel.notchInteractionMode == .output
+            ? outputBridgeHeight(targetWidth: targetWidth * NotchWrapMetrics.inlineContentScale)
+            : NotchWrapMetrics.inlineBridgeHeight
+    }
+    private var targetWidth: CGFloat {
+        guard isInlineActive else { return 128 }
+        return viewModel.notchInteractionMode == .output ? 392 : 527
+    }
+    private var targetHeight: CGFloat { isInlineActive ? menuBarHeight + inlineBridgeHeight : menuBarHeight }
+    private var surfaceCornerRadius: CGFloat { isInlineActive ? 14 : 11 }
+    private var nonNotchSurfaceDuration: Double { reduceMotion ? 0.18 : 0.90 }
     private var surfaceAnimation: Animation {
         reduceMotion
             ? .easeInOut(duration: 0.18)
-            : .timingCurve(0.22, 0.0, 0.18, 1.0, duration: 0.90)
+            : .timingCurve(0.22, 0.0, 0.18, 1.0, duration: nonNotchSurfaceDuration)
+    }
+    private var nonNotchSurfaceShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: surfaceCornerRadius, style: .continuous)
+    }
+
+    private func outputBridgeHeight(targetWidth: CGFloat) -> CGFloat {
+        let text = NotchOutputLayout.responseText(
+            latestText: viewModel.latestAssistantText,
+            isStreaming: viewModel.isLatestAssistantStreaming,
+            isThinking: viewModel.isThinking
+        )
+        return NotchOutputLayout.bridgeHeight(
+            text: text,
+            visibleWidth: targetWidth,
+            message: viewModel.latestAssistantMessage
+        )
+    }
+
+    private func estimatedNotchTextHeight(_ text: String, width: CGFloat) -> CGFloat {
+        NotchOutputLayout.textHeight(text, width: width)
+    }
+
+    private func updateInlineContentOpacity(active: Bool) {
+        let revealID = UUID()
+        inlineContentRevealID = revealID
+        if active {
+            inlineContentOpacity = 0
+            let delay = reduceMotion ? 0.0 : nonNotchSurfaceDuration * 0.45
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard inlineContentRevealID == revealID, isInlineActive && !isVoice else { return }
+                withAnimation(.easeOut(duration: reduceMotion ? 0.08 : 0.22)) {
+                    inlineContentOpacity = 1
+                }
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.12)) {
+                inlineContentOpacity = 0
+            }
+        }
     }
 
     var body: some View {
         ZStack(alignment: .top) {
-            RoundedRectangle(cornerRadius: isInlineActive ? 14 : 11, style: .continuous)
-                .fill(Color.black)
-                .overlay {
-                    RoundedRectangle(cornerRadius: isInlineActive ? 14 : 11, style: .continuous)
-                        .stroke(NotchWrapMetrics.notchBorderColor.opacity(isInlineActive ? 0.72 : 0.35), lineWidth: 1)
+            ZStack(alignment: .top) {
+                nonNotchSurfaceShape
+                    .fill(Color.black)
+                    .overlay {
+                        nonNotchSurfaceShape
+                            .stroke(NotchWrapMetrics.notchBorderColor.opacity(isInlineActive ? 0.72 : 0.35), lineWidth: 1)
+                    }
+
+                HStack(spacing: 6) {
+                    Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(0.90))
+                        .symbolEffect(.bounce, value: viewModel.notchInteractionMode)
+
+                    if !isInlineActive {
+                        Text("bagent")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Color.white.opacity(0.80))
+                            .transition(.opacity)
+                    }
                 }
-                .frame(width: targetWidth, height: targetHeight)
-                .animation(surfaceAnimation, value: isInlineActive)
+                .frame(width: targetWidth, height: menuBarHeight, alignment: .center)
 
-            HStack(spacing: 6) {
-                Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.90))
-                    .symbolEffect(.bounce, value: viewModel.notchInteractionMode)
-
-                if !isInlineActive {
-                    Text("bagent")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.80))
+                if isInlineActive && !isVoice {
+                    InlineNotchContent(viewModel: viewModel, showsInputLeadingIcon: false)
+                        .frame(width: targetWidth * NotchWrapMetrics.inlineContentScale, height: inlineBridgeHeight - 14)
+                        .offset(y: menuBarHeight + 7)
+                        .opacity(inlineContentOpacity)
                         .transition(.opacity)
                 }
             }
-            .frame(width: targetWidth, height: menuBarHeight, alignment: .center)
+            .frame(width: targetWidth, height: targetHeight, alignment: .top)
+            .clipShape(nonNotchSurfaceShape)
+            .contentShape(nonNotchSurfaceShape)
             .animation(surfaceAnimation, value: isInlineActive)
-
-            if isInlineActive && !isVoice {
-                InlineNotchContent(viewModel: viewModel)
-                    .frame(width: targetWidth * NotchWrapMetrics.inlineContentScale, height: NotchWrapMetrics.inlineBridgeHeight - 14)
-                    .offset(y: menuBarHeight + 7)
-                    .transition(.opacity)
-            }
+            .animation(surfaceAnimation, value: viewModel.notchInteractionMode)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onAppear {
+            updateInlineContentOpacity(active: isInlineActive && !isVoice)
+        }
+        .onChange(of: viewModel.notchInteractionMode) {
+            updateInlineContentOpacity(active: isInlineActive && !isVoice)
+        }
+        .onChange(of: viewModel.isVoiceNotchActive) {
+            updateInlineContentOpacity(active: isInlineActive && !isVoice)
+        }
     }
 }
 
@@ -1028,20 +1503,10 @@ struct SpotlightInputPanel: View {
     @State private var verticalOffset: CGFloat = -34
     @State private var fieldOpacity: CGFloat = 0
     @State private var localPickerVisible = false
-    /// True once the open animation has fully settled — gates overflow detection
-    /// so short text typed immediately after opening never triggers a promotion.
-    @State private var openSettled = false
-    /// Set true immediately before triggering promotion so that the macOS TextField
-    /// focus-loss path (which fires onSubmit) doesn't accidentally call send().
-    @State private var isPromoting = false
 
     private let fullFieldWidth: CGFloat = 540
     private let compactFieldWidth: CGFloat = 356
     private let inputHeight: CGFloat = 56
-    /// Text wider than this (measured with NSFont at size 22) overflows one line.
-    /// Computed from fullFieldWidth (540) minus horizontal padding (2×20), icon
-    /// (24), HStack spacing (10), and a safety margin — ≈420 pt.
-    private let textOverflowThreshold: CGFloat = 420
 
     private var pickerVisible: Bool {
         localPickerVisible || viewModel.isSourcePickerForced
@@ -1082,34 +1547,10 @@ struct SpotlightInputPanel: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                     inputFocused = true
                 }
-                // Gate overflow detection until the open animation fully settles
-                // (0.18 s delay + 0.22 s animation + small buffer = 0.45 s).
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-                    openSettled = true
-                }
             }
             .onDisappear {
                 viewModel.hoveredSourceMode = nil
                 viewModel.isSourcePickerForced = false
-                openSettled = false
-            }
-            .onChange(of: viewModel.inputText) { _, text in
-                guard openSettled, !isPromoting else { return }
-                // Paste can insert a newline directly.
-                if text.contains("\n") {
-                    promoteToChat(preserving: text)
-                    return
-                }
-                // Measure the proportional text width. Promote if it no longer fits
-                // one line in the input capsule (threshold ≈ fullFieldWidth minus
-                // padding, icon, and spacing). Always measure against the full-width
-                // threshold so showing the source picker never triggers promotion.
-                guard !text.isEmpty else { return }
-                let font = NSFont.systemFont(ofSize: 22, weight: .regular)
-                let measured = (text as NSString).size(withAttributes: [.font: font]).width
-                if measured > textOverflowThreshold {
-                    promoteToChat(preserving: text)
-                }
             }
             .accessibilityElement(children: .contain)
             .accessibilityLabel("bagent input")
@@ -1189,9 +1630,7 @@ struct SpotlightInputPanel: View {
                 .font(.system(size: 22, weight: .regular))
                 .focused($inputFocused)
                 .onSubmit {
-                    if !isPromoting && !viewModel.isPromotingSpotlightDraft {
-                        viewModel.send()
-                    }
+                    viewModel.send()
                 }
 
             if viewModel.selectedSourceMode != nil {
@@ -1208,12 +1647,6 @@ struct SpotlightInputPanel: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
         .liquidGlassInputSurface()
-    }
-
-    private func promoteToChat(preserving text: String) {
-        guard !isPromoting else { return }
-        isPromoting = true
-        viewModel.promoteSpotlightDraft(text)
     }
 }
 
@@ -1368,21 +1801,7 @@ struct ExpandedChatView: View {
             Text("Na analýzu obrázkov je potrebný model qwen2.5vl:7b.\nSpusti v termináli: ollama pull qwen2.5vl:7b")
         }
         .onAppear {
-            if let promoted = viewModel.pendingPromotedText {
-                // Clear the signal immediately so it isn't re-applied if the view re-appears.
-                viewModel.pendingPromotedText = nil
-                // Force a genuine binding delta: "" → promoted.
-                // SwiftUI's TextField doesn't propagate programmatic binding changes to the
-                // NSTextField field editor once it's focused; clearing first ensures the
-                // value is visibly different when we restore and set focus next tick.
-                viewModel.inputText = ""
-                DispatchQueue.main.async {
-                    viewModel.inputText = promoted
-                    inputFocused = true
-                }
-            } else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { inputFocused = true }
-            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { inputFocused = true }
             viewModel.startApprovalPolling()
             // Restore scroll viewport is handled inside messageList via ScrollViewProxy.
         }
@@ -1569,7 +1988,7 @@ struct ExpandedChatView: View {
                                 .padding(.top, 12)
                         }
                         ForEach(viewModel.messages) { msg in
-                            let streaming = viewModel.isThinking && msg.id == viewModel.messages.last?.id
+                            let streaming = viewModel.streamingAssistantMessageId == msg.id
                             MessageBubble(message: msg, isStreaming: streaming, viewModel: viewModel)
                                 .id(msg.id)
                         }

@@ -244,6 +244,61 @@ struct MailRef {
     auto_open: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MailSearchDebugTrace {
+    looked_like_mail: bool,
+    mail_connector_available: bool,
+    effective_action: Option<String>,
+    intent: Option<serde_json::Value>,
+    attempts: Vec<MailSearchAttemptTrace>,
+    selected_rowid: Option<i64>,
+    miss_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MailSearchAttemptTrace {
+    phase: String,
+    adapter: String,
+    filter: MailSearchFilterTrace,
+    result_count: usize,
+    candidates: Vec<MailSearchCandidateTrace>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MailSearchFilterTrace {
+    sender: Option<String>,
+    subject: Option<String>,
+    date_from: Option<i64>,
+    date_to: Option<i64>,
+    date_from_local: Option<String>,
+    date_to_local: Option<String>,
+    limit: usize,
+    keywords: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MailSearchCandidateTrace {
+    rowid: i64,
+    sender: String,
+    sender_display: Option<String>,
+    subject: String,
+    received_at: i64,
+    received_at_local: String,
+    mailbox_url: String,
+}
+
+#[derive(Debug, Default)]
+struct ToolContextResult {
+    tool_ctx: Option<String>,
+    mail_pdf_paths: Vec<(String, std::path::PathBuf)>,
+    mail_ref: Option<MailRef>,
+    action_taken: Option<String>,
+    odoo_ref: Option<OdooRecordRef>,
+    whatsapp_ref: Option<WhatsappRef>,
+    mail_search_trace: Option<MailSearchDebugTrace>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WhatsappRef {
     chat_id: String,
@@ -1633,7 +1688,13 @@ fn debug_trace_preview(trace: &PromptTrace) -> String {
             trace.past_turn_candidates.len()
         )
     };
-    preview_text(&format!("{layers}; {recall}"), 180)
+    let mail = trace
+        .mail_search_trace
+        .as_ref()
+        .and_then(|v| v.get("attempts").and_then(|a| a.as_array()).map(Vec::len))
+        .map(|n| format!("; mail search attempts={n}"))
+        .unwrap_or_default();
+    preview_text(&format!("{layers}; {recall}{mail}"), 180)
 }
 
 fn build_reference_candidates(
@@ -1731,7 +1792,11 @@ fn explicit_connector_in_turn(turn: &str) -> Option<&'static str> {
     {
         return Some("filesystem");
     }
-    if low.contains("mail") || low.contains("email") || low.contains("inbox") || low.contains("mailbox") {
+    if low.contains("mail")
+        || low.contains("email")
+        || low.contains("inbox")
+        || low.contains("mailbox")
+    {
         return Some("mail");
     }
     None
@@ -2400,29 +2465,37 @@ async fn chat(
         tracing::info!("chat timing: rules checked {}ms", t0.elapsed().as_millis());
         // Fetch live tool context (mail/notes/window) only for approved tools.
         // Filesystem turns are now handled by the agentic tool loop below.
-        let (tool_ctx, mail_pdf_paths, mail_ref_opt, action_taken, odoo_ref_opt, whatsapp_ref_opt) =
-            fetch_tool_context(
-                &user_message,
-                &history,
-                last_mail_ref.as_ref(),
-                last_odoo_ref.as_ref(),
-                last_whatsapp_ref.as_ref(),
-                &reference_resolution,
-                &context_plan.task_type,
-                &context_plan.candidate_skill_names,
-                &allowed_tools,
-                ctx_db,
-                mail,
-                notes,
-                ollama.clone(),
-                intent_model.clone(),
-                memory.clone(),
-                state.odoo.clone(),
-                state.whatsapp.clone(),
-                state.pending_approvals.clone(),
-                state.rules.clone(),
-            )
-            .await;
+        let tool_context = fetch_tool_context(
+            &user_message,
+            &history,
+            last_mail_ref.as_ref(),
+            last_odoo_ref.as_ref(),
+            last_whatsapp_ref.as_ref(),
+            &reference_resolution,
+            &context_plan.task_type,
+            &context_plan.candidate_skill_names,
+            &allowed_tools,
+            ctx_db,
+            mail,
+            notes,
+            ollama.clone(),
+            intent_model.clone(),
+            memory.clone(),
+            state.odoo.clone(),
+            state.whatsapp.clone(),
+            state.pending_approvals.clone(),
+            state.rules.clone(),
+        )
+        .await;
+        let ToolContextResult {
+            tool_ctx,
+            mail_pdf_paths,
+            mail_ref: mail_ref_opt,
+            action_taken,
+            odoo_ref: odoo_ref_opt,
+            whatsapp_ref: whatsapp_ref_opt,
+            mail_search_trace,
+        } = tool_context;
 
         // Background action (e.g. workspace switch): skip LLM, emit brief confirmation.
         if let Some(action_msg) = action_taken {
@@ -2789,6 +2862,9 @@ async fn chat(
                     };
                 built.trace.reference_needs_live_fetch =
                     Some(reference_resolution.needs_live_fetch);
+                built.trace.mail_search_trace = mail_search_trace
+                    .as_ref()
+                    .and_then(|trace| serde_json::to_value(trace).ok());
                 if att_data.images_b64.is_empty() {
                     built.messages.push(Message::user(&user_message));
                 } else {
@@ -5313,15 +5389,19 @@ async fn mail_sync(State(state): State<AppState>) -> impl IntoResponse {
 /// Slovak sentences like "subject toho mailu by mal byt X" is the topic marker,
 /// not a direct prefix of the title. We catch those via "by mal byt" instead.
 /// Parse an ISO date string "YYYY-MM-DD" into a [start, end) Unix-epoch second range
-/// covering the whole calendar day in UTC.
+/// covering the whole calendar day in the user's local timezone.
 fn parse_date_to_range(iso: &str) -> Option<(i64, i64)> {
-    use chrono::{NaiveDate, TimeZone, Utc};
+    use chrono::{Duration, Local, NaiveDate, TimeZone};
     let d = NaiveDate::parse_from_str(iso, "%Y-%m-%d").ok()?;
-    let start = Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?).timestamp();
-    let end = Utc
-        .from_utc_datetime(&d.and_hms_opt(23, 59, 59)?)
-        .timestamp()
-        + 1;
+    let start = Local
+        .from_local_datetime(&d.and_hms_opt(0, 0, 0)?)
+        .earliest()?
+        .timestamp();
+    let next = d + Duration::days(1);
+    let end = Local
+        .from_local_datetime(&next.and_hms_opt(0, 0, 0)?)
+        .earliest()?
+        .timestamp();
     Some((start, end))
 }
 
@@ -5365,9 +5445,61 @@ fn resolver_requests_full_mail_record(reference_resolution: &ReferenceResolution
 
 fn format_unix_local(unix: i64) -> String {
     use chrono::{DateTime, Local, Utc};
+    if unix <= 0 {
+        return "neznáme".to_string();
+    }
     DateTime::<Utc>::from_timestamp(unix, 0)
         .map(|d| d.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string())
         .unwrap_or_else(|| unix.to_string())
+}
+
+fn trace_filter(filter: &MailSearchFilter) -> MailSearchFilterTrace {
+    MailSearchFilterTrace {
+        sender: filter.sender.clone(),
+        subject: filter.subject.clone(),
+        date_from: filter.date_from,
+        date_to: filter.date_to,
+        date_from_local: filter.date_from.map(format_unix_local),
+        date_to_local: filter.date_to.map(format_unix_local),
+        limit: filter.limit,
+        keywords: filter.keywords.clone(),
+    }
+}
+
+fn trace_candidates(
+    messages: &[apple_mail_connector::MailMessage],
+) -> Vec<MailSearchCandidateTrace> {
+    messages
+        .iter()
+        .take(5)
+        .map(|m| MailSearchCandidateTrace {
+            rowid: m.rowid,
+            sender: m.sender.clone(),
+            sender_display: m.sender_display.clone(),
+            subject: m.subject.clone(),
+            received_at: m.received_at,
+            received_at_local: format_unix_local(m.received_at),
+            mailbox_url: m.mailbox_url.clone(),
+        })
+        .collect()
+}
+
+fn push_sender_fallback_terms(terms: &mut Vec<String>, sender: Option<&str>) {
+    let Some(sender) = sender.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some((local_part, domain)) = sender.split_once('@') else {
+        return;
+    };
+    push_search_term(terms, Some(local_part));
+    for part in local_part.split(['.', '_', '-', '+']) {
+        if part.len() >= 3 {
+            push_search_term(terms, Some(part));
+        }
+    }
+    if let Some(domain_name) = domain.split('.').next().filter(|s| s.len() >= 3) {
+        push_search_term(terms, Some(domain_name));
+    }
 }
 
 fn push_search_term(terms: &mut Vec<String>, term: Option<&str>) {
@@ -5382,20 +5514,75 @@ fn push_search_term(terms: &mut Vec<String>, term: Option<&str>) {
     }
 }
 
-async fn search_mail_messages(
+async fn search_mail_messages_traced(
     mail: &Option<MailConnector>,
     filter: MailSearchFilter,
+    phase: &str,
+    trace: &mut MailSearchDebugTrace,
 ) -> Vec<apple_mail_connector::MailMessage> {
-    if let Some(ref mc) = *mail {
+    let (msgs, db_error) = if let Some(ref mc) = *mail {
         let mc = mc.clone();
-        tokio::task::spawn_blocking(move || mc.search_messages(&filter))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
+        match tokio::task::spawn_blocking({
+            let filter = filter.clone();
+            move || mc.search_messages(&filter)
+        })
+        .await
+        {
+            Ok(Ok(msgs)) => (msgs, None),
+            Ok(Err(e)) => (vec![], Some(e.to_string())),
+            Err(e) => (vec![], Some(e.to_string())),
+        }
     } else {
-        vec![]
+        (vec![], Some("mail connector unavailable".to_string()))
+    };
+    trace.attempts.push(MailSearchAttemptTrace {
+        phase: phase.to_string(),
+        adapter: "envelope_index".to_string(),
+        filter: trace_filter(&filter),
+        result_count: msgs.len(),
+        candidates: trace_candidates(&msgs),
+        error: db_error,
+    });
+    if !msgs.is_empty() || !is_targeted_mail_filter(&filter) {
+        return msgs;
     }
+
+    match apple_mail_connector::search_messages_via_applescript(&filter).await {
+        Ok(script_msgs) => {
+            trace.attempts.push(MailSearchAttemptTrace {
+                phase: phase.to_string(),
+                adapter: "mail_app_applescript".to_string(),
+                filter: trace_filter(&filter),
+                result_count: script_msgs.len(),
+                candidates: trace_candidates(&script_msgs),
+                error: None,
+            });
+            script_msgs
+        }
+        Err(e) => {
+            trace.attempts.push(MailSearchAttemptTrace {
+                phase: phase.to_string(),
+                adapter: "mail_app_applescript".to_string(),
+                filter: trace_filter(&filter),
+                result_count: 0,
+                candidates: vec![],
+                error: Some(e.to_string()),
+            });
+            vec![]
+        }
+    }
+}
+
+fn is_targeted_mail_filter(filter: &MailSearchFilter) -> bool {
+    filter
+        .sender
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || filter
+            .subject
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        || filter.keywords.iter().any(|kw| !kw.trim().is_empty())
 }
 
 /// Helper: fetch recent messages, merging mail_cache with live Envelope Index.
@@ -5551,9 +5738,13 @@ async fn enrich_message(
     // Format datetime as "DD.MM.YYYY HH:MM" in the system local timezone.
     let dt = {
         use chrono::{DateTime, Local, Utc};
-        DateTime::<Utc>::from_timestamp(full_msg.received_at, 0)
-            .map(|d| d.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string())
-            .unwrap_or_else(|| full_msg.received_at.to_string())
+        if full_msg.received_at <= 0 {
+            "neznáme".to_string()
+        } else {
+            DateTime::<Utc>::from_timestamp(full_msg.received_at, 0)
+                .map(|d| d.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string())
+                .unwrap_or_else(|| full_msg.received_at.to_string())
+        }
     };
 
     // Build the Od/Komu/Prijaté/Predmet header
@@ -5642,6 +5833,49 @@ async fn enrich_message(
     }
 
     att_files
+}
+
+async fn enrich_applescript_message(
+    msg: &apple_mail_connector::MailMessage,
+    wants_attachment: bool,
+    lines: &mut Vec<String>,
+) {
+    let dt = format_unix_local(msg.received_at);
+    let sender_fmt = match &msg.sender_display {
+        Some(name) if !name.is_empty() => format!("{} <{}>", name, msg.sender),
+        _ => msg.sender.clone(),
+    };
+    let komu = msg.recipient.as_deref().unwrap_or("tvoja schránka");
+
+    lines.push(
+        "⚠️ SYSTÉMOVÁ INŠTRUKCIA: Nasledujúci email bol nájdený cez Mail.app Automation, \
+         pretože priamy Apple Mail index nie je čitateľný. Zobraz iba poskytnuté polia a telo; \
+         nič nevymýšľaj."
+            .to_string(),
+    );
+    lines.push(format!(
+        "Našiel som email:  \n**Od:** {sender_fmt}  \n**Komu:** {komu}  \n**Prijaté:** {dt}  \n**Predmet:** {}",
+        msg.subject
+    ));
+
+    if wants_attachment {
+        lines.push(
+            "\n\n**Prílohy:** Kontrola príloh vyžaduje čitateľný lokálny Mail index alebo stiahnutý .emlx súbor."
+                .to_string(),
+        );
+        return;
+    }
+
+    let body = match &msg.body {
+        Some(body) if !body.trim().is_empty() => Some(body.clone()),
+        _ => apple_mail_connector::body_via_applescript(&msg.subject).await,
+    };
+    if let Some(body) = body {
+        let truncated = compact_mail_body_preserving_line_items(&body, 2000);
+        lines.push(format!("\n\n**Obsah:**\n\n{truncated}"));
+    } else {
+        lines.push("\n\n**Obsah:** TELO EMAILU SA NEPODARILO NAČÍTAŤ. Toto nie je šablóna — nič nevymýšľaj ani nedoplňaj.".to_string());
+    }
 }
 
 /// Detects intent with an LLM classifier and pre-fetches the right Mail / Notes
@@ -5831,14 +6065,7 @@ async fn fetch_tool_context(
     whatsapp: Arc<WhatsappConnector>,
     pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     rules: Arc<RuleEngine>,
-) -> (
-    Option<String>,
-    Vec<(String, std::path::PathBuf)>,
-    Option<MailRef>,
-    Option<String>,        // action_taken: Some(msg) skips LLM
-    Option<OdooRecordRef>, // top Odoo record found this turn
-    Option<WhatsappRef>,   // top WhatsApp chat/context found this turn
-) {
+) -> ToolContextResult {
     let low = message.to_lowercase();
     let planner_selected_whatsapp =
         task_type == "whatsapp" || candidate_skill_names.iter().any(|s| s == "whatsapp");
@@ -5953,6 +6180,11 @@ async fn fetch_tool_context(
     let mut found_mail_ref: Option<MailRef> = None;
     let mut found_odoo_ref: Option<OdooRecordRef> = None;
     let mut found_whatsapp_ref: Option<WhatsappRef> = None;
+    let mut mail_search_trace = MailSearchDebugTrace {
+        looked_like_mail: looks_like_mail,
+        mail_connector_available: mail.is_some(),
+        ..Default::default()
+    };
 
     // ── Mail ─────────────────────────────────────────────────────────────────
     if looks_like_mail {
@@ -6002,6 +6234,8 @@ async fn fetch_tool_context(
             } else {
                 intent.action.as_str()
             };
+            mail_search_trace.effective_action = Some(effective_action.to_string());
+            mail_search_trace.intent = serde_json::to_value(&intent).ok();
 
             match effective_action {
                 "none" => {}
@@ -6012,7 +6246,7 @@ async fn fetch_tool_context(
                         let (date_from, date_to) = local_date_range(0)
                             .map(|(s, e)| (Some(s), Some(e)))
                             .unwrap_or((None, None));
-                        search_mail_messages(
+                        search_mail_messages_traced(
                             &mail,
                             MailSearchFilter {
                                 sender: None,
@@ -6022,6 +6256,8 @@ async fn fetch_tool_context(
                                 limit: 20,
                                 keywords: vec![],
                             },
+                            "list_recent_today",
+                            &mut mail_search_trace,
                         )
                         .await
                     } else {
@@ -6230,7 +6466,13 @@ async fn fetch_tool_context(
                             push_search_term(&mut broad_terms, Some(kw));
                         }
 
-                        let mut msgs = search_mail_messages(&mail, filter.clone()).await;
+                        let mut msgs = search_mail_messages_traced(
+                            &mail,
+                            filter.clone(),
+                            "exact",
+                            &mut mail_search_trace,
+                        )
+                        .await;
 
                         // Fallback 1: retry ambiguous company/person terms across sender and subject.
                         // Example: "moneys3" may be classified as sender, while Apple Mail stores
@@ -6244,11 +6486,40 @@ async fn fetch_tool_context(
                                 limit: 10,
                                 keywords: broad_terms.clone(),
                             };
-                            msgs = search_mail_messages(&mail, broad).await;
+                            msgs = search_mail_messages_traced(
+                                &mail,
+                                broad,
+                                "broad_terms_same_date",
+                                &mut mail_search_trace,
+                            )
+                            .await;
                         }
 
-                        // Fallback 2: if no results and we had a date filter, retry without it.
-                        if msgs.is_empty() && had_date_filter && intent.date.is_none() {
+                        // Fallback 2: retry email-address senders by local-part/name/domain tokens.
+                        if msgs.is_empty() {
+                            let mut sender_terms = Vec::new();
+                            push_sender_fallback_terms(&mut sender_terms, filter.sender.as_deref());
+                            if !sender_terms.is_empty() {
+                                let sender_broad = MailSearchFilter {
+                                    sender: None,
+                                    subject: filter.subject.clone(),
+                                    date_from: filter.date_from,
+                                    date_to: filter.date_to,
+                                    limit: 10,
+                                    keywords: sender_terms,
+                                };
+                                msgs = search_mail_messages_traced(
+                                    &mail,
+                                    sender_broad,
+                                    "sender_email_terms_same_date",
+                                    &mut mail_search_trace,
+                                )
+                                .await;
+                            }
+                        }
+
+                        // Fallback 3: if no results and we had a date filter, retry without it.
+                        if msgs.is_empty() && had_date_filter {
                             let wider = MailSearchFilter {
                                 sender: filter.sender.clone(),
                                 subject: filter.subject.clone(),
@@ -6257,29 +6528,61 @@ async fn fetch_tool_context(
                                 limit: 10,
                                 keywords: filter.keywords.clone(),
                             };
-                            msgs = search_mail_messages(&mail, wider).await;
+                            msgs = search_mail_messages_traced(
+                                &mail,
+                                wider,
+                                "date_relaxed",
+                                &mut mail_search_trace,
+                            )
+                            .await;
                         }
 
-                        // Fallback 3: combine both relaxations when each one alone failed.
-                        if msgs.is_empty()
-                            && had_date_filter
-                            && intent.date.is_none()
-                            && !broad_terms.is_empty()
-                        {
+                        // Fallback 4: combine both relaxations when each one alone failed.
+                        if msgs.is_empty() && had_date_filter && !broad_terms.is_empty() {
                             let wider_broad = MailSearchFilter {
                                 sender: None,
                                 subject: None,
                                 date_from: None,
                                 date_to: None,
                                 limit: 10,
-                                keywords: broad_terms,
+                                keywords: broad_terms.clone(),
                             };
-                            msgs = search_mail_messages(&mail, wider_broad).await;
+                            msgs = search_mail_messages_traced(
+                                &mail,
+                                wider_broad,
+                                "broad_terms_date_relaxed",
+                                &mut mail_search_trace,
+                            )
+                            .await;
+                        }
+
+                        if msgs.is_empty() && had_date_filter {
+                            let mut sender_terms = Vec::new();
+                            push_sender_fallback_terms(&mut sender_terms, filter.sender.as_deref());
+                            if !sender_terms.is_empty() {
+                                let wider_sender_broad = MailSearchFilter {
+                                    sender: None,
+                                    subject: filter.subject.clone(),
+                                    date_from: None,
+                                    date_to: None,
+                                    limit: 10,
+                                    keywords: sender_terms,
+                                };
+                                msgs = search_mail_messages_traced(
+                                    &mail,
+                                    wider_sender_broad,
+                                    "sender_email_terms_date_relaxed",
+                                    &mut mail_search_trace,
+                                )
+                                .await;
+                            }
                         }
 
                         let msgs = msgs;
 
                         if msgs.is_empty() {
+                            mail_search_trace.miss_reason =
+                                Some("all_mail_search_attempts_empty".to_string());
                             let mut why = Vec::new();
                             if let Some(ref s) = intent.sender {
                                 why.push(format!("odosielateľ: {s}"));
@@ -6346,17 +6649,24 @@ async fn fetch_tool_context(
                                 }
                             }
 
-                            let found =
-                                enrich_message(best_rowid, &mail, is_attachment, &mut lines).await;
-                            pdf_paths.extend(found);
-
                             let best_msg = msgs
                                 .iter()
                                 .find(|m| m.rowid == best_rowid)
                                 .unwrap_or(&msgs[0]);
+                            if best_rowid < 0 {
+                                enrich_applescript_message(best_msg, is_attachment, &mut lines)
+                                    .await;
+                            } else {
+                                let found =
+                                    enrich_message(best_rowid, &mail, is_attachment, &mut lines)
+                                        .await;
+                                pdf_paths.extend(found);
+                            }
+                            mail_search_trace.selected_rowid = Some(best_rowid);
+
                             found_mail_ref = Some(MailRef {
                                 rowid: best_rowid,
-                                message_id: None,
+                                message_id: best_msg.message_id.clone(),
                                 subject: best_msg.subject.clone(),
                                 sender: best_msg.sender.clone(),
                                 auto_open: wants_open,
@@ -6446,7 +6756,15 @@ async fn fetch_tool_context(
                     // Background action completed — signal caller to skip LLM streaming
                     // and show a brief confirmation in the voice notch instead.
                     tracing::info!("window action taken: {}", note);
-                    return (None, Vec::new(), None, Some(note), None, None);
+                    return ToolContextResult {
+                        action_taken: Some(note),
+                        mail_search_trace: if mail_search_trace.looked_like_mail {
+                            Some(mail_search_trace)
+                        } else {
+                            None
+                        },
+                        ..Default::default()
+                    };
                 }
             }
         }
@@ -6508,15 +6826,11 @@ async fn fetch_tool_context(
                         let query = intent.query.as_deref().unwrap_or("");
                         match conn.search_partners(query, 5).await {
                             Ok(r) => {
-                                parts.push(format!(
-                                    "## Živé dáta z Odoo — partneri\n{}",
-                                    r.text
-                                ));
+                                parts.push(format!("## Živé dáta z Odoo — partneri\n{}", r.text));
                                 if let (Some(id), Some(name)) =
                                     (r.first_id, r.first_name.as_deref())
                                 {
-                                    found_odoo_ref =
-                                        Some(conn.record_ref("res.partner", id, name));
+                                    found_odoo_ref = Some(conn.record_ref("res.partner", id, name));
                                 }
                             }
                             Err(e) => {
@@ -6526,31 +6840,23 @@ async fn fetch_tool_context(
                         }
                     }
 
-                    OdooAction::GetInvoices => {
-                        match conn.my_invoices(intent.open_only, 10).await {
-                            Ok(r) => {
-                                let header = if intent.open_only {
-                                    "neuhradené faktúry"
-                                } else {
-                                    "faktúry"
-                                };
-                                parts.push(format!(
-                                    "## Živé dáta z Odoo — {header}\n{}",
-                                    r.text
-                                ));
-                                if let (Some(id), Some(name)) =
-                                    (r.first_id, r.first_name.as_deref())
-                                {
-                                    found_odoo_ref =
-                                        Some(conn.record_ref("account.move", id, name));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Odoo my_invoices error: {e}");
-                                parts.push("Odoo faktúry nedostupné.".into());
+                    OdooAction::GetInvoices => match conn.my_invoices(intent.open_only, 10).await {
+                        Ok(r) => {
+                            let header = if intent.open_only {
+                                "neuhradené faktúry"
+                            } else {
+                                "faktúry"
+                            };
+                            parts.push(format!("## Živé dáta z Odoo — {header}\n{}", r.text));
+                            if let (Some(id), Some(name)) = (r.first_id, r.first_name.as_deref()) {
+                                found_odoo_ref = Some(conn.record_ref("account.move", id, name));
                             }
                         }
-                    }
+                        Err(e) => {
+                            tracing::warn!("Odoo my_invoices error: {e}");
+                            parts.push("Odoo faktúry nedostupné.".into());
+                        }
+                    },
 
                     OdooAction::ListTickets => {
                         match conn.my_helpdesk_tickets(intent.open_only, 10).await {
@@ -6560,10 +6866,7 @@ async fn fetch_tool_context(
                                 } else {
                                     "helpdesk tikety"
                                 };
-                                parts.push(format!(
-                                    "## Živé dáta z Odoo — {header}\n{}",
-                                    r.text
-                                ));
+                                parts.push(format!("## Živé dáta z Odoo — {header}\n{}", r.text));
                                 if let (Some(id), Some(name)) =
                                     (r.first_id, r.first_name.as_deref())
                                 {
@@ -6589,9 +6892,8 @@ async fn fetch_tool_context(
                                     found_odoo_ref = Some(conn.record_ref(model_str, id, name));
                                 }
                                 Ok(None) => {
-                                    parts.push(format!(
-                                        "Odoo: záznam {model_str} #{id} nenájdený."
-                                    ));
+                                    parts
+                                        .push(format!("Odoo: záznam {model_str} #{id} nenájdený."));
                                 }
                                 Err(e) => {
                                     tracing::warn!("Odoo get_record error: {e}");
@@ -7209,14 +7511,19 @@ async fn fetch_tool_context(
         ))
     };
 
-    (
-        ctx,
-        pdf_paths,
-        found_mail_ref,
-        None,
-        found_odoo_ref,
-        found_whatsapp_ref,
-    )
+    ToolContextResult {
+        tool_ctx: ctx,
+        mail_pdf_paths: pdf_paths,
+        mail_ref: found_mail_ref,
+        action_taken: None,
+        odoo_ref: found_odoo_ref,
+        whatsapp_ref: found_whatsapp_ref,
+        mail_search_trace: if mail_search_trace.looked_like_mail {
+            Some(mail_search_trace)
+        } else {
+            None
+        },
+    }
 }
 
 // ── WhatsApp DB helpers ───────────────────────────────────────────────────────
@@ -7767,6 +8074,36 @@ mod tests {
         assert!(asks_today_mailbox("whats in my todays mailbox"));
         assert!(asks_today_mailbox("čo mám dnes v pošte"));
         assert!(!asks_today_mailbox("what is today"));
+    }
+
+    #[test]
+    fn explicit_mail_date_uses_local_day_range() {
+        use chrono::{Datelike, Local};
+
+        let today = Local::now().date_naive();
+        let iso = today.format("%Y-%m-%d").to_string();
+        let parsed = parse_date_to_range(&iso).expect("parse local date");
+        let local_today = local_date_range(0).expect("local today range");
+
+        assert_eq!(parsed, local_today);
+        assert_eq!(
+            chrono::DateTime::from_timestamp(parsed.0, 0)
+                .unwrap()
+                .with_timezone(&Local)
+                .day(),
+            today.day()
+        );
+    }
+
+    #[test]
+    fn sender_fallback_terms_expand_email_address() {
+        let mut terms = Vec::new();
+        push_sender_fallback_terms(&mut terms, Some("radoslava.nemethova@tenenet.sk"));
+
+        assert!(terms.contains(&"radoslava.nemethova".to_string()));
+        assert!(terms.contains(&"radoslava".to_string()));
+        assert!(terms.contains(&"nemethova".to_string()));
+        assert!(terms.contains(&"tenenet".to_string()));
     }
 
     #[test]
