@@ -186,6 +186,9 @@ struct NotchWrapView: View {
     @State private var voiceContentOpacity: CGFloat = 0
     @State private var inlineContentOpacity: CGFloat = 0
     @State private var cmuxContentOpacity: CGFloat = 0
+    /// When the pointer entered a cmux hover-reveal — gates the ≥0.4s dwell before
+    /// a hover-leave counts as "seen".
+    @State private var cmuxRevealStartedAt: Date?
     @State private var hoverIconRevealID = UUID()
     @State private var inlineRevealID = UUID()
     @State private var borderPulseOpacity: CGFloat = 0.35
@@ -535,6 +538,29 @@ struct NotchWrapView: View {
         return displayedCmuxNotification != nil
     }
 
+    /// Where an acknowledged cmux icon flies to: on a notched display, up into the
+    /// physical notch gap; on an external display, off the top edge (same centered X
+    /// since the synthetic notch is centered).
+    private var cmuxFlyoffTarget: CGPoint {
+        CGPoint(x: notchOffset + notchWidth / 2,
+                y: viewModel.hasNotch ? notchHeight * 0.15 : -40)
+    }
+
+    /// Fly-off animations for cues the user just acknowledged (tab-open / hover-leave
+    /// / click). Rendered unclipped so the icon is visible travelling into the notch.
+    @ViewBuilder
+    private var cmuxDepartureLayer: some View {
+        ForEach(viewModel.cmuxDeparting) { departure in
+            CmuxFlyoffView(
+                departure: departure,
+                start: leftIconPos,
+                target: cmuxFlyoffTarget,
+                hasNotch: viewModel.hasNotch,
+                onFinished: { viewModel.finishCmuxDeparture(departure.id) }
+            )
+        }
+    }
+
     /// Click-through on a cmux banner/reveal focuses the cmux workspace/tab.
     private func handleTap() {
         if isCmuxSurfaceActive, let notification = displayedCmuxNotification {
@@ -595,8 +621,16 @@ struct NotchWrapView: View {
         guard isHovered != active else { return }
         let wasRevealingCmux = isCmuxHoverReveal
         isHovered = active
-        // Finished-run cues are considered seen once the hover reveal ends.
-        if !active && wasRevealingCmux { viewModel.markCmuxFinishedSeen() }
+        if active {
+            if isCmuxHoverReveal { cmuxRevealStartedAt = Date() }
+        } else if wasRevealingCmux {
+            // Cues are seen once the hover reveal ends — but only if the pointer
+            // actually dwelt (≥0.4s), so a mouse merely passing through the notch
+            // doesn't wipe everything.
+            let dwelt = (cmuxRevealStartedAt.map { Date().timeIntervalSince($0) } ?? 0) >= 0.4
+            cmuxRevealStartedAt = nil
+            if dwelt { viewModel.markAllCmuxSeen() }
+        }
         if !isVoiceActive { refreshSurface() }
         onHoverChanged(active || isDragTargeted)
     }
@@ -629,6 +663,7 @@ struct NotchWrapView: View {
             )
 
             cmuxLeftIconLayer
+            cmuxDepartureLayer
 
             // Left icon — only when chat open, hovered, or voice active (idle = blank notch)
             if showsLeftStatusIcon {
@@ -1559,6 +1594,81 @@ struct CmuxIconView: View {
         } else {
             icon
         }
+    }
+}
+
+/// A cmux icon flying off after the user acknowledged its cue. Four concurrent
+/// keyframe tracks (travel, scale, opacity, tilt) — an anticipation pop then a
+/// quick shrink-and-fade as it settles into the notch (built-in) or shoots off
+/// the top edge (external). Reports back when the flight is over so the token
+/// can be dropped. Only spawned when Reduce Motion is off.
+struct CmuxFlyoffView: View {
+    let departure: CmuxDeparture
+    let start: CGPoint
+    let target: CGPoint
+    let hasNotch: Bool
+    let onFinished: () -> Void
+    var size: CGFloat = 17
+
+    @State private var play = false
+
+    /// Built-in settles a touch slower than the external "lose it over the top".
+    private var duration: Double { hasNotch ? 0.5 : 0.42 }
+
+    struct Frame {
+        var x: CGFloat
+        var y: CGFloat
+        var scale: CGFloat
+        var opacity: CGFloat
+        var rotation: CGFloat
+    }
+
+    var body: some View {
+        let endScale: CGFloat = hasNotch ? 0.26 : 0.55
+        Image(nsImage: CmuxEventMonitor.appIcon)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(width: size, height: size)
+            .keyframeAnimator(
+                initialValue: Frame(x: start.x, y: start.y, scale: 1, opacity: 1, rotation: 0),
+                trigger: play
+            ) { view, f in
+                view
+                    .rotationEffect(.degrees(f.rotation))
+                    .scaleEffect(f.scale)
+                    .opacity(f.opacity)
+                    .position(x: f.x, y: f.y)
+            } keyframes: { _ in
+                KeyframeTrack(\.x) {
+                    CubicKeyframe(target.x, duration: duration)
+                }
+                KeyframeTrack(\.y) {
+                    // brief anticipation dip, then travel to the target
+                    SpringKeyframe(start.y + 5, duration: duration * 0.24, spring: .snappy)
+                    CubicKeyframe(target.y, duration: duration * 0.76)
+                }
+                KeyframeTrack(\.scale) {
+                    CubicKeyframe(1.10, duration: duration * 0.24)
+                    CubicKeyframe(endScale, duration: duration * 0.76)
+                }
+                KeyframeTrack(\.opacity) {
+                    // Built-in: hold opaque so it visibly reaches the notch, then fade.
+                    // External: fade earlier so it dissolves before the panel's top edge
+                    // clips it (target is above the window bounds).
+                    LinearKeyframe(1.0, duration: duration * (hasNotch ? 0.55 : 0.28))
+                    CubicKeyframe(0.0, duration: duration * (hasNotch ? 0.45 : 0.72))
+                }
+                KeyframeTrack(\.rotation) {
+                    CubicKeyframe(-6, duration: duration * 0.3)
+                    CubicKeyframe(0, duration: duration * 0.7)
+                }
+            }
+            .onAppear {
+                play.toggle()
+                DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.05) {
+                    onFinished()
+                }
+            }
     }
 }
 

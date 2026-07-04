@@ -8,6 +8,14 @@ enum CmuxEventKind {
     case finished
 }
 
+/// A cue the user has acknowledged, snapshotted so the notch can fly its icon
+/// off toward the notch (or off the top of an external screen) after the pending
+/// entry itself is gone.
+struct CmuxDeparture: Identifiable, Equatable {
+    let id = UUID()
+    let kind: CmuxEventKind
+}
+
 struct CmuxNotification: Identifiable, Equatable {
     let id: UUID
     let kind: CmuxEventKind

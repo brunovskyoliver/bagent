@@ -739,6 +739,7 @@ final class NotchWindowController: NSObject {
     }
 
     private func updateNotchVisibility() {
+        checkCmuxSeen()
         let shouldHide = isExternalFullscreenActive()
         guard shouldHide != notchHiddenForFullscreen else {
             reconcileStatusPanelVisibility()
@@ -754,6 +755,23 @@ final class NotchWindowController: NSObject {
             }
         }
         reconcileStatusPanelVisibility()
+    }
+
+    /// Auto-clear cmux cues the user has actually looked at: if cmux is frontmost
+    /// and the notified workspace is the one selected on screen, treat it as seen
+    /// and fly it off. Same predicate as delivery-time suppression
+    /// (`ChatViewModel.handleCmuxEvent`). Cheap — only runs while cues are pending.
+    private func checkCmuxSeen() {
+        guard !chatViewModel.cmuxPending.isEmpty,
+              CmuxEventMonitor.isCmuxFrontmost() else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let visible = await CmuxEventMonitor.visibleWorkspaceIds()
+            let seen = Set(self.chatViewModel.cmuxPending.map(\.workspaceId)).intersection(visible)
+            for workspaceId in seen {
+                self.chatViewModel.markCmuxSeen(workspaceId: workspaceId)
+            }
+        }
     }
 
     /// Returns true when a fullscreen video/app is covering this screen.

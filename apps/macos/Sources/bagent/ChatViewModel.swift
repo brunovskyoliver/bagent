@@ -640,6 +640,10 @@ final class ChatViewModel: ObservableObject {
     @Published var cmuxPending: [CmuxNotification] = []
     /// Notification currently shown in the transient notch banner.
     @Published var cmuxBanner: CmuxNotification? = nil
+    /// Cues that have been acknowledged (seen) and are mid fly-off. Rendered by
+    /// the notch as a transient departing icon after the pending entry is gone;
+    /// removed once the animation reports completion.
+    @Published var cmuxDeparting: [CmuxDeparture] = []
     /// Attention (amber) outranks finished (green).
     var cmuxDotKind: CmuxEventKind? {
         if cmuxPending.contains(where: { $0.kind == .attention }) { return .attention }
@@ -685,16 +689,48 @@ final class ChatViewModel: ObservableObject {
         onCmuxNotification?(notification)
     }
 
-    /// Finished-run cues clear once the user has seen them (hover reveal ended).
-    func markCmuxFinishedSeen() {
-        cmuxPending.removeAll { $0.kind == .finished }
+    /// All cues clear once the user has acknowledged them (hover reveal ended).
+    /// Both amber (attention) and green (finished) fly off — seeing = seen.
+    func markAllCmuxSeen() {
+        guard !cmuxPending.isEmpty else { return }
+        beginCmuxDeparture(kind: cmuxDotKind ?? .finished)
+        cmuxPending.removeAll()
+        cmuxBanner = nil
     }
 
-    /// Click-through: focus cmux on the workspace/tab and clear the cue.
+    /// Auto-detect: the user opened the notified workspace in cmux. Clear every
+    /// cue for that workspace with a fly-off.
+    func markCmuxSeen(workspaceId: String) {
+        let matched = cmuxPending.filter { $0.workspaceId == workspaceId }
+        guard !matched.isEmpty else { return }
+        let kind: CmuxEventKind = matched.contains { $0.kind == .attention } ? .attention : .finished
+        beginCmuxDeparture(kind: kind)
+        cmuxPending.removeAll { $0.workspaceId == workspaceId }
+        if let banner = cmuxBanner, banner.workspaceId == workspaceId { cmuxBanner = nil }
+    }
+
+    /// Click-through: focus cmux on the workspace/tab and clear the cue with a fly-off.
     func focusCmux(_ notification: CmuxNotification) {
-        cmuxMonitor.focus(notification)
+        // Spawn the fly-off before activating cmux — once bagent resigns active its
+        // panel animations can be throttled, so start the flight while still frontmost.
+        let kind: CmuxEventKind = cmuxPending
+            .filter { $0.workspaceId == notification.workspaceId }
+            .contains { $0.kind == .attention } ? .attention : notification.kind
+        beginCmuxDeparture(kind: kind)
         cmuxPending.removeAll { $0.workspaceId == notification.workspaceId }
         cmuxBanner = nil
+        cmuxMonitor.focus(notification)
+    }
+
+    /// Spawn a fly-off token unless Reduce Motion is on (then the cue just clears).
+    private func beginCmuxDeparture(kind: CmuxEventKind) {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        cmuxDeparting.append(CmuxDeparture(kind: kind))
+    }
+
+    /// The notch reports the fly-off animation finished; drop the token.
+    func finishCmuxDeparture(_ id: UUID) {
+        cmuxDeparting.removeAll { $0.id == id }
     }
     // Session ID persisted in UserDefaults so it survives app restarts
     private var sessionId: String? {
