@@ -9,6 +9,7 @@ enum NotchWrapMetrics {
     static let hoverBridgeHeight: CGFloat = 22   // wraps under the notch
     static let cornerRadius: CGFloat      = 10   // bottom corners only
     static let innerCornerRadius: CGFloat = 8    // notch border
+    static let syntheticNotchWidth: CGFloat = 221 // measured Mac17,2 notch width for external/non-notch displays
     static let expandedBridgeHeight: CGFloat = 520  // matches chatH
     static let expandedWingWidth: CGFloat   = 200   // chatW / 2
     static let inlineWingWidth: CGFloat   = 221
@@ -30,8 +31,16 @@ private enum NotchOutputLayout {
     static let lineSpacing: CGFloat = 1.5
     static let bottomSlack: CGFloat = 12
     static let chromePadding: CGFloat = 26
+    static let contentVerticalInset: CGFloat = 14
     static let minTextWidth: CGFloat = 120
     static let resizeThreshold: CGFloat = 14
+    /// Output scroll viewport height once the notch bridge is fully grown.
+    /// Mirrors the layout chain in NotchWrapView: bridge height minus contentVerticalInset.
+    /// While the viewport is below this, `bridgeHeight(text:visibleWidth:message:)`
+    /// guarantees the text fits, so the panel grows instead of scrolling.
+    static var maxViewportHeight: CGFloat {
+        NotchWrapMetrics.outputMaxBridgeHeight - contentVerticalInset
+    }
     static func font() -> NSFont { NSFont.systemFont(ofSize: 13, weight: .regular) }
 
     static func responseText(
@@ -130,7 +139,6 @@ private struct NotchWrapBorderShape: Shape {
 // MARK: - Status panel content (always visible, never moves)
 
 struct StatusPillView: View {
-    let isOnNotch: Bool
     let notchWidth: CGFloat
     let notchHeight: CGFloat
     @ObservedObject var viewModel: ChatViewModel
@@ -138,19 +146,13 @@ struct StatusPillView: View {
     let onHoverChanged: (Bool) -> Void
 
     var body: some View {
-        if isOnNotch {
-            NotchWrapView(
-                notchWidth: notchWidth,
-                notchHeight: notchHeight,
-                viewModel: viewModel,
-                onTap: onTap,
-                onHoverChanged: onHoverChanged
-            )
-        } else {
-            MenuBarPillView(viewModel: viewModel, menuBarHeight: notchHeight)
-                .contentShape(Rectangle())
-                .onTapGesture { onTap() }
-        }
+        NotchWrapView(
+            notchWidth: notchWidth,
+            notchHeight: notchHeight,
+            viewModel: viewModel,
+            onTap: onTap,
+            onHoverChanged: onHoverChanged
+        )
     }
 }
 
@@ -265,6 +267,9 @@ struct NotchWrapView: View {
         }
 
         let surfaceTargetChanged = targetWingWidth != targetWing || targetBridgeHeight != targetBridge
+        let outputHeightOnlyResize = viewModel.notchInteractionMode == .output
+            && targetWingWidth == targetWing
+            && targetBridgeHeight != targetBridge
         var instantTargetUpdate = Transaction()
         instantTargetUpdate.disablesAnimations = true
         withTransaction(instantTargetUpdate) {
@@ -272,7 +277,9 @@ struct NotchWrapView: View {
             targetBridgeHeight = targetBridge
             if surfaceTargetChanged {
                 hoverIconRevealID = UUID()
-                inlineRevealID = UUID()
+                if !outputHeightOnlyResize {
+                    inlineRevealID = UUID()
+                }
             }
         }
 
@@ -449,7 +456,7 @@ struct NotchWrapView: View {
                 InlineNotchContent(viewModel: viewModel)
                     .frame(
                         width: (notchWidth + 2 * contentWing) * NotchWrapMetrics.inlineContentScale,
-                        height: contentBridge - 14
+                        height: contentBridge - NotchOutputLayout.contentVerticalInset
                     )
                     .position(x: notchOffset + notchWidth / 2,
                               y: notchHeight + contentBridge / 2)
@@ -754,7 +761,10 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
     let reduceMotion: Bool
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView = UserTrackingScrollView()
+        scrollView.onUserScroll = { [weak coordinator = context.coordinator] in
+            coordinator?.handleUserScroll()
+        }
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         scrollView.hasVerticalScroller = false
@@ -796,8 +806,6 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
         guard let textView = context.coordinator.textView else { return }
         let coordinator = context.coordinator
         let messageChanged = coordinator.messageId != messageId
-        let textChanged = coordinator.lastText != text
-        let wasNearBottom = coordinator.isNearBottom()
 
         if messageChanged {
             coordinator.messageId = messageId
@@ -805,17 +813,13 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
             coordinator.lastText = nil
         }
 
-        if textChanged || messageChanged {
+        if coordinator.lastText != text {
             coordinator.lastText = text
             textView.textStorage?.setAttributedString(attributedText(text))
         }
 
         coordinator.resizeTextView()
-
-        let shouldStickToBottom = messageChanged || wasNearBottom || (isStreaming && !coordinator.userScrolledAway)
-        guard shouldStickToBottom else { return }
-
-        coordinator.requestBottomPin(animated: !reduceMotion && !messageChanged && !isStreaming)
+        coordinator.applyAutoScroll()
     }
 
     static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
@@ -851,13 +855,47 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
         var messageId: UUID?
         var lastText: String?
         var userScrolledAway = false
-        var suppressScrollObservation = false
-        var bottomPinScheduled = false
-        var pendingAnimatedBottomPin = false
+        private var lastClipSize: NSSize = .zero
+
+        /// Called only for scroll-wheel/trackpad events (including momentum),
+        /// never for programmatic pins — so it is the single source of truth
+        /// for user scroll intent. Scrolling back to the bottom re-engages
+        /// the streaming auto-scroll.
+        func handleUserScroll() {
+            userScrolledAway = !isNearBottom()
+        }
 
         @objc func boundsDidChange(_ note: Notification) {
-            guard !suppressScrollObservation else { return }
-            userScrolledAway = !isNearBottom()
+            guard let scrollView else { return }
+            let size = scrollView.contentView.bounds.size
+            let clipHeightChanged = abs(size.height - lastClipSize.height) > 0.5
+            let clipWidthChanged = abs(size.width - lastClipSize.width) > 0.5
+            lastClipSize = size
+            guard clipHeightChanged || clipWidthChanged else { return }
+            resizeTextView()
+            applyAutoScroll()
+        }
+
+        /// Two-phase streaming scroll policy:
+        /// - Growth phase (viewport below its max height): the text stays
+        ///   top-anchored and perfectly still while the notch panel grows
+        ///   downward to reveal new lines. Bottom-pinning here would drag the
+        ///   text down with the animating panel edge while token pins push it
+        ///   up — the vertical jumping this replaces.
+        /// - Scroll phase (viewport fully grown): pin to the bottom so new
+        ///   lines scroll into view. Never overrides a user's manual scroll.
+        func applyAutoScroll() {
+            guard !userScrolledAway else { return }
+            if viewportFullyGrown() {
+                pinToBottom()
+            } else {
+                scrollTo(y: 0)
+            }
+        }
+
+        func viewportFullyGrown() -> Bool {
+            guard let scrollView else { return false }
+            return scrollView.contentView.bounds.height >= NotchOutputLayout.maxViewportHeight - 1
         }
 
         func resizeTextView() {
@@ -871,49 +909,37 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
             textView.setFrameSize(NSSize(width: width, height: height))
         }
 
-        func isNearBottom(threshold: CGFloat = 10) -> Bool {
+        func isNearBottom(threshold: CGFloat = 12) -> Bool {
             guard let scrollView, let documentView = scrollView.documentView else { return true }
             let maxY = max(0, documentView.bounds.height - scrollView.contentView.bounds.height)
             let distance = maxY - scrollView.contentView.bounds.origin.y
             return distance <= threshold
         }
 
-        func requestBottomPin(animated: Bool) {
-            pendingAnimatedBottomPin = pendingAnimatedBottomPin || animated
-            guard !bottomPinScheduled else { return }
-            bottomPinScheduled = true
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                let animated = self.pendingAnimatedBottomPin
-                self.bottomPinScheduled = false
-                self.pendingAnimatedBottomPin = false
-                self.suppressScrollObservation = true
-                self.resizeTextView()
-                self.scrollToBottom(animated: animated)
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    self.suppressScrollObservation = false
-                    self.userScrolledAway = !self.isNearBottom()
-                }
-            }
+        func pinToBottom() {
+            guard let scrollView, let documentView = scrollView.documentView else { return }
+            scrollTo(y: max(0, documentView.bounds.height - scrollView.contentView.bounds.height))
         }
 
-        func scrollToBottom(animated: Bool) {
-            guard let scrollView, let documentView = scrollView.documentView else { return }
+        func scrollTo(y targetY: CGFloat) {
+            guard let scrollView else { return }
             let clipView = scrollView.contentView
-            let targetY = max(0, documentView.bounds.height - clipView.bounds.height)
-            let target = NSPoint(x: 0, y: targetY)
-            if animated {
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = 0.12
-                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                    clipView.animator().setBoundsOrigin(target)
-                }
-            } else {
-                clipView.setBoundsOrigin(target)
-            }
+            guard abs(clipView.bounds.origin.y - targetY) > 0.5 else { return }
+            clipView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
             scrollView.reflectScrolledClipView(clipView)
         }
+    }
+}
+
+/// NSScrollView that reports user-initiated scrolling. Programmatic
+/// `setBoundsOrigin` pins do not go through `scrollWheel`, so this cleanly
+/// separates user intent from streaming auto-scroll.
+private final class UserTrackingScrollView: NSScrollView {
+    var onUserScroll: (() -> Void)?
+
+    override func scrollWheel(with event: NSEvent) {
+        super.scrollWheel(with: event)
+        onUserScroll?()
     }
 }
 
@@ -1243,126 +1269,6 @@ struct StatusDotView: View {
         }
         .onAppear { dotBlink = status == .thinking }
         .onChange(of: status) { dotBlink = status == .thinking }
-    }
-}
-
-// MARK: - Menu-bar inline pill (external / non-notch display)
-
-struct MenuBarPillView: View {
-    @ObservedObject var viewModel: ChatViewModel
-    let menuBarHeight: CGFloat
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var inlineContentOpacity: CGFloat = 0
-    @State private var inlineContentRevealID = UUID()
-
-    private var isVoice: Bool { viewModel.isVoiceNotchActive }
-    private var isInlineActive: Bool { viewModel.notchInteractionMode != .collapsed }
-    private var inlineBridgeHeight: CGFloat {
-        viewModel.notchInteractionMode == .output
-            ? outputBridgeHeight(targetWidth: targetWidth * NotchWrapMetrics.inlineContentScale)
-            : NotchWrapMetrics.inlineBridgeHeight
-    }
-    private var targetWidth: CGFloat {
-        guard isInlineActive else { return 128 }
-        return viewModel.notchInteractionMode == .output ? 392 : 527
-    }
-    private var targetHeight: CGFloat { isInlineActive ? menuBarHeight + inlineBridgeHeight : menuBarHeight }
-    private var surfaceCornerRadius: CGFloat { isInlineActive ? 14 : 11 }
-    private var nonNotchSurfaceDuration: Double { reduceMotion ? 0.18 : 0.90 }
-    private var surfaceAnimation: Animation {
-        reduceMotion
-            ? .easeInOut(duration: 0.18)
-            : .timingCurve(0.22, 0.0, 0.18, 1.0, duration: nonNotchSurfaceDuration)
-    }
-    private var nonNotchSurfaceShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: surfaceCornerRadius, style: .continuous)
-    }
-
-    private func outputBridgeHeight(targetWidth: CGFloat) -> CGFloat {
-        let text = NotchOutputLayout.responseText(
-            latestText: viewModel.latestAssistantText,
-            isStreaming: viewModel.isLatestAssistantStreaming,
-            isThinking: viewModel.isThinking
-        )
-        return NotchOutputLayout.bridgeHeight(
-            text: text,
-            visibleWidth: targetWidth,
-            message: viewModel.latestAssistantMessage
-        )
-    }
-
-    private func estimatedNotchTextHeight(_ text: String, width: CGFloat) -> CGFloat {
-        NotchOutputLayout.textHeight(text, width: width)
-    }
-
-    private func updateInlineContentOpacity(active: Bool) {
-        let revealID = UUID()
-        inlineContentRevealID = revealID
-        if active {
-            inlineContentOpacity = 0
-            let delay = reduceMotion ? 0.0 : nonNotchSurfaceDuration * 0.45
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard inlineContentRevealID == revealID, isInlineActive && !isVoice else { return }
-                withAnimation(.easeOut(duration: reduceMotion ? 0.08 : 0.22)) {
-                    inlineContentOpacity = 1
-                }
-            }
-        } else {
-            withAnimation(.easeOut(duration: 0.12)) {
-                inlineContentOpacity = 0
-            }
-        }
-    }
-
-    var body: some View {
-        ZStack(alignment: .top) {
-            ZStack(alignment: .top) {
-                nonNotchSurfaceShape
-                    .fill(Color.black)
-                    .overlay {
-                        nonNotchSurfaceShape
-                            .stroke(NotchWrapMetrics.notchBorderColor.opacity(isInlineActive ? 0.72 : 0.35), lineWidth: 1)
-                    }
-
-                HStack(spacing: 6) {
-                    Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Color.white.opacity(0.90))
-                        .symbolEffect(.bounce, value: viewModel.notchInteractionMode)
-
-                    if !isInlineActive {
-                        Text("bagent")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(Color.white.opacity(0.80))
-                            .transition(.opacity)
-                    }
-                }
-                .frame(width: targetWidth, height: menuBarHeight, alignment: .center)
-
-                if isInlineActive && !isVoice {
-                    InlineNotchContent(viewModel: viewModel, showsInputLeadingIcon: false)
-                        .frame(width: targetWidth * NotchWrapMetrics.inlineContentScale, height: inlineBridgeHeight - 14)
-                        .offset(y: menuBarHeight + 7)
-                        .opacity(inlineContentOpacity)
-                        .transition(.opacity)
-                }
-            }
-            .frame(width: targetWidth, height: targetHeight, alignment: .top)
-            .clipShape(nonNotchSurfaceShape)
-            .contentShape(nonNotchSurfaceShape)
-            .animation(surfaceAnimation, value: isInlineActive)
-            .animation(surfaceAnimation, value: viewModel.notchInteractionMode)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .onAppear {
-            updateInlineContentOpacity(active: isInlineActive && !isVoice)
-        }
-        .onChange(of: viewModel.notchInteractionMode) {
-            updateInlineContentOpacity(active: isInlineActive && !isVoice)
-        }
-        .onChange(of: viewModel.isVoiceNotchActive) {
-            updateInlineContentOpacity(active: isInlineActive && !isVoice)
-        }
     }
 }
 

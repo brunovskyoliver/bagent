@@ -9,10 +9,10 @@ Living document. Future phases (7, 9, 10) and any new UI component should read t
 | Mode | Condition | Resting UI |
 |---|---|---|
 | **Notch wrap** | `NSScreen.main?.auxiliaryTopLeftArea != nil` | Curved black bar hugging the physical notch |
-| **Menu-bar inline** | External display or non-notch Mac | Transparent pill inside menu bar at screen center |
+| **Fake notch wrap** | External display or non-notch Mac | Centered notch-style black wrap, top edge flush with menu-bar/screen top |
 | **Status item fallback** | Non-notch Mac, no external display | `NSStatusItem` at right of menu bar |
 
-The `NotchWindowController.hasNotch` flag drives the branch. External display logic (`screensChanged`) fires on `NSApplication.didChangeScreenParametersNotification` and recomputes geometry.
+`NotchWindowController.hasNotch` records whether a physical notch exists. The status surface is always notch-style: physical notch displays use measured `auxiliaryTopLeftArea` / `auxiliaryTopRightArea`; external/non-notch displays use a centered synthetic 221 pt notch gap. External display logic (`screensChanged`) fires on `NSApplication.didChangeScreenParametersNotification` and recomputes geometry.
 
 ---
 
