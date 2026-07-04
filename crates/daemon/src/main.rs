@@ -39,7 +39,13 @@ use ollama_connector::{
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, convert::Infallible, io::Write, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    io::Write,
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -82,7 +88,7 @@ struct AppState {
     /// Codex external-reasoning connector (None when binary not found).
     codex: Option<CodexConnector>,
     /// Odoo connector — in-memory only; API key never written to disk.
-    /// Swift re-pushes credentials from Keychain on each launch.
+    /// Swift pushes credentials from Keychain lazily when an Odoo turn needs it.
     odoo: Arc<RwLock<Option<OdooConnector>>>,
     /// WhatsApp Web bridge connector. Always present; owns the bridge subprocess.
     /// Bridge can autostart when a prior LocalAuth session exists, and is also
@@ -349,6 +355,112 @@ struct WhatsappHealthStatus {
     error: Option<String>,
 }
 
+async fn shutdown_signal(state: AppState) {
+    wait_for_shutdown_signal().await;
+    tracing::info!("shutdown signal received; cleaning runtime resources");
+    cleanup_runtime_resources(&state).await;
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn cleanup_runtime_resources(state: &AppState) {
+    cleanup_ollama_models(state).await;
+
+    if let Err(e) = state.whatsapp.stop().await {
+        tracing::debug!("shutdown: WhatsApp stop skipped: {e}");
+    }
+}
+
+async fn cleanup_ollama_models(state: &AppState) {
+    let loaded_models = match state.ollama.loaded_models().await {
+        Ok(models) => models,
+        Err(e) => {
+            tracing::debug!("shutdown: Ollama loaded-model check skipped: {e}");
+            return;
+        }
+    };
+
+    let mut seen = HashSet::new();
+    let mut generate_models = Vec::new();
+    for model in [
+        state.default_model.as_str(),
+        state.classifier_model.as_str(),
+        state.vision_model.as_str(),
+    ] {
+        let trimmed = model.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            if let Some(loaded_name) = matching_loaded_model(&loaded_models, trimmed) {
+                generate_models.push(loaded_name);
+            }
+        }
+    }
+
+    for model in generate_models {
+        match state.ollama.unload_generate_model(&model).await {
+            Ok(()) => tracing::info!(model = %model, "shutdown: Ollama model unloaded"),
+            Err(e) => tracing::debug!(model = %model, "shutdown: Ollama model unload skipped: {e}"),
+        }
+    }
+
+    if let Some(loaded_embed_model) = matching_loaded_model(&loaded_models, DEFAULT_EMBED_MODEL) {
+        match state
+            .ollama
+            .unload_embedding_model(&loaded_embed_model)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                model = %loaded_embed_model,
+                "shutdown: Ollama embedding model unloaded"
+            ),
+            Err(e) => tracing::debug!(
+                model = %loaded_embed_model,
+                "shutdown: Ollama embedding unload skipped: {e}"
+            ),
+        }
+    }
+}
+
+fn matching_loaded_model(loaded_models: &[String], requested: &str) -> Option<String> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    loaded_models.iter().find_map(|loaded| {
+        let loaded = loaded.trim();
+        let exact = loaded == requested;
+        let requested_latest = !requested.contains(':') && loaded == format!("{requested}:latest");
+        let loaded_latest = loaded
+            .strip_suffix(":latest")
+            .map(|base| base == requested)
+            .unwrap_or(false);
+        let requested_latest_alias = requested
+            .strip_suffix(":latest")
+            .map(|base| base == loaded)
+            .unwrap_or(false);
+        if exact || requested_latest || loaded_latest || requested_latest_alias {
+            Some(loaded.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -405,17 +517,23 @@ async fn main() -> Result<()> {
     let memory = Arc::new(MemoryStore::new(mem_db, ollama.clone()).with_data_dir(data_dir.clone()));
     let prompt_builder = Arc::new(PromptBuilder::new());
 
-    // Startup: warm both chat model and embed model into GPU memory so first user
-    // query doesn't pay cold-load cost (~5-10s for 4.7GB + 1.2GB models).
-    // Fires after a short delay to avoid competing with server startup.
+    let default_model =
+        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
+    let classifier_model =
+        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| "qwen2.5:0.5b".to_string());
+    let vision_model =
+        std::env::var("BAGENT_VISION_MODEL").unwrap_or_else(|_| "qwen2.5vl:7b".to_string());
+
+    // Startup: warm the selected chat model and embed model into memory so first
+    // user query doesn't pay cold-load cost. Vision stays lazy and only loads
+    // when an image attachment or screen capture routes to the vision model.
     {
         let warmup_ollama = ollama.clone();
-        let warmup_chat_model = "qwen2.5:7b".to_string();
+        let warmup_chat_model = default_model.clone();
         let warmup_embed_model = ollama_connector::DEFAULT_EMBED_MODEL.to_string();
         tokio::spawn(async move {
-            // No delay — start warming immediately. The HTTP server is up by this point.
-            // Both models load in parallel: sequential was the bug (bge-m3 only started
-            // after qwen2.5:7b finished ~5s, leaving a cold-embed window).
+            // Both models load in parallel: sequential warmup leaves a cold-embed
+            // window after the chat model finishes loading.
             let ollama_chat = warmup_ollama.clone();
             let ollama_embed = warmup_ollama.clone();
             let (r_chat, r_embed) = tokio::join!(
@@ -423,10 +541,10 @@ async fn main() -> Result<()> {
                 ollama_embed.embed(&warmup_embed_model, "warmup"),
             );
             if r_chat.is_ok() {
-                tracing::info!("warmup: chat model loaded");
+                tracing::info!(model = %warmup_chat_model, "warmup: chat model loaded");
             }
             if r_embed.is_ok() {
-                tracing::info!("warmup: embed model loaded");
+                tracing::info!(model = %warmup_embed_model, "warmup: embed model loaded");
             }
         });
     }
@@ -541,13 +659,6 @@ async fn main() -> Result<()> {
     let pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-    let default_model =
-        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
-    let classifier_model =
-        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| "qwen2.5:0.5b".to_string());
-    let vision_model =
-        std::env::var("BAGENT_VISION_MODEL").unwrap_or_else(|_| "qwen2.5vl:7b".to_string());
-
     // Scan skills directories: repo skills/ first, then user skills dir (override by name).
     let skills = {
         let mut skills_dirs: Vec<std::path::PathBuf> = vec![];
@@ -617,7 +728,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Odoo connector — starts unconfigured; Swift pushes creds from Keychain via POST /odoo/config.
+    // Odoo connector — starts unconfigured; Swift configures it lazily via POST /odoo/config.
     let odoo: Arc<RwLock<Option<OdooConnector>>> = Arc::new(RwLock::new(None));
 
     // WhatsApp connector — always present; autostarts only for prior paired sessions.
@@ -659,6 +770,7 @@ async fn main() -> Result<()> {
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    let shutdown_state = state.clone();
     let app = Router::new()
         .route("/health", get(health))
         .route("/models", get(models))
@@ -750,8 +862,11 @@ async fn main() -> Result<()> {
     std::fs::write(data_dir.join("daemon.port"), port.to_string())?;
     tracing::info!("bagentd listening on 127.0.0.1:{}", port);
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_state))
+        .await?;
     let _ = std::fs::remove_file(data_dir.join("daemon.pid"));
+    let _ = std::fs::remove_file(data_dir.join("daemon.port"));
     Ok(())
 }
 
@@ -6178,25 +6293,28 @@ async fn fetch_tool_context(
 
         // Keyword gate — independent of the context_planner's is_odoo(), because
         // "faktúra" routes to invoice_analysis there (→ hits this branch too).
+        let planner_selected_odoo = task_type == "odoo_lookup"
+            || candidate_skill_names.iter().any(|s| s == "odoo-readonly");
         let looks_like_odoo = odoo_configured
-            && ([
-                "odoo",
-                "faktúr",
-                "faktura",
-                "invoice",
-                "partner",
-                "kontakt",
-                "zákazník",
-                "zakaznik",
-                "helpdesk",
-                "tiket",
-                "ticket",
-                "úloh",
-                "uloh",
-                "objednávk",
-            ]
-            .iter()
-            .any(|kw| low.contains(kw))
+            && (planner_selected_odoo
+                || [
+                    "odoo",
+                    "faktúr",
+                    "faktura",
+                    "invoice",
+                    "partner",
+                    "kontakt",
+                    "zákazník",
+                    "zakaznik",
+                    "helpdesk",
+                    "tiket",
+                    "ticket",
+                    "úloh",
+                    "uloh",
+                    "objednávk",
+                ]
+                .iter()
+                .any(|kw| low.contains(kw))
                 || (last_odoo_ref.is_some()
                     && [
                         "otvor to",

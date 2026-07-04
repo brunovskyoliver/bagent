@@ -56,6 +56,8 @@ final class NotchWindowController: NSObject {
     /// Monitors used for the inline voice surface (click-away + Escape).
     private var voiceMouseMonitor: Any?
     private var voiceKeyMonitor: Any?
+    /// Pending auto-dismiss of the transient cmux banner (5s after presenting).
+    private var cmuxBannerDismissWork: DispatchWorkItem?
 
     private var pillFrame: NSRect = .zero
     private var chatFrame: NSRect = .zero
@@ -131,6 +133,22 @@ final class NotchWindowController: NSObject {
                 self.chatViewModel.voiceActionMessage = nil
                 self.teardownVoiceNotch(restoreApp: true)
             }
+        }
+
+        // cmux agent event: transient banner in the collapsed notch for 5s, then
+        // collapse back to the persistent left icon (still jiggling) + right corner
+        // dot, which linger until the event clears. Latest event wins the banner.
+        chatViewModel.onCmuxNotification = { [weak self] notification in
+            guard let self else { return }
+            guard !self.isExpanded, !self.isVoiceShowing,
+                  self.chatViewModel.notchInteractionMode == .collapsed else { return }
+            self.chatViewModel.cmuxBanner = notification
+            self.cmuxBannerDismissWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.chatViewModel.cmuxBanner = nil
+            }
+            self.cmuxBannerDismissWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: work)
         }
 
         sizeCancellable = Publishers.CombineLatest(
@@ -416,6 +434,9 @@ final class NotchWindowController: NSObject {
     // MARK: - Toggle
 
     func toggle() {
+        // Opening chat retires the transient cmux banner (dot state persists).
+        cmuxBannerDismissWork?.cancel()
+        chatViewModel.cmuxBanner = nil
         (isExpanded || isInputShowing || isNotchInteractionShowing) ? collapse() : presentInputOnly()
     }
 

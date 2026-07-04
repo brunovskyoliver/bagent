@@ -249,6 +249,27 @@ struct SettingsView: View {
                     accessible: viewModel.daemonHealth?.notesConnector
                 )
                 Divider()
+                HStack(spacing: 8) {
+                    Image(systemName: "bell.badge")
+                        .font(.system(size: 13))
+                        .foregroundStyle(viewModel.cmuxNotificationsEnabled && CmuxEventMonitor.isAvailable ? Color.accentColor : Color.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("cmux notifikácie")
+                            .font(.system(size: 12))
+                        Text(CmuxEventMonitor.isAvailable
+                             ? "Upozornenia agentov (otázka / koniec behu) v notchi."
+                             : "cmux nenájdený v /Applications.")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $viewModel.cmuxNotificationsEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .disabled(!CmuxEventMonitor.isAvailable)
+                        .accessibilityLabel("cmux notifikácie")
+                }
+                Divider()
                 HStack {
                     if viewModel.isSyncing {
                         ProgressView().scaleEffect(0.65)

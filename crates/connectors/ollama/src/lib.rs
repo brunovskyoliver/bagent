@@ -197,6 +197,38 @@ impl OllamaClient {
         Ok(names)
     }
 
+    /// Sorted list of models currently loaded in Ollama memory.
+    pub async fn loaded_models(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Resp {
+            models: Vec<Info>,
+        }
+        #[derive(Deserialize)]
+        struct Info {
+            name: Option<String>,
+            model: Option<String>,
+        }
+
+        let resp: Resp = self
+            .http
+            .get(format!("{}/api/ps", self.base_url))
+            .send()
+            .await
+            .context("GET /api/ps")?
+            .json()
+            .await
+            .context("parse ps response")?;
+
+        let mut names: Vec<String> = resp
+            .models
+            .into_iter()
+            .filter_map(|m| m.name.or(m.model))
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     /// Streaming chat — yields decoded tokens as they arrive.
     pub fn chat_stream(
         &self,
@@ -266,6 +298,44 @@ impl OllamaClient {
             .filter_map(|v| v.as_f64().map(|f| f as f32))
             .collect();
         Ok(vec)
+    }
+
+    /// Best-effort unload for chat/generation-capable models.
+    ///
+    /// Ollama unloads a model when it receives an empty generation request with
+    /// `keep_alive: 0`. This is used during bagent shutdown to release VRAM/RAM.
+    pub async fn unload_generate_model(&self, model: &str) -> Result<()> {
+        self.http
+            .post(format!("{}/api/generate", self.base_url))
+            .json(&serde_json::json!({
+                "model": model,
+                "prompt": "",
+                "stream": false,
+                "keep_alive": 0
+            }))
+            .send()
+            .await
+            .context("unload generate model request")?
+            .error_for_status()
+            .context("unload generate model status")?;
+        Ok(())
+    }
+
+    /// Best-effort unload for embedding-only models.
+    pub async fn unload_embedding_model(&self, model: &str) -> Result<()> {
+        self.http
+            .post(format!("{}/api/embeddings", self.base_url))
+            .json(&serde_json::json!({
+                "model": model,
+                "prompt": "",
+                "keep_alive": 0
+            }))
+            .send()
+            .await
+            .context("unload embedding model request")?
+            .error_for_status()
+            .context("unload embedding model status")?;
+        Ok(())
     }
 
     /// Single non-streaming generation call — useful for classifiers and extractors.

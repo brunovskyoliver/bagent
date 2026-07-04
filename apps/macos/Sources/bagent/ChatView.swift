@@ -21,10 +21,18 @@ enum NotchWrapMetrics {
     static let inlineContentScale: CGFloat = 0.90
     static let voiceWingWidth: CGFloat    = 100  // voice mode — wide enough for sentence
     static let voiceBridgeHeight: CGFloat = 120  // voice mode — fits wave + 2 text lines
+    static let cmuxWingWidth: CGFloat     = 84   // cmux banner — fits one-line event title
+    static let cmuxBridgeHeight: CGFloat  = 19   // single caption line, minimal growth
     static let maxWingWidth: CGFloat      = 260
     static let maxBridgeHeight: CGFloat   = 280
     static let surfaceDuration: Double     = 0.58
     static let notchBorderColor           = Color(white: 0.30)
+
+    // Soft off-white for notch text — grayish, never pure white.
+    static let notchTextPrimary   = Color(white: 0.80)   // primary lines
+    static let notchTextSecondary = Color(white: 0.55)   // subtitles / echoes
+    static let notchTextFaint     = Color(white: 0.42)   // placeholder
+    static let notchTextPrimaryNS = NSColor(white: 0.80, alpha: 1)  // AppKit output
 }
 
 private enum NotchOutputLayout {
@@ -177,6 +185,7 @@ struct NotchWrapView: View {
     @State private var isVoiceActive = false
     @State private var voiceContentOpacity: CGFloat = 0
     @State private var inlineContentOpacity: CGFloat = 0
+    @State private var cmuxContentOpacity: CGFloat = 0
     @State private var hoverIconRevealID = UUID()
     @State private var inlineRevealID = UUID()
     @State private var borderPulseOpacity: CGFloat = 0.35
@@ -198,6 +207,20 @@ struct NotchWrapView: View {
     private var status: AgentStatus { viewModel.agentStatus }
     private var isInlineActive: Bool {
         viewModel.notchInteractionMode == .input || viewModel.notchInteractionMode == .output
+    }
+
+    /// Transient cmux banner (5s after an agent event, latest wins).
+    private var isCmuxBannerActive: Bool {
+        viewModel.cmuxBanner != nil && !isInlineActive && !isVoiceActive
+    }
+    /// Hovering the collapsed notch re-reveals pending cmux events.
+    private var isCmuxHoverReveal: Bool {
+        viewModel.cmuxBanner == nil && !viewModel.cmuxPending.isEmpty
+            && isHovered && !isInlineActive && !isVoiceActive
+    }
+    private var isCmuxSurfaceActive: Bool { isCmuxBannerActive || isCmuxHoverReveal }
+    private var displayedCmuxNotification: CmuxNotification? {
+        viewModel.cmuxBanner ?? viewModel.cmuxPending.first
     }
 
     /// SF Symbol name for the right-wing voice indicator.
@@ -266,6 +289,9 @@ struct NotchWrapView: View {
         } else if isInlineActive {
             targetWing = inlineWingWidth(for: viewModel.notchInteractionMode)
             targetBridge = inlineBridgeHeight(for: viewModel.notchInteractionMode)
+        } else if isCmuxSurfaceActive {
+            targetWing = NotchWrapMetrics.cmuxWingWidth
+            targetBridge = NotchWrapMetrics.cmuxBridgeHeight
         } else if hoverExpanded {
             targetWing = NotchWrapMetrics.hoverWingWidth
             targetBridge = NotchWrapMetrics.hoverBridgeHeight
@@ -296,6 +322,7 @@ struct NotchWrapView: View {
             bridgeHeight = targetBridge
         }
         updateInlineOpacity(active: isInlineActive && !isVoiceActive)
+        updateCmuxOpacity(active: isCmuxSurfaceActive)
     }
 
     private func updateStatusDotTravelState() {
@@ -347,6 +374,22 @@ struct NotchWrapView: View {
         }
     }
 
+    private func updateCmuxOpacity(active: Bool) {
+        if active {
+            let delay = reduceMotion ? 0.0 : NotchWrapMetrics.surfaceDuration * 0.55
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard isCmuxSurfaceActive else { return }
+                withAnimation(.easeOut(duration: reduceMotion ? 0.10 : 0.24)) {
+                    cmuxContentOpacity = 1
+                }
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.14)) {
+                cmuxContentOpacity = 0
+            }
+        }
+    }
+
     // Icon y is clamped to the notch/hover area so it doesn't drift into bridge content.
     private var iconY: CGFloat {
         let clampedBridge = min(bridgeHeight, NotchWrapMetrics.hoverBridgeHeight)
@@ -359,6 +402,11 @@ struct NotchWrapView: View {
     }
     private var rightIconPos: CGPoint {
         CGPoint(x: notchOffset + notchWidth + wingWidth / 2, y: iconY)
+    }
+    /// Left-wing cmux icon position — wing-animated so it slides smoothly as the
+    /// banner grows/collapses instead of snapping to the target slot.
+    private var leftIconPos: CGPoint {
+        CGPoint(x: notchOffset - wingWidth / 2, y: iconY)
     }
     private var collapsedStatusPos: CGPoint {
         CGPoint(
@@ -455,8 +503,77 @@ struct NotchWrapView: View {
         }
     }
 
+    /// Pending cmux events — animated dot on the right wing, own agent status wins.
+    @ViewBuilder
+    private var cmuxDotLayer: some View {
+        if let kind = viewModel.cmuxDotKind,
+           !isVoiceActive, !isInlineActive, !viewModel.isExpanded, status == .ready {
+            CmuxStatusDotView(kind: kind, reduceMotion: reduceMotion)
+                .position(rightIconPos)
+                .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+                .clipShape(animatedNotchClipShape)
+        }
+    }
+
+    /// cmux app icon in the left wing while a cmux event is pending. Fades in with
+    /// the banner, then persists in the collapsed left wing after the 5s banner
+    /// text falls away — cleared only when the event clears (same lifecycle as the
+    /// right-wing dot). Attention events ring it like a bell — "come do something".
+    @ViewBuilder
+    private var cmuxLeftIconLayer: some View {
+        if showsCmuxLeftIcon, let notification = displayedCmuxNotification {
+            CmuxIconView(kind: notification.kind, reduceMotion: reduceMotion)
+                .position(leftIconPos)
+                .opacity(isCmuxSurfaceActive ? cmuxContentOpacity : 1)
+        }
+    }
+
+    /// The left cmux icon shows while any cmux event is pending and the notch is in
+    /// its collapsed presentation (not inline/voice/expanded).
+    private var showsCmuxLeftIcon: Bool {
+        guard !isInlineActive, !isVoiceActive, !viewModel.isExpanded else { return false }
+        return displayedCmuxNotification != nil
+    }
+
+    /// Click-through on a cmux banner/reveal focuses the cmux workspace/tab.
+    private func handleTap() {
+        if isCmuxSurfaceActive, let notification = displayedCmuxNotification {
+            viewModel.focusCmux(notification)
+            refreshSurface()
+        } else {
+            onTap()
+        }
+    }
+
+    /// One-line cmux event title shown in the bridge while the banner or
+    /// hover-reveal surface is grown.
+    @ViewBuilder
+    private var cmuxBannerLayer: some View {
+        if isCmuxSurfaceActive, let notification = displayedCmuxNotification {
+            HStack(spacing: 5) {
+                Text(notification.title)
+                    .font(.system(size: 11, weight: .regular))
+                    .kerning(0.2)
+                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                    .lineLimit(1)
+                if isCmuxHoverReveal && viewModel.cmuxPending.count > 1 {
+                    Text("+\(viewModel.cmuxPending.count - 1)")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                }
+            }
+            .frame(maxWidth: notchWidth + 2 * NotchWrapMetrics.cmuxWingWidth - 36)
+            .position(x: notchOffset + notchWidth / 2,
+                      y: notchHeight + max(1, bridgeHeight) / 2)
+            .opacity(cmuxContentOpacity)
+            .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+            .clipShape(animatedNotchClipShape)
+        }
+    }
+
     private var showsLeftStatusIcon: Bool {
         !isInlineActive
+            && !isCmuxSurfaceActive
             && viewModel.notchInteractionMode != .thinking
             && (viewModel.isExpanded || isHovered || isVoiceActive)
     }
@@ -476,7 +593,10 @@ struct NotchWrapView: View {
 
     private func setPointerHover(_ active: Bool) {
         guard isHovered != active else { return }
+        let wasRevealingCmux = isCmuxHoverReveal
         isHovered = active
+        // Finished-run cues are considered seen once the hover reveal ends.
+        if !active && wasRevealingCmux { viewModel.markCmuxFinishedSeen() }
         if !isVoiceActive { refreshSurface() }
         onHoverChanged(active || isDragTargeted)
     }
@@ -507,6 +627,8 @@ struct NotchWrapView: View {
                 ),
                 lineWidth: 1
             )
+
+            cmuxLeftIconLayer
 
             // Left icon — only when chat open, hovered, or voice active (idle = blank notch)
             if showsLeftStatusIcon {
@@ -550,7 +672,9 @@ struct NotchWrapView: View {
             }
 
             inlineSurfaceLayer
+            cmuxBannerLayer
             statusDotLayer
+            cmuxDotLayer
         }
         .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
         .contentShape(
@@ -563,7 +687,7 @@ struct NotchWrapView: View {
                 cornerRadius: NotchWrapMetrics.cornerRadius
             )
         )
-        .onTapGesture { onTap() }
+        .onTapGesture { handleTap() }
         .onDrop(of: [.fileURL], isTargeted: $isDragTargeted) { providers in
             // Expand the chat panel, then queue the dropped files
             onTap()
@@ -598,6 +722,9 @@ struct NotchWrapView: View {
             setVoiceState(active: active)
         }
         .onChange(of: viewModel.notchInteractionMode) {
+            if !isVoiceActive { refreshSurface() }
+        }
+        .onChange(of: viewModel.cmuxBanner) {
             if !isVoiceActive { refreshSurface() }
         }
         .onChange(of: viewModel.streamingChunk) {
@@ -706,7 +833,7 @@ struct InlineNotchContent: View {
             }
         }
         .font(.system(size: 15, weight: .regular))
-        .foregroundStyle(Color.white.opacity(0.92))
+        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
         .onAppear { focusIfNeeded() }
         .onChange(of: viewModel.notchInteractionMode) {
             placeholderRevealID = UUID()
@@ -725,7 +852,7 @@ struct InlineNotchContent: View {
         HStack(spacing: 10) {
             if showsInputLeadingIcon {
                 Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(Color.white.opacity(0.82))
                     .frame(width: 18, height: 18)
             }
@@ -738,7 +865,7 @@ struct InlineNotchContent: View {
                         delay: NotchWrapMetrics.surfaceDuration * 0.82,
                         reduceMotion: reduceMotion
                     )
-                        .foregroundStyle(Color.white.opacity(0.56))
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
                         .allowsHitTesting(false)
                         .id(placeholderRevealID)
                 }
@@ -746,7 +873,7 @@ struct InlineNotchContent: View {
                 TextField("", text: $viewModel.inputText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 14, weight: .regular))
-                    .foregroundStyle(Color.white)
+                    .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
                     .focused($inputFocused)
                     .onSubmit {
                         if canSend { viewModel.send() }
@@ -765,12 +892,12 @@ struct InlineNotchContent: View {
                 .scaleEffect(0.74)
             VStack(alignment: .leading, spacing: 3) {
                 Text("Thinking")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(Color.white.opacity(0.90))
+                    .font(.system(size: 14, weight: .regular))
+                    .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
                 if !viewModel.latestUserText.isEmpty {
                     Text(viewModel.latestUserText)
                         .font(.system(size: 12, weight: .regular))
-                        .foregroundStyle(Color.white.opacity(0.50))
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
@@ -929,7 +1056,7 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
             string: text,
             attributes: [
                 .font: NotchOutputLayout.font(),
-                .foregroundColor: NSColor.white.withAlphaComponent(0.92),
+                .foregroundColor: NotchWrapMetrics.notchTextPrimaryNS,
                 .paragraphStyle: paragraph,
             ]
         )
@@ -1356,6 +1483,82 @@ struct StatusDotView: View {
         }
         .onAppear { dotBlink = status == .thinking }
         .onChange(of: status) { dotBlink = status == .thinking }
+    }
+}
+
+/// Right-wing dot for pending cmux events — same pulse/blink rhythm as the
+/// thinking dot; amber = agent needs attention, green = agent finished.
+struct CmuxStatusDotView: View {
+    let kind: CmuxEventKind
+    let reduceMotion: Bool
+
+    @State private var pulsing = false
+    @State private var blink = false
+
+    private let blinkDuration: Double = 0.6
+    private var ringDuration: Double { blinkDuration * 2 }
+    private var color: Color {
+        kind == .attention ? AgentStatus.awaitingApproval.color : AgentStatus.ready.color
+    }
+
+    var body: some View {
+        ZStack {
+            if !reduceMotion {
+                Circle()
+                    .fill(color.opacity(0.45))
+                    .frame(width: 16, height: 16)
+                    .scaleEffect(pulsing ? 1.9 : 1.0)
+                    .opacity(pulsing ? 0.0 : 0.65)
+                    .animation(
+                        pulsing
+                            ? .easeOut(duration: ringDuration).repeatForever(autoreverses: false)
+                            : .default,
+                        value: pulsing
+                    )
+            }
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+                .opacity(reduceMotion ? 1.0 : (blink ? 0.28 : 1.0))
+                .animation(
+                    reduceMotion
+                        ? .default
+                        : .easeInOut(duration: blinkDuration).repeatForever(autoreverses: true),
+                    value: blink
+                )
+        }
+        .onAppear {
+            pulsing = true
+            blink = true
+        }
+    }
+}
+
+/// cmux app icon shown in the left wing of the notch. For attention events it
+/// swings from its top edge like a rung bell — a periodic nudge that manual
+/// action is waiting in cmux. Finished events keep the icon still.
+struct CmuxIconView: View {
+    let kind: CmuxEventKind
+    let reduceMotion: Bool
+    var size: CGFloat = 17
+
+    /// One ring (decaying swing) followed by three resting beats.
+    private static let swingPhases: [Double] = [0, -16, 12, -8, 5, -2, 0, 0, 0]
+
+    var body: some View {
+        let icon = Image(nsImage: CmuxEventMonitor.appIcon)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(width: size, height: size)
+        if kind == .attention && !reduceMotion {
+            icon.phaseAnimator(Self.swingPhases) { view, angle in
+                view.rotationEffect(.degrees(angle), anchor: .top)
+            } animation: { angle in
+                angle == 0 ? .easeOut(duration: 0.5) : .spring(duration: 0.16, bounce: 0.35)
+            }
+        } else {
+            icon
+        }
     }
 }
 

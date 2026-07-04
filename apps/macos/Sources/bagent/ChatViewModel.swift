@@ -315,27 +315,35 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Re-push Odoo credentials from Keychain to the daemon.
-    /// Called automatically on daemon-ready (Phase 6B fix — was defined but never called).
-    func restoreOdooFromKeychain() {
-        guard let creds = KeychainStore.loadOdoo() else { return }
+    /// Load saved Odoo credentials and connect the daemon-side MCP connector.
+    /// This intentionally runs lazily, only for Odoo turns or explicit Settings tests.
+    @discardableResult
+    func restoreOdooFromKeychain() async -> Bool {
+        guard let creds = KeychainStore.loadOdoo() else { return false }
         // Update live fields so Settings shows the saved values.
         odooURL  = creds.url
         odooDB   = creds.db
         odooUser = creds.user
         odooAPIKey = creds.apiKey
         let uvxOverride = odooUvxPath.trimmingCharacters(in: .whitespaces)
-        Task {
-            if let result = try? await client.odooConfigure(
+        do {
+            let result = try await client.odooConfigure(
                 url: creds.url, db: creds.db, user: creds.user, apiKey: creds.apiKey,
                 uvxPath: uvxOverride.isEmpty ? nil : uvxOverride
-            ) {
-                await MainActor.run {
-                    self.odooMcpAvailable = result.mcp_available ?? true
-                    self.odooToolCount = result.tool_count ?? 0
-                }
-            }
+            )
+            odooMcpAvailable = result.mcp_available ?? true
+            odooToolCount = result.tool_count ?? 0
+            return result.ok
+        } catch {
+            odooTestResult = "✗ \(error.localizedDescription)"
+            return false
         }
+    }
+
+    private func ensureOdooConfiguredIfNeeded(for text: String, sourceMode: SourceMode?) async {
+        guard sourceMode == .odoo || Self.looksLikeOdooTurn(text) else { return }
+        if let status = try? await client.odooStatus(), status.connected { return }
+        _ = await restoreOdooFromKeychain()
     }
 
     /// Open an Odoo record in Safari (called by the "Otvoriť v Safari" button).
@@ -612,6 +620,82 @@ final class ChatViewModel: ObservableObject {
     @Published var voiceActionMessage: String? = nil
     /// Called when the daemon executed a background action instead of streaming LLM.
     var onVoiceActionTaken: ((String) -> Void)?
+
+    // MARK: - cmux notifications
+
+    /// Ambient notifications from cmux agents (needs attention / finished run).
+    @Published var cmuxNotificationsEnabled: Bool = UserDefaults.standard.object(forKey: "bagent.cmux.enabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(cmuxNotificationsEnabled, forKey: "bagent.cmux.enabled")
+            if cmuxNotificationsEnabled {
+                startCmuxMonitor()
+            } else {
+                cmuxMonitor.stop()
+                cmuxPending = []
+                cmuxBanner = nil
+            }
+        }
+    }
+    /// Unread cmux events (newest first). Drives the persistent corner dot.
+    @Published var cmuxPending: [CmuxNotification] = []
+    /// Notification currently shown in the transient notch banner.
+    @Published var cmuxBanner: CmuxNotification? = nil
+    /// Attention (amber) outranks finished (green).
+    var cmuxDotKind: CmuxEventKind? {
+        if cmuxPending.contains(where: { $0.kind == .attention }) { return .attention }
+        return cmuxPending.isEmpty ? nil : .finished
+    }
+    let cmuxMonitor = CmuxEventMonitor()
+    /// Invoked for each fresh cmux event so AppKit can present the transient banner.
+    var onCmuxNotification: ((CmuxNotification) -> Void)?
+
+    func startCmuxMonitor() {
+        guard cmuxNotificationsEnabled, CmuxEventMonitor.isAvailable else { return }
+        cmuxMonitor.onEvent = { [weak self] notification in
+            self?.handleCmuxEvent(notification)
+        }
+        cmuxMonitor.start()
+    }
+
+    private func handleCmuxEvent(_ raw: CmuxNotification) {
+        // Suppress only when the user is already looking at that exact
+        // workspace (cmux frontmost + workspace selected). Events from
+        // background workspaces still cue even while cmux is focused.
+        if CmuxEventMonitor.isCmuxFrontmost() {
+            Task { [weak self] in
+                let visible = await CmuxEventMonitor.visibleWorkspaceIds()
+                guard !visible.contains(raw.workspaceId) else { return }
+                self?.deliverCmuxEvent(raw)
+            }
+        } else {
+            deliverCmuxEvent(raw)
+        }
+    }
+
+    private func deliverCmuxEvent(_ raw: CmuxNotification) {
+        var notification = raw
+        if notification.workspaceName == nil {
+            notification.workspaceName = cmuxMonitor.workspaceName(for: notification.workspaceId)
+        }
+        // Latest event per agent session wins; separate sessions (even in one
+        // workspace) keep their own pending slot.
+        cmuxPending.removeAll { $0.dedupeKey == notification.dedupeKey }
+        cmuxPending.insert(notification, at: 0)
+        if cmuxPending.count > 10 { cmuxPending.removeLast(cmuxPending.count - 10) }
+        onCmuxNotification?(notification)
+    }
+
+    /// Finished-run cues clear once the user has seen them (hover reveal ended).
+    func markCmuxFinishedSeen() {
+        cmuxPending.removeAll { $0.kind == .finished }
+    }
+
+    /// Click-through: focus cmux on the workspace/tab and clear the cue.
+    func focusCmux(_ notification: CmuxNotification) {
+        cmuxMonitor.focus(notification)
+        cmuxPending.removeAll { $0.workspaceId == notification.workspaceId }
+        cmuxBanner = nil
+    }
     // Session ID persisted in UserDefaults so it survives app restarts
     private var sessionId: String? {
         get { UserDefaults.standard.string(forKey: "bagent.session_id") }
@@ -630,6 +714,7 @@ final class ChatViewModel: ObservableObject {
         speech.preferredInputName = savedMic.isEmpty ? nil : savedMic
 
         startHealthMonitor()
+        startCmuxMonitor()
         Task { await refreshHealth() }
     }
 
@@ -710,11 +795,8 @@ final class ChatViewModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
-        // Re-push Odoo credentials from Keychain whenever the daemon becomes available.
-        // `restoreOdooFromKeychain()` was defined but never called — wired here (Phase 6B).
-        if daemonHealth?.daemonUp == true {
-            restoreOdooFromKeychain()
-        }
+        // Odoo connects lazily on the first Odoo turn, avoiding MCP startup and
+        // Keychain prompts during app launch.
         await refreshWhatsappStatusNow()
         permissions.refresh()
         if messages.isEmpty {
@@ -926,6 +1008,8 @@ final class ChatViewModel: ObservableObject {
             let idx = messages.count - 1
 
             do {
+                await ensureOdooConfiguredIfNeeded(for: text, sourceMode: sourceMode)
+
                 // ── Screen context gate (Phase 7) ─────────────────────────────
                 // 1. Cheap local keyword pre-gate (avoids LLM call on every turn)
                 // 2. If pre-gate passes → authoritative LLM classifier via /screen/intent
@@ -1257,6 +1341,27 @@ final class ChatViewModel: ObservableObject {
             "analyze this", "analyse this", "read this", "read the screen",
             "what does it say", "what does this say", "find on screen",
             "find the button", "locate on screen", "read selection", "selected text",
+        ]
+        return keywords.contains { low.contains($0) }
+    }
+
+    static func looksLikeOdooTurn(_ message: String) -> Bool {
+        let low = message.lowercased()
+        let keywords = [
+            "odoo",
+            "faktúr",
+            "faktura",
+            "invoice",
+            "partner",
+            "kontakt",
+            "zákazník",
+            "zakaznik",
+            "helpdesk",
+            "tiket",
+            "ticket",
+            "úloh",
+            "uloh",
+            "objednávk",
         ]
         return keywords.contains { low.contains($0) }
     }

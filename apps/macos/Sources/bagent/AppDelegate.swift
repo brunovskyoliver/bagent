@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var notchController: NotchWindowController?
     private var statusBar: StatusBarController?
     private var daemonLauncher: DaemonLauncher?
+    private var chatViewModel: ChatViewModel?
     private var approvalObserver: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -17,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         daemonLauncher = launcher
 
         let vm = ChatViewModel()
+        chatViewModel = vm
         notchController = NotchWindowController(chatViewModel: vm)
 
         // On notch Mac the pill below the notch is the primary indicator;
@@ -78,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         GlobalHotkey.unregister()
+        chatViewModel?.cmuxMonitor.stop()
         daemonLauncher?.stop()
     }
 }
