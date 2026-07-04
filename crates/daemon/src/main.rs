@@ -14,14 +14,13 @@ use axum::{
     Json, Router,
 };
 use bagent_agent::{
-    has_explicit_trigger, select_resolver_lessons, ContextPlan, ContextPlanner,
-    CorrectionClassifier, DirectiveExtractor, MailIntentClassifier, MemoryExtractor, OdooAction,
-    OdooIntentClassifier, PlannerRuntimeContext, PromptBuilder, PromptTrace, ReferenceCandidate,
-    ReferenceResolution, ReferenceResolver, ScreenIntentClassifier, SelectedSkill, TaskRater,
-    WhatsappAction, WhatsappIntent, WhatsappIntentClassifier, WindowIntentClassifier,
+    ContextPlan, ContextPlanner, MailIntentClassifier, OdooAction, OdooIntentClassifier,
+    PlannerRuntimeContext, PromptBuilder, PromptTrace, ReferenceCandidate, ReferenceResolution,
+    ReferenceResolver, ScreenIntentClassifier, SelectedSkill, TaskRater, WhatsappAction,
+    WhatsappIntent, WhatsappIntentClassifier, WindowIntentClassifier,
 };
 use bagent_attachments::extract as extract_attachment;
-use bagent_memory::{selector as memory_selector, InsertParams, MemoryStore, RetrieveQuery};
+use bagent_memory::MemoryStore;
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
 use bagent_skills::{selector as skill_selector, LoadedSkill};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -52,10 +51,6 @@ use whatsapp_connector::{
 mod embedded {
     refinery::embed_migrations!("migrations");
 }
-
-const SUMMARIZE_THRESHOLD: usize = 60;
-const KEEP_RECENT: usize = 20;
-const MAX_HISTORY: usize = 20; // 40 turns → ~2000 token prefill; 20 keeps TTFT <1.5s
 
 #[derive(Clone)]
 struct AppState {
@@ -93,15 +88,24 @@ struct AppState {
     /// Bridge can autostart when a prior LocalAuth session exists, and is also
     /// controlled explicitly via `/whatsapp/start` and `/whatsapp/stop`.
     whatsapp: Arc<WhatsappConnector>,
+    /// Ephemeral connector refs for current daemon run only. Never persisted.
+    runtime_refs: Arc<Mutex<HashMap<String, RuntimeRefs>>>,
 }
 
-type OllamaMsg = Message;
+#[derive(Debug, Clone, Default)]
+struct RuntimeRefs {
+    mail: Option<MailRef>,
+    file: Option<FileRef>,
+    odoo: Option<OdooRecordRef>,
+    whatsapp: Option<WhatsappRef>,
+}
 
 #[derive(Deserialize)]
 struct ChatRequest {
     message: String,
     #[serde(default)]
-    history: Vec<OllamaMsg>,
+    #[allow(dead_code)]
+    history: Vec<Message>,
     model: Option<String>,
     session_id: Option<String>,
     /// IDs returned by POST /attachments — empty when no files attached.
@@ -163,6 +167,7 @@ struct RulesSaveRequest {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct MemoryInsertRequest {
     namespace: String,
     kind: String,
@@ -185,6 +190,7 @@ fn default_und() -> String {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct MemorySearchQuery {
     #[serde(default)]
     q: String,
@@ -359,6 +365,7 @@ async fn main() -> Result<()> {
     embedded::migrations::runner()
         .run(&mut conn)
         .map_err(|e| anyhow::anyhow!("migration error: {e}"))?;
+    purge_legacy_context_data(&data_dir, &mut conn);
     let db = Arc::new(Mutex::new(conn));
 
     let token_path = data_dir.join("daemon.token");
@@ -420,54 +427,6 @@ async fn main() -> Result<()> {
             }
             if r_embed.is_ok() {
                 tracing::info!("warmup: embed model loaded");
-            }
-        });
-    }
-
-    // Startup: import any markdown mirror files changed since last run
-    {
-        let mirror_memory = memory.clone();
-        tokio::spawn(async move {
-            mirror_memory.scan_and_import_mirror().await;
-        });
-    }
-
-    // Startup: backfill embeddings for chat_turns missing from embeddings table
-    {
-        let backfill_memory = memory.clone();
-        let backfill_db_path = data_dir.join("bagent.db");
-        tokio::spawn(async move {
-            // Small delay to let the server start before loading the embed model
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let conn = match rusqlite::Connection::open(&backfill_db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("backfill: failed to open db: {e}");
-                    return;
-                }
-            };
-            let ids: Vec<(String, String)> = {
-                let mut stmt = match conn.prepare(
-                    "SELECT id, content FROM chat_turns \
-                     WHERE id NOT IN (SELECT item_id FROM embeddings WHERE source='chat_turn') \
-                     AND role IN ('user','assistant') \
-                     LIMIT 200",
-                ) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                    .ok()
-                    .map(|rows| rows.flatten().collect())
-                    .unwrap_or_default()
-            };
-            tracing::info!("backfill: embedding {} chat_turns", ids.len());
-            for (id, content) in ids {
-                if let Err(e) = backfill_memory.embed_chat_turn(&id, &content).await {
-                    tracing::debug!("backfill embed error: {e}");
-                }
-                // Throttle to avoid hammering Ollama
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
     }
@@ -697,6 +656,7 @@ async fn main() -> Result<()> {
         codex,
         odoo,
         whatsapp,
+        runtime_refs: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -793,6 +753,28 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
     let _ = std::fs::remove_file(data_dir.join("daemon.pid"));
     Ok(())
+}
+
+fn purge_legacy_context_data(data_dir: &std::path::Path, conn: &mut Connection) {
+    let cleanup_sql = [
+        "DELETE FROM memory_items",
+        "DELETE FROM chat_turn_attachments",
+        "DELETE FROM chat_turns",
+        "DELETE FROM embeddings WHERE source IN ('memory_item','chat_turn')",
+        "UPDATE sessions SET summary = NULL, metadata_json = NULL",
+    ];
+    for sql in cleanup_sql {
+        if let Err(e) = conn.execute(sql, []) {
+            tracing::debug!("legacy context purge skipped `{sql}`: {e}");
+        }
+    }
+
+    let memories_dir = data_dir.join("memories");
+    if memories_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&memories_dir) {
+            tracing::debug!("legacy memory mirror purge skipped: {e}");
+        }
+    }
 }
 
 // ── Filesystem handlers ───────────────────────────────────────────────────────
@@ -1471,7 +1453,7 @@ async fn debug_context_plan(
             &req.message,
             &req.recent_context,
             &req.reference_candidates,
-            &resolver_lessons_for_turn(&state.memory, &req.message).await,
+            &[],
             &chrono::Local::now().to_rfc3339(),
         )
         .await
@@ -1505,30 +1487,11 @@ async fn debug_context_plan(
         skill_selector::select(&plan.candidate_skill_names, &state.skills, &req.message);
     let selected_skill_names: Vec<&str> = selected_skills.iter().map(|s| s.name.as_str()).collect();
 
-    // Run memory selection (dry run — no updates to use_count)
-    let selected_memory_ids: Vec<String> =
-        if plan.needs_memory && !plan.memory_namespaces.is_empty() {
-            let ns_refs: Vec<&str> = plan.memory_namespaces.iter().map(|s| s.as_str()).collect();
-            let kind_refs: Vec<&str> = plan.memory_kinds.iter().map(|s| s.as_str()).collect();
-            state
-                .memory
-                .retrieve_filtered(RetrieveQuery {
-                    query: &req.message,
-                    namespaces: &ns_refs,
-                    kinds: &kind_refs,
-                    k: 6,
-                    max_per_namespace: 3,
-                    score_threshold: 0.0,
-                    allow_sensitive: false,
-                })
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|h| h.item.id)
-                .collect()
-        } else {
-            vec![]
-        };
+    plan.needs_memory = false;
+    plan.memory_namespaces.clear();
+    plan.memory_kinds.clear();
+    plan.needs_conversation_recall = false;
+    let selected_memory_ids: Vec<String> = Vec::new();
 
     (
         StatusCode::OK,
@@ -1747,22 +1710,6 @@ fn build_reference_candidates(
     candidates
 }
 
-async fn resolver_lessons_for_turn(memory: &Arc<MemoryStore>, user_message: &str) -> Vec<String> {
-    let hits = memory
-        .retrieve_filtered(RetrieveQuery {
-            query: user_message,
-            namespaces: &["resolver_lessons"],
-            kinds: &["routing_lesson"],
-            k: 3,
-            max_per_namespace: 3,
-            score_threshold: 0.08,
-            allow_sensitive: false,
-        })
-        .await
-        .unwrap_or_default();
-    select_resolver_lessons(&hits, 3)
-}
-
 /// Return the connector that the user explicitly named in their turn, if any.
 /// Used to prevent the resolver override from replacing an explicitly-named connector
 /// (e.g. "whatsapp") with a contradicting one produced by the LLM (e.g. "mail").
@@ -1921,51 +1868,6 @@ fn preview_text(s: &str, max: usize) -> String {
     } else {
         let end = compact.floor_char_boundary(max);
         format!("{}…", &compact[..end])
-    }
-}
-
-fn resolver_lesson_from_correction(
-    result: &bagent_agent::CorrectionResult,
-) -> Option<&'static str> {
-    if !result.is_correction || result.confidence <= 0.7 {
-        return None;
-    }
-    let combined = format!(
-        "{} {}",
-        result.what_was_wrong.as_deref().unwrap_or(""),
-        result.correct_behavior.as_deref().unwrap_or("")
-    )
-    .to_lowercase();
-    let indicates_source_gap = [
-        "source",
-        "detail",
-        "details",
-        "content",
-        "body",
-        "record",
-        "metadata",
-        "summary",
-        "summar",
-        "fetch",
-        "full",
-        "table",
-        "row",
-        "line item",
-        "obsah",
-        "telo",
-        "riad",
-        "tabuľ",
-        "tabul",
-    ]
-    .iter()
-    .any(|needle| combined.contains(needle));
-
-    if indicates_source_gap {
-        Some(
-            "When a follow-up asks for content details after a prior metadata, summary, or list answer, fetch the target connector's full source record before answering; prior summaries are not sufficient evidence.",
-        )
-    } else {
-        None
     }
 }
 
@@ -2189,7 +2091,6 @@ async fn chat(
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel(64);
     let model = req.model.clone().unwrap_or(state.default_model.clone());
-    let classifier_model = state.classifier_model.clone();
     let intent_model = state.classifier_model.clone();
     let db = state.db.clone();
     let ollama = state.ollama.clone();
@@ -2216,6 +2117,7 @@ async fn chat(
     let task_rater = state.task_rater.clone();
     let fs = state.fs.clone();
     let fs_exec = state.fs.clone(); // kept for action execution in handler post-classify
+    let runtime_refs = state.runtime_refs.clone();
 
     tokio::spawn(async move {
         let t0 = std::time::Instant::now();
@@ -2235,59 +2137,17 @@ async fn chat(
             }
         };
 
-        // Check for explicit memory directive before answering
-        let directive_extractor = DirectiveExtractor::new(ollama.clone(), classifier_model.clone());
-        if has_explicit_trigger(&user_message) {
-            if let Ok(Some(directive)) = directive_extractor.detect_and_extract(&user_message).await
-            {
-                if let Ok(Some(mem_id)) = memory
-                    .insert_full(InsertParams {
-                        namespace: &directive.namespace,
-                        kind: &directive.kind,
-                        language: &directive.language,
-                        text: &directive.directive,
-                        source: "explicit",
-                        confidence: 0.95,
-                        importance: 0.80,
-                        sensitivity: "normal",
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    let ev = Event::default()
-                        .data(serde_json::json!({"type":"memory_saved","id": mem_id}).to_string());
-                    let _ = tx.send(Ok(ev)).await;
-                }
-            }
-        }
-
+        let history: Vec<Message> = Vec::new();
+        let session_summary = None;
+        let runtime_snapshot = load_runtime_refs(&runtime_refs, &session_id).await;
+        let last_mail_ref = runtime_snapshot.mail;
+        let last_file_ref = runtime_snapshot.file;
+        let last_odoo_ref = runtime_snapshot.odoo;
+        let last_whatsapp_ref = runtime_snapshot.whatsapp;
         tracing::info!(
-            "chat timing: directive check {}ms",
+            "chat timing: clean state loaded {}ms",
             t0.elapsed().as_millis()
         );
-        // Load server-side history + session summary + connector refs in parallel.
-        let (
-            history,
-            session_summary,
-            last_mail_ref,
-            last_file_ref,
-            last_odoo_ref,
-            last_whatsapp_ref,
-        ) = tokio::join!(
-            async {
-                if req.history.is_empty() {
-                    load_session_history(&db, &session_id).await
-                } else {
-                    prepare_history(&ollama, &model, req.history).await
-                }
-            },
-            load_session_summary(&db, &session_id),
-            load_last_mail_ref(&db, &session_id),
-            load_last_file_ref(&db, &session_id),
-            load_last_odoo_ref(&db, &session_id),
-            load_last_whatsapp_ref(&db, &session_id),
-        );
-        tracing::info!("chat timing: history loaded {}ms", t0.elapsed().as_millis());
 
         // Detect language (simple heuristic: SK diacritics present?)
         let lang = if user_message.chars().any(|c| "áčďéíľĺňóôŕšťúýž".contains(c)) {
@@ -2319,13 +2179,12 @@ async fn chat(
             last_odoo_ref.as_ref(),
             last_whatsapp_ref.as_ref(),
         );
-        let resolver_lessons = resolver_lessons_for_turn(&memory, &user_message).await;
         let reference_resolution = reference_resolver
             .resolve(
                 &user_message,
                 &recent_context,
                 &reference_candidates,
-                &resolver_lessons,
+                &[],
                 &chrono::Local::now().to_rfc3339(),
             )
             .await
@@ -2351,6 +2210,10 @@ async fn chat(
             .await;
         apply_reference_resolution_to_plan(&mut context_plan, &reference_resolution, &user_message);
         apply_source_mode_to_plan(&mut context_plan, source_mode.as_deref());
+        context_plan.needs_memory = false;
+        context_plan.memory_namespaces.clear();
+        context_plan.memory_kinds.clear();
+        context_plan.needs_conversation_recall = false;
         tracing::info!(
             "chat timing: context plan ready {}ms — task={} source={} needs_memory={} skills={:?} ref={:?}",
             t0.elapsed().as_millis(),
@@ -2528,8 +2391,7 @@ async fn chat(
                     .to_string(),
                 )))
                 .await;
-            // Persist for cross-turn reference ("tento mail", "má prílohy?")
-            save_last_mail_ref(&db, &session_id, mail_ref).await;
+            save_last_mail_ref(&runtime_refs, &session_id, mail_ref).await;
         }
 
         // Emit odoo_found so the client can show an "Otvoriť v Safari" button.
@@ -2546,7 +2408,7 @@ async fn chat(
                     .to_string(),
                 )))
                 .await;
-            save_last_odoo_ref(&db, &session_id, odoo_ref).await;
+            save_last_odoo_ref(&runtime_refs, &session_id, odoo_ref).await;
         }
 
         if let Some(ref whatsapp_ref) = whatsapp_ref_opt {
@@ -2562,7 +2424,7 @@ async fn chat(
                     .to_string(),
                 )))
                 .await;
-            save_last_whatsapp_ref(&db, &session_id, whatsapp_ref).await;
+            save_last_whatsapp_ref(&runtime_refs, &session_id, whatsapp_ref).await;
         }
 
         // Load attachment records from DB and build context + image data for Ollama.
@@ -2754,54 +2616,12 @@ async fn chat(
                 .collect()
         };
 
-        // Select memory + corrections
-        let (selected_memory, corrections, recall_candidates) = {
-            let (mem_result, corr_result, recall_result) = tokio::join!(
-                async {
-                    if context_plan.needs_memory && !context_plan.memory_namespaces.is_empty() {
-                        memory_selector::select(
-                            &memory,
-                            memory_selector::SelectQuery {
-                                query: &user_message,
-                                namespaces: &context_plan.memory_namespaces,
-                                kinds: &context_plan.memory_kinds,
-                                max_cards: None,
-                            },
-                        )
-                        .await
-                        .unwrap_or_default()
-                    } else {
-                        vec![]
-                    }
-                },
-                async {
-                    // Corrections and glossary always retrieved when memory is needed
-                    if context_plan.needs_memory {
-                        memory
-                            .retrieve(
-                                &user_message,
-                                &["sk_glossary", "correction", "corrections", "negative_rules"],
-                                6,
-                            )
-                            .await
-                            .unwrap_or_default()
-                    } else {
-                        vec![]
-                    }
-                },
-                async {
-                    // Recall candidates fetched always for debug trace; injected only when planned
-                    memory
-                        .retrieve_turn_candidates(&user_message, Some(&session_id), 3)
-                        .await
-                        .unwrap_or_default()
-                },
-            );
-            (mem_result, corr_result, recall_result)
-        };
+        let selected_memory = Vec::new();
+        let corrections = Vec::new();
+        let recall_candidates = Vec::new();
 
         tracing::info!(
-            "chat timing: memory selected {}ms — {} cards, {} corrections, recall={}",
+            "chat timing: stateless context selected {}ms — {} cards, {} corrections, recall={}",
             t0.elapsed().as_millis(),
             selected_memory.len(),
             corrections.len(),
@@ -2834,24 +2654,6 @@ async fn chat(
         {
             Ok(mut built) => {
                 let reference_json = serde_json::to_value(&reference_resolution).ok();
-                if reference_resolution.confidence >= 0.60
-                    || reference_resolution.resolved_connector.is_some()
-                {
-                    let reference_block = format!(
-                        "## Resolved current reference\n{}",
-                        serde_json::to_string_pretty(&reference_resolution).unwrap_or_default()
-                    );
-                    built
-                        .messages
-                        .push(Message::system(reference_block.clone()));
-                    built.trace.layers.push(bagent_agent::PromptLayerTrace {
-                        name: "resolved_reference".to_string(),
-                        role: "system".to_string(),
-                        included: true,
-                        chars: reference_block.len(),
-                        preview: preview_text(&reference_block, 240),
-                    });
-                }
                 built.trace.reference_resolution = reference_json;
                 built.trace.resolved_connector = reference_resolution.resolved_connector.clone();
                 built.trace.standalone_query =
@@ -2922,24 +2724,7 @@ async fn chat(
             }
         };
 
-        // Persist user turn + attachment links
-        {
-            let turn_id = Uuid::new_v4().to_string();
-            let now = chrono::Utc::now().to_rfc3339();
-            if let Ok(db) = db.try_lock() {
-                let _ = db.execute(
-                    "INSERT INTO chat_turns (id, session_id, role, content, language, model, created_at) \
-                     VALUES (?1,?2,'user',?3,?4,?5,?6)",
-                    rusqlite::params![turn_id, session_id, user_message, lang, effective_model, now],
-                );
-                for att_id in &att_data.turn_ids {
-                    let _ = db.execute(
-                        "INSERT OR IGNORE INTO chat_turn_attachments (chat_turn_id, attachment_id) VALUES (?1, ?2)",
-                        rusqlite::params![turn_id, att_id],
-                    );
-                }
-            }
-        }
+        // Stateless chat: do not persist user turns or attachment links.
 
         let prompt_chars: usize = messages.iter().map(|m| m.content.len()).sum();
         tracing::info!(
@@ -3397,9 +3182,8 @@ async fn chat(
                     }
                 } // end 'agent loop
 
-                // Persist found file ref for cross-turn coreference
                 if let Some(ref fref) = found_file_ref {
-                    save_last_file_ref(&db, &session_id, fref).await;
+                    save_last_file_ref(&runtime_refs, &session_id, fref).await;
                 }
 
                 // Final streaming answer: model has all tool results in context.
@@ -3430,21 +3214,11 @@ async fn chat(
                     }
                 }
 
-                // Persist assistant turn
-                {
-                    let turn_id = Uuid::new_v4().to_string();
-                    let now = chrono::Utc::now().to_rfc3339();
-                    if let Ok(db) = db.try_lock() {
-                        let _ = db.execute(
-                            "INSERT INTO chat_turns (id, session_id, role, content, language, model, created_at) \
-                             VALUES (?1,?2,'assistant',?3,?4,?5,?6)",
-                            rusqlite::params![turn_id, session_id, full_response, lang, effective_model, now],
-                        );
-                        let _ = db.execute(
-                            "INSERT INTO audit_entries (action, payload, model) VALUES (?1, ?2, ?3)",
-                            rusqlite::params!["chat", &user_message, &effective_model],
-                        );
-                    }
+                if let Ok(db) = db.try_lock() {
+                    let _ = db.execute(
+                        "INSERT INTO audit_entries (action, payload, model) VALUES (?1, ?2, ?3)",
+                        rusqlite::params!["chat", &user_message, &effective_model],
+                    );
                 }
 
                 let _ = tx
@@ -3452,33 +3226,6 @@ async fn chat(
                         serde_json::json!({"type":"done","session_id": session_id}).to_string(),
                     )))
                     .await;
-
-                // Background: memory extraction + turn embedding
-                let memory_extractor =
-                    MemoryExtractor::new(ollama.clone(), classifier_model.clone());
-                let memory_bg = memory.clone();
-                let user_msg_bg = user_message.clone();
-                let reply_bg = full_response.clone();
-                let lang_bg = lang.to_string();
-                let db_bg = db.clone();
-                let turn_id_bg = {
-                    let db_g = db_bg.try_lock().ok();
-                    db_g.and_then(|d| {
-                        d.query_row(
-                            "SELECT id FROM chat_turns WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1",
-                            rusqlite::params![session_id],
-                            |r| r.get::<_, String>(0),
-                        )
-                        .ok()
-                    })
-                    .unwrap_or_default()
-                };
-                tokio::spawn(async move {
-                    let extract_fut =
-                        memory_extractor.run(&user_msg_bg, &reply_bg, memory_bg.clone(), &lang_bg);
-                    let embed_fut = memory_bg.embed_chat_turn(&turn_id_bg, &reply_bg);
-                    let _ = tokio::join!(extract_fut, embed_fut);
-                });
 
                 return; // ← early return; skip the non-file single-LLM path below
             }
@@ -3526,16 +3273,8 @@ async fn chat(
                 .await;
         }
 
-        // Persist assistant turn
         let response_for_audit = full_response.clone();
-        let turn_id = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().to_rfc3339();
         if let Ok(db) = db.try_lock() {
-            let _ = db.execute(
-                "INSERT INTO chat_turns (id, session_id, role, content, language, model, created_at) \
-                 VALUES (?1,?2,'assistant',?3,?4,?5,?6)",
-                rusqlite::params![turn_id, session_id, full_response, lang, effective_model, now],
-            );
             let _ = db.execute(
                 "INSERT INTO audit_entries (action, payload, model) VALUES (?1, ?2, ?3)",
                 rusqlite::params!["chat", &user_message, &effective_model],
@@ -3576,137 +3315,6 @@ async fn chat(
                 serde_json::json!({"type":"done","session_id": session_id}).to_string(),
             )))
             .await;
-
-        // Background: correction classifier + passive memory extraction + session summarizer + turn embedding
-        let correction_classifier =
-            CorrectionClassifier::new(ollama.clone(), classifier_model.clone());
-        let memory_extractor = MemoryExtractor::new(ollama.clone(), classifier_model.clone());
-        let memory_bg = memory.clone();
-        let ollama_bg = ollama.clone();
-        let model_bg = effective_model.clone();
-        let user_msg_bg = user_message.clone();
-        let reply_bg = response_for_audit.clone();
-        let lang_bg = lang.to_string();
-        let session_bg = session_id.clone();
-        let db_bg = db.clone();
-        let turn_id_bg = turn_id.clone();
-        tokio::spawn(async move {
-            // Embed + correction + memory extraction all in parallel — none depends on
-            // the others, and each calls a different model (bge-m3 / qwen2.5:0.5b).
-            let embed_fut = memory_bg.embed_chat_turn(&turn_id_bg, &reply_bg);
-
-            let correction_fut = {
-                let mem = memory_bg.clone();
-                let reply = reply_bg.clone();
-                let msg = user_msg_bg.clone();
-                async move {
-                    if let Ok(result) = correction_classifier.classify(&reply, &msg).await {
-                        if result.is_correction && result.confidence > 0.7 {
-                            let text = format!(
-                                "Oprava: {} → {}",
-                                result.what_was_wrong.as_deref().unwrap_or("?"),
-                                result.correct_behavior.as_deref().unwrap_or("?")
-                            );
-                            if let Some(lesson) = resolver_lesson_from_correction(&result) {
-                                let _ = mem
-                                    .insert_full(InsertParams {
-                                        namespace: "resolver_lessons",
-                                        kind: "routing_lesson",
-                                        language: "und",
-                                        text: lesson,
-                                        source: "explicit",
-                                        source_ref: Some("correction"),
-                                        confidence: result.confidence,
-                                        importance: 0.85,
-                                        sensitivity: "normal",
-                                        ..Default::default()
-                                    })
-                                    .await;
-                            }
-                            let namespace = if result.scope == "sk_lang" {
-                                "sk_glossary"
-                            } else {
-                                "corrections"
-                            };
-                            let _ = mem
-                                .insert_full(InsertParams {
-                                    namespace,
-                                    kind: "correction",
-                                    language: "und",
-                                    text: &text,
-                                    source: "passive",
-                                    confidence: result.confidence,
-                                    importance: 0.75,
-                                    sensitivity: "normal",
-                                    ..Default::default()
-                                })
-                                .await;
-                        }
-                    }
-                }
-            };
-
-            let extract_fut =
-                memory_extractor.run(&user_msg_bg, &reply_bg, memory_bg.clone(), &lang_bg);
-
-            let (embed_result, _, _) = tokio::join!(embed_fut, correction_fut, extract_fut);
-            if let Err(e) = embed_result {
-                tracing::debug!("chat turn embed error: {e}");
-            }
-
-            // Session summarizer: every 10 turns, regenerate sessions.summary
-            let turn_count: i64 = db_bg
-                .try_lock()
-                .ok()
-                .and_then(|db| {
-                    db.query_row(
-                        "SELECT COUNT(*) FROM chat_turns WHERE session_id = ?1",
-                        rusqlite::params![session_bg],
-                        |r| r.get(0),
-                    )
-                    .ok()
-                })
-                .unwrap_or(0);
-
-            if turn_count > 0 && turn_count % 10 == 0 {
-                // Fetch last 20 turns for summary
-                let turns_text: Option<String> = db_bg.try_lock().ok().and_then(|db| {
-                    let mut stmt = db
-                        .prepare(
-                            "SELECT role, content FROM chat_turns WHERE session_id = ?1 \
-                         ORDER BY created_at DESC LIMIT 20",
-                        )
-                        .ok()?;
-                    let rows: Vec<String> = stmt
-                        .query_map(rusqlite::params![session_bg], |r| {
-                            let role: String = r.get(0)?;
-                            let content: String = r.get(1)?;
-                            Ok(format!("[{role}]: {content}"))
-                        })
-                        .ok()?
-                        .flatten()
-                        .collect();
-                    Some(rows.into_iter().rev().collect::<Vec<_>>().join("\n"))
-                });
-
-                if let Some(text) = turns_text {
-                    let prompt = format!(
-                        "Summarize this conversation concisely in 2-3 sentences, preserving key facts and decisions:\n{text}"
-                    );
-                    if let Ok(summary) = ollama_bg
-                        .summarize(&model_bg, &[Message::user(prompt)])
-                        .await
-                    {
-                        if let Ok(db) = db_bg.try_lock() {
-                            let _ = db.execute(
-                                "UPDATE sessions SET summary = ?1 WHERE id = ?2",
-                                rusqlite::params![summary, session_bg],
-                            );
-                        }
-                    }
-                }
-            }
-        });
     });
 
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
@@ -3733,62 +3341,18 @@ async fn session_create(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn sessions_list(State(state): State<AppState>) -> impl IntoResponse {
-    let db = state.db.lock().await;
-    let mut stmt = match db.prepare(
-        "SELECT id, started_at, ended_at, language, summary FROM sessions ORDER BY started_at DESC LIMIT 50"
-    ) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
-    };
-    let sessions: Vec<serde_json::Value> = stmt
-        .query_map([], |row| {
-            Ok(serde_json::json!({
-                "id": row.get::<_, String>(0)?,
-                "started_at": row.get::<_, String>(1)?,
-                "ended_at": row.get::<_, Option<String>>(2)?,
-                "language": row.get::<_, Option<String>>(3)?,
-                "summary": row.get::<_, Option<String>>(4)?,
-            }))
-        })
-        .ok()
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "sessions": sessions })),
-    )
+async fn sessions_list(State(_state): State<AppState>) -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({ "sessions": [] })))
 }
 
-async fn session_turns(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    let db = state.db.lock().await;
-    let mut stmt = match db.prepare(
-        "SELECT id, role, content, language, model, created_at FROM chat_turns \
-         WHERE session_id = ?1 ORDER BY created_at",
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-        }
-    };
-    let turns: Vec<serde_json::Value> = stmt
-        .query_map(rusqlite::params![id], |row| {
-            Ok(serde_json::json!({
-                "id": row.get::<_, String>(0)?,
-                "role": row.get::<_, String>(1)?,
-                "content": row.get::<_, String>(2)?,
-                "language": row.get::<_, String>(3)?,
-                "model": row.get::<_, Option<String>>(4)?,
-                "created_at": row.get::<_, String>(5)?,
-            }))
-        })
-        .ok()
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default();
-    (StatusCode::OK, Json(serde_json::json!({ "turns": turns })))
+async fn session_turns(
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
+) -> impl IntoResponse {
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({ "error": "session history is disabled", "turns": [] })),
+    )
 }
 
 async fn session_delete(
@@ -3812,179 +3376,43 @@ async fn session_delete(
 // ── Memory handlers ───────────────────────────────────────────────────────────
 
 async fn memory_insert(
-    State(state): State<AppState>,
-    Json(req): Json<MemoryInsertRequest>,
+    State(_state): State<AppState>,
+    Json(_req): Json<MemoryInsertRequest>,
 ) -> impl IntoResponse {
-    match state
-        .memory
-        .insert_full(InsertParams {
-            namespace: &req.namespace,
-            kind: &req.kind,
-            language: &req.language,
-            text: &req.text,
-            source_ref: req.source_ref.as_deref(),
-            metadata_json: req.metadata_json.as_deref(),
-            expires_at: req.expires_at.as_deref(),
-            source: req.source.as_deref().unwrap_or("explicit"),
-            confidence: req.confidence.unwrap_or(0.9),
-            importance: req.importance.unwrap_or(0.7),
-            sensitivity: req.sensitivity.as_deref().unwrap_or("normal"),
-            subject: req.subject.as_deref(),
-        })
-        .await
-    {
-        Ok(Some(id)) => {
-            let db = state.db.lock().await;
-            let _ = db.execute(
-                "INSERT INTO audit_entries (action, payload, model) VALUES ('memory_save', ?1, '')",
-                rusqlite::params![
-                    serde_json::json!({"id": id, "kind": req.kind, "namespace": req.namespace})
-                        .to_string()
-                ],
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "id": id, "saved": true })),
-            )
-        }
-        Ok(None) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "saved": false, "reason": "duplicate" })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({ "error": "memory is disabled" })),
+    )
 }
 
 async fn memory_list(
-    State(state): State<AppState>,
-    Query(q): Query<MemorySearchQuery>,
+    State(_state): State<AppState>,
+    Query(_q): Query<MemorySearchQuery>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().await;
-    let sql = if q.namespace.is_empty() {
-        "SELECT id, namespace, kind, language, text, source_ref, created_at, use_count, \
-                status, source, confidence, importance, sensitivity \
-         FROM memory_items WHERE status = 'active' ORDER BY updated_at DESC LIMIT ?1"
-            .to_string()
-    } else {
-        "SELECT id, namespace, kind, language, text, source_ref, created_at, use_count, \
-                status, source, confidence, importance, sensitivity \
-         FROM memory_items WHERE namespace = ?2 AND status = 'active' ORDER BY updated_at DESC LIMIT ?1"
-            .to_string()
-    };
-
-    let query_fn = |row: &rusqlite::Row<'_>| {
-        Ok(serde_json::json!({
-            "id": row.get::<_, String>(0)?,
-            "namespace": row.get::<_, String>(1)?,
-            "kind": row.get::<_, String>(2)?,
-            "language": row.get::<_, String>(3)?,
-            "text": row.get::<_, String>(4)?,
-            "source_ref": row.get::<_, Option<String>>(5)?,
-            "created_at": row.get::<_, String>(6)?,
-            "use_count": row.get::<_, i64>(7)?,
-            "status": row.get::<_, String>(8)?,
-            "source": row.get::<_, String>(9)?,
-            "confidence": row.get::<_, f64>(10)?,
-            "importance": row.get::<_, f64>(11)?,
-            "sensitivity": row.get::<_, String>(12)?,
-        }))
-    };
-
-    let items: Vec<serde_json::Value> = if q.namespace.is_empty() {
-        db.prepare(&sql)
-            .ok()
-            .and_then(|mut s| {
-                s.query_map(rusqlite::params![q.limit as i64], query_fn)
-                    .ok()
-                    .map(|rows| rows.flatten().collect())
-            })
-            .unwrap_or_default()
-    } else {
-        db.prepare(&sql)
-            .ok()
-            .and_then(|mut s| {
-                s.query_map(rusqlite::params![q.limit as i64, q.namespace], query_fn)
-                    .ok()
-                    .map(|rows| rows.flatten().collect())
-            })
-            .unwrap_or_default()
-    };
-
-    (StatusCode::OK, Json(serde_json::json!({ "items": items })))
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({ "error": "memory is disabled", "items": [] })),
+    )
 }
 
 async fn memory_search(
-    State(state): State<AppState>,
-    Query(q): Query<MemorySearchQuery>,
+    State(_state): State<AppState>,
+    Query(_q): Query<MemorySearchQuery>,
 ) -> impl IntoResponse {
-    let namespaces: Vec<&str> = if q.namespace.is_empty() {
-        vec!["global", "user_pref", "sk_glossary", "correction"]
-    } else {
-        vec![q.namespace.as_str()]
-    };
-    let kind_filter: Vec<&str> = if q.kind.is_empty() {
-        vec![]
-    } else {
-        vec![q.kind.as_str()]
-    };
-
-    match state
-        .memory
-        .retrieve_filtered(RetrieveQuery {
-            query: &q.q,
-            namespaces: &namespaces,
-            kinds: &kind_filter,
-            k: q.limit,
-            max_per_namespace: 3,
-            score_threshold: 0.0,
-            allow_sensitive: false,
-        })
-        .await
-    {
-        Ok(hits) => {
-            let items: Vec<serde_json::Value> = hits
-                .into_iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "id": h.item.id,
-                        "namespace": h.item.namespace,
-                        "kind": h.item.kind,
-                        "text": h.item.text,
-                        "score": h.score,
-                    })
-                })
-                .collect();
-            (StatusCode::OK, Json(serde_json::json!({ "hits": items })))
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({ "error": "memory is disabled", "hits": [] })),
+    )
 }
 
-async fn memory_delete(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    match state.memory.delete(&id) {
-        Ok(true) => {
-            let db = state.db.lock().await;
-            let _ = db.execute(
-                "INSERT INTO audit_entries (action, payload, model) VALUES ('memory_forget', ?1, '')",
-                rusqlite::params![serde_json::json!({"id": id}).to_string()],
-            );
-            (StatusCode::OK, Json(serde_json::json!({ "deleted": true })))
-        }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "not found" })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
+async fn memory_delete(
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
+) -> impl IntoResponse {
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({ "error": "memory is disabled" })),
+    )
 }
 
 // ── Mail handlers ─────────────────────────────────────────────────────────────
@@ -5201,13 +4629,6 @@ async fn whatsapp_send_handler(
         _ => {} // Auto or Ask — BOTH proceed to explicit approval below (trap #1).
     }
 
-    // Approval modal description — shown verbatim to the user.
-    // Trap #2: the audit_description passed to request_approval_core must be
-    // REDACTED (preview only) to keep raw message bodies out of audit_entries.
-    let approval_description = format!(
-        "Odoslať WhatsApp správu — Príjemca: {}\nText: {}",
-        recipient_display, &text
-    );
     let text_preview = if text.len() > 60 {
         format!("{}… ({} znakov)", &text[..60], text.len())
     } else {
@@ -5236,11 +4657,6 @@ async fn whatsapp_send_handler(
             Json(serde_json::json!({ "sent": false, "reason": "denied" })),
         );
     }
-
-    // Store the approval description (with full text) in the modal side-channel
-    // so the Swift app can show it before the user decides. Here we just proceed.
-    // (The full-text version was already shown via `approval_description` above in the
-    //  approval request that the Swift app rendered.)
 
     match state.whatsapp.send_message(target, &text).await {
         Ok(msg_ref) => {
@@ -5277,7 +4693,7 @@ async fn whatsapp_send_handler(
 async fn mail_sync_inner(
     db: Arc<Mutex<Connection>>,
     mail: MailConnector,
-    memory: Arc<MemoryStore>,
+    _memory: Arc<MemoryStore>,
 ) -> Result<(usize, i64), String> {
     // Determine last sync and whether this is a first sync (deeper history)
     let (last_sync, is_first): (i64, bool) = {
@@ -5306,8 +4722,6 @@ async fn mail_sync_inner(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let rowids: Vec<i64> = new_msgs.iter().map(|m| m.rowid).collect();
-
     {
         let db_lock = db.lock().await;
         for msg in &new_msgs {
@@ -5330,20 +4744,6 @@ async fn mail_sync_inner(
                 rusqlite::params![now],
             )
             .ok();
-    }
-
-    // Post-sync: embed new mail subjects for semantic search (best-effort, background)
-    if !rowids.is_empty() {
-        let memory_embed = memory.clone();
-        let msgs_for_embed = new_msgs;
-        tokio::spawn(async move {
-            for msg in msgs_for_embed {
-                let text = format!("{} {}", msg.subject, msg.sender);
-                let turn_id = format!("mail:{}", msg.rowid);
-                let _ = memory_embed.embed_chat_turn(&turn_id, &text).await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        });
     }
 
     Ok((count, now))
@@ -7816,197 +7216,63 @@ fn relative_date(unix: i64) -> String {
 
 // ── Context management ────────────────────────────────────────────────────────
 
-async fn load_session_summary(db: &Arc<Mutex<Connection>>, session_id: &str) -> Option<String> {
-    db.lock()
-        .await
-        .query_row(
-            "SELECT summary FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-}
-
-/// Read-modify-write a single key inside `sessions.metadata_json`.
-/// Safe to call concurrently: each call holds the mutex for the duration.
-async fn merge_session_metadata(
-    db: &Arc<Mutex<Connection>>,
+async fn load_runtime_refs(
+    refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
-    key: &str,
-    value: serde_json::Value,
+) -> RuntimeRefs {
+    refs.lock()
+        .await
+        .get(session_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn save_last_mail_ref(
+    refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
+    session_id: &str,
+    mail_ref: &MailRef,
 ) {
-    let existing: Option<String> = db
-        .lock()
+    refs.lock()
         .await
-        .query_row(
-            "SELECT metadata_json FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-
-    let mut blob: serde_json::Value = existing
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-
-    if let Some(obj) = blob.as_object_mut() {
-        obj.insert(key.to_string(), value);
-    }
-
-    if let Ok(json) = serde_json::to_string(&blob) {
-        let _ = db.lock().await.execute(
-            "UPDATE sessions SET metadata_json = ?1 WHERE id = ?2",
-            rusqlite::params![json, session_id],
-        );
-    }
+        .entry(session_id.to_string())
+        .or_default()
+        .mail = Some(mail_ref.clone());
 }
 
-async fn save_last_mail_ref(db: &Arc<Mutex<Connection>>, session_id: &str, mail_ref: &MailRef) {
-    let val = serde_json::to_value(mail_ref).unwrap_or(serde_json::Value::Null);
-    merge_session_metadata(db, session_id, "last_mail_ref", val).await;
-}
-
-async fn load_last_mail_ref(db: &Arc<Mutex<Connection>>, session_id: &str) -> Option<MailRef> {
-    let json: Option<String> = db
-        .lock()
+async fn save_last_file_ref(
+    refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
+    session_id: &str,
+    file_ref: &FileRef,
+) {
+    refs.lock()
         .await
-        .query_row(
-            "SELECT metadata_json FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    let val: serde_json::Value = serde_json::from_str(&json?).ok()?;
-    serde_json::from_value(val["last_mail_ref"].clone()).ok()
-}
-
-async fn save_last_file_ref(db: &Arc<Mutex<Connection>>, session_id: &str, file_ref: &FileRef) {
-    let val = serde_json::to_value(file_ref).unwrap_or(serde_json::Value::Null);
-    merge_session_metadata(db, session_id, "last_file_ref", val).await;
-}
-
-async fn load_last_file_ref(db: &Arc<Mutex<Connection>>, session_id: &str) -> Option<FileRef> {
-    let json: Option<String> = db
-        .lock()
-        .await
-        .query_row(
-            "SELECT metadata_json FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    let val: serde_json::Value = serde_json::from_str(&json?).ok()?;
-    serde_json::from_value(val["last_file_ref"].clone()).ok()
+        .entry(session_id.to_string())
+        .or_default()
+        .file = Some(file_ref.clone());
 }
 
 async fn save_last_odoo_ref(
-    db: &Arc<Mutex<Connection>>,
+    refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     odoo_ref: &OdooRecordRef,
 ) {
-    let val = serde_json::to_value(odoo_ref).unwrap_or(serde_json::Value::Null);
-    merge_session_metadata(db, session_id, "last_odoo_ref", val).await;
-}
-
-async fn load_last_odoo_ref(
-    db: &Arc<Mutex<Connection>>,
-    session_id: &str,
-) -> Option<OdooRecordRef> {
-    let json: Option<String> = db
-        .lock()
+    refs.lock()
         .await
-        .query_row(
-            "SELECT metadata_json FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    let val: serde_json::Value = serde_json::from_str(&json?).ok()?;
-    serde_json::from_value(val["last_odoo_ref"].clone()).ok()
+        .entry(session_id.to_string())
+        .or_default()
+        .odoo = Some(odoo_ref.clone());
 }
 
 async fn save_last_whatsapp_ref(
-    db: &Arc<Mutex<Connection>>,
+    refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     whatsapp_ref: &WhatsappRef,
 ) {
-    let val = serde_json::to_value(whatsapp_ref).unwrap_or(serde_json::Value::Null);
-    merge_session_metadata(db, session_id, "last_whatsapp_ref", val).await;
-}
-
-async fn load_last_whatsapp_ref(
-    db: &Arc<Mutex<Connection>>,
-    session_id: &str,
-) -> Option<WhatsappRef> {
-    let json: Option<String> = db
-        .lock()
+    refs.lock()
         .await
-        .query_row(
-            "SELECT metadata_json FROM sessions WHERE id = ?1",
-            rusqlite::params![session_id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    let val: serde_json::Value = serde_json::from_str(&json?).ok()?;
-    serde_json::from_value(val["last_whatsapp_ref"].clone()).ok()
-}
-
-async fn load_session_history(db: &Arc<Mutex<Connection>>, session_id: &str) -> Vec<Message> {
-    let db = db.lock().await;
-    let mut stmt = match db.prepare(
-        "SELECT role, content FROM chat_turns \
-         WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 10",
-    ) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-    let mut turns: Vec<Message> = stmt
-        .query_map(rusqlite::params![session_id], |row| {
-            let role: String = row.get(0)?;
-            let content: String = row.get(1)?;
-            Ok(match role.as_str() {
-                "user" => Message::user(content),
-                "assistant" => Message::assistant(content),
-                _ => Message::system(content),
-            })
-        })
-        .ok()
-        .map(|rows| rows.flatten().collect())
-        .unwrap_or_default();
-    turns.reverse();
-    turns
-}
-
-async fn prepare_history(
-    ollama: &OllamaClient,
-    model: &str,
-    history: Vec<OllamaMsg>,
-) -> Vec<OllamaMsg> {
-    if history.len() > SUMMARIZE_THRESHOLD {
-        let split = history.len() - KEEP_RECENT;
-        let old = &history[..split];
-        let recent = history[split..].to_vec();
-
-        if let Ok(summary) = ollama.summarize(model, old).await {
-            let mut result = vec![Message::system(format!(
-                "Zhrnutie predchádzajúcej konverzácie: {summary}"
-            ))];
-            result.extend(recent);
-            return result;
-        }
-        history[history.len() - MAX_HISTORY..].to_vec()
-    } else if history.len() > MAX_HISTORY {
-        history[history.len() - MAX_HISTORY..].to_vec()
-    } else {
-        history
-    }
+        .entry(session_id.to_string())
+        .or_default()
+        .whatsapp = Some(whatsapp_ref.clone());
 }
 
 fn err_event(msg: &str) -> Event {
@@ -8016,6 +7282,55 @@ fn err_event(msg: &str) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purge_legacy_context_data_clears_memory_chat_and_mirror() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE memory_items (id TEXT);
+            CREATE TABLE chat_turns (id TEXT);
+            CREATE TABLE chat_turn_attachments (chat_turn_id TEXT, attachment_id TEXT);
+            CREATE TABLE embeddings (item_id TEXT, source TEXT);
+            CREATE TABLE sessions (id TEXT, summary TEXT, metadata_json TEXT);
+            INSERT INTO memory_items VALUES ('m1');
+            INSERT INTO chat_turns VALUES ('t1');
+            INSERT INTO chat_turn_attachments VALUES ('t1', 'a1');
+            INSERT INTO embeddings VALUES ('m1', 'memory_item');
+            INSERT INTO embeddings VALUES ('t1', 'chat_turn');
+            INSERT INTO embeddings VALUES ('wa1', 'whatsapp');
+            INSERT INTO sessions VALUES ('s1', 'old summary', '{\"last_mail_ref\":{}}');
+            ",
+        )
+        .unwrap();
+
+        let data_dir = std::env::temp_dir().join(format!("bagent-purge-test-{}", Uuid::new_v4()));
+        let memories_dir = data_dir.join("memories");
+        std::fs::create_dir_all(&memories_dir).unwrap();
+        std::fs::write(memories_dir.join("old.md"), "old memory").unwrap();
+
+        purge_legacy_context_data(&data_dir, &mut conn);
+
+        for table in ["memory_items", "chat_turns", "chat_turn_attachments"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table} should be empty");
+        }
+        let embeddings: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(embeddings, 1, "non memory/chat embeddings must remain");
+        let cleared: (Option<String>, Option<String>) = conn
+            .query_row("SELECT summary, metadata_json FROM sessions", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(cleared, (None, None));
+        assert!(!memories_dir.exists());
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
 
     #[test]
     fn infers_contact_from_latest_whatsapp_message_request() {

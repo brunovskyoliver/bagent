@@ -152,7 +152,6 @@ final class ChatViewModel: ObservableObject {
     @Published var isSyncing = false
     @Published var lastSyncResult: String? = nil
     @Published var streamingChunk: Int = 0
-    @Published var lastMemorySavedId: String? = nil
     @Published var memoryItems: [MemoryItem] = []
     @Published var isLoadingMemory = false
     @Published var skills: [SkillItem] = []
@@ -382,7 +381,6 @@ final class ChatViewModel: ObservableObject {
                     self.isConnectingWhatsapp = false
                     withAnimation(.easeOut(duration: 0.18)) {
                         self.showWhatsappPairing = false
-                        self.showSettings = true
                     }
                 }
             }
@@ -397,7 +395,6 @@ final class ChatViewModel: ObservableObject {
             await MainActor.run {
                 withAnimation(.easeOut(duration: 0.18)) {
                     self.showWhatsappPairing = false
-                    self.showSettings = true
                 }
             }
         }
@@ -413,7 +410,6 @@ final class ChatViewModel: ObservableObject {
                 self.whatsappDebugPayload = nil
                 withAnimation(.easeOut(duration: 0.18)) {
                     self.showWhatsappPairing = false
-                    self.showSettings = true
                 }
             }
         }
@@ -476,7 +472,6 @@ final class ChatViewModel: ObservableObject {
                         if !Task.isCancelled {
                             withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
                                 self.showWhatsappPairing = false
-                                self.showSettings = true
                             }
                         }
                         break
@@ -797,54 +792,19 @@ final class ChatViewModel: ObservableObject {
     }
 
     func toggleMemoryPanel() {
-        if showMemory {
-            showMemory = false
-        } else {
-            showSettings = false
-            showSkills = false
-            showDebug = false
-            showWhatsappPairing = false
-            showMemory = true
-            Task { await loadMemoryItems() }
-        }
+        showMemory = false
     }
 
     func toggleSkillsPanel() {
-        if showSkills {
-            showSkills = false
-        } else {
-            showSettings = false
-            showMemory = false
-            showDebug = false
-            showWhatsappPairing = false
-            showSkills = true
-            Task { await loadSkills() }
-        }
+        showSkills = false
     }
 
     func toggleSettingsPanel() {
-        if showSettings {
-            showSettings = false
-        } else {
-            showMemory = false
-            showSkills = false
-            showDebug = false
-            showWhatsappPairing = false
-            showSettings = true
-        }
+        showSettings = false
     }
 
     func toggleDebugPanel() {
-        if showDebug {
-            showDebug = false
-        } else {
-            showSettings = false
-            showMemory = false
-            showSkills = false
-            showWhatsappPairing = false
-            showDebug = true
-            Task { await loadDebugConversation() }
-        }
+        showDebug = false
     }
 
     func loadDebugConversation() async {
@@ -1021,12 +981,8 @@ final class ChatViewModel: ObservableObject {
                                 openMail(ref)
                             }
                         }
-                    case .memorySaved(let id):
-                        lastMemorySavedId = id
-                        Task {
-                            try? await Task.sleep(for: .seconds(3))
-                            if lastMemorySavedId == id { lastMemorySavedId = nil }
-                        }
+                    case .memorySaved:
+                        break
                     case .approvalRequested(let id, let tool, let desc):
                         let item = ApprovalItem(
                             id: id, toolName: tool, description: desc,

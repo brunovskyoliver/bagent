@@ -180,6 +180,10 @@ struct NotchWrapView: View {
     @State private var hoverIconRevealID = UUID()
     @State private var inlineRevealID = UUID()
     @State private var borderPulseOpacity: CGFloat = 0.35
+    @State private var previousNotchInteractionMode: NotchInteractionMode = .collapsed
+    @State private var returningStatusDotFromOutput = false
+    @State private var outputStatusReturnStartPos: CGPoint = .zero
+    @State private var outputStatusReturnStartBridgeHeight: CGFloat = NotchWrapMetrics.outputMinBridgeHeight
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     // Panel is sized for voice mode (the widest/tallest state) so the frame never needs
@@ -192,7 +196,9 @@ struct NotchWrapView: View {
             : .easeInOut(duration: NotchWrapMetrics.surfaceDuration)
     }
     private var status: AgentStatus { viewModel.agentStatus }
-    private var isInlineActive: Bool { viewModel.notchInteractionMode != .collapsed }
+    private var isInlineActive: Bool {
+        viewModel.notchInteractionMode == .input || viewModel.notchInteractionMode == .output
+    }
 
     /// SF Symbol name for the right-wing voice indicator.
     private var voiceIconName: String {
@@ -249,6 +255,8 @@ struct NotchWrapView: View {
     }
 
     private func refreshSurface() {
+        updateStatusDotTravelState()
+
         let hoverExpanded = isHovered || isDragTargeted || viewModel.pillHovered
         let targetWing: CGFloat
         let targetBridge: CGFloat
@@ -288,6 +296,20 @@ struct NotchWrapView: View {
             bridgeHeight = targetBridge
         }
         updateInlineOpacity(active: isInlineActive && !isVoiceActive)
+    }
+
+    private func updateStatusDotTravelState() {
+        let currentMode = viewModel.notchInteractionMode
+        if previousNotchInteractionMode == .output && currentMode != .output {
+            outputStatusReturnStartPos = outputStatusTargetPos
+            outputStatusReturnStartBridgeHeight = max(1, targetBridgeHeight)
+            returningStatusDotFromOutput = !reduceMotion
+        } else if currentMode == .output {
+            returningStatusDotFromOutput = false
+        } else if returningStatusDotFromOutput && bridgeHeight <= NotchWrapMetrics.idleBridgeHeight + 0.5 {
+            returningStatusDotFromOutput = false
+        }
+        previousNotchInteractionMode = currentMode
     }
 
     private func setVoiceState(active: Bool) {
@@ -338,14 +360,105 @@ struct NotchWrapView: View {
     private var rightIconPos: CGPoint {
         CGPoint(x: notchOffset + notchWidth + wingWidth / 2, y: iconY)
     }
-    private var inlineStatusPos: CGPoint {
-        let bridge = inlineBridgeHeight(for: viewModel.notchInteractionMode)
-        let visibleW = notchWidth + 2 * inlineWingWidth(for: viewModel.notchInteractionMode)
+    private var collapsedStatusPos: CGPoint {
+        CGPoint(
+            x: notchOffset + notchWidth + NotchWrapMetrics.idleWingWidth / 2,
+            y: notchHeight / 2
+        )
+    }
+    private var outputStatusTargetPos: CGPoint {
+        let visibleW = notchWidth + 2 * targetWingWidth
         let contentW = visibleW * NotchWrapMetrics.inlineContentScale
         return CGPoint(
             x: notchOffset + notchWidth / 2 + contentW / 2 - 10,
-            y: notchHeight + bridge / 2
+            y: notchHeight + targetBridgeHeight / 2
         )
+    }
+    private var outputStatusTravelProgress: CGFloat {
+        guard viewModel.notchInteractionMode == .output else { return 0 }
+        guard targetBridgeHeight > 0 else { return 1 }
+        return min(1, max(0, bridgeHeight / targetBridgeHeight))
+    }
+    private var animatedInlineStatusPos: CGPoint {
+        let visibleW = notchWidth + 2 * wingWidth
+        let contentW = visibleW * NotchWrapMetrics.inlineContentScale
+        return CGPoint(
+            x: notchOffset + notchWidth / 2 + contentW / 2 - 10,
+            y: notchHeight + bridgeHeight / 2
+        )
+    }
+    private var statusDotPos: CGPoint {
+        if viewModel.notchInteractionMode == .output {
+            let progress = reduceMotion ? CGFloat(1) : outputStatusTravelProgress
+            return CGPoint(
+                x: collapsedStatusPos.x + (outputStatusTargetPos.x - collapsedStatusPos.x) * progress,
+                y: collapsedStatusPos.y + (outputStatusTargetPos.y - collapsedStatusPos.y) * progress
+            )
+        }
+        if returningStatusDotFromOutput || (previousNotchInteractionMode == .output && viewModel.notchInteractionMode != .output) {
+            let startPos = returningStatusDotFromOutput ? outputStatusReturnStartPos : outputStatusTargetPos
+            let startBridgeHeight = returningStatusDotFromOutput
+                ? outputStatusReturnStartBridgeHeight
+                : max(1, targetBridgeHeight)
+            let progress = min(1, max(0, bridgeHeight / startBridgeHeight))
+            return CGPoint(
+                x: collapsedStatusPos.x + (startPos.x - collapsedStatusPos.x) * progress,
+                y: collapsedStatusPos.y + (startPos.y - collapsedStatusPos.y) * progress
+            )
+        }
+        if isInlineActive {
+            return animatedInlineStatusPos
+        }
+        return rightIconPos
+    }
+
+    private var animatedNotchClipShape: NotchWrapShape {
+        NotchWrapShape(
+            wingWidth: wingWidth,
+            bridgeHeight: bridgeHeight,
+            notchOffset: notchOffset,
+            notchWidth: notchWidth,
+            notchHeight: notchHeight,
+            cornerRadius: NotchWrapMetrics.cornerRadius
+        )
+    }
+
+    @ViewBuilder
+    private var inlineSurfaceLayer: some View {
+        if isInlineActive && !isVoiceActive {
+            let contentWing = wingWidth
+            let contentBridge = bridgeHeight
+            ZStack(alignment: .topLeading) {
+                InlineNotchContent(viewModel: viewModel)
+                    .frame(
+                        width: (notchWidth + 2 * contentWing) * NotchWrapMetrics.inlineContentScale,
+                        height: max(1, contentBridge - NotchOutputLayout.contentVerticalInset)
+                    )
+                    .position(x: notchOffset + notchWidth / 2,
+                              y: notchHeight + contentBridge / 2)
+                    .opacity(inlineContentOpacity)
+                    .id(inlineRevealID)
+                    .animation(surfaceAnimation, value: viewModel.notchInteractionMode)
+            }
+            .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+            .clipShape(animatedNotchClipShape)
+        }
+    }
+
+    @ViewBuilder
+    private var statusDotLayer: some View {
+        if !isVoiceActive && (status != .ready || (viewModel.isExpanded && !isInlineActive)) {
+            StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
+                .position(statusDotPos)
+                .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+                .clipShape(animatedNotchClipShape)
+        }
+    }
+
+    private var showsLeftStatusIcon: Bool {
+        !isInlineActive
+            && viewModel.notchInteractionMode != .thinking
+            && (viewModel.isExpanded || isHovered || isVoiceActive)
     }
 
     private func isNearVisibleSurface(_ point: CGPoint) -> Bool {
@@ -396,7 +509,7 @@ struct NotchWrapView: View {
             )
 
             // Left icon — only when chat open, hovered, or voice active (idle = blank notch)
-            if !isInlineActive && (viewModel.isExpanded || isHovered || isVoiceActive) {
+            if showsLeftStatusIcon {
                 DrawInSymbol(
                     systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles",
                     trigger: hoverIconRevealID,
@@ -422,18 +535,6 @@ struct NotchWrapView: View {
                     .contentTransition(.symbolEffect(.replace))
                     .position(rightIconPos)
                     .opacity(voiceContentOpacity)
-            } else if isInlineActive && status != .ready {
-                LightbulbStatusDotView(
-                    status: status,
-                    reduceMotion: reduceMotion,
-                    copyFlashed: copyFlashed,
-                    isDragTargeted: isDragTargeted
-                )
-                .position(x: inlineStatusPos.x, y: inlineStatusPos.y)
-            } else if (viewModel.isExpanded && !isInlineActive) || status != .ready {
-                // Show dot: chat open (green) OR non-idle status (thinking/approval/error)
-                StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
-                    .position(rightIconPos)
             }
 
             // Voice content in bridge area (wave + live sentence)
@@ -448,22 +549,8 @@ struct NotchWrapView: View {
                     .opacity(voiceContentOpacity)
             }
 
-            if isInlineActive && !isVoiceActive {
-                let contentWing = inlineWingWidth(for: viewModel.notchInteractionMode)
-                let contentBridge = viewModel.notchInteractionMode == .output
-                    ? bridgeHeight
-                    : inlineBridgeHeight(for: viewModel.notchInteractionMode)
-                InlineNotchContent(viewModel: viewModel)
-                    .frame(
-                        width: (notchWidth + 2 * contentWing) * NotchWrapMetrics.inlineContentScale,
-                        height: contentBridge - NotchOutputLayout.contentVerticalInset
-                    )
-                    .position(x: notchOffset + notchWidth / 2,
-                              y: notchHeight + contentBridge / 2)
-                    .opacity(inlineContentOpacity)
-                    .id(inlineRevealID)
-                    .animation(surfaceAnimation, value: viewModel.notchInteractionMode)
-            }
+            inlineSurfaceLayer
+            statusDotLayer
         }
         .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
         .contentShape(
@@ -1660,15 +1747,6 @@ struct ExpandedChatView: View {
                                 removal: .move(edge: .leading).combined(with: .opacity)
                             )
                         )
-                } else if viewModel.showSettings {
-                    SettingsView(viewModel: viewModel)
-                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                } else if viewModel.showMemory {
-                    MemoryPanelView(viewModel: viewModel)
-                } else if viewModel.showSkills {
-                    SkillsPanelView(viewModel: viewModel)
-                } else if viewModel.showDebug {
-                    DebugPanelView(viewModel: viewModel)
                 } else {
                     messageList
                     Divider()
@@ -1809,20 +1887,6 @@ struct ExpandedChatView: View {
                 .foregroundStyle(Color.accentColor)
             Text("bagent")
                 .font(.system(size: 13, weight: .semibold))
-            if viewModel.lastMemorySavedId != nil {
-                HStack(spacing: 3) {
-                    Image(systemName: "brain")
-                        .font(.system(size: 9))
-                    Text("uložené")
-                        .font(.system(size: 10))
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.purple)
-                .clipShape(Capsule())
-                .transition(.opacity.combined(with: .scale(scale: 0.8)))
-            }
             if !viewModel.pendingApprovals.isEmpty {
                 HStack(spacing: 3) {
                     Image(systemName: "shield.lefthalf.filled")
@@ -1838,33 +1902,6 @@ struct ExpandedChatView: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.8)))
             }
             Spacer()
-            Button { viewModel.toggleDebugPanel() } label: {
-                Image(systemName: viewModel.showDebug ? "ladybug.fill" : "ladybug")
-                    .font(.system(size: 14))
-                    .foregroundStyle(viewModel.showDebug ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
-            }
-            .buttonStyle(.plain)
-            .help("Debug")
-            Button { viewModel.toggleSkillsPanel() } label: {
-                Image(systemName: viewModel.showSkills ? "wand.and.stars" : "wand.and.stars.inverse")
-                    .font(.system(size: 14))
-                    .foregroundStyle(viewModel.showSkills ? AnyShapeStyle(Color.teal) : AnyShapeStyle(.tertiary))
-            }
-            .buttonStyle(.plain)
-            .help("Schopnosti")
-            Button { viewModel.toggleMemoryPanel() } label: {
-                Image(systemName: viewModel.showMemory ? "brain.fill" : "brain")
-                    .font(.system(size: 14))
-                    .foregroundStyle(viewModel.showMemory ? AnyShapeStyle(Color.purple) : AnyShapeStyle(.tertiary))
-            }
-            .buttonStyle(.plain)
-            .help("Pamäť")
-            Button { viewModel.toggleSettingsPanel() } label: {
-                Image(systemName: viewModel.showSettings ? "gear.circle.fill" : "gear")
-                    .font(.system(size: 15))
-                    .foregroundStyle(viewModel.showSettings ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
-            }
-            .buttonStyle(.plain)
             Button { viewModel.clear() } label: {
                 Image(systemName: "trash")
                     .font(.system(size: 14))
@@ -2138,14 +2175,13 @@ struct WhatsAppPairingView: View {
             Button {
                 withAnimation(reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.24, dampingFraction: 0.8)) {
                     viewModel.showWhatsappPairing = false
-                    viewModel.showSettings = true
                 }
             } label: {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 12, weight: .semibold))
             }
             .buttonStyle(.plain)
-            .help("Späť do nastavení")
+            .help("Späť")
 
             Label("WhatsApp pairing", systemImage: "qrcode.viewfinder")
                 .font(.system(size: 13, weight: .semibold))
