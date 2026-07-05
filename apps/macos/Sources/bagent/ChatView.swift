@@ -15,6 +15,7 @@ enum NotchWrapMetrics {
     static let inlineWingWidth: CGFloat   = 221
     static let inlineBridgeHeight: CGFloat = 72
     static let outputWingWidth: CGFloat   = 154
+    static let outputMinWingWidth: CGFloat = 72
     static let outputBridgeHeight: CGFloat = 96
     static let outputMinBridgeHeight: CGFloat = 88
     static let outputMaxBridgeHeight: CGFloat = 280
@@ -62,21 +63,35 @@ private enum NotchOutputLayout {
     }
 
     static func reservedWidth(for message: ChatMessage?) -> CGFloat {
-        (message?.debugTraceId == nil ? CGFloat(0) : CGFloat(34))
-            + (message?.hasOutputActions == true ? CGFloat(92) : CGFloat(0))
+        message?.debugTraceId == nil ? CGFloat(0) : CGFloat(34)
+    }
+
+    /// Width of the widest rendered line when nothing wraps — drives the
+    /// content-fit panel width the same way `textHeight` drives the height.
+    static func longestLineWidth(_ text: String) -> CGFloat {
+        let attributed = NotchMarkdown.attributedString(text.isEmpty ? " " : text)
+        let rect = attributed.boundingRect(
+            with: NSSize(width: CGFloat.greatestFiniteMagnitude,
+                         height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        return ceil(rect.width)
+    }
+
+    /// Wing width that fits the longest line, clamped to
+    /// [outputMinWingWidth, outputWingWidth]. Inverts the visible-width formula
+    /// used by the output surface. The +16 slack absorbs measurement rounding
+    /// so text measured to exactly fit doesn't wrap at the rendered width.
+    static func wingWidth(text: String, notchWidth: CGFloat, message: ChatMessage?) -> CGFloat {
+        let contentWidth = longestLineWidth(text) + reservedWidth(for: message) + 16
+        let visibleWidth = contentWidth / NotchWrapMetrics.inlineContentScale
+        let wing = (visibleWidth - notchWidth) / 2
+        return min(NotchWrapMetrics.outputWingWidth,
+                   max(NotchWrapMetrics.outputMinWingWidth, ceil(wing)))
     }
 
     static func textHeight(_ text: String, width: CGFloat) -> CGFloat {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = lineSpacing
-        paragraph.lineBreakMode = .byWordWrapping
-        let attributed = NSAttributedString(
-            string: text.isEmpty ? " " : text,
-            attributes: [
-                .font: font(),
-                .paragraphStyle: paragraph,
-            ]
-        )
+        let attributed = NotchMarkdown.attributedString(text.isEmpty ? " " : text)
         let rect = attributed.boundingRect(
             with: NSSize(width: width, height: CGFloat.greatestFiniteMagnitude),
             options: [.usesLineFragmentOrigin, .usesFontLeading]
@@ -194,6 +209,9 @@ struct NotchWrapView: View {
     @State private var borderPulseOpacity: CGFloat = 0.35
     @State private var previousNotchInteractionMode: NotchInteractionMode = .collapsed
     @State private var returningStatusDotFromOutput = false
+    /// Content-fit output wing — grow-only per assistant message so the panel
+    /// never pumps narrower mid-stream; reset when a new message starts.
+    @State private var outputWingRatchet: CGFloat = NotchWrapMetrics.outputMinWingWidth
     @State private var outputStatusReturnStartPos: CGPoint = .zero
     @State private var outputStatusReturnStartBridgeHeight: CGFloat = NotchWrapMetrics.outputMinBridgeHeight
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -244,22 +262,37 @@ struct NotchWrapView: View {
     }
 
     private func inlineWingWidth(for mode: NotchInteractionMode) -> CGFloat {
-        mode == .output ? NotchWrapMetrics.outputWingWidth : NotchWrapMetrics.inlineWingWidth
+        mode == .output ? outputWingWidth() : NotchWrapMetrics.inlineWingWidth
     }
 
     private func inlineBridgeHeight(for mode: NotchInteractionMode) -> CGFloat {
         mode == .output ? outputBridgeHeight() : NotchWrapMetrics.inlineBridgeHeight
     }
 
-    private func outputBridgeHeight() -> CGFloat {
-        let text = NotchOutputLayout.responseText(
+    private var outputResponseText: String {
+        NotchOutputLayout.responseText(
             latestText: viewModel.latestAssistantText,
             isStreaming: viewModel.isLatestAssistantStreaming,
             isThinking: viewModel.isThinking
         )
-        let visibleWidth = (notchWidth + 2 * NotchWrapMetrics.outputWingWidth) * NotchWrapMetrics.inlineContentScale
+    }
+
+    private func outputWingWidth() -> CGFloat {
+        let wanted = NotchOutputLayout.wingWidth(
+            text: outputResponseText,
+            notchWidth: notchWidth,
+            message: viewModel.latestAssistantMessage
+        )
+        if wanted > outputWingRatchet { outputWingRatchet = wanted }
+        return outputWingRatchet
+    }
+
+    private func outputBridgeHeight() -> CGFloat {
+        // Height must be measured at the same width the text will render at,
+        // so wrap width and measured height always agree.
+        let visibleWidth = (notchWidth + 2 * outputWingWidth()) * NotchWrapMetrics.inlineContentScale
         return NotchOutputLayout.bridgeHeight(
-            text: text,
+            text: outputResponseText,
             visibleWidth: visibleWidth,
             message: viewModel.latestAssistantMessage
         )
@@ -271,20 +304,25 @@ struct NotchWrapView: View {
 
     private func refreshOutputSurfaceIfNeeded(force: Bool = false) {
         guard viewModel.notchInteractionMode == .output, !isVoiceActive else { return }
+        let nextWing = outputWingWidth()
         let nextBridge = outputBridgeHeight()
         let shouldResize = force
             || !viewModel.isLatestAssistantStreaming
             || abs(nextBridge - targetBridgeHeight) >= NotchOutputLayout.resizeThreshold
             || nextBridge == NotchWrapMetrics.outputMaxBridgeHeight
+            || abs(nextWing - targetWingWidth) >= NotchOutputLayout.resizeThreshold
+            || nextWing == NotchWrapMetrics.outputWingWidth
         guard shouldResize else { return }
         refreshSurface()
     }
 
     private func refreshSurface() {
+        // Captured before updateStatusDotTravelState() mutates previousNotchInteractionMode.
+        let previousModeWasOutput = previousNotchInteractionMode == .output
         updateStatusDotTravelState()
 
         let hoverExpanded = isHovered || isDragTargeted || viewModel.pillHovered
-        let targetWing: CGFloat
+        var targetWing: CGFloat
         let targetBridge: CGFloat
         if isVoiceActive {
             targetWing = NotchWrapMetrics.voiceWingWidth
@@ -302,11 +340,17 @@ struct NotchWrapView: View {
             targetWing = NotchWrapMetrics.idleWingWidth
             targetBridge = NotchWrapMetrics.idleBridgeHeight
         }
+        // The pill widens (in any non-voice state) so the pending left-wing
+        // icon row always fits inside the black shape.
+        if !isVoiceActive {
+            targetWing = max(targetWing, requiredLeftWingWidth)
+        }
 
         let surfaceTargetChanged = targetWingWidth != targetWing || targetBridgeHeight != targetBridge
-        let outputHeightOnlyResize = viewModel.notchInteractionMode == .output
-            && targetWingWidth == targetWing
-            && targetBridgeHeight != targetBridge
+        // Width/height growth while already in output mode must not replay the
+        // inline reveal — only the initial transition into output resets it.
+        let outputContentOnlyResize = viewModel.notchInteractionMode == .output
+            && previousModeWasOutput
         var instantTargetUpdate = Transaction()
         instantTargetUpdate.disablesAnimations = true
         withTransaction(instantTargetUpdate) {
@@ -314,7 +358,7 @@ struct NotchWrapView: View {
             targetBridgeHeight = targetBridge
             if surfaceTargetChanged {
                 hoverIconRevealID = UUID()
-                if !outputHeightOnlyResize {
+                if !outputContentOnlyResize {
                     inlineRevealID = UUID()
                 }
             }
@@ -405,11 +449,6 @@ struct NotchWrapView: View {
     }
     private var rightIconPos: CGPoint {
         CGPoint(x: notchOffset + notchWidth + wingWidth / 2, y: iconY)
-    }
-    /// Left-wing cmux icon position — wing-animated so it slides smoothly as the
-    /// banner grows/collapses instead of snapping to the target slot.
-    private var leftIconPos: CGPoint {
-        CGPoint(x: notchOffset - wingWidth / 2, y: iconY)
     }
     private var collapsedStatusPos: CGPoint {
         CGPoint(
@@ -518,17 +557,76 @@ struct NotchWrapView: View {
         }
     }
 
-    /// cmux app icon in the left wing while a cmux event is pending. Fades in with
-    /// the banner, then persists in the collapsed left wing after the 5s banner
-    /// text falls away — cleared only when the event clears (same lifecycle as the
-    /// right-wing dot). Attention events ring it like a bell — "come do something".
+    /// Left-wing icon row: colorful connector action icons plus the cmux app
+    /// icon. cmux keeps its collapsed-only visibility; connector icons stay
+    /// visible while the inline input/output surface is open too — they
+    /// persist (no timeout) until clicked or the next user message. The row is
+    /// right-aligned against the notch's left edge and enters with the same
+    /// bell-swing the cmux icon uses.
     @ViewBuilder
-    private var cmuxLeftIconLayer: some View {
-        if showsCmuxLeftIcon, let notification = displayedCmuxNotification {
-            CmuxIconView(kind: notification.kind, reduceMotion: reduceMotion)
-                .position(leftIconPos)
-                .opacity(isCmuxSurfaceActive ? cmuxContentOpacity : 1)
+    private var leftWingIconLayer: some View {
+        if leftWingIconCount > 0 {
+            HStack(spacing: Self.leftWingIconSpacing) {
+                ForEach(Array(visibleConnectorActions.enumerated()), id: \.element.id) { index, action in
+                    Button {
+                        viewModel.performConnectorAction(action, slotIndex: index)
+                    } label: {
+                        ConnectorIconView(kind: action.kind, reduceMotion: reduceMotion,
+                                          size: Self.leftWingIconSize)
+                    }
+                    .buttonStyle(.plain)
+                    .help(action.kind.accessibilityLabel)
+                    .accessibilityLabel(action.kind.accessibilityLabel)
+                }
+                if showsCmuxLeftIcon, let notification = displayedCmuxNotification {
+                    CmuxIconView(kind: notification.kind, reduceMotion: reduceMotion)
+                        .opacity(isCmuxSurfaceActive ? cmuxContentOpacity : 1)
+                }
+            }
+            .position(x: notchOffset - Self.leftWingRowInset - leftWingRowWidth / 2, y: iconY)
         }
+    }
+
+    private static let leftWingIconSize: CGFloat = 18
+    private static let leftWingIconSpacing: CGFloat = 6
+    /// Gap between the row's right edge and the notch's left edge.
+    private static let leftWingRowInset: CGFloat = 8
+
+    /// Connector icons hide only for voice and the expanded chat panel — unlike
+    /// the cmux icon they stay through inline input/output.
+    private var visibleConnectorActions: [ConnectorAction] {
+        guard !isVoiceActive, !viewModel.isExpanded else { return [] }
+        return viewModel.pendingConnectorActions
+    }
+
+    private var leftWingIconCount: Int {
+        visibleConnectorActions.count + (showsCmuxLeftIcon ? 1 : 0)
+    }
+
+    private var leftWingRowWidth: CGFloat {
+        let n = CGFloat(leftWingIconCount)
+        guard n > 0 else { return 0 }
+        return n * Self.leftWingIconSize + (n - 1) * Self.leftWingIconSpacing
+    }
+
+    /// Wing floor so the whole row fits inside the black pill.
+    private var requiredLeftWingWidth: CGFloat {
+        leftWingIconCount == 0 ? 0 : leftWingRowWidth + 2 * Self.leftWingRowInset
+    }
+
+    /// Where the connector icon sat at click time — the row still had the
+    /// departing icon, so measure against a one-wider row.
+    private func connectorSlotPosition(_ slotIndex: Int) -> CGPoint {
+        let n = CGFloat(leftWingIconCount + 1)
+        let rowWidth = n * Self.leftWingIconSize + (n - 1) * Self.leftWingIconSpacing
+        let left = notchOffset - Self.leftWingRowInset - rowWidth
+        let step = Self.leftWingIconSize + Self.leftWingIconSpacing
+        return CGPoint(x: left + Self.leftWingIconSize / 2 + CGFloat(slotIndex) * step, y: iconY)
+    }
+
+    /// The cmux icon sits in the row's rightmost slot.
+    private var cmuxSlotPosition: CGPoint {
+        CGPoint(x: notchOffset - Self.leftWingRowInset - Self.leftWingIconSize / 2, y: iconY)
     }
 
     /// The left cmux icon shows while any cmux event is pending and the notch is in
@@ -549,15 +647,30 @@ struct NotchWrapView: View {
     /// Fly-off animations for cues the user just acknowledged (tab-open / hover-leave
     /// / click). Rendered unclipped so the icon is visible travelling into the notch.
     @ViewBuilder
-    private var cmuxDepartureLayer: some View {
+    private var iconDepartureLayer: some View {
         ForEach(viewModel.cmuxDeparting) { departure in
-            CmuxFlyoffView(
-                departure: departure,
-                start: leftIconPos,
+            IconFlyoffView(
+                start: cmuxSlotPosition,
                 target: cmuxFlyoffTarget,
                 hasNotch: viewModel.hasNotch,
                 onFinished: { viewModel.finishCmuxDeparture(departure.id) }
-            )
+            ) {
+                Image(nsImage: CmuxEventMonitor.appIcon)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            }
+        }
+        ForEach(viewModel.connectorDeparting) { departure in
+            IconFlyoffView(
+                start: connectorSlotPosition(departure.slotIndex),
+                target: cmuxFlyoffTarget,
+                hasNotch: viewModel.hasNotch,
+                size: Self.leftWingIconSize,
+                onFinished: { viewModel.finishConnectorDeparture(departure.id) }
+            ) {
+                ConnectorIconView(kind: departure.kind, reduceMotion: true,
+                                  size: Self.leftWingIconSize)
+            }
         }
     }
 
@@ -635,7 +748,8 @@ struct NotchWrapView: View {
         onHoverChanged(active || isDragTargeted)
     }
 
-    var body: some View {
+    // Split out of `body` so the modifier chain below stays type-checkable.
+    private var surfaceLayers: some View {
         ZStack(alignment: .topLeading) {
             NotchWrapShape(
                 wingWidth: wingWidth,
@@ -662,8 +776,8 @@ struct NotchWrapView: View {
                 lineWidth: 1
             )
 
-            cmuxLeftIconLayer
-            cmuxDepartureLayer
+            leftWingIconLayer
+            iconDepartureLayer
 
             // Left icon — only when chat open, hovered, or voice active (idle = blank notch)
             if showsLeftStatusIcon {
@@ -711,6 +825,10 @@ struct NotchWrapView: View {
             statusDotLayer
             cmuxDotLayer
         }
+    }
+
+    private var interactiveSurface: some View {
+        surfaceLayers
         .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
         .contentShape(
             NotchWrapShape(
@@ -756,16 +874,25 @@ struct NotchWrapView: View {
             isVoiceActive = active
             setVoiceState(active: active)
         }
-        .onChange(of: viewModel.notchInteractionMode) {
+        .onChange(of: viewModel.notchInteractionMode) { _, mode in
+            if mode != .output { outputWingRatchet = NotchWrapMetrics.outputMinWingWidth }
             if !isVoiceActive { refreshSurface() }
         }
         .onChange(of: viewModel.cmuxBanner) {
             if !isVoiceActive { refreshSurface() }
         }
+        .onChange(of: viewModel.pendingConnectorActions) {
+            if !isVoiceActive { refreshSurface() }
+        }
+    }
+
+    var body: some View {
+        interactiveSurface
         .onChange(of: viewModel.streamingChunk) {
             refreshOutputSurfaceIfNeeded()
         }
         .onChange(of: viewModel.latestAssistantMessageId) {
+            outputWingRatchet = NotchWrapMetrics.outputMinWingWidth
             refreshOutputSurfaceIfNeeded(force: true)
         }
         .onChange(of: viewModel.isLatestAssistantStreaming) {
@@ -957,16 +1084,10 @@ struct InlineNotchContent: View {
                     reduceMotion: reduceMotion
                 )
                 .padding(.leading, latestMessage?.debugTraceId == nil ? 0 : 34)
-                .padding(.trailing, latestMessage?.hasOutputActions == true ? 92 : 0)
                 .frame(maxWidth: .infinity)
                 .frame(maxHeight: .infinity)
                 .accessibilityLabel("Latest assistant response")
                 .accessibilityValue(text)
-
-                if let latestMessage {
-                    NotchOutputActionButtons(message: latestMessage, viewModel: viewModel)
-                        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .topTrailing)))
-                }
 
                 if latestMessage?.debugTraceId != nil {
                     NotchDebugCopyButton(viewModel: viewModel)
@@ -1084,17 +1205,7 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
     }
 
     private func attributedText(_ text: String) -> NSAttributedString {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = NotchOutputLayout.lineSpacing
-        paragraph.lineBreakMode = .byWordWrapping
-        return NSAttributedString(
-            string: text,
-            attributes: [
-                .font: NotchOutputLayout.font(),
-                .foregroundColor: NotchWrapMetrics.notchTextPrimaryNS,
-                .paragraphStyle: paragraph,
-            ]
-        )
+        NotchMarkdown.attributedString(text)
     }
 
     @MainActor
@@ -1192,58 +1303,6 @@ private final class UserTrackingScrollView: NSScrollView {
     }
 }
 
-private extension ChatMessage {
-    var hasOutputActions: Bool {
-        mailRef != nil || odooRef != nil || whatsappRef != nil
-    }
-}
-
-private struct NotchOutputActionButtons: View {
-    let message: ChatMessage
-    @ObservedObject var viewModel: ChatViewModel
-
-    var body: some View {
-        if message.hasOutputActions {
-            HStack(spacing: 5) {
-                if let ref = message.whatsappRef {
-                    NotchOutputActionChip(
-                        systemName: "bubble.left.and.bubble.right.fill",
-                        label: ref.contact_name ?? "WhatsApp",
-                        tint: .green,
-                        action: nil
-                    )
-                }
-                if let ref = message.odooRef {
-                    NotchOutputActionChip(
-                        systemName: "globe",
-                        label: "Open",
-                        tint: .orange
-                    ) {
-                        viewModel.openOdoo(ref)
-                    }
-                }
-                if let ref = message.mailRef {
-                    NotchOutputActionChip(
-                        systemName: "envelope.fill",
-                        label: "Mail",
-                        tint: .accentColor
-                    ) {
-                        viewModel.openMail(ref)
-                    }
-                }
-            }
-            .padding(3)
-            .background(
-                Capsule()
-                    .fill(Color.black.opacity(0.42))
-                    .overlay(Capsule().stroke(Color.white.opacity(0.10), lineWidth: 0.5))
-            )
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("Output actions")
-        }
-    }
-}
-
 private struct NotchDebugCopyButton: View {
     @ObservedObject var viewModel: ChatViewModel
     @State private var isHovered = false
@@ -1279,63 +1338,6 @@ private struct NotchDebugCopyButton: View {
             }
             hovering ? NSCursor.pointingHand.push() : NSCursor.pop()
         }
-    }
-}
-
-private struct NotchOutputActionChip: View {
-    let systemName: String
-    let label: String
-    let tint: Color
-    let action: (() -> Void)?
-
-    @State private var isHovered = false
-
-    var body: some View {
-        Group {
-            if let action {
-                Button(action: action) {
-                    chipBody
-                }
-                .buttonStyle(.plain)
-            } else {
-                chipBody
-            }
-        }
-        .help(label)
-        .accessibilityLabel(label)
-        .onHover { hovering in
-            withAnimation(.spring(response: 0.22, dampingFraction: 0.78)) {
-                isHovered = hovering
-            }
-            guard action != nil else { return }
-            hovering ? NSCursor.pointingHand.push() : NSCursor.pop()
-        }
-    }
-
-    private var chipBody: some View {
-        HStack(spacing: 5) {
-            if isHovered {
-                Text(label)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(0.88))
-                    .lineLimit(1)
-                    .fixedSize()
-                    .transition(.opacity.combined(with: .move(edge: .trailing)))
-            }
-            Image(systemName: systemName)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(action == nil ? 0.58 : 0.92))
-                .frame(width: 15, height: 15)
-        }
-        .padding(.horizontal, isHovered ? 7 : 4)
-        .frame(height: 24)
-        .frame(minWidth: 24)
-        .background(
-            Capsule()
-                .fill(Color.white.opacity(isHovered ? 0.14 : 0.08))
-                .overlay(Capsule().stroke(tint.opacity(isHovered ? 0.46 : 0.26), lineWidth: 0.6))
-        )
-        .contentShape(Capsule())
     }
 }
 
@@ -1577,19 +1579,16 @@ struct CmuxIconView: View {
     let reduceMotion: Bool
     var size: CGFloat = 17
 
-    /// One ring (decaying swing) followed by three resting beats.
-    private static let swingPhases: [Double] = [0, -16, 12, -8, 5, -2, 0, 0, 0]
-
     var body: some View {
         let icon = Image(nsImage: CmuxEventMonitor.appIcon)
             .resizable()
             .aspectRatio(contentMode: .fit)
             .frame(width: size, height: size)
         if kind == .attention && !reduceMotion {
-            icon.phaseAnimator(Self.swingPhases) { view, angle in
+            icon.phaseAnimator(NotchIconSwing.phases) { view, angle in
                 view.rotationEffect(.degrees(angle), anchor: .top)
             } animation: { angle in
-                angle == 0 ? .easeOut(duration: 0.5) : .spring(duration: 0.16, bounce: 0.35)
+                NotchIconSwing.animation(for: angle)
             }
         } else {
             icon
@@ -1597,40 +1596,57 @@ struct CmuxIconView: View {
     }
 }
 
-/// A cmux icon flying off after the user acknowledged its cue. Four concurrent
-/// keyframe tracks (travel, scale, opacity, tilt) — an anticipation pop then a
-/// quick shrink-and-fade as it settles into the notch (built-in) or shoots off
-/// the top edge (external). Reports back when the flight is over so the token
-/// can be dropped. Only spawned when Reduce Motion is off.
-struct CmuxFlyoffView: View {
-    let departure: CmuxDeparture
+/// An acknowledged notch icon flying off. Four concurrent keyframe tracks
+/// (travel, scale, opacity, tilt) — an anticipation pop then a quick
+/// shrink-and-fade as it settles into the notch (built-in) or shoots off the
+/// top edge (external). Reports back when the flight is over so the token can
+/// be dropped. Only spawned when Reduce Motion is off. Shared by the cmux icon
+/// and the connector icons.
+struct IconFlyoffFrame {
+    var x: CGFloat
+    var y: CGFloat
+    var scale: CGFloat
+    var opacity: CGFloat
+    var rotation: CGFloat
+}
+
+struct IconFlyoffView<Icon: View>: View {
     let start: CGPoint
     let target: CGPoint
     let hasNotch: Bool
-    let onFinished: () -> Void
     var size: CGFloat = 17
+    let onFinished: () -> Void
+    @ViewBuilder let icon: () -> Icon
+
+    var body: some View {
+        // Type-erased so the keyframe animator below isn't generic (avoids a
+        // non-Sendable metatype capture warning in its closures).
+        IconFlyoffCore(
+            start: start, target: target, hasNotch: hasNotch,
+            size: size, onFinished: onFinished, icon: AnyView(icon())
+        )
+    }
+}
+
+private struct IconFlyoffCore: View {
+    let start: CGPoint
+    let target: CGPoint
+    let hasNotch: Bool
+    let size: CGFloat
+    let onFinished: () -> Void
+    let icon: AnyView
 
     @State private var play = false
 
     /// Built-in settles a touch slower than the external "lose it over the top".
     private var duration: Double { hasNotch ? 0.5 : 0.42 }
 
-    struct Frame {
-        var x: CGFloat
-        var y: CGFloat
-        var scale: CGFloat
-        var opacity: CGFloat
-        var rotation: CGFloat
-    }
-
     var body: some View {
         let endScale: CGFloat = hasNotch ? 0.26 : 0.55
-        Image(nsImage: CmuxEventMonitor.appIcon)
-            .resizable()
-            .aspectRatio(contentMode: .fit)
+        icon
             .frame(width: size, height: size)
             .keyframeAnimator(
-                initialValue: Frame(x: start.x, y: start.y, scale: 1, opacity: 1, rotation: 0),
+                initialValue: IconFlyoffFrame(x: start.x, y: start.y, scale: 1, opacity: 1, rotation: 0),
                 trigger: play
             ) { view, f in
                 view
@@ -1665,8 +1681,10 @@ struct CmuxFlyoffView: View {
             }
             .onAppear {
                 play.toggle()
+                // Hoisted so the async closure doesn't capture the generic self.
+                let finish = onFinished
                 DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.05) {
-                    onFinished()
+                    finish()
                 }
             }
     }

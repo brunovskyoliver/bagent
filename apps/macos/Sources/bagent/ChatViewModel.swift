@@ -732,6 +732,47 @@ final class ChatViewModel: ObservableObject {
     func finishCmuxDeparture(_ id: UUID) {
         cmuxDeparting.removeAll { $0.id == id }
     }
+
+    // MARK: - Connector actions (left-wing icons)
+
+    /// Clickable connector results found during the latest response. Rendered
+    /// as colorful icons in the notch left wing (next to the cmux icon);
+    /// cleared on the next user message or session clear — no timeout.
+    @Published var pendingConnectorActions: [ConnectorAction] = []
+    /// Clicked connector icons mid fly-off (same lifecycle as `cmuxDeparting`).
+    @Published var connectorDeparting: [ConnectorDeparture] = []
+
+    /// Latest result per connector wins — a fresh mail_found replaces the
+    /// previous mail slot instead of stacking duplicates.
+    private func upsertConnectorAction(_ action: ConnectorAction) {
+        pendingConnectorActions.removeAll { $0.kind == action.kind }
+        pendingConnectorActions.append(action)
+    }
+
+    /// Click-through on a left-wing connector icon: perform the open action
+    /// and send the icon flying into the notch.
+    func performConnectorAction(_ action: ConnectorAction, slotIndex: Int) {
+        switch action.payload {
+        case .mail(let ref):
+            openMail(ref)
+        case .odoo(let ref):
+            openOdoo(ref)
+        case .whatsapp:
+            // No daemon open endpoint yet — best-effort hand-off to the app.
+            if let url = URL(string: "whatsapp://") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            connectorDeparting.append(ConnectorDeparture(kind: action.kind, slotIndex: slotIndex))
+        }
+        pendingConnectorActions.removeAll { $0.id == action.id }
+    }
+
+    /// The notch reports the connector fly-off finished; drop the token.
+    func finishConnectorDeparture(_ id: UUID) {
+        connectorDeparting.removeAll { $0.id == id }
+    }
     // Session ID persisted in UserDefaults so it survives app restarts
     private var sessionId: String? {
         get { UserDefaults.standard.string(forKey: "bagent.session_id") }
@@ -764,6 +805,7 @@ final class ChatViewModel: ObservableObject {
         showSettings = false
         showDebug = false
         pendingAttachments = []
+        pendingConnectorActions = []
         selectedSourceMode = nil
         hoveredSourceMode = nil
         savedScrollAnchorId = nil
@@ -1017,6 +1059,7 @@ final class ChatViewModel: ObservableObject {
             sessionId = nil
         }
         inputText = ""
+        pendingConnectorActions = []
         let model = selectedModel
         let sid = sessionId
         let attachments = pendingAttachments
@@ -1125,12 +1168,15 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].attachments.append(contentsOf: chips)
                     case .mailFound(let ref):
                         messages[idx].mailRef = ref
+                        upsertConnectorAction(ConnectorAction(kind: .mail, payload: .mail(ref)))
                     case .fileFound(let ref):
                         messages[idx].fileRef = ref
                     case .odooFound(let ref):
                         messages[idx].odooRef = ref
+                        upsertConnectorAction(ConnectorAction(kind: .odoo, payload: .odoo(ref)))
                     case .whatsappFound(let ref):
                         messages[idx].whatsappRef = ref
+                        upsertConnectorAction(ConnectorAction(kind: .whatsapp, payload: .whatsapp(ref)))
                     case .fileOpened:
                         break // no UI action for now; daemon already opened the file
                     case .actionTaken(let message):
