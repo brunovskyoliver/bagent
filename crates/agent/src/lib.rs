@@ -1,4 +1,6 @@
 pub mod context_planner;
+pub mod evidence;
+pub mod routing;
 mod feedback;
 mod file_intent;
 mod mail_intent;
@@ -19,6 +21,7 @@ pub use feedback::{
     has_explicit_trigger, CorrectionClassifier, CorrectionResult, DirectiveExtractor,
     DirectiveResult, StyleProfile,
 };
+pub use evidence::{embed_rerank, rank, render_evidence_block, render_evidence_context, Evidence};
 pub use file_intent::{FileAction, FileIntent, FileIntentClassifier};
 pub use mail_intent::{MailIntent, MailIntentClassifier};
 pub use memory_extractor::MemoryExtractor;
@@ -26,6 +29,10 @@ pub use odoo_intent::{OdooAction, OdooIntent, OdooIntentClassifier};
 pub use prompt::{
     preview, BuiltPrompt, PromptBuilder, PromptLayerTrace, PromptMemoryHitTrace,
     PromptPastTurnTrace, PromptTrace, SelectedSkill,
+};
+pub use routing::{
+    build_route, deterministic_hints, needs_careful_pass, IntentType, PlannedSearch,
+    RouteBudgets, RouteClassification, RouteClassifier, RoutePlan, Source, SourceHint,
 };
 pub use reference_resolver::{
     select_resolver_lessons, ReferenceCandidate, ReferenceResolution, ReferenceResolver,

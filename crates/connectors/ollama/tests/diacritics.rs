@@ -1,12 +1,12 @@
 //! Slovak diacritics regression tests.
-//! Require a running Ollama with qwen2.5:7b pulled.
+//! Require a running Ollama with qwen3:8b pulled.
 //!
 //!   cargo test -p ollama-connector -- --include-ignored
 
 use futures_util::StreamExt;
 use ollama_connector::{Message, OllamaClient, DEFAULT_BASE_URL};
 
-const MODEL: &str = "qwen2.5:7b";
+const MODEL: &str = "qwen3:8b";
 
 async fn ask(prompt: &str) -> String {
     let client = OllamaClient::new(DEFAULT_BASE_URL);
@@ -20,7 +20,7 @@ async fn ask(prompt: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires Ollama + qwen2.5:7b"]
+#[ignore = "requires Ollama + qwen3:8b"]
 async fn diacritics_preserved_in_responses() {
     // Each entry: (prompt, stem that must appear somewhere in the response).
     // We check for a stem rather than an exact form because the model may
@@ -47,7 +47,7 @@ async fn diacritics_preserved_in_responses() {
 }
 
 #[tokio::test]
-#[ignore = "requires Ollama + qwen2.5:7b"]
+#[ignore = "requires Ollama + qwen3:8b"]
 async fn no_czech_contamination() {
     let response = ask("Napíš slovensky: Posielam faktúru s DPH.").await;
     // Czech equivalents that must NOT appear
@@ -66,7 +66,7 @@ async fn no_czech_contamination() {
 }
 
 #[tokio::test]
-#[ignore = "requires Ollama + qwen2.5:7b"]
+#[ignore = "requires Ollama + qwen3:8b"]
 async fn fixture_faktura_upomienka() {
     let fixture = include_str!("../../../../fixtures/sk/faktura-upomienka.txt");
     let prompt = format!(
@@ -112,7 +112,7 @@ async fn fixture_faktura_upomienka() {
 
 /// Simulate what fetch_tool_context does: summarise a real Slovak email body.
 #[tokio::test]
-#[ignore = "requires Ollama + qwen2.5:7b"]
+#[ignore = "requires Ollama + qwen3:8b"]
 async fn sk_email_body_summarization() {
     let body = include_str!("../../../../fixtures/sk/faktura-upomienka.txt");
     let prompt = format!(
@@ -138,7 +138,7 @@ async fn sk_email_body_summarization() {
 }
 
 #[tokio::test]
-#[ignore = "requires Ollama + qwen2.5:7b"]
+#[ignore = "requires Ollama + qwen3:8b"]
 async fn summarize_helper_preserves_language() {
     let client = OllamaClient::new(DEFAULT_BASE_URL);
     let messages = vec![

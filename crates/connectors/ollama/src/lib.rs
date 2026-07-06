@@ -245,7 +245,10 @@ impl OllamaClient {
                     "model": model,
                     "messages": messages,
                     "stream": true,
-                    "keep_alive": -1
+                    "keep_alive": -1,
+                    // ponytail: thinking off everywhere except the planner fallback —
+                    // classifier/synthesis latency matters more than hidden reasoning
+                    "think": false
                 }))
                 .send()
                 .await
@@ -298,6 +301,36 @@ impl OllamaClient {
             .filter_map(|v| v.as_f64().map(|f| f as f32))
             .collect();
         Ok(vec)
+    }
+
+    /// Embed several texts in one request via `/api/embed` (batch input).
+    pub async fn embed_batch(&self, model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let resp: serde_json::Value = self
+            .http
+            .post(format!("{}/api/embed", self.base_url))
+            .json(&serde_json::json!({ "model": model, "input": texts, "keep_alive": -1 }))
+            .send()
+            .await
+            .context("POST /api/embed")?
+            .json()
+            .await
+            .context("parse embed batch response")?;
+
+        let vecs = resp["embeddings"]
+            .as_array()
+            .context("no 'embeddings' field in response")?
+            .iter()
+            .map(|e| {
+                e.as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                            .collect::<Vec<f32>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        Ok(vecs)
     }
 
     /// Best-effort unload for chat/generation-capable models.
@@ -353,6 +386,7 @@ impl OllamaClient {
                 "messages": [{ "role": "user", "content": prompt }],
                 "stream": false,
                 "keep_alive": -1,
+                "think": false,
                 "options": { "temperature": temperature }
             }))
             .send()
@@ -385,6 +419,7 @@ impl OllamaClient {
                 "stream": false,
                 "keep_alive": -1,
                 "format": "json",
+                "think": false,
                 "options": { "temperature": temperature }
             }))
             .send()
@@ -409,6 +444,20 @@ impl OllamaClient {
         schema: serde_json::Value,
         temperature: f32,
     ) -> Result<String> {
+        self.generate_json_schema_think(model, prompt, schema, temperature, false)
+            .await
+    }
+
+    /// Schema-constrained JSON generation with an explicit `think` toggle.
+    /// `think: true` is reserved for the careful planner fallback on ambiguous turns.
+    pub async fn generate_json_schema_think(
+        &self,
+        model: &str,
+        prompt: &str,
+        schema: serde_json::Value,
+        temperature: f32,
+        think: bool,
+    ) -> Result<String> {
         let resp: serde_json::Value = self
             .http
             .post(format!("{}/api/chat", self.base_url))
@@ -418,6 +467,7 @@ impl OllamaClient {
                 "stream": false,
                 "keep_alive": -1,
                 "format": schema,
+                "think": think,
                 "options": { "temperature": temperature }
             }))
             .send()
@@ -452,7 +502,8 @@ impl OllamaClient {
                 "messages": messages,
                 "tools": tools,
                 "stream": false,
-                "keep_alive": -1
+                "keep_alive": -1,
+                "think": false
             }))
             .send()
             .await
@@ -503,7 +554,8 @@ impl OllamaClient {
                 "model": model,
                 "messages": [{ "role": "user", "content": prompt }],
                 "stream": false,
-                "keep_alive": -1
+                "keep_alive": -1,
+                "think": false
             }))
             .send()
             .await

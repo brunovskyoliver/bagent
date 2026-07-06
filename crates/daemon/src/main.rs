@@ -14,9 +14,10 @@ use axum::{
     Json, Router,
 };
 use bagent_agent::{
-    ContextPlan, ContextPlanner, MailIntentClassifier, OdooAction, OdooIntentClassifier,
-    PlannerRuntimeContext, PromptBuilder, PromptTrace, ReferenceCandidate, ReferenceResolution,
-    ReferenceResolver, ScreenIntentClassifier, SelectedSkill, TaskRater, WhatsappAction,
+    ContextPlan, ContextPlanner, Evidence, IntentType as RouteIntentType, MailIntentClassifier,
+    OdooAction, OdooIntentClassifier, PlannerRuntimeContext, PromptBuilder, PromptTrace,
+    ReferenceCandidate, ReferenceResolution, ReferenceResolver, RouteClassifier, RoutePlan,
+    ScreenIntentClassifier, SelectedSkill, Source as RouteSource, TaskRater, WhatsappAction,
     WhatsappIntent, WhatsappIntentClassifier, WindowIntentClassifier,
 };
 use bagent_attachments::extract as extract_attachment;
@@ -518,9 +519,9 @@ async fn main() -> Result<()> {
     let prompt_builder = Arc::new(PromptBuilder::new());
 
     let default_model =
-        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
+        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
     let classifier_model =
-        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| "qwen2.5:0.5b".to_string());
+        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| "qwen3:0.6b".to_string());
     let vision_model =
         std::env::var("BAGENT_VISION_MODEL").unwrap_or_else(|_| "qwen2.5vl:7b".to_string());
 
@@ -2339,6 +2340,54 @@ async fn chat(
             reference_resolution
         );
 
+        // ── Route plan ────────────────────────────────────────────────────────
+        // Hints + small-model classifier merged into a validated, budget-clamped
+        // plan. The plan is a recommendation the app enforces — the model never
+        // picks tools directly.
+        let route_hints = bagent_agent::deterministic_hints(&user_message);
+        let route_classifier = RouteClassifier::new(ollama.clone(), intent_model.clone());
+        let mut route_classification =
+            match route_classifier.classify(&user_message, &recent_context).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!("route classifier failed: {e}");
+                    None
+                }
+            };
+        if bagent_agent::needs_careful_pass(route_classification.as_ref(), &route_hints) {
+            match route_classifier
+                .classify_careful(&model, &user_message, &recent_context)
+                .await
+            {
+                Ok(c) => route_classification = Some(c),
+                Err(e) => tracing::warn!("careful route pass failed: {e}"),
+            }
+        }
+        let route_plan = bagent_agent::build_route(
+            &user_message,
+            &route_hints,
+            route_classification.as_ref(),
+            &bagent_agent::RouteBudgets::default(),
+            chrono::Local::now().date_naive(),
+        );
+        let route_plan_json = serde_json::to_value(&route_plan).unwrap_or_default();
+        tracing::info!(
+            "chat timing: route plan ready {}ms — {}",
+            t0.elapsed().as_millis(),
+            route_plan_json
+        );
+        // Audit the decision (sources/filters only — never message contents).
+        audit_fs(&db, "route_plan", &route_plan_json);
+        let _ = tx
+            .send(Ok(Event::default().data(
+                serde_json::json!({"type": "route_plan", "plan": route_plan_json}).to_string(),
+            )))
+            .await;
+        let route_plan_sources: HashSet<RouteSource> = match &route_plan {
+            RoutePlan::Search { searches, .. } => searches.iter().map(|s| s.source).collect(),
+            _ => HashSet::new(),
+        };
+
         // Determine which tools are needed and gate via rules engine
         let low = user_message.to_lowercase();
         let selected_whatsapp = context_plan.task_type == "whatsapp"
@@ -2399,6 +2448,11 @@ async fn chat(
                 "show it", "ukáž", "ten súbor", "that file",
             ].iter().any(|kw| low.contains(kw))));
 
+        // Route plan sources must pass the same approval gate as keyword-detected ones.
+        let needs_mail = needs_mail || route_plan_sources.contains(&RouteSource::AppleMail);
+        let needs_file =
+            needs_file || (fs.is_some() && route_plan_sources.contains(&RouteSource::Files));
+
         let mut allowed_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (needed, tool_name, description) in [
@@ -2441,6 +2495,35 @@ async fn chat(
         }
 
         tracing::info!("chat timing: rules checked {}ms", t0.elapsed().as_millis());
+
+        // ── Evidence pipeline ─────────────────────────────────────────────────
+        // Execute the validated route plan (read-only, parallel, budgeted).
+        // Only genuine live-fetch follow-ups (full_record / more_history) keep the
+        // legacy paths. A standalone turn whose connector the resolver merely
+        // *guessed* (needs_live_fetch=false) must still reach the evidence
+        // pipeline — otherwise it falls to the weak qwen3:0.6b mail classifier.
+        let route_execution = if !reference_resolution.needs_live_fetch {
+            execute_route_plan(
+                &route_plan,
+                &allowed_tools,
+                &db,
+                &mail,
+                &fs_exec,
+                &state.whatsapp,
+                &ollama,
+            )
+            .await
+        } else {
+            RouteExecution::default()
+        };
+        if route_execution.evidence_block.is_some() {
+            tracing::info!(
+                "chat timing: evidence pipeline done {}ms — handled {:?}",
+                t0.elapsed().as_millis(),
+                route_execution.handled
+            );
+        }
+
         // Fetch live tool context (mail/notes/window) only for approved tools.
         // Filesystem turns are now handled by the agentic tool loop below.
         let tool_context = fetch_tool_context(
@@ -2453,6 +2536,7 @@ async fn chat(
             &context_plan.task_type,
             &context_plan.candidate_skill_names,
             &allowed_tools,
+            &route_execution.handled,
             ctx_db,
             mail,
             notes,
@@ -2474,6 +2558,19 @@ async fn chat(
             whatsapp_ref: whatsapp_ref_opt,
             mail_search_trace,
         } = tool_context;
+
+        // Merge evidence-pipeline output: the evidence block leads the tool
+        // context, and its refs win over legacy ones for coreference.
+        let tool_ctx = match (route_execution.evidence_block.clone(), tool_ctx) {
+            (Some(ev), Some(rest)) => Some(format!("{ev}\n\n{rest}")),
+            (Some(ev), None) => Some(ev),
+            (None, rest) => rest,
+        };
+        let mail_ref_opt = route_execution.mail_ref.clone().or(mail_ref_opt);
+        let whatsapp_ref_opt = route_execution.whatsapp_ref.clone().or(whatsapp_ref_opt);
+        if let Some(ref fref) = route_execution.file_ref {
+            save_last_file_ref(&runtime_refs, &session_id, fref).await;
+        }
 
         // Background action (e.g. workspace switch): skip LLM, emit brief confirmation.
         if let Some(action_msg) = action_taken {
@@ -2855,7 +2952,10 @@ async fn chat(
         // For file-search turns the model drives search/read/open tool calls
         // and sees only real filesystem results — hallucination is structurally
         // impossible because the model can only name files that tools returned.
-        let is_file_turn = context_plan.task_type == "file_search"
+        // Skip the free-form tool loop when the evidence pipeline already
+        // searched files this turn; open/reveal follow-ups still use it.
+        let is_file_turn = !route_execution.handled.contains(&RouteSource::Files)
+            && (context_plan.task_type == "file_search"
             || needs_file
             || (last_file_ref.is_some() && {
                 let lv = user_message.to_lowercase();
@@ -2872,7 +2972,7 @@ async fn chat(
                 ]
                 .iter()
                 .any(|kw| lv.contains(kw))
-            });
+            }));
 
         if is_file_turn {
             if let Some(ref fs_c) = fs_exec {
@@ -5560,6 +5660,467 @@ fn find_matching_whatsapp_contact<'a>(
     })
 }
 
+// ── Route executor (evidence pipeline) ───────────────────────────────────────
+
+/// Result of executing a validated `RoutePlan`: ranked evidence rendered as a
+/// prompt block, plus coreference refs and the set of sources this pipeline
+/// handled (used to suppress the legacy per-connector branches).
+#[derive(Default)]
+struct RouteExecution {
+    evidence_block: Option<String>,
+    mail_ref: Option<MailRef>,
+    file_ref: Option<FileRef>,
+    whatsapp_ref: Option<WhatsappRef>,
+    handled: HashSet<RouteSource>,
+}
+
+/// "YYYY-MM-DD" (local) → inclusive unix-second bounds.
+fn iso_date_to_unix_range(from: Option<&str>, to: Option<&str>) -> (Option<i64>, Option<i64>) {
+    use chrono::TimeZone as _;
+    let parse = |s: &str, h: u32, m: u32, sec: u32| {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(h, m, sec))
+            .and_then(|dt| chrono::Local.from_local_datetime(&dt).single())
+            .map(|dt| dt.timestamp())
+    };
+    (
+        from.and_then(|s| parse(s, 0, 0, 0)),
+        to.and_then(|s| parse(s, 23, 59, 59)),
+    )
+}
+
+/// Execute the read-only searches of a `RoutePlan::Search` in parallel with
+/// per-tool timeouts, normalise everything into `Evidence`, rank + dedup +
+/// embed-rerank, and render the size-capped block the synthesizer will see.
+///
+/// Only sources whose tools passed the approval gate run. Open-intent and
+/// untargeted turns return `default()` so the legacy flows (approval-gated
+/// open, unread lists, follow-up refs) keep handling them.
+#[allow(clippy::too_many_arguments)]
+async fn execute_route_plan(
+    plan: &RoutePlan,
+    allowed_tools: &HashSet<String>,
+    db: &Arc<Mutex<Connection>>,
+    mail: &Option<MailConnector>,
+    fs: &Option<FsConnector>,
+    whatsapp: &Arc<WhatsappConnector>,
+    ollama: &OllamaClient,
+) -> RouteExecution {
+    use std::time::Duration;
+
+    let RoutePlan::Search {
+        searches,
+        intent_type,
+        read_top,
+    } = plan
+    else {
+        return RouteExecution::default();
+    };
+    if matches!(intent_type, RouteIntentType::Open) {
+        return RouteExecution::default();
+    }
+    let targeted = searches
+        .iter()
+        .any(|s| !s.query.trim().is_empty() || s.person.is_some() || s.date_from.is_some());
+    if !targeted {
+        return RouteExecution::default();
+    }
+
+    let mail_plan = searches
+        .iter()
+        .find(|s| s.source == RouteSource::AppleMail)
+        .filter(|_| mail.is_some() && allowed_tools.contains("mail_inbox"));
+    let file_plan = searches
+        .iter()
+        .find(|s| s.source == RouteSource::Files)
+        .filter(|_| fs.is_some() && allowed_tools.contains("filesystem.search_files"));
+    let wa_plan = searches.iter().find(|s| s.source == RouteSource::Whatsapp);
+
+    let mail_fut = async {
+        let (Some(p), Some(mc)) = (mail_plan, mail.clone()) else {
+            return (false, Vec::new());
+        };
+        let (date_from, date_to) =
+            iso_date_to_unix_range(p.date_from.as_deref(), p.date_to.as_deref());
+        let filter = MailSearchFilter {
+            sender: p.person.clone(),
+            subject: None,
+            date_from,
+            date_to,
+            limit: p.limit,
+            keywords: p.query.split_whitespace().map(String::from).collect(),
+        };
+        let msgs = match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || mc.search_messages(&filter)),
+        )
+        .await
+        {
+            Ok(Ok(Ok(m))) => m,
+            _ => Vec::new(),
+        };
+        let evs = msgs
+            .into_iter()
+            .map(|m| {
+                let mut ev = Evidence::new(
+                    RouteSource::AppleMail,
+                    m.subject.clone(),
+                    m.rowid.to_string(),
+                )
+                .with_snippet(m.body.clone().unwrap_or_else(|| m.subject.clone()));
+                ev.author = Some(m.sender_display.clone().unwrap_or_else(|| m.sender.clone()));
+                ev.date = chrono::DateTime::from_timestamp(m.received_at, 0)
+                    .map(|d| d.format("%Y-%m-%d").to_string());
+                ev.location = Some(m.mailbox_url.clone());
+                ev.metadata = serde_json::json!({
+                    "message_id": m.message_id,
+                    "sender": m.sender,
+                    "attachments": m.attachments.len(),
+                });
+                ev
+            })
+            .collect();
+        (true, evs)
+    };
+
+    let file_fut = async {
+        let (Some(p), Some(fc)) = (file_plan, fs.clone()) else {
+            return (false, Vec::new());
+        };
+        let mut terms: Vec<String> = p.query.split_whitespace().map(String::from).collect();
+        if let Some(person) = &p.person {
+            terms.push(person.clone());
+        }
+        if terms.is_empty() {
+            return (true, Vec::new());
+        }
+        let req = FileSearchRequest {
+            query: p.query.clone(),
+            terms,
+            roots: None,
+            search_names: true,
+            search_contents: true,
+            extensions: p.file_type.clone().map(|e| vec![e]),
+            include_hidden: false,
+            max_results: p.limit,
+            max_depth: Some(8),
+        };
+        let policy = fc.policy.clone();
+        let results = match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || fs_search::search_files_sync(&policy, req)),
+        )
+        .await
+        {
+            Ok(Ok(Ok(r))) => r.results,
+            _ => Vec::new(),
+        };
+        let evs = results
+            .into_iter()
+            .map(|f| {
+                let mut ev =
+                    Evidence::new(RouteSource::Files, f.display_name.clone(), f.path.clone())
+                        .with_snippet(f.matched_line.clone().unwrap_or_else(|| f.path.clone()));
+                ev.date = f.modified_at.clone();
+                ev.location = f.parent.clone();
+                ev.metadata = serde_json::json!({
+                    "kind": format!("{:?}", f.kind).to_lowercase(),
+                    "mime": f.mime,
+                });
+                ev
+            })
+            .collect();
+        (true, evs)
+    };
+
+    let wa_fut = async {
+        let Some(p) = wa_plan else {
+            return (false, Vec::new(), None);
+        };
+        let terms: Vec<String> = p
+            .query
+            .split_whitespace()
+            .filter(|w| w.len() > 2)
+            .map(|s| s.to_lowercase())
+            .collect();
+        let ready = matches!(
+            whatsapp.status().await.map(|s| s.status),
+            Ok(WhatsappConnectionStatus::Ready)
+        );
+        // Person-targeted: resolve the chat live and scan recent messages.
+        if ready {
+            if let Some(person) = &p.person {
+                let resolved = match whatsapp.list_chats(200).await {
+                    Ok(chats) => find_matching_whatsapp_chat(&chats, person).map(|c| {
+                        (
+                            c.id.clone(),
+                            c.name.clone().unwrap_or_else(|| person.clone()),
+                        )
+                    }),
+                    Err(_) => None,
+                };
+                let resolved = match resolved {
+                    Some(r) => Some(r),
+                    None => whatsapp.list_contacts(500).await.ok().and_then(|contacts| {
+                        find_matching_whatsapp_contact(&contacts, person).map(|c| {
+                            (
+                                c.id.clone(),
+                                c.name
+                                    .clone()
+                                    .or_else(|| c.push_name.clone())
+                                    .unwrap_or_else(|| person.clone()),
+                            )
+                        })
+                    }),
+                };
+                if let Some((chat_id, chat_name)) = resolved {
+                    let msgs = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        whatsapp.chat_messages(&chat_id, 50, None),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default();
+                    let mut hits: Vec<_> = msgs
+                        .iter()
+                        .filter(|m| {
+                            terms.is_empty() || {
+                                let b = m.body.to_lowercase();
+                                terms.iter().any(|t| b.contains(t))
+                            }
+                        })
+                        .collect();
+                    hits.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
+                    let evs: Vec<Evidence> = hits
+                        .into_iter()
+                        .take(p.limit)
+                        .map(|m| {
+                            let mut ev = Evidence::new(
+                                RouteSource::Whatsapp,
+                                format!("Chat: {chat_name}"),
+                                m.id.clone(),
+                            )
+                            .with_snippet(m.body.clone());
+                            ev.author = Some(if m.from_me {
+                                "me".to_string()
+                            } else {
+                                chat_name.clone()
+                            });
+                            ev.date = chrono::DateTime::from_timestamp(m.timestamp, 0)
+                                .map(|d| d.format("%Y-%m-%d").to_string());
+                            ev.location = Some(chat_name.clone());
+                            ev.metadata = serde_json::json!({"chat_id": m.chat_id});
+                            ev
+                        })
+                        .collect();
+                    let wref = WhatsappRef {
+                        chat_id,
+                        contact_name: Some(chat_name),
+                        snippet: evs.first().map(|e| e.snippet.clone()),
+                        source: "route_search".to_string(),
+                        last_message_timestamp: None,
+                    };
+                    return (true, evs, Some(wref));
+                }
+            }
+        }
+        // Fallback: cached WhatsApp messages in SQLite.
+        let rows = search_whatsapp_cache(db, &terms, p.limit).await;
+        let evs = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut ev = Evidence::new(
+                    RouteSource::Whatsapp,
+                    format!("Message from {}", r.sender),
+                    format!("cache:{i}"),
+                )
+                .with_snippet(r.body);
+                ev.author = Some(r.sender);
+                ev
+            })
+            .collect();
+        (true, evs, None)
+    };
+
+    let ((mail_ran, mail_evs), (file_ran, file_evs), (wa_ran, wa_evs, whatsapp_ref)) =
+        tokio::join!(mail_fut, file_fut, wa_fut);
+
+    let mut searched: Vec<(RouteSource, usize)> = Vec::new();
+    let mut handled = HashSet::new();
+    for (ran, source, count) in [
+        (mail_ran, RouteSource::AppleMail, mail_evs.len()),
+        (file_ran, RouteSource::Files, file_evs.len()),
+        (wa_ran, RouteSource::Whatsapp, wa_evs.len()),
+    ] {
+        if ran {
+            searched.push((source, count));
+            handled.insert(source);
+        }
+    }
+    if handled.is_empty() {
+        // Plan wanted private sources but none could run (connector missing /
+        // tool not permitted). Tell the model the truth so it doesn't invent
+        // a "privacy restrictions" refusal.
+        let wanted: Vec<&str> = searches.iter().map(|s| s.source.as_str()).collect();
+        if wanted.is_empty() {
+            return RouteExecution::default();
+        }
+        return RouteExecution {
+            evidence_block: Some(format!(
+                "## Local search evidence\n\
+                 The user asked to search: {}. These local sources are currently \
+                 unavailable to the assistant (connector not accessible or not \
+                 permitted — Apple Mail requires Full Disk Access). Tell the user \
+                 the search could not be run and that access can be enabled in \
+                 bagent Settings / macOS System Settings. Do NOT claim privacy or \
+                 legal restrictions prevent searching — this app searches these \
+                 sources locally by design.\n",
+                wanted.join(", ")
+            )),
+            ..RouteExecution::default()
+        };
+    }
+
+    let budgets = bagent_agent::RouteBudgets::default();
+    let query = searches
+        .iter()
+        .map(|s| s.query.as_str())
+        .find(|q| !q.trim().is_empty())
+        .unwrap_or("")
+        .to_string();
+    let person = searches.iter().find_map(|s| s.person.clone());
+    let prio: HashMap<RouteSource, u8> = searches.iter().map(|s| (s.source, s.priority)).collect();
+    let items: Vec<Evidence> = mail_evs
+        .into_iter()
+        .chain(file_evs)
+        .chain(wa_evs)
+        .collect();
+    let mut ranked = bagent_agent::rank(
+        &query,
+        person.as_deref(),
+        |s| *prio.get(&s).unwrap_or(&3),
+        items,
+        budgets.max_evidence_items,
+    );
+    if let Err(e) = bagent_agent::embed_rerank(ollama, DEFAULT_EMBED_MODEL, &query, &mut ranked).await
+    {
+        tracing::debug!("embed rerank skipped: {e}");
+    }
+
+    // Auto-read the top hit when the intent needs content and it clearly wins.
+    let mut full_content: Option<String> = None;
+    if *read_top {
+        let clear_winner = ranked.len() == 1
+            || ranked
+                .get(1)
+                .map(|second| ranked[0].confidence - second.confidence > 0.15)
+                .unwrap_or(false);
+        // A mail body is one cheap emlx read — always surface the top hit's
+        // content so "find the email from X" can describe what's inside, even
+        // when several mails from the same sender rank closely. Files keep the
+        // strict gate (full-file reads are heavier and noisier).
+        let top_is_mail = ranked
+            .first()
+            .map(|t| t.source == RouteSource::AppleMail)
+            .unwrap_or(false);
+        if clear_winner || top_is_mail {
+            if let Some(top) = ranked.first() {
+                full_content = match top.source {
+                    RouteSource::AppleMail => match (mail.clone(), top.object_id.parse::<i64>()) {
+                        (Some(mc), Ok(rowid)) => {
+                            tokio::task::spawn_blocking(move || mc.get_message(rowid))
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .flatten()
+                                .and_then(|m| m.body)
+                                .map(|b| b.chars().take(4000).collect())
+                        }
+                        _ => None,
+                    },
+                    RouteSource::Files => {
+                        if let Some(fc) = fs.clone() {
+                            let req = ReadTextRequest {
+                                path: top.object_id.clone(),
+                                max_bytes: None,
+                                around_line: None,
+                            };
+                            let policy = fc.policy.clone();
+                            tokio::task::spawn_blocking(move || {
+                                fs_search::read_text_sync(&policy, req)
+                            })
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .map(|r| r.content.chars().take(4000).collect())
+                        } else {
+                            None
+                        }
+                    }
+                    // Chat messages are already the content.
+                    RouteSource::Whatsapp => None,
+                };
+            }
+        }
+    }
+
+    let mail_ref = ranked
+        .iter()
+        .find(|e| e.source == RouteSource::AppleMail)
+        .and_then(|e| {
+            e.object_id.parse::<i64>().ok().map(|rowid| MailRef {
+                rowid,
+                message_id: e
+                    .metadata
+                    .get("message_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                subject: e.title.clone(),
+                sender: e.author.clone().unwrap_or_default(),
+                auto_open: false,
+            })
+        });
+    let file_ref = ranked
+        .iter()
+        .find(|e| e.source == RouteSource::Files)
+        .map(|e| FileRef {
+            path: e.object_id.clone(),
+            display_name: e.title.clone(),
+            kind: e
+                .metadata
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("file")
+                .to_string(),
+        });
+
+    // Audit result shape only — titles/ids, never snippets.
+    audit_fs(
+        db,
+        "route_executed",
+        &serde_json::json!({
+            "searched": searched.iter().map(|(s, n)| (s.as_str(), n)).collect::<Vec<_>>(),
+            "evidence_count": ranked.len(),
+            "read_top": full_content.is_some(),
+        }),
+    );
+
+    RouteExecution {
+        evidence_block: Some(bagent_agent::render_evidence_context(
+            &searched,
+            &ranked,
+            full_content.as_deref(),
+        )),
+        mail_ref,
+        file_ref,
+        whatsapp_ref,
+        handled,
+    }
+}
+
 async fn fetch_tool_context(
     message: &str,
     history: &[Message],
@@ -5570,6 +6131,7 @@ async fn fetch_tool_context(
     task_type: &str,
     candidate_skill_names: &[String],
     allowed_tools: &std::collections::HashSet<String>,
+    route_handled: &HashSet<RouteSource>,
     db: Arc<Mutex<Connection>>,
     mail: Option<MailConnector>,
     notes: Option<NotesConnector>,
@@ -5644,6 +6206,7 @@ async fn fetch_tool_context(
         .iter()
         .any(|kw| low.contains(kw));
     let looks_like_mail = allowed_tools.contains("mail_inbox")
+        && !route_handled.contains(&RouteSource::AppleMail)
         && (task_type == "mail_search"
             || reference_resolution.resolved_connector.as_deref() == Some("mail")
             || (!mentions_whatsapp && (mail_keyword_match || mail_followup_match)));
@@ -6504,14 +7067,15 @@ async fn fetch_tool_context(
                 "posledné správy",
                 "posledne spravy",
             ];
-            explicit.iter().any(|k| low.contains(k))
-                || planner_selected_whatsapp
-                || reference_resolution.resolved_connector.as_deref() == Some("whatsapp")
-                || (send_signals.iter().any(|k| low.contains(k)) && !has_mail)
-                || (find_signals.iter().any(|k| low.contains(k)) && !has_mail)
-                || (last_whatsapp_ref.is_some()
-                    && followup_signals.iter().any(|k| low.contains(k))
-                    && !has_mail)
+            !route_handled.contains(&RouteSource::Whatsapp)
+                && (explicit.iter().any(|k| low.contains(k))
+                    || planner_selected_whatsapp
+                    || reference_resolution.resolved_connector.as_deref() == Some("whatsapp")
+                    || (send_signals.iter().any(|k| low.contains(k)) && !has_mail)
+                    || (find_signals.iter().any(|k| low.contains(k)) && !has_mail)
+                    || (last_whatsapp_ref.is_some()
+                        && followup_signals.iter().any(|k| low.contains(k))
+                        && !has_mail))
         };
 
         if looks_like_whatsapp {

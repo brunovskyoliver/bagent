@@ -16,7 +16,7 @@ cargo build --release --workspace
 # Run all tests (excluding live-Ollama tests)
 cargo test --workspace
 
-# Run live-Ollama tests (requires Ollama running with qwen2.5:7b + bge-m3)
+# Run live-Ollama tests (requires Ollama running with qwen3:8b + qwen3:0.6b + bge-m3)
 cargo test --workspace -- --include-ignored
 
 # Run a single crate's tests
@@ -54,8 +54,9 @@ make whatsapp-bridge-install   # from apps/macos/ — installs Node deps + Chrom
 ### Required models (pull once)
 
 ```bash
-ollama pull qwen2.5:7b      # default chat model (passes SK diacritics)
-ollama pull bge-m3          # embeddings (Phase 3+)
+ollama pull qwen3:8b        # default chat model (passes SK diacritics)
+ollama pull qwen3:0.6b      # route/intent classifier (fast, think disabled)
+ollama pull bge-m3          # embeddings (Phase 3+, evidence rerank)
 ollama pull qwen2.5vl:7b   # vision / screen-context (Phase 7+, ~6 GB)
 ```
 
@@ -111,10 +112,11 @@ Ollama  ·  Connectors  ·  SQLite (refinery migrations)
 Every `/chat` request runs through a planning layer before prompt assembly:
 
 1. `ContextPlanner` — deterministic keyword gates (mail / file / odoo / screen / window / whatsapp) with Ollama JSON-mode fallback → `ContextPlan { task_type, needs_*, language_hint }`
-2. `SkillSelector` — picks up to 3 matching `SKILL.md` files from `skills/`
-3. `MemorySelector` + corrections + cross-session recall run in `tokio::join!`
-4. `fetch_tool_context` dispatches the appropriate connector
-5. `PromptBuilder::build` assembles 9 layers (identity, style, glossary, correction, memory, tool-data, attachment, session summary, recent turns)
+2. Route plan (`crates/agent/src/routing.rs`) — bilingual deterministic hints + qwen3:0.6b slim JSON classifier (think off, careful qwen3:8b retry on weak/invalid output) merged by `build_route` into a validated `RoutePlan` (privacy gate fails closed, budgets clamped, destructive verbs → clarify). Emitted as a `route_plan` SSE event and audited.
+3. `SkillSelector` — picks up to 3 matching `SKILL.md` files from `skills/`
+4. `MemorySelector` + corrections + cross-session recall run in `tokio::join!`
+5. `execute_route_plan` (daemon) — parallel read-only mail/files/whatsapp searches per plan → normalized `Evidence` → deterministic rank + dedup + bge-m3 rerank (`crates/agent/src/evidence.rs`), capped at 12 items; auto-reads the top hit for summarize/read intents. Legacy `fetch_tool_context` branches handle follow-ups, unread lists, opens, odoo/notes/screen/window.
+6. `PromptBuilder::build` assembles 9 layers (identity, style, glossary, correction, memory, tool-data, attachment, session summary, recent turns); the tool-data layer carries the evidence block with evidence-only grounding rules
 
 ### Slovak / English bilingual rules
 
