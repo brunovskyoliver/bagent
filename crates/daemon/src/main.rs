@@ -13,13 +13,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use bagent_agent::{
-    ContextPlan, ContextPlanner, Evidence, IntentType as RouteIntentType, MailIntentClassifier,
-    OdooAction, OdooIntentClassifier, PlannerRuntimeContext, PromptBuilder, PromptTrace,
-    ReferenceCandidate, ReferenceResolution, ReferenceResolver, RouteClassifier, RoutePlan,
-    ScreenIntentClassifier, SelectedSkill, Source as RouteSource, TaskRater, WhatsappAction,
-    WhatsappIntent, WhatsappIntentClassifier, WindowIntentClassifier,
-};
+use bagent_agent::{PromptBuilder, PromptTrace, ScreenIntentClassifier, SelectedSkill, TaskRater};
 use bagent_attachments::extract as extract_attachment;
 use bagent_memory::MemoryStore;
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
@@ -34,9 +28,7 @@ use filesystem_connector::{
 };
 use futures_util::StreamExt;
 use odoo_connector::{OdooConfig, OdooConnector, OdooError, OdooRecordRef};
-use ollama_connector::{
-    ChatTurn as OllamaChatTurn, Message, OllamaClient, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL,
-};
+use ollama_connector::{Message, OllamaClient, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,8 +43,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 use whatsapp_connector::{
-    WhatsappChat, WhatsappConfig, WhatsappConnectionStatus, WhatsappConnector, WhatsappContact,
-    WhatsappSendTarget,
+    WhatsappConfig, WhatsappConnectionStatus, WhatsappConnector, WhatsappSendTarget,
 };
 
 mod embedded {
@@ -80,10 +71,6 @@ struct AppState {
     pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     /// Loaded skill manifests + bodies, scanned at startup.
     skills: Arc<Vec<LoadedSkill>>,
-    /// Context planner for the planning layer (deterministic + LLM fallback).
-    context_planner: Arc<ContextPlanner>,
-    /// Local model resolver for implicit follow-ups ("this chat", "it", "when was this").
-    reference_resolver: Arc<ReferenceResolver>,
     /// Deterministic task rater — classifies local vs Codex tasks.
     task_rater: Arc<TaskRater>,
     /// Codex external-reasoning connector (None when binary not found).
@@ -257,60 +244,10 @@ struct MailRef {
     auto_open: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct MailSearchDebugTrace {
-    looked_like_mail: bool,
-    mail_connector_available: bool,
-    effective_action: Option<String>,
-    intent: Option<serde_json::Value>,
-    attempts: Vec<MailSearchAttemptTrace>,
-    selected_rowid: Option<i64>,
-    miss_reason: Option<String>,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MailSearchAttemptTrace {
-    phase: String,
-    adapter: String,
-    filter: MailSearchFilterTrace,
-    result_count: usize,
-    candidates: Vec<MailSearchCandidateTrace>,
-    error: Option<String>,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MailSearchFilterTrace {
-    sender: Option<String>,
-    subject: Option<String>,
-    date_from: Option<i64>,
-    date_to: Option<i64>,
-    date_from_local: Option<String>,
-    date_to_local: Option<String>,
-    limit: usize,
-    keywords: Vec<String>,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MailSearchCandidateTrace {
-    rowid: i64,
-    sender: String,
-    sender_display: Option<String>,
-    subject: String,
-    received_at: i64,
-    received_at_local: String,
-    mailbox_url: String,
-}
 
-#[derive(Debug, Default)]
-struct ToolContextResult {
-    tool_ctx: Option<String>,
-    mail_pdf_paths: Vec<(String, std::path::PathBuf)>,
-    mail_ref: Option<MailRef>,
-    action_taken: Option<String>,
-    odoo_ref: Option<OdooRecordRef>,
-    whatsapp_ref: Option<WhatsappRef>,
-    mail_search_trace: Option<MailSearchDebugTrace>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WhatsappRef {
@@ -698,14 +635,6 @@ async fn main() -> Result<()> {
         Arc::new(loaded)
     };
 
-    let context_planner = Arc::new(ContextPlanner::new(
-        ollama.clone(),
-        classifier_model.clone(),
-    ));
-    let reference_resolver = Arc::new(ReferenceResolver::new(
-        ollama.clone(),
-        classifier_model.clone(),
-    ));
 
     let task_rater = Arc::new(TaskRater::new());
 
@@ -762,8 +691,6 @@ async fn main() -> Result<()> {
         rules,
         pending_approvals,
         skills,
-        context_planner,
-        reference_resolver,
         task_rater,
         codex,
         odoo,
@@ -820,7 +747,6 @@ async fn main() -> Result<()> {
         .route("/skills", get(skills_list))
         .route("/skills/:name", get(skills_get))
         // Context plan debug
-        .route("/debug/context-plan", post(debug_context_plan))
         // Phase 13A — Filesystem + app-open
         .route("/filesystem/roots", get(filesystem_roots))
         .route("/filesystem/search", post(filesystem_search))
@@ -1536,99 +1462,7 @@ async fn skills_get(State(state): State<AppState>, Path(name): Path<String>) -> 
 
 // ── Debug: context plan ───────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct ContextPlanRequest {
-    message: String,
-    #[serde(default = "default_und")]
-    language: String,
-    #[serde(default)]
-    has_mail_ctx: bool,
-    #[serde(default)]
-    recent_context: String,
-    #[serde(default)]
-    reference_candidates: Vec<ReferenceCandidate>,
-}
 
-async fn debug_context_plan(
-    State(state): State<AppState>,
-    Json(req): Json<ContextPlanRequest>,
-) -> impl IntoResponse {
-    let lang = if req.language == "auto" {
-        if req.message.chars().any(|c| "áčďéíľĺňóôŕšťúýž".contains(c)) {
-            "sk"
-        } else {
-            "en"
-        }
-    } else {
-        &req.language
-    };
-
-    let reference_resolution = state
-        .reference_resolver
-        .resolve(
-            &req.message,
-            &req.recent_context,
-            &req.reference_candidates,
-            &[],
-            &chrono::Local::now().to_rfc3339(),
-        )
-        .await
-        .unwrap_or_default();
-
-    let mut plan = state
-        .context_planner
-        .plan(
-            &req.message,
-            lang,
-            req.has_mail_ctx,
-            &PlannerRuntimeContext {
-                recent_context: format!(
-                    "{}\n\nResolved reference: {}",
-                    req.recent_context,
-                    serde_json::to_string(&reference_resolution).unwrap_or_default()
-                ),
-                available_skill_names: state
-                    .skills
-                    .iter()
-                    .map(|s| s.manifest.name.clone())
-                    .collect(),
-                ..Default::default()
-            },
-        )
-        .await;
-    apply_reference_resolution_to_plan(&mut plan, &reference_resolution, &req.message);
-
-    // Run skill selection for the response
-    let selected_skills =
-        skill_selector::select(&plan.candidate_skill_names, &state.skills, &req.message);
-    let selected_skill_names: Vec<&str> = selected_skills.iter().map(|s| s.name.as_str()).collect();
-
-    plan.needs_memory = false;
-    plan.memory_namespaces.clear();
-    plan.memory_kinds.clear();
-    plan.needs_conversation_recall = false;
-    let selected_memory_ids: Vec<String> = Vec::new();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "task_type": plan.task_type,
-            "response_language_hint": format!("{:?}", plan.response_language_hint),
-            "needs_memory": plan.needs_memory,
-            "memory_namespaces": plan.memory_namespaces,
-            "memory_kinds": plan.memory_kinds,
-            "needs_conversation_recall": plan.needs_conversation_recall,
-            "candidate_skill_names": plan.candidate_skill_names,
-            "selected_skill_names": selected_skill_names,
-            "selected_memory_ids": selected_memory_ids,
-            "confidence": plan.confidence,
-            "intent_source": plan.intent_source,
-            "selected_connector": plan.selected_connector,
-            "clarification_needed": plan.clarification_needed,
-            "reference_resolution": reference_resolution,
-        })),
-    )
-}
 
 async fn debug_conversation(
     State(state): State<AppState>,
@@ -1776,206 +1610,9 @@ fn debug_trace_preview(trace: &PromptTrace) -> String {
     preview_text(&format!("{layers}; {recall}{mail}"), 180)
 }
 
-fn build_reference_candidates(
-    mail_ref: Option<&MailRef>,
-    file_ref: Option<&FileRef>,
-    odoo_ref: Option<&OdooRecordRef>,
-    whatsapp_ref: Option<&WhatsappRef>,
-) -> Vec<ReferenceCandidate> {
-    let mut candidates = Vec::new();
-    if let Some(r) = mail_ref {
-        candidates.push(ReferenceCandidate {
-            connector: "mail".to_string(),
-            entity_type: "mail".to_string(),
-            entity_id: Some(r.rowid.to_string()),
-            label: Some(r.subject.clone()),
-            timestamp: None,
-            summary: Some(format!("from {}", r.sender)),
-        });
-    }
-    if let Some(r) = file_ref {
-        candidates.push(ReferenceCandidate {
-            connector: "filesystem".to_string(),
-            entity_type: r.kind.clone(),
-            entity_id: Some(r.path.clone()),
-            label: Some(r.display_name.clone()),
-            timestamp: None,
-            summary: None,
-        });
-    }
-    if let Some(r) = odoo_ref {
-        candidates.push(ReferenceCandidate {
-            connector: "odoo".to_string(),
-            entity_type: "record".to_string(),
-            entity_id: Some(format!("{}:{}", r.model, r.id)),
-            label: Some(r.name.clone()),
-            timestamp: None,
-            summary: Some(r.url.clone()),
-        });
-    }
-    if let Some(r) = whatsapp_ref {
-        candidates.push(ReferenceCandidate {
-            connector: "whatsapp".to_string(),
-            entity_type: "chat".to_string(),
-            entity_id: Some(r.chat_id.clone()),
-            label: r.contact_name.clone(),
-            timestamp: r.last_message_timestamp,
-            summary: r.snippet.clone(),
-        });
-    }
-    candidates
-}
 
-/// Return the connector that the user explicitly named in their turn, if any.
-/// Used to prevent the resolver override from replacing an explicitly-named connector
-/// (e.g. "whatsapp") with a contradicting one produced by the LLM (e.g. "mail").
-fn explicit_connector_in_turn(turn: &str) -> Option<&'static str> {
-    let low = turn.to_lowercase();
-    // WhatsApp — check first so "mail" substring does not override it
-    if [
-        "whatsapp",
-        "whatspp",
-        "whatsap",
-        "whatapp",
-        "na whatsappe",
-        "cez whatsapp",
-    ]
-    .iter()
-    .any(|k| low.contains(k))
-    {
-        return Some("whatsapp");
-    }
-    if low.contains("odoo") {
-        return Some("odoo");
-    }
-    if low.contains("finder")
-        || low.contains("s\u{fa}bor")   // Slovak "súbor"
-        || low.contains("subor")
-        || low.contains(" file")
-    {
-        return Some("filesystem");
-    }
-    if low.contains("mail")
-        || low.contains("email")
-        || low.contains("inbox")
-        || low.contains("mailbox")
-    {
-        return Some("mail");
-    }
-    None
-}
 
-fn apply_reference_resolution_to_plan(
-    plan: &mut ContextPlan,
-    resolution: &ReferenceResolution,
-    user_turn: &str,
-) {
-    if resolution.confidence < 0.55 {
-        return;
-    }
-    // If the user explicitly named a connector in their turn and the resolver
-    // produced a *different* connector, trust the deterministic planner and skip
-    // the override entirely (guards against the LLM synthesising "mail" for
-    // queries that clearly reference whatsapp/odoo/etc.).
-    if let (Some(explicit), Some(resolved)) = (
-        explicit_connector_in_turn(user_turn),
-        resolution.resolved_connector.as_deref(),
-    ) {
-        if explicit != resolved {
-            return;
-        }
-    }
-    match resolution.resolved_connector.as_deref() {
-        Some("whatsapp") => {
-            plan.task_type = "whatsapp".to_string();
-            plan.selected_connector = Some("whatsapp".to_string());
-            if !plan.candidate_skill_names.iter().any(|s| s == "whatsapp") {
-                plan.candidate_skill_names.insert(0, "whatsapp".to_string());
-            }
-            plan.candidate_skill_names.retain(|s| s == "whatsapp");
-            plan.needs_conversation_recall = false;
-            if matches!(
-                resolution.requested_operation.as_str(),
-                "answer_from_current_context"
-                    | "fetch_timestamp"
-                    | "fetch_more_history"
-                    | "analyze_tone"
-            ) {
-                plan.needs_memory = false;
-                plan.memory_namespaces.clear();
-                plan.memory_kinds.clear();
-            }
-            plan.intent_source = "reference_resolver".to_string();
-        }
-        Some("mail") => {
-            plan.task_type = "mail_search".to_string();
-            plan.selected_connector = Some("mail".to_string());
-            if !plan
-                .candidate_skill_names
-                .iter()
-                .any(|s| s == "mail-search")
-            {
-                plan.candidate_skill_names
-                    .insert(0, "mail-search".to_string());
-            }
-            plan.candidate_skill_names
-                .retain(|s| s == "mail-search" || s == "sk-business-email");
-            plan.needs_conversation_recall = false;
-            plan.intent_source = "reference_resolver".to_string();
-        }
-        Some("filesystem") => {
-            plan.task_type = "file_search".to_string();
-            plan.selected_connector = Some("filesystem".to_string());
-            if !plan
-                .candidate_skill_names
-                .iter()
-                .any(|s| s == "file-search")
-            {
-                plan.candidate_skill_names
-                    .insert(0, "file-search".to_string());
-            }
-            plan.intent_source = "reference_resolver".to_string();
-        }
-        Some("odoo") => {
-            plan.task_type = "odoo_lookup".to_string();
-            plan.selected_connector = Some("odoo".to_string());
-            if !plan
-                .candidate_skill_names
-                .iter()
-                .any(|s| s == "odoo-readonly")
-            {
-                plan.candidate_skill_names
-                    .insert(0, "odoo-readonly".to_string());
-            }
-            plan.intent_source = "reference_resolver".to_string();
-        }
-        _ => {}
-    }
-    plan.candidate_skill_names.truncate(3);
-}
 
-fn apply_source_mode_to_plan(plan: &mut ContextPlan, source_mode: Option<&str>) {
-    let Some(mode) = source_mode.map(str::trim).filter(|s| !s.is_empty()) else {
-        return;
-    };
-
-    let (task_type, connector, skill) = match mode {
-        "mail" => ("mail_search", "mail", "mail-search"),
-        "filesystem" | "files" => ("file_search", "filesystem", "file-search"),
-        "whatsapp" => ("whatsapp", "whatsapp", "whatsapp"),
-        "odoo" => ("odoo_lookup", "odoo", "odoo-readonly"),
-        _ => return,
-    };
-
-    plan.task_type = task_type.to_string();
-    plan.selected_connector = Some(connector.to_string());
-    plan.intent_source = "ui_source_mode".to_string();
-    plan.confidence = plan.confidence.max(0.95);
-    if !plan.candidate_skill_names.iter().any(|s| s == skill) {
-        plan.candidate_skill_names.insert(0, skill.to_string());
-    }
-    plan.candidate_skill_names.truncate(3);
-}
 
 fn preview_text(s: &str, max: usize) -> String {
     let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2207,14 +1844,11 @@ async fn chat(
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel(64);
     let model = req.model.clone().unwrap_or(state.default_model.clone());
-    let intent_model = state.classifier_model.clone();
     let db = state.db.clone();
     let ollama = state.ollama.clone();
     let user_message = req.message.clone();
     let mail = state.mail.clone();
     let notes = state.notes.clone();
-    let ctx_db = state.db.clone();
-    let memory = state.memory.clone();
     let prompt_builder = state.prompt_builder.clone();
     let rules = state.rules.clone();
     let debug_dir = state.debug_dir.clone();
@@ -2228,10 +1862,7 @@ async fn chat(
     let selected_text = req.selected_text.clone();
     let source_mode = req.source_mode.clone();
     let skills = state.skills.clone();
-    let context_planner = state.context_planner.clone();
-    let reference_resolver = state.reference_resolver.clone();
     let task_rater = state.task_rater.clone();
-    let fs = state.fs.clone();
     let fs_exec = state.fs.clone(); // kept for action execution in handler post-classify
     let runtime_refs = state.runtime_refs.clone();
 
@@ -2272,372 +1903,42 @@ async fn chat(
             "en"
         };
 
-        // ── Planning layer ────────────────────────────────────────────────────
-        // Run intent routing before tool approval/context so selected skills can
-        // drive connector loading. This is intentionally before live tool fetch.
-        let mut last_connector_refs = Vec::new();
-        if last_mail_ref.is_some() {
-            last_connector_refs.push("mail".to_string());
+        // ── Follow-up references ──────────────────────────────────────────────
+        // The tool loop resolves "open it" / "the second one" from a short note
+        // about the last things tools returned this session.
+        let mut ref_notes: Vec<String> = Vec::new();
+        if let Some(ref m) = last_mail_ref {
+            ref_notes.push(format!(
+                "Last mail seen: rowid={} subject=\"{}\" from {}",
+                m.rowid, m.subject, m.sender
+            ));
         }
-        if last_file_ref.is_some() {
-            last_connector_refs.push("filesystem".to_string());
+        if let Some(ref f) = last_file_ref {
+            ref_notes.push(format!("Last file seen: {}", f.path));
         }
-        if last_odoo_ref.is_some() {
-            last_connector_refs.push("odoo".to_string());
+        if let Some(ref o) = last_odoo_ref {
+            ref_notes.push(format!(
+                "Last Odoo record seen: model={} id={} name=\"{}\"",
+                o.model, o.id, o.name
+            ));
         }
-        if last_whatsapp_ref.is_some() {
-            last_connector_refs.push("whatsapp".to_string());
+        if let Some(ref w) = last_whatsapp_ref {
+            ref_notes.push(format!(
+                "Last WhatsApp chat seen: chat_id={} contact={}",
+                w.chat_id,
+                w.contact_name.as_deref().unwrap_or("?")
+            ));
         }
-        let recent_context = format_history_snippet(&history, 6);
-        let reference_candidates = build_reference_candidates(
-            last_mail_ref.as_ref(),
-            last_file_ref.as_ref(),
-            last_odoo_ref.as_ref(),
-            last_whatsapp_ref.as_ref(),
-        );
-        let reference_resolution = reference_resolver
-            .resolve(
-                &user_message,
-                &recent_context,
-                &reference_candidates,
-                &[],
-                &chrono::Local::now().to_rfc3339(),
-            )
-            .await
-            .unwrap_or_default();
-        let runtime_context = PlannerRuntimeContext {
-            recent_context: format!(
-                "{}\n\nResolved reference: {}",
-                format_history_snippet(&history, 4),
-                serde_json::to_string(&reference_resolution).unwrap_or_default()
-            ),
-            last_connector_refs,
-            connector_statuses: vec![
-                format!("mail:{}", mail.is_some()),
-                format!("notes:{}", notes.is_some()),
-                format!("filesystem:{}", fs.is_some()),
-                "whatsapp:configured".to_string(),
-            ],
-            available_skill_names: skills.iter().map(|s| s.manifest.name.clone()).collect(),
-        };
-        let has_prior_mail_ctx = last_mail_ref.is_some();
-        let mut context_plan = context_planner
-            .plan(&user_message, lang, has_prior_mail_ctx, &runtime_context)
-            .await;
-        apply_reference_resolution_to_plan(&mut context_plan, &reference_resolution, &user_message);
-        apply_source_mode_to_plan(&mut context_plan, source_mode.as_deref());
-        context_plan.needs_memory = false;
-        context_plan.memory_namespaces.clear();
-        context_plan.memory_kinds.clear();
-        context_plan.needs_conversation_recall = false;
-        tracing::info!(
-            "chat timing: context plan ready {}ms — task={} source={} needs_memory={} skills={:?} ref={:?}",
-            t0.elapsed().as_millis(),
-            context_plan.task_type,
-            context_plan.intent_source,
-            context_plan.needs_memory,
-            context_plan.candidate_skill_names,
-            reference_resolution
-        );
-
-        // ── Route plan ────────────────────────────────────────────────────────
-        // Hints + small-model classifier merged into a validated, budget-clamped
-        // plan. The plan is a recommendation the app enforces — the model never
-        // picks tools directly.
-        let route_hints = bagent_agent::deterministic_hints(&user_message);
-        let route_classifier = RouteClassifier::new(ollama.clone(), intent_model.clone());
-        let mut route_classification =
-            match route_classifier.classify(&user_message, &recent_context).await {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::warn!("route classifier failed: {e}");
-                    None
-                }
-            };
-        if bagent_agent::needs_careful_pass(route_classification.as_ref(), &route_hints) {
-            match route_classifier
-                .classify_careful(&model, &user_message, &recent_context)
-                .await
-            {
-                Ok(c) => route_classification = Some(c),
-                Err(e) => tracing::warn!("careful route pass failed: {e}"),
-            }
-        }
-        let route_plan = bagent_agent::build_route(
-            &user_message,
-            &route_hints,
-            route_classification.as_ref(),
-            &bagent_agent::RouteBudgets::default(),
-            chrono::Local::now().date_naive(),
-        );
-        let route_plan_json = serde_json::to_value(&route_plan).unwrap_or_default();
-        tracing::info!(
-            "chat timing: route plan ready {}ms — {}",
-            t0.elapsed().as_millis(),
-            route_plan_json
-        );
-        // Audit the decision (sources/filters only — never message contents).
-        audit_fs(&db, "route_plan", &route_plan_json);
-        let _ = tx
-            .send(Ok(Event::default().data(
-                serde_json::json!({"type": "route_plan", "plan": route_plan_json}).to_string(),
-            )))
-            .await;
-        let route_plan_sources: HashSet<RouteSource> = match &route_plan {
-            RoutePlan::Search { searches, .. } => searches.iter().map(|s| s.source).collect(),
-            _ => HashSet::new(),
-        };
-
-        // Determine which tools are needed and gate via rules engine
-        let low = user_message.to_lowercase();
-        let selected_whatsapp = context_plan.task_type == "whatsapp"
-            || context_plan
-                .candidate_skill_names
-                .iter()
-                .any(|s| s == "whatsapp");
-        let mentions_whatsapp = selected_whatsapp
-            || [
-                "whatsapp",
-                "whatspp",
-                "whatsap",
-                "whatapp",
-                " wa ",
-                "wa:",
-                "na whatsappe",
-                "cez whatsapp",
-            ]
-            .iter()
-            .any(|kw| low.contains(kw));
-        let needs_mail = context_plan.task_type == "mail_search"
-            || (!mentions_whatsapp
-                && [
-                    "email",
-                    "mail",
-                    "správ",
-                    "inbox",
-                    "schránk",
-                    "doručen",
-                    "posledn",
-                    "prečítaj",
-                    "read",
-                    "sender",
-                    "odosielate",
-                    "nazvom",
-                    "názvom",
-                    "mailbox",
-                    "prilohu",
-                    "prílohu",
-                ]
-                .iter()
-                .any(|kw| low.contains(kw)));
-        let needs_notes = ["poznámk", "note", "zápis", "zapisal", "napísal"]
-            .iter()
-            .any(|kw| low.contains(kw));
-        let needs_file = fs.is_some()
-            && (context_plan.task_type == "file_search" || [
-            "nájdi", "vyhľadaj", "kde mám", "kde je súbor", "súbor", "priečinok",
-            "finder", "preview", "faktúr", "zmluv", "zmluvu", "zmluva",
-            "find file", "find document", "find invoice", "find contract",
-            "search files", "search documents", "search for file", "files containing",
-            "open file", "open folder", "reveal in finder", "show in finder",
-            "open in", "open with", "launch ", "focus finder",
-        ].iter().any(|kw| low.contains(kw))
-            // Also trigger when user references last found file
-            || (last_file_ref.is_some() && [
-                "otvor ho", "otvor ju", "otvor to", "open it", "reveal it",
-                "show it", "ukáž", "ten súbor", "that file",
-            ].iter().any(|kw| low.contains(kw))));
-
-        // Route plan sources must pass the same approval gate as keyword-detected ones.
-        let needs_mail = needs_mail || route_plan_sources.contains(&RouteSource::AppleMail);
-        let needs_file =
-            needs_file || (fs.is_some() && route_plan_sources.contains(&RouteSource::Files));
-
-        let mut allowed_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for (needed, tool_name, description) in [
-            (
-                needs_mail,
-                "mail_inbox",
-                "Čítanie poštovej schránky (Apple Mail)",
-            ),
-            (needs_notes, "notes_list", "Čítanie poznámok (Apple Notes)"),
-            (
-                needs_file,
-                "filesystem.search_files",
-                "Vyhľadávanie lokálnych súborov",
-            ),
-        ] {
-            if !needed {
-                continue;
-            }
-            match rules.check(tool_name, "{}") {
-                ApprovalLevel::Auto => {
-                    allowed_tools.insert(tool_name.to_string());
-                }
-                ApprovalLevel::Ask => {
-                    let approved =
-                        request_tool_approval(&db, &pending_approvals, &tx, tool_name, description)
-                            .await;
-                    if approved {
-                        allowed_tools.insert(tool_name.to_string());
-                    }
-                }
-                ApprovalLevel::Forbidden => {
-                    let _ = tx
-                        .send(Ok(Event::default().data(
-                            serde_json::json!({"type":"tool_blocked","tool": tool_name})
-                                .to_string(),
-                        )))
-                        .await;
-                }
-            }
-        }
-
-        tracing::info!("chat timing: rules checked {}ms", t0.elapsed().as_millis());
-
-        // ── Evidence pipeline ─────────────────────────────────────────────────
-        // Execute the validated route plan (read-only, parallel, budgeted).
-        // Only genuine live-fetch follow-ups (full_record / more_history) keep the
-        // legacy paths. A standalone turn whose connector the resolver merely
-        // *guessed* (needs_live_fetch=false) must still reach the evidence
-        // pipeline — otherwise it falls to the weak qwen3:0.6b mail classifier.
-        let route_execution = if !reference_resolution.needs_live_fetch {
-            execute_route_plan(
-                &route_plan,
-                &allowed_tools,
-                &db,
-                &mail,
-                &fs_exec,
-                &state.whatsapp,
-                &ollama,
-            )
-            .await
+        let tool_ctx: Option<String> = if ref_notes.is_empty() {
+            None
         } else {
-            RouteExecution::default()
+            Some(format!(
+                "Recent tool references (for follow-ups like \"open it\"):\n{}",
+                ref_notes.join("\n")
+            ))
         };
-        if route_execution.evidence_block.is_some() {
-            tracing::info!(
-                "chat timing: evidence pipeline done {}ms — handled {:?}",
-                t0.elapsed().as_millis(),
-                route_execution.handled
-            );
-        }
+        let _ = source_mode; // source hints are obsolete — the model picks tools itself
 
-        // Fetch live tool context (mail/notes/window) only for approved tools.
-        // Filesystem turns are now handled by the agentic tool loop below.
-        let tool_context = fetch_tool_context(
-            &user_message,
-            &history,
-            last_mail_ref.as_ref(),
-            last_odoo_ref.as_ref(),
-            last_whatsapp_ref.as_ref(),
-            &reference_resolution,
-            &context_plan.task_type,
-            &context_plan.candidate_skill_names,
-            &allowed_tools,
-            &route_execution.handled,
-            ctx_db,
-            mail,
-            notes,
-            ollama.clone(),
-            intent_model.clone(),
-            memory.clone(),
-            state.odoo.clone(),
-            state.whatsapp.clone(),
-            state.pending_approvals.clone(),
-            state.rules.clone(),
-        )
-        .await;
-        let ToolContextResult {
-            tool_ctx,
-            mail_pdf_paths,
-            mail_ref: mail_ref_opt,
-            action_taken,
-            odoo_ref: odoo_ref_opt,
-            whatsapp_ref: whatsapp_ref_opt,
-            mail_search_trace,
-        } = tool_context;
-
-        // Merge evidence-pipeline output: the evidence block leads the tool
-        // context, and its refs win over legacy ones for coreference.
-        let tool_ctx = match (route_execution.evidence_block.clone(), tool_ctx) {
-            (Some(ev), Some(rest)) => Some(format!("{ev}\n\n{rest}")),
-            (Some(ev), None) => Some(ev),
-            (None, rest) => rest,
-        };
-        let mail_ref_opt = route_execution.mail_ref.clone().or(mail_ref_opt);
-        let whatsapp_ref_opt = route_execution.whatsapp_ref.clone().or(whatsapp_ref_opt);
-        if let Some(ref fref) = route_execution.file_ref {
-            save_last_file_ref(&runtime_refs, &session_id, fref).await;
-        }
-
-        // Background action (e.g. workspace switch): skip LLM, emit brief confirmation.
-        if let Some(action_msg) = action_taken {
-            let _ = tx
-                .send(Ok(Event::default().data(
-                    serde_json::json!({"type": "action_taken", "message": action_msg}).to_string(),
-                )))
-                .await;
-            let _ = tx
-                .send(Ok(Event::default().data(
-                    serde_json::json!({"type": "done", "session_id": session_id}).to_string(),
-                )))
-                .await;
-            return;
-        }
-
-        // Emit mail_found before tokens so the MailRef is in place when the client
-        // starts watching for the auto-open trigger.
-        if let Some(ref mail_ref) = mail_ref_opt {
-            let _ = tx
-                .send(Ok(Event::default().data(
-                    serde_json::json!({
-                        "type": "mail_found",
-                        "rowid": mail_ref.rowid,
-                        "message_id": mail_ref.message_id,
-                        "subject": mail_ref.subject,
-                        "sender": mail_ref.sender,
-                        "auto_open": mail_ref.auto_open,
-                    })
-                    .to_string(),
-                )))
-                .await;
-            save_last_mail_ref(&runtime_refs, &session_id, mail_ref).await;
-        }
-
-        // Emit odoo_found so the client can show an "Otvoriť v Safari" button.
-        if let Some(ref odoo_ref) = odoo_ref_opt {
-            let _ = tx
-                .send(Ok(Event::default().data(
-                    serde_json::json!({
-                        "type": "odoo_found",
-                        "model": odoo_ref.model,
-                        "record_id": odoo_ref.id,
-                        "name": odoo_ref.name,
-                        "url": odoo_ref.url,
-                    })
-                    .to_string(),
-                )))
-                .await;
-            save_last_odoo_ref(&runtime_refs, &session_id, odoo_ref).await;
-        }
-
-        if let Some(ref whatsapp_ref) = whatsapp_ref_opt {
-            let _ = tx
-                .send(Ok(Event::default().data(
-                    serde_json::json!({
-                        "type": "whatsapp_found",
-                        "chat_id": whatsapp_ref.chat_id,
-                        "contact_name": whatsapp_ref.contact_name,
-                        "snippet": whatsapp_ref.snippet,
-                        "last_message_timestamp": whatsapp_ref.last_message_timestamp,
-                    })
-                    .to_string(),
-                )))
-                .await;
-            save_last_whatsapp_ref(&runtime_refs, &session_id, whatsapp_ref).await;
-        }
 
         // Load attachment records from DB and build context + image data for Ollama.
         struct AttachmentData {
@@ -2818,7 +2119,7 @@ async fn chat(
         // Select skills
         let selected_skills: Vec<SelectedSkill> = {
             let bagent_selected =
-                skill_selector::select(&context_plan.candidate_skill_names, &skills, &user_message);
+                skill_selector::select(&[], &skills, &user_message);
             bagent_selected
                 .into_iter()
                 .map(|s| SelectedSkill {
@@ -2833,14 +2134,11 @@ async fn chat(
         let recall_candidates = Vec::new();
 
         tracing::info!(
-            "chat timing: stateless context selected {}ms — {} cards, {} corrections, recall={}",
+            "chat timing: stateless context selected {}ms — {} cards, {} corrections",
             t0.elapsed().as_millis(),
             selected_memory.len(),
             corrections.len(),
-            context_plan.needs_conversation_recall
         );
-
-        let context_plan_json = serde_json::to_value(&context_plan).ok();
 
         // ── Build layered prompt ──────────────────────────────────────────────
         let prompt_trace_id = Uuid::new_v4().to_string();
@@ -2849,7 +2147,7 @@ async fn chat(
             .build(
                 &user_message,
                 lang,
-                &context_plan.response_language_hint,
+                &bagent_agent::ResponseLanguageHint::MatchUser,
                 &selected_skills,
                 &selected_memory,
                 &corrections,
@@ -2858,27 +2156,13 @@ async fn chat(
                 history,
                 session_summary,
                 recall_candidates,
-                context_plan.needs_conversation_recall,
-                context_plan_json,
+                false,
+                None,
                 &user_message,
             )
             .await
         {
             Ok(mut built) => {
-                let reference_json = serde_json::to_value(&reference_resolution).ok();
-                built.trace.reference_resolution = reference_json;
-                built.trace.resolved_connector = reference_resolution.resolved_connector.clone();
-                built.trace.standalone_query =
-                    if reference_resolution.standalone_query.trim().is_empty() {
-                        None
-                    } else {
-                        Some(reference_resolution.standalone_query.clone())
-                    };
-                built.trace.reference_needs_live_fetch =
-                    Some(reference_resolution.needs_live_fetch);
-                built.trace.mail_search_trace = mail_search_trace
-                    .as_ref()
-                    .and_then(|trace| serde_json::to_value(trace).ok());
                 if att_data.images_b64.is_empty() {
                     built.messages.push(Message::user(&user_message));
                 } else {
@@ -2894,15 +2178,6 @@ async fn chat(
                     chars: user_message.len(),
                     preview: preview_text(&user_message, 240),
                 });
-                if let Some(ref whatsapp_ref) = whatsapp_ref_opt {
-                    built.trace.whatsapp_contact = whatsapp_ref.contact_name.clone();
-                    built.trace.whatsapp_chat_id = Some(whatsapp_ref.chat_id.clone());
-                    built.trace.whatsapp_context_injected = Some(true);
-                    built.trace.whatsapp_intent = Some(serde_json::json!({
-                        "source": whatsapp_ref.source,
-                        "snippet_present": whatsapp_ref.snippet.is_some(),
-                    }));
-                }
                 let prompt_chars: usize = built.messages.iter().map(|m| m.content.len()).sum();
                 let _ = tx
                     .send(Ok(Event::default().data(
@@ -2948,336 +2223,734 @@ async fn chat(
         );
         let prompt_messages_for_log = messages.clone();
 
-        // ── Agentic file tool loop ────────────────────────────────────────────
-        // For file-search turns the model drives search/read/open tool calls
-        // and sees only real filesystem results — hallucination is structurally
-        // impossible because the model can only name files that tools returned.
-        // Skip the free-form tool loop when the evidence pipeline already
-        // searched files this turn; open/reveal follow-ups still use it.
-        let is_file_turn = !route_execution.handled.contains(&RouteSource::Files)
-            && (context_plan.task_type == "file_search"
-            || needs_file
-            || (last_file_ref.is_some() && {
-                let lv = user_message.to_lowercase();
-                [
-                    "otvor ho",
-                    "otvor ju",
-                    "otvor to",
-                    "open it",
-                    "reveal it",
-                    "show it",
-                    "ukáž",
-                    "ten súbor",
-                    "that file",
-                ]
-                .iter()
-                .any(|kw| lv.contains(kw))
-            }));
+        // ── Agentic tool loop ─────────────────────────────────────────────────
+        // The model drives all data access through tool calls and can only cite
+        // what tools returned. Guardrails live in the dispatcher: rules engine
+        // verdicts, PathPolicy (inside the fs connector), approval modal for
+        // writes, per-turn budgets, and an audit entry per call.
+        // Vision turns (image attachment / screen capture) skip tools — the
+        // vision model answers directly from the injected context.
+        use ollama_connector::{ChatStreamEvent, ToolCall as OllamaToolCall, ToolDef as OllamaToolDef};
 
-        if is_file_turn {
-            if let Some(ref fs_c) = fs_exec {
-                // Define filesystem tools exposed to the model
-                use ollama_connector::ToolDef as OllamaToolDef;
-                let fs_tools: Vec<OllamaToolDef> = vec![
-                    OllamaToolDef::function(
-                        "filesystem_search_files",
-                        "Search the user's Mac for files by name or content using macOS Spotlight. \
-                         Use multiple Slovak/English synonym terms for best recall on Slovak documents. \
-                         IMPORTANT: Never name or describe a file that was not returned by this tool.",
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "terms": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "Search terms (OR semantics). When the user's query is in English but the files are Slovak business documents, include Slovak synonyms and transliterations. E.g. 'customer statement' → ['zákazník','zakaznik','preplatk','saldokonto','výpis','prehľad']."
-                                },
-                                "roots": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "Folders to search, e.g. ['~/Downloads']. Omit to search all allowed folders."
-                                },
-                                "extensions": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "File extensions without dot, e.g. ['pdf','xlsx']."
-                                },
-                                "search_contents": {
-                                    "type": "boolean",
-                                    "description": "Also search inside document contents (needed when the filename doesn't match but contents do)."
-                                },
-                                "max_results": {
-                                    "type": "integer",
-                                    "description": "Max results to return. Default 10."
+        let mut tools: Vec<OllamaToolDef> = Vec::new();
+        if att_data.model_override.is_none() {
+            if mail.is_some() {
+                tools.push(OllamaToolDef::function(
+                    "mail_search",
+                    "Search the user's Apple Mail. Returns message headers (rowid, subject, sender, date). \
+                     Use mail_read with a rowid to get a message body. \
+                     Put the sender's email address or name in `sender` when the user asks about mail from someone. \
+                     IMPORTANT: Never describe a message that this tool did not return.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "sender": {"type": "string", "description": "Sender email address or name."},
+                            "subject": {"type": "string", "description": "Subject substring."},
+                            "keywords": {"type": "array", "items": {"type": "string"}, "description": "Terms that must ALL match sender or subject."},
+                            "date_from": {"type": "string", "description": "ISO date YYYY-MM-DD."},
+                            "date_to": {"type": "string", "description": "ISO date YYYY-MM-DD."},
+                            "limit": {"type": "integer", "description": "Max results, default 10."}
+                        }
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "mail_list_inbox",
+                    "List the most recent inbox messages, optionally unread only.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "limit": {"type": "integer", "description": "Max results, default 10."},
+                            "unread_only": {"type": "boolean"}
+                        }
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "mail_read",
+                    "Read the full body of a mail message by rowid (from mail_search / mail_list_inbox).",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"rowid": {"type": "integer"}},
+                        "required": ["rowid"]
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "mail_open",
+                    "Open a mail message in the Mail app by rowid.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"rowid": {"type": "integer"}},
+                        "required": ["rowid"]
+                    }),
+                ));
+            }
+            if fs_exec.is_some() {
+                tools.push(OllamaToolDef::function(
+                    "filesystem_search_files",
+                    "Search the user's Mac for files by name or content using macOS Spotlight. \
+                     Use multiple Slovak/English synonym terms for best recall on Slovak documents. \
+                     IMPORTANT: Never name or describe a file that was not returned by this tool.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "terms": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Search terms (OR semantics). When the user's query is in English but the files are Slovak business documents, include Slovak synonyms and transliterations. E.g. 'customer statement' → ['zákazník','zakaznik','preplatk','saldokonto','výpis','prehľad']."
+                            },
+                            "roots": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Folders to search, e.g. ['~/Downloads']. Omit to search all allowed folders."
+                            },
+                            "extensions": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "File extensions without dot, e.g. ['pdf','xlsx']."
+                            },
+                            "search_contents": {
+                                "type": "boolean",
+                                "description": "Also search inside document contents (needed when the filename doesn't match but contents do)."
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "description": "Max results to return. Default 10."
+                            }
+                        },
+                        "required": ["terms"]
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "filesystem_read_text",
+                    "Read the text content of a local file (PDF, Word, Excel, or plain text). \
+                     Use this to inspect candidate files returned by filesystem_search_files.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Absolute path to the file."}
+                        },
+                        "required": ["path"]
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "filesystem_open_file",
+                    "Open a local file in its default application. Requires user approval.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Absolute path to the file."}
+                        },
+                        "required": ["path"]
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "filesystem_open_file_with",
+                    "Open a local file in a specific application. Requires user approval.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "app": {"type": "string", "description": "App name, e.g. 'Microsoft Excel', 'Preview'."}
+                        },
+                        "required": ["path", "app"]
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "filesystem_reveal_in_finder",
+                    "Reveal a local file in the macOS Finder.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "macos_open_app",
+                    "Launch or focus a macOS application by name.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "app": {"type": "string", "description": "App name, e.g. 'Mail', 'Finder', 'Preview'."}
+                        },
+                        "required": ["app"]
+                    }),
+                ));
+            }
+            if notes.is_some() {
+                tools.push(OllamaToolDef::function(
+                    "notes_search",
+                    "Search Apple Notes by title/snippet. Returns note metadata; use notes_read for the body.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer", "description": "Max results, default 10."}
+                        },
+                        "required": ["query"]
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "notes_read",
+                    "Read the body of an Apple Note by its coredata_id (from notes_search).",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"coredata_id": {"type": "string"}},
+                        "required": ["coredata_id"]
+                    }),
+                ));
+            }
+            tools.push(OllamaToolDef::function(
+                "macos_switch_workspace",
+                "Switch to an AeroSpace window-manager workspace by name/number.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"workspace": {"type": "string"}},
+                    "required": ["workspace"]
+                }),
+            ));
+            // WhatsApp connector always exists; calls report politely when the bridge is down.
+            tools.push(OllamaToolDef::function(
+                "whatsapp_list_chats",
+                "List the user's recent WhatsApp chats (chat_id, contact name, last message).",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer", "description": "Max chats, default 20."}}
+                }),
+            ));
+            tools.push(OllamaToolDef::function(
+                "whatsapp_chat_messages",
+                "Read recent messages of one WhatsApp chat by chat_id (from whatsapp_list_chats).",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "chat_id": {"type": "string"},
+                        "limit": {"type": "integer", "description": "Max messages, default 20."}
+                    },
+                    "required": ["chat_id"]
+                }),
+            ));
+            tools.push(OllamaToolDef::function(
+                "whatsapp_send_message",
+                "Send ONE WhatsApp text message to a chat. Always requires explicit user approval.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "chat_id": {"type": "string"},
+                        "message": {"type": "string"}
+                    },
+                    "required": ["chat_id", "message"]
+                }),
+            ));
+            if state.odoo.read().await.is_some() {
+                tools.push(OllamaToolDef::function(
+                    "odoo_search_partners",
+                    "Search Odoo partners (customers/suppliers) by name or email.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer", "description": "Max results, default 10."}
+                        },
+                        "required": ["query"]
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "odoo_my_invoices",
+                    "List Odoo invoices. open_only=true returns only unpaid/partially-paid ones.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "open_only": {"type": "boolean"},
+                            "limit": {"type": "integer", "description": "Max results, default 10."}
+                        }
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "odoo_my_helpdesk_tickets",
+                    "List the user's Odoo helpdesk tickets. open_only=true excludes closed stages.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "open_only": {"type": "boolean"},
+                            "limit": {"type": "integer", "description": "Max results, default 10."}
+                        }
+                    }),
+                ));
+                tools.push(OllamaToolDef::function(
+                    "odoo_get_record",
+                    "Read a single Odoo record by model and id, e.g. model='res.partner', id=42.",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "model": {"type": "string"},
+                            "id": {"type": "integer"}
+                        },
+                        "required": ["model", "id"]
+                    }),
+                ));
+            }
+        }
+
+        let mut full_response = String::new();
+
+        if tools.is_empty() {
+            // Vision turns / no connectors: single streamed answer, no tools.
+            let token_stream = ollama.chat_stream(effective_model.clone(), messages.clone());
+            tokio::pin!(token_stream);
+            while let Some(result) = token_stream.next().await {
+                match result {
+                    Ok(token) => {
+                        full_response.push_str(&token);
+                        let ev = Event::default()
+                            .data(serde_json::json!({"type":"token","content":token}).to_string());
+                        if tx.send(Ok(ev)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Ok(err_event(&e.to_string()))).await;
+                        return;
+                    }
+                }
+            }
+        } else {
+            let mut found_file_ref: Option<FileRef> = None;
+            let mut tool_calls_used: usize = 0;
+            // ponytail: flat budgets — raise if real sessions hit them
+            const MAX_ROUNDS: usize = 5;
+            const MAX_TOOL_CALLS: usize = 8;
+
+            'agent: for round in 0..=MAX_ROUNDS {
+                // Final round or exhausted budget: no tools → model must answer.
+                let round_tools = if round == MAX_ROUNDS || tool_calls_used >= MAX_TOOL_CALLS {
+                    Vec::new()
+                } else {
+                    tools.clone()
+                };
+                let stream = ollama.chat_stream_with_tools(
+                    effective_model.clone(),
+                    messages.clone(),
+                    round_tools,
+                );
+                tokio::pin!(stream);
+
+                let mut round_text = String::new();
+                let mut round_calls: Vec<OllamaToolCall> = Vec::new();
+                while let Some(ev) = stream.next().await {
+                    match ev {
+                        Ok(ChatStreamEvent::Delta(token)) => {
+                            round_text.push_str(&token);
+                            let ev = Event::default().data(
+                                serde_json::json!({"type":"token","content":token}).to_string(),
+                            );
+                            if tx.send(Ok(ev)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(ChatStreamEvent::ToolCalls(calls)) => round_calls.extend(calls),
+                        Err(e) => {
+                            let _ = tx.send(Ok(err_event(&e.to_string()))).await;
+                            return;
+                        }
+                    }
+                }
+
+                if round_calls.is_empty() {
+                    full_response = round_text;
+                    break 'agent;
+                }
+
+                // Assistant turn carrying this round's calls (plus any preamble text).
+                let mut assistant = Message::assistant(round_text);
+                assistant.tool_calls = round_calls.clone();
+                messages.push(assistant);
+
+                for call in &round_calls {
+                    tool_calls_used += 1;
+                    let fn_name = &call.function.name;
+                    let args = &call.function.arguments;
+                    tracing::info!("tool loop call {}: {} {:?}", tool_calls_used, fn_name, args);
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({"type":"tool_call","tool": fn_name}).to_string(),
+                        )))
+                        .await;
+                    audit_fs(&db, "tool_call", &serde_json::json!({"tool": fn_name}));
+
+                    let tool_result: String = if tool_calls_used > MAX_TOOL_CALLS {
+                        "Tool budget exhausted — answer now using what you have.".to_string()
+                    } else {
+                        match fn_name.as_str() {
+                            // ── Mail ──────────────────────────────────────────
+                            tool @ ("mail_search" | "mail_list_inbox" | "mail_read"
+                            | "mail_open") => match (&mail, rules.check("mail_inbox", "{}")) {
+                                (None, _) => {
+                                    "Apple Mail connector unavailable (Full Disk Access not granted)."
+                                        .to_string()
+                                }
+                                (_, ApprovalLevel::Forbidden) => {
+                                    let _ = tx
+                                        .send(Ok(Event::default().data(
+                                            serde_json::json!({"type":"tool_blocked","tool":"mail_inbox"})
+                                                .to_string(),
+                                        )))
+                                        .await;
+                                    "Mail access blocked by rules.".to_string()
+                                }
+                                (Some(m), level) => {
+                                    let approved = match level {
+                                        ApprovalLevel::Ask => {
+                                            request_tool_approval(
+                                                &db,
+                                                &pending_approvals,
+                                                &tx,
+                                                "mail_inbox",
+                                                "Čítanie poštovej schránky (Apple Mail)",
+                                            )
+                                            .await
+                                        }
+                                        _ => true,
+                                    };
+                                    if !approved {
+                                        "Mail access not approved by the user.".to_string()
+                                    } else {
+                                        match tool {
+                                            "mail_search" => {
+                                                let (result, mail_ref) =
+                                                    tool_mail_search(m, args).await;
+                                                if let Some(ref r) = mail_ref {
+                                                    let _ = tx
+                                                        .send(Ok(Event::default().data(
+                                                            serde_json::json!({
+                                                                "type": "mail_found",
+                                                                "rowid": r.rowid,
+                                                                "message_id": r.message_id,
+                                                                "subject": r.subject,
+                                                                "sender": r.sender,
+                                                                "auto_open": false,
+                                                            })
+                                                            .to_string(),
+                                                        )))
+                                                        .await;
+                                                    save_last_mail_ref(
+                                                        &runtime_refs,
+                                                        &session_id,
+                                                        r,
+                                                    )
+                                                    .await;
+                                                }
+                                                result
+                                            }
+                                            "mail_list_inbox" => tool_mail_list_inbox(m, args).await,
+                                            "mail_read" => {
+                                                let (result, mail_ref) =
+                                                    tool_mail_read(m, args).await;
+                                                if let Some(ref r) = mail_ref {
+                                                    save_last_mail_ref(
+                                                        &runtime_refs,
+                                                        &session_id,
+                                                        r,
+                                                    )
+                                                    .await;
+                                                }
+                                                result
+                                            }
+                                            _ => tool_mail_open(m, args).await,
+                                        }
+                                    }
                                 }
                             },
-                            "required": ["terms"]
-                        }),
-                    ),
-                    OllamaToolDef::function(
-                        "filesystem_read_text",
-                        "Read the text content of a local file (PDF, Word, Excel, or plain text). \
-                         Use this to inspect candidate files returned by filesystem_search_files.",
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string", "description": "Absolute path to the file."}
+
+                            // ── Notes ─────────────────────────────────────────
+                            tool @ ("notes_search" | "notes_read") => match &notes {
+                                None => "Apple Notes connector unavailable.".to_string(),
+                                Some(n) => match rules.check("notes_search", "{}") {
+                                    ApprovalLevel::Forbidden => {
+                                        "Notes access blocked by rules.".to_string()
+                                    }
+                                    _ => {
+                                        if tool == "notes_search" {
+                                            tool_notes_search(n, args).await
+                                        } else {
+                                            tool_notes_read(n, args).await
+                                        }
+                                    }
+                                },
                             },
-                            "required": ["path"]
-                        }),
-                    ),
-                    OllamaToolDef::function(
-                        "filesystem_open_file",
-                        "Open a local file in its default application. Requires user approval.",
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string", "description": "Absolute path to the file."}
-                            },
-                            "required": ["path"]
-                        }),
-                    ),
-                    OllamaToolDef::function(
-                        "filesystem_open_file_with",
-                        "Open a local file in a specific application. Requires user approval.",
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string"},
-                                "app": {"type": "string", "description": "App name, e.g. 'Microsoft Excel', 'Preview'."}
-                            },
-                            "required": ["path", "app"]
-                        }),
-                    ),
-                    OllamaToolDef::function(
-                        "filesystem_reveal_in_finder",
-                        "Reveal a local file in the macOS Finder.",
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "path": {"type": "string"}
-                            },
-                            "required": ["path"]
-                        }),
-                    ),
-                    OllamaToolDef::function(
-                        "macos_open_app",
-                        "Launch or focus a macOS application by name.",
-                        serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "app": {"type": "string", "description": "App name, e.g. 'Mail', 'Finder', 'Preview'."}
-                            },
-                            "required": ["app"]
-                        }),
-                    ),
-                ];
 
-                let mut found_file_ref: Option<FileRef> = None;
-
-                // Status hint so the UI shows activity during tool-calling rounds
-                let _ = tx
-                    .send(Ok(Event::default().data(
-                        serde_json::json!({"type":"tool_status","message":"🔎 searching..."})
-                            .to_string(),
-                    )))
-                    .await;
-
-                // Tool-calling loop (max 5 rounds)
-                'agent: for _round in 0..5 {
-                    match ollama
-                        .chat_once_with_tools(
-                            effective_model.clone(),
-                            messages.clone(),
-                            fs_tools.clone(),
-                        )
-                        .await
-                    {
-                        Ok(OllamaChatTurn::ToolCalls(calls)) => {
-                            // Append the assistant message carrying the tool calls
-                            messages.push(Message::assistant_tool_calls(calls.clone()));
-
-                            for call in &calls {
-                                let fn_name = &call.function.name;
-                                let args = &call.function.arguments;
-                                tracing::debug!("file agent tool call: {} {:?}", fn_name, args);
-
-                                // Dispatch the tool call
-                                let tool_result: String = match fn_name.as_str() {
-                                    "filesystem_search_files" => {
-                                        let terms: Vec<String> = args["terms"]
-                                            .as_array()
-                                            .map(|a| {
-                                                a.iter()
-                                                    .filter_map(|v| {
-                                                        v.as_str().map(|s| s.to_string())
-                                                    })
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default();
-                                        let query = terms.first().cloned().unwrap_or_default();
-                                        let roots: Option<Vec<String>> =
-                                            args["roots"].as_array().map(|a| {
-                                                a.iter()
-                                                    .filter_map(|v| {
-                                                        v.as_str().map(|s| s.to_string())
-                                                    })
-                                                    .collect()
-                                            });
-                                        let extensions: Option<Vec<String>> =
-                                            args["extensions"].as_array().map(|a| {
-                                                a.iter()
-                                                    .filter_map(|v| {
-                                                        v.as_str().map(|s| s.to_string())
-                                                    })
-                                                    .collect()
-                                            });
-                                        let search_contents =
-                                            args["search_contents"].as_bool().unwrap_or(false);
-                                        let max_results = args["max_results"]
-                                            .as_u64()
-                                            .map(|n| n as usize)
-                                            .unwrap_or(10);
-
-                                        let req = FileSearchRequest {
-                                            query,
-                                            terms,
-                                            roots,
-                                            search_names: true,
-                                            search_contents,
-                                            extensions,
-                                            include_hidden: false,
-                                            max_results,
-                                            max_depth: Some(8),
-                                        };
-                                        let policy = fs_c.policy.clone();
-                                        match tokio::task::spawn_blocking(move || {
-                                            fs_search::search_files_sync(&policy, req)
-                                        })
-                                        .await
+                            // ── WhatsApp ──────────────────────────────────────
+                            "whatsapp_list_chats" => {
+                                tool_whatsapp_list_chats(&state.whatsapp, args).await
+                            }
+                            "whatsapp_chat_messages" => {
+                                let (result, wa_ref) =
+                                    tool_whatsapp_chat_messages(&state.whatsapp, args).await;
+                                if let Some(ref r) = wa_ref {
+                                    save_last_whatsapp_ref(&runtime_refs, &session_id, r).await;
+                                }
+                                result
+                            }
+                            "whatsapp_send_message" => {
+                                let chat_id =
+                                    args["chat_id"].as_str().unwrap_or_default().to_string();
+                                let text =
+                                    args["message"].as_str().unwrap_or_default().to_string();
+                                if chat_id.is_empty() || text.is_empty() {
+                                    "chat_id and message are required.".to_string()
+                                } else {
+                                    let approved = request_tool_approval(
+                                        &db,
+                                        &pending_approvals,
+                                        &tx,
+                                        "whatsapp.send_message",
+                                        &format!("WhatsApp → {chat_id}: {text}"),
+                                    )
+                                    .await;
+                                    if !approved {
+                                        "User did not approve sending the message.".to_string()
+                                    } else {
+                                        match state
+                                            .whatsapp
+                                            .send_message(
+                                                WhatsappSendTarget::ChatId(chat_id),
+                                                &text,
+                                            )
+                                            .await
                                         {
-                                            Ok(Ok(resp)) => {
+                                            Ok(_) => "Message sent.".to_string(),
+                                            Err(e) => format!("WhatsApp send failed: {e}"),
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ── Odoo (read-only; writes are forbidden by rules) ─
+                            tool @ ("odoo_search_partners" | "odoo_my_invoices"
+                            | "odoo_my_helpdesk_tickets" | "odoo_get_record") => {
+                                let guard = state.odoo.read().await;
+                                match guard.as_ref() {
+                                    None => "Odoo not connected — connect it in Settings first."
+                                        .to_string(),
+                                    Some(o) => {
+                                        let (result, odoo_ref) = tool_odoo(o, tool, args).await;
+                                        if let Some(ref r) = odoo_ref {
+                                            let _ = tx
+                                                .send(Ok(Event::default().data(
+                                                    serde_json::json!({
+                                                        "type": "odoo_found",
+                                                        "model": r.model,
+                                                        "record_id": r.id,
+                                                        "name": r.name,
+                                                        "url": r.url,
+                                                    })
+                                                    .to_string(),
+                                                )))
+                                                .await;
+                                            save_last_odoo_ref(&runtime_refs, &session_id, r)
+                                                .await;
+                                        }
+                                        result
+                                    }
+                                }
+                            }
+
+                            // ── Window management (AeroSpace) ─────────────────
+                            "macos_switch_workspace" => {
+                                match json_str_arg(args, "workspace") {
+                                    None => "workspace is required.".to_string(),
+                                    Some(ws) => match run_aerospace(&["workspace", &ws]).await {
+                                        Ok(_) => format!("Switched to workspace {ws}."),
+                                        Err(e) => format!("AeroSpace error: {e}"),
+                                    },
+                                }
+                            }
+
+                            // ── Filesystem ────────────────────────────────────
+                            "filesystem_search_files" => match fs_exec.as_ref() {
+                                None => "Filesystem connector unavailable.".to_string(),
+                                Some(fs_c) => {
+                                    let terms: Vec<String> = args["terms"]
+                                        .as_array()
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let query = terms.first().cloned().unwrap_or_default();
+                                    let roots: Option<Vec<String>> =
+                                        args["roots"].as_array().map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        });
+                                    let extensions: Option<Vec<String>> =
+                                        args["extensions"].as_array().map(|a| {
+                                            a.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        });
+                                    let search_contents =
+                                        args["search_contents"].as_bool().unwrap_or(false);
+                                    let max_results = args["max_results"]
+                                        .as_u64()
+                                        .map(|n| n as usize)
+                                        .unwrap_or(10);
+
+                                    let req = FileSearchRequest {
+                                        query,
+                                        terms,
+                                        roots,
+                                        search_names: true,
+                                        search_contents,
+                                        extensions,
+                                        include_hidden: false,
+                                        max_results,
+                                        max_depth: Some(8),
+                                    };
+                                    let policy = fs_c.policy.clone();
+                                    match tokio::task::spawn_blocking(move || {
+                                        fs_search::search_files_sync(&policy, req)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(resp)) => {
+                                            audit_fs(
+                                                &db,
+                                                "filesystem_search",
+                                                &serde_json::json!({
+                                                    "result_count": resp.results.len(),
+                                                    "ok": true
+                                                }),
+                                            );
+                                            // Track top result for coreference
+                                            if found_file_ref.is_none() {
+                                                if let Some(top) = resp.results.first() {
+                                                    found_file_ref = Some(FileRef {
+                                                        path: top.path.clone(),
+                                                        display_name: top.display_name.clone(),
+                                                        kind: format!("{:?}", top.kind)
+                                                            .to_lowercase(),
+                                                    });
+                                                }
+                                            }
+                                            serde_json::to_string(&resp)
+                                                .unwrap_or_else(|_| "[]".to_string())
+                                        }
+                                        Ok(Err(e)) => {
+                                            format!("{{\"error\":\"{}\"}}", e)
+                                        }
+                                        Err(e) => {
+                                            format!("{{\"error\":\"{}\"}}", e)
+                                        }
+                                    }
+                                }
+                            },
+
+                            "filesystem_read_text" => match fs_exec.as_ref() {
+                                None => "Filesystem connector unavailable.".to_string(),
+                                Some(fs_c) => {
+                                    let path = args["path"].as_str().unwrap_or("").to_string();
+                                    let req = ReadTextRequest {
+                                        path,
+                                        max_bytes: None,
+                                        around_line: None,
+                                    };
+                                    let policy = fs_c.policy.clone();
+                                    match tokio::task::spawn_blocking(move || {
+                                        fs_search::read_text_sync(&policy, req)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(resp)) => {
+                                            // Cap content to avoid huge context
+                                            let content: String =
+                                                resp.content.chars().take(4000).collect();
+                                            let truncated_note = if resp.truncated {
+                                                " [truncated]"
+                                            } else {
+                                                ""
+                                            };
+                                            format!(
+                                                "[File: {}]\n{}{}",
+                                                resp.path, content, truncated_note
+                                            )
+                                        }
+                                        Ok(Err(e)) => format!("Error reading file: {e}"),
+                                        Err(e) => format!("Error: {e}"),
+                                    }
+                                }
+                            },
+
+                            tool @ ("filesystem_open_file"
+                            | "filesystem_open_file_with"
+                            | "filesystem_reveal_in_finder"
+                            | "filesystem_open_folder"
+                            | "macos_open_app"
+                            | "macos_focus_app") => {
+                                // Derive the dotted rule name from the underscore tool name
+                                let rule_name = match tool {
+                                    "filesystem_open_file" => "filesystem.open_file",
+                                    "filesystem_open_file_with" => "filesystem.open_file_with",
+                                    "filesystem_reveal_in_finder" => "filesystem.reveal_in_finder",
+                                    "filesystem_open_folder" => "filesystem.open_folder",
+                                    "macos_open_app" => "macos.open_app",
+                                    "macos_focus_app" => "macos.focus_app",
+                                    _ => tool,
+                                };
+                                let path = args["path"].as_str().map(|s| s.to_string());
+                                let app = args["app"].as_str().map(|s| s.to_string());
+                                let approval_level = rules.check(rule_name, "{}");
+                                let approved = match approval_level {
+                                    ApprovalLevel::Auto => true,
+                                    ApprovalLevel::Ask => {
+                                        request_tool_approval(
+                                            &db,
+                                            &pending_approvals,
+                                            &tx,
+                                            rule_name,
+                                            &format!(
+                                                "Open: {}",
+                                                path.as_deref().or(app.as_deref()).unwrap_or("?")
+                                            ),
+                                        )
+                                        .await
+                                    }
+                                    ApprovalLevel::Forbidden => {
+                                        let _ = tx
+                                            .send(Ok(Event::default().data(
+                                                serde_json::json!({
+                                                    "type": "tool_blocked",
+                                                    "tool": rule_name
+                                                })
+                                                .to_string(),
+                                            )))
+                                            .await;
+                                        false
+                                    }
+                                };
+                                if !approved {
+                                    format!("Tool {rule_name} blocked — user did not approve.")
+                                } else if rule_name.starts_with("macos.") {
+                                    match app {
+                                        Some(ref a) => match fs_open::open_app(a).await {
+                                            Ok(_) => {
                                                 audit_fs(
                                                     &db,
-                                                    "filesystem_search",
-                                                    &serde_json::json!({
-                                                        "result_count": resp.results.len(),
-                                                        "ok": true
-                                                    }),
+                                                    &rule_name.replace('.', "_"),
+                                                    &serde_json::json!({"app": a, "ok": true}),
                                                 );
-                                                // Track top result for coreference
-                                                if found_file_ref.is_none() {
-                                                    if let Some(top) = resp.results.first() {
-                                                        found_file_ref = Some(FileRef {
-                                                            path: top.path.clone(),
-                                                            display_name: top.display_name.clone(),
-                                                            kind: format!("{:?}", top.kind)
-                                                                .to_lowercase(),
-                                                        });
-                                                    }
-                                                }
-                                                serde_json::to_string(&resp)
-                                                    .unwrap_or_else(|_| "[]".to_string())
+                                                format!("Opened: {a}")
                                             }
-                                            Ok(Err(e)) => {
-                                                format!("{{\"error\":\"{}\"}}", e)
-                                            }
-                                            Err(e) => {
-                                                format!("{{\"error\":\"{}\"}}", e)
-                                            }
-                                        }
-                                    }
-
-                                    "filesystem_read_text" => {
-                                        let path = args["path"].as_str().unwrap_or("").to_string();
-                                        let req = ReadTextRequest {
-                                            path,
-                                            max_bytes: None,
-                                            around_line: None,
-                                        };
-                                        let policy = fs_c.policy.clone();
-                                        match tokio::task::spawn_blocking(move || {
-                                            fs_search::read_text_sync(&policy, req)
-                                        })
-                                        .await
-                                        {
-                                            Ok(Ok(resp)) => {
-                                                // Cap content to avoid huge context
-                                                let content: String =
-                                                    resp.content.chars().take(4000).collect();
-                                                let truncated_note = if resp.truncated {
-                                                    " [truncated]"
-                                                } else {
-                                                    ""
-                                                };
-                                                format!(
-                                                    "[File: {}]\n{}{}",
-                                                    resp.path, content, truncated_note
-                                                )
-                                            }
-                                            Ok(Err(e)) => format!("Error reading file: {e}"),
                                             Err(e) => format!("Error: {e}"),
-                                        }
+                                        },
+                                        None => "Error: no app".to_string(),
                                     }
-
-                                    tool @ ("filesystem_open_file"
-                                    | "filesystem_open_file_with"
-                                    | "filesystem_reveal_in_finder"
-                                    | "filesystem_open_folder"
-                                    | "macos_open_app"
-                                    | "macos_focus_app") => {
-                                        // Derive the dotted rule name from the underscore tool name
-                                        let rule_name = match tool {
-                                            "filesystem_open_file" => "filesystem.open_file",
-                                            "filesystem_open_file_with" => {
-                                                "filesystem.open_file_with"
-                                            }
-                                            "filesystem_reveal_in_finder" => {
-                                                "filesystem.reveal_in_finder"
-                                            }
-                                            "filesystem_open_folder" => "filesystem.open_folder",
-                                            "macos_open_app" => "macos.open_app",
-                                            "macos_focus_app" => "macos.focus_app",
-                                            _ => tool,
-                                        };
-                                        let path = args["path"].as_str().map(|s| s.to_string());
-                                        let app = args["app"].as_str().map(|s| s.to_string());
-                                        let approval_level = rules.check(rule_name, "{}");
-                                        let approved = match approval_level {
-                                            ApprovalLevel::Auto => true,
-                                            ApprovalLevel::Ask => {
-                                                request_tool_approval(
-                                                    &db,
-                                                    &pending_approvals,
-                                                    &tx,
-                                                    rule_name,
-                                                    &format!(
-                                                        "Open: {}",
-                                                        path.as_deref()
-                                                            .or(app.as_deref())
-                                                            .unwrap_or("?")
-                                                    ),
-                                                )
-                                                .await
-                                            }
-                                            ApprovalLevel::Forbidden => {
-                                                let _ = tx
-                                                    .send(Ok(Event::default().data(
-                                                        serde_json::json!({
-                                                            "type": "tool_blocked",
-                                                            "tool": rule_name
-                                                        })
-                                                        .to_string(),
-                                                    )))
-                                                    .await;
-                                                false
-                                            }
-                                        };
-                                        if !approved {
-                                            format!(
-                                                "Tool {rule_name} blocked — user did not approve."
-                                            )
-                                        } else {
+                                } else {
+                                    match fs_exec.as_ref() {
+                                        None => "Filesystem connector unavailable.".to_string(),
+                                        Some(fs_c) => {
                                             let result: anyhow::Result<OpenResponse> =
                                                 match rule_name {
                                                     "filesystem.open_file" => {
@@ -3321,18 +2994,12 @@ async fn chat(
                                                             Err(anyhow::anyhow!("no path"))
                                                         }
                                                     }
-                                                    "macos.open_app" | "macos.focus_app" => {
-                                                        if let Some(ref a) = app {
-                                                            fs_open::open_app(a).await
-                                                        } else {
-                                                            Err(anyhow::anyhow!("no app"))
-                                                        }
-                                                    }
                                                     _ => Err(anyhow::anyhow!("unknown")),
                                                 };
                                             match result {
                                                 Ok(ref resp) => {
-                                                    let path_hash = path.as_deref().map(sha256_str);
+                                                    let path_hash =
+                                                        path.as_deref().map(sha256_str);
                                                     audit_fs(
                                                         &db,
                                                         &rule_name.replace('.', "_"),
@@ -3374,118 +3041,23 @@ async fn chat(
                                             }
                                         }
                                     }
+                                }
+                            }
 
-                                    other => {
-                                        tracing::warn!("unknown file agent tool: {}", other);
-                                        format!("Unknown tool: {other}")
-                                    }
-                                };
-
-                                messages.push(Message::tool_result(fn_name, tool_result));
+                            other => {
+                                tracing::warn!("unknown tool: {}", other);
+                                format!("Unknown tool: {other}. Answer with what you have or use a listed tool.")
                             }
                         }
+                    };
 
-                        Ok(OllamaChatTurn::Content(_)) => {
-                            // Model is done calling tools — exit to the final stream
-                            break 'agent;
-                        }
-
-                        Err(e) => {
-                            tracing::warn!("file agent tool loop error: {}", e);
-                            break 'agent;
-                        }
-                    }
-                } // end 'agent loop
-
-                if let Some(ref fref) = found_file_ref {
-                    save_last_file_ref(&runtime_refs, &session_id, fref).await;
+                    messages.push(Message::tool_result(fn_name, tool_result));
                 }
+            } // end 'agent loop
 
-                // Final streaming answer: model has all tool results in context.
-                // We call chat_stream without tools so the model answers (not calls more tools).
-                tracing::info!(
-                    "chat timing: file agent loop done {}ms, streaming final answer",
-                    t0.elapsed().as_millis()
-                );
-                let token_stream_agent = ollama.chat_stream(effective_model.clone(), messages);
-                tokio::pin!(token_stream_agent);
-
-                let mut full_response = String::new();
-                while let Some(result) = token_stream_agent.next().await {
-                    match result {
-                        Ok(token) => {
-                            full_response.push_str(&token);
-                            let ev = Event::default().data(
-                                serde_json::json!({"type":"token","content":token}).to_string(),
-                            );
-                            if tx.send(Ok(ev)).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Ok(err_event(&e.to_string()))).await;
-                            return;
-                        }
-                    }
-                }
-
-                if let Ok(db) = db.try_lock() {
-                    let _ = db.execute(
-                        "INSERT INTO audit_entries (action, payload, model) VALUES (?1, ?2, ?3)",
-                        rusqlite::params!["chat", &user_message, &effective_model],
-                    );
-                }
-
-                let _ = tx
-                    .send(Ok(Event::default().data(
-                        serde_json::json!({"type":"done","session_id": session_id}).to_string(),
-                    )))
-                    .await;
-
-                return; // ← early return; skip the non-file single-LLM path below
+            if let Some(ref fref) = found_file_ref {
+                save_last_file_ref(&runtime_refs, &session_id, fref).await;
             }
-        }
-        // ── End agentic file tool loop ────────────────────────────────────────
-
-        // Stream response
-        let token_stream = ollama.chat_stream(effective_model.clone(), messages);
-        tokio::pin!(token_stream);
-
-        let mut full_response = String::new();
-        while let Some(result) = token_stream.next().await {
-            match result {
-                Ok(token) => {
-                    full_response.push_str(&token);
-                    let ev = Event::default()
-                        .data(serde_json::json!({"type":"token","content":token}).to_string());
-                    if tx.send(Ok(ev)).await.is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Ok(err_event(&e.to_string()))).await;
-                    return;
-                }
-            }
-        }
-
-        // Emit mail attachment chips before done so the UI can show them
-        if !mail_pdf_paths.is_empty() {
-            let atts: Vec<serde_json::Value> = mail_pdf_paths
-                .iter()
-                .map(|(fname, path)| {
-                    serde_json::json!({
-                        "filename": fname,
-                        "path": path.to_string_lossy(),
-                        "size": std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
-                    })
-                })
-                .collect();
-            let _ = tx
-                .send(Ok(Event::default().data(
-                    serde_json::json!({"type":"mail_attachments","attachments": atts}).to_string(),
-                )))
-                .await;
         }
 
         let response_for_audit = full_response.clone();
@@ -4997,2700 +4569,32 @@ async fn mail_sync(State(state): State<AppState>) -> impl IntoResponse {
 
 // ── Tool context injection ────────────────────────────────────────────────────
 
-/// Extract a subject hint from natural-language patterns.
-///
-/// Handles: "by mal byt X", "nazvom X", "named X", quoted strings.
-/// "subject X" is intentionally NOT used as a prefix — the word "subject" in
-/// Slovak sentences like "subject toho mailu by mal byt X" is the topic marker,
-/// not a direct prefix of the title. We catch those via "by mal byt" instead.
-/// Parse an ISO date string "YYYY-MM-DD" into a [start, end) Unix-epoch second range
-/// covering the whole calendar day in the user's local timezone.
-fn parse_date_to_range(iso: &str) -> Option<(i64, i64)> {
-    use chrono::{Duration, Local, NaiveDate, TimeZone};
-    let d = NaiveDate::parse_from_str(iso, "%Y-%m-%d").ok()?;
-    let start = Local
-        .from_local_datetime(&d.and_hms_opt(0, 0, 0)?)
-        .earliest()?
-        .timestamp();
-    let next = d + Duration::days(1);
-    let end = Local
-        .from_local_datetime(&next.and_hms_opt(0, 0, 0)?)
-        .earliest()?
-        .timestamp();
-    Some((start, end))
-}
 
-fn local_date_range(day_offset: i64) -> Option<(i64, i64)> {
-    use chrono::{Duration, Local, TimeZone};
-    let date = Local::now().date_naive() + Duration::days(day_offset);
-    let start = Local
-        .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
-        .earliest()?
-        .timestamp();
-    let next = date + Duration::days(1);
-    let end = Local
-        .from_local_datetime(&next.and_hms_opt(0, 0, 0)?)
-        .earliest()?
-        .timestamp();
-    Some((start, end))
-}
 
-fn asks_today_mailbox(low: &str) -> bool {
-    let has_today = [
-        "today", "today's", "todays", "dnes", "dneš", "dnesny", "dnešný",
-    ]
-    .iter()
-    .any(|kw| low.contains(kw));
-    let has_mailbox = [
-        "mailbox", "inbox", "mail", "email", "schránk", "posta", "pošt",
-    ]
-    .iter()
-    .any(|kw| low.contains(kw));
-    has_today && has_mailbox
-}
 
-fn resolver_requests_full_mail_record(reference_resolution: &ReferenceResolution) -> bool {
-    reference_resolution
-        .target_connector
-        .as_deref()
-        .or(reference_resolution.resolved_connector.as_deref())
-        == Some("mail")
-        && reference_resolution.source_needed == "full_record"
-}
 
-fn format_unix_local(unix: i64) -> String {
-    use chrono::{DateTime, Local, Utc};
-    if unix <= 0 {
-        return "neznáme".to_string();
-    }
-    DateTime::<Utc>::from_timestamp(unix, 0)
-        .map(|d| d.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string())
-        .unwrap_or_else(|| unix.to_string())
-}
 
-fn trace_filter(filter: &MailSearchFilter) -> MailSearchFilterTrace {
-    MailSearchFilterTrace {
-        sender: filter.sender.clone(),
-        subject: filter.subject.clone(),
-        date_from: filter.date_from,
-        date_to: filter.date_to,
-        date_from_local: filter.date_from.map(format_unix_local),
-        date_to_local: filter.date_to.map(format_unix_local),
-        limit: filter.limit,
-        keywords: filter.keywords.clone(),
-    }
-}
 
-fn trace_candidates(
-    messages: &[apple_mail_connector::MailMessage],
-) -> Vec<MailSearchCandidateTrace> {
-    messages
-        .iter()
-        .take(5)
-        .map(|m| MailSearchCandidateTrace {
-            rowid: m.rowid,
-            sender: m.sender.clone(),
-            sender_display: m.sender_display.clone(),
-            subject: m.subject.clone(),
-            received_at: m.received_at,
-            received_at_local: format_unix_local(m.received_at),
-            mailbox_url: m.mailbox_url.clone(),
-        })
-        .collect()
-}
 
-fn push_sender_fallback_terms(terms: &mut Vec<String>, sender: Option<&str>) {
-    let Some(sender) = sender.map(str::trim).filter(|s| !s.is_empty()) else {
-        return;
-    };
-    let Some((local_part, domain)) = sender.split_once('@') else {
-        return;
-    };
-    push_search_term(terms, Some(local_part));
-    for part in local_part.split(['.', '_', '-', '+']) {
-        if part.len() >= 3 {
-            push_search_term(terms, Some(part));
-        }
-    }
-    if let Some(domain_name) = domain.split('.').next().filter(|s| s.len() >= 3) {
-        push_search_term(terms, Some(domain_name));
-    }
-}
 
-fn push_search_term(terms: &mut Vec<String>, term: Option<&str>) {
-    let Some(term) = term.map(str::trim).filter(|s| !s.is_empty()) else {
-        return;
-    };
-    if !terms
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(term))
-    {
-        terms.push(term.to_string());
-    }
-}
 
-async fn search_mail_messages_traced(
-    mail: &Option<MailConnector>,
-    filter: MailSearchFilter,
-    phase: &str,
-    trace: &mut MailSearchDebugTrace,
-) -> Vec<apple_mail_connector::MailMessage> {
-    let (msgs, db_error) = if let Some(ref mc) = *mail {
-        let mc = mc.clone();
-        match tokio::task::spawn_blocking({
-            let filter = filter.clone();
-            move || mc.search_messages(&filter)
-        })
-        .await
-        {
-            Ok(Ok(msgs)) => (msgs, None),
-            Ok(Err(e)) => (vec![], Some(e.to_string())),
-            Err(e) => (vec![], Some(e.to_string())),
-        }
-    } else {
-        (vec![], Some("mail connector unavailable".to_string()))
-    };
-    trace.attempts.push(MailSearchAttemptTrace {
-        phase: phase.to_string(),
-        adapter: "envelope_index".to_string(),
-        filter: trace_filter(&filter),
-        result_count: msgs.len(),
-        candidates: trace_candidates(&msgs),
-        error: db_error,
-    });
-    if !msgs.is_empty() || !is_targeted_mail_filter(&filter) {
-        return msgs;
-    }
 
-    match apple_mail_connector::search_messages_via_applescript(&filter).await {
-        Ok(script_msgs) => {
-            trace.attempts.push(MailSearchAttemptTrace {
-                phase: phase.to_string(),
-                adapter: "mail_app_applescript".to_string(),
-                filter: trace_filter(&filter),
-                result_count: script_msgs.len(),
-                candidates: trace_candidates(&script_msgs),
-                error: None,
-            });
-            script_msgs
-        }
-        Err(e) => {
-            trace.attempts.push(MailSearchAttemptTrace {
-                phase: phase.to_string(),
-                adapter: "mail_app_applescript".to_string(),
-                filter: trace_filter(&filter),
-                result_count: 0,
-                candidates: vec![],
-                error: Some(e.to_string()),
-            });
-            vec![]
-        }
-    }
-}
 
-fn is_targeted_mail_filter(filter: &MailSearchFilter) -> bool {
-    filter
-        .sender
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty())
-        || filter
-            .subject
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-        || filter.keywords.iter().any(|kw| !kw.trim().is_empty())
-}
 
-/// Helper: fetch recent messages, merging mail_cache with live Envelope Index.
-/// Always queries both sources so very-recent (not-yet-synced) mails appear.
-async fn fetch_recent_mails(
-    db: &Arc<Mutex<Connection>>,
-    mail: &Option<MailConnector>,
-    limit: usize,
-) -> Vec<apple_mail_connector::MailMessage> {
-    let cached: Vec<apple_mail_connector::MailMessage> =
-        {
-            let db_lock = db.lock().await;
-            db_lock.prepare(
-            "SELECT rowid, subject, sender, sender_display, received_at, is_read, mailbox_url \
-             FROM mail_cache ORDER BY received_at DESC LIMIT ?1"
-        )
-        .and_then(|mut s| s.query_map(rusqlite::params![limit as i64], |r| {
-            let display: Option<String> = r.get(3)?;
-            Ok(apple_mail_connector::MailMessage {
-                rowid: r.get(0)?,
-                subject: r.get(1)?,
-                sender: r.get(2)?,
-                sender_display: display,
-                received_at: r.get(4)?,
-                is_read: r.get::<_, i64>(5)? != 0,
-                mailbox_url: r.get(6)?,
-                recipient: None,
-                body: None, body_available: true, language: None, attachments: vec![],
-                message_id: None,
-            })
-        }).map(|rows| rows.flatten().collect()))
-        .unwrap_or_default()
-        };
 
-    // Always also query live Envelope Index to catch emails received since last sync.
-    let live: Vec<apple_mail_connector::MailMessage> = if let Some(ref mc) = *mail {
-        let mc = mc.clone();
-        tokio::task::spawn_blocking(move || mc.list_inbox(limit, false))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default()
-    } else {
-        vec![]
-    };
 
-    if cached.is_empty() && live.is_empty() {
-        return vec![];
-    }
 
-    // Merge: live takes precedence (fresher), dedup by rowid, sort newest-first.
-    let mut seen = std::collections::HashSet::new();
-    let mut merged: Vec<apple_mail_connector::MailMessage> = Vec::new();
-    for m in live.into_iter().chain(cached.into_iter()) {
-        if seen.insert(m.rowid) {
-            merged.push(m);
-        }
-    }
-    merged.sort_by(|a, b| b.received_at.cmp(&a.received_at));
-    merged.truncate(limit);
-    merged
-}
 
-fn compact_mail_body_preserving_line_items(body: &str, normal_limit: usize) -> String {
-    if body.len() <= normal_limit {
-        return body.to_string();
-    }
 
-    let head_end = body.floor_char_boundary(normal_limit.min(body.len()));
-    let head = &body[..head_end];
-    let mut preserved = Vec::new();
-    let mut preserved_chars = 0usize;
-    let max_preserved_chars = normal_limit;
 
-    for line in body[head_end..].lines() {
-        let trimmed = line.trim();
-        if !is_table_like_or_line_item(trimmed) {
-            continue;
-        }
-        let line_chars = line.chars().count();
-        if preserved_chars + line_chars > max_preserved_chars {
-            break;
-        }
-        preserved.push(line.to_string());
-        preserved_chars += line_chars + 1;
-    }
 
-    if preserved.is_empty() {
-        format!("{}…[skrátené]", head)
-    } else {
-        format!(
-            "{}…[skrátené; zachované štruktúrované riadky nižšie]\n{}",
-            head,
-            preserved.join("\n")
-        )
-    }
-}
 
-fn is_table_like_or_line_item(trimmed: &str) -> bool {
-    if trimmed.len() < 4 {
-        return false;
-    }
-    let has_digit = trimmed.chars().any(|c| c.is_ascii_digit());
-    let has_repeated_space = trimmed.contains("  ");
-    let separator_count = [
-        trimmed.contains('\t'),
-        trimmed.contains('|'),
-        trimmed.contains(';'),
-        has_repeated_space,
-        trimmed.contains(':'),
-    ]
-    .into_iter()
-    .filter(|b| *b)
-    .count();
-    let first = trimmed.split_whitespace().next().unwrap_or("");
-    let list_marker = trimmed.starts_with('-')
-        || trimmed.starts_with('*')
-        || trimmed.starts_with('•')
-        || first.ends_with('.')
-        || first.ends_with(')');
-    let columns = trimmed.split_whitespace().count();
 
-    (has_digit && separator_count >= 2)
-        || (list_marker && separator_count >= 1)
-        || (list_marker && has_digit)
-        || (has_digit && has_repeated_space && columns >= 4)
-}
-
-/// Read body + all supported attachments for a single message.
-/// Injects structured context (Od/Komu/Prijaté/Predmet/Obsah) into `lines`
-/// and returns (filename, on-disk-path) for every attachment written to disk.
-async fn enrich_message(
-    rowid: i64,
-    mail: &Option<MailConnector>,
-    wants_attachment: bool,
-    lines: &mut Vec<String>,
-) -> Vec<(String, std::path::PathBuf)> {
-    let Some(ref mc) = *mail else { return vec![] };
-    let mc_clone = mc.clone();
-    let full = {
-        let mc2 = mc_clone.clone();
-        tokio::task::spawn_blocking(move || mc2.get_message(rowid))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .flatten()
-    };
-    let Some(mut full_msg) = full else {
-        return vec![];
-    };
-    let subject_for_fallback = full_msg.subject.clone();
-
-    // Format datetime as "DD.MM.YYYY HH:MM" in the system local timezone.
-    let dt = {
-        use chrono::{DateTime, Local, Utc};
-        if full_msg.received_at <= 0 {
-            "neznáme".to_string()
-        } else {
-            DateTime::<Utc>::from_timestamp(full_msg.received_at, 0)
-                .map(|d| d.with_timezone(&Local).format("%d.%m.%Y %H:%M").to_string())
-                .unwrap_or_else(|| full_msg.received_at.to_string())
-        }
-    };
-
-    // Build the Od/Komu/Prijaté/Predmet header
-    let sender_fmt = match &full_msg.sender_display {
-        Some(name) if !name.is_empty() => format!("{} <{}>", name, full_msg.sender),
-        _ => full_msg.sender.clone(),
-    };
-    // Try to extract user email from mailbox URL (e.g. "imap://user@domain/...") before falling back.
-    let komu_fallback: String;
-    let komu = if let Some(addr) = full_msg.recipient.as_deref() {
-        addr
-    } else {
-        komu_fallback = full_msg
-            .mailbox_url
-            .split("://")
-            .nth(1)
-            .and_then(|s| s.split('/').next())
-            .filter(|s| s.contains('@'))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "tvoja schránka".to_string());
-        &komu_fallback
-    };
-
-    // Strict guard: LLM must not modify, invent, or cross-contaminate with past context.
-    lines.push(
-        "⚠️ SYSTÉMOVÁ INŠTRUKCIA: Nasledujúci email je skutočný, doslovný obsah zo schránky. \
-         Zobraz hlavičku a telo PRESNE ako je — nič nevymýšľaj, nedoplňaj, nenahrádzaj prázdne \
-         polia vlastnými odhadmi, nemiešaj s inými rozhovormi ani kontextami."
-            .to_string(),
-    );
-
-    // Use markdown hard line breaks (two trailing spaces) so each field renders on its own line.
-    lines.push(format!(
-        "Našiel som email:  \n**Od:** {sender_fmt}  \n**Komu:** {komu}  \n**Prijaté:** {dt}  \n**Predmet:** {}",
-        full_msg.subject
-    ));
-
-    // Body
-    if full_msg.body.is_none() {
-        full_msg.body = apple_mail_connector::body_via_applescript(&subject_for_fallback).await;
-    }
-
-    let mut att_files: Vec<(String, std::path::PathBuf)> = Vec::new();
-
-    if wants_attachment && !full_msg.attachments.is_empty() {
-        // Extract all non-image attachments
-        for att_meta in &full_msg.attachments {
-            if att_meta.mimetype.starts_with("image/") {
-                continue;
-            }
-            let mc2 = mc_clone.clone();
-            let part_idx = att_meta.part_index;
-            let filename = att_meta.filename.clone();
-            let mime = att_meta.mimetype.clone();
-            let bytes_result =
-                tokio::task::spawn_blocking(move || mc2.get_message_attachment(rowid, part_idx))
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok());
-
-            if let Some((_, bytes)) = bytes_result {
-                let tmp = std::env::temp_dir().join(format!("bagent_mail_{}", &filename));
-                if std::fs::write(&tmp, &bytes).is_ok() {
-                    let extracted = extract_attachment(&tmp, &mime)
-                        .ok()
-                        .and_then(|r| r.extracted_text);
-                    if let Some(text) = extracted {
-                        lines.push(format!("\n\n**Obsah prílohy ({filename}):**\n\n{text}"));
-                    } else {
-                        lines.push(format!(
-                            "\n\n**Príloha:** {filename} (obsah nedostupný na analýzu)"
-                        ));
-                    }
-                    att_files.push((filename, tmp));
-                }
-            }
-        }
-    } else {
-        // No attachment requested — show body
-        if let Some(ref body) = full_msg.body {
-            let truncated = compact_mail_body_preserving_line_items(body, 2000);
-            lines.push(format!("\n\n**Obsah:**\n\n{truncated}"));
-        } else {
-            lines.push("\n\n**Obsah:** TELO EMAILU SA NEPODARILO NAČÍTAŤ. Toto nie je šablóna — nič nevymýšľaj ani nedoplňaj.".to_string());
-        }
-    }
-
-    att_files
-}
-
-async fn enrich_applescript_message(
-    msg: &apple_mail_connector::MailMessage,
-    wants_attachment: bool,
-    lines: &mut Vec<String>,
-) {
-    let dt = format_unix_local(msg.received_at);
-    let sender_fmt = match &msg.sender_display {
-        Some(name) if !name.is_empty() => format!("{} <{}>", name, msg.sender),
-        _ => msg.sender.clone(),
-    };
-    let komu = msg.recipient.as_deref().unwrap_or("tvoja schránka");
-
-    lines.push(
-        "⚠️ SYSTÉMOVÁ INŠTRUKCIA: Nasledujúci email bol nájdený cez Mail.app Automation, \
-         pretože priamy Apple Mail index nie je čitateľný. Zobraz iba poskytnuté polia a telo; \
-         nič nevymýšľaj."
-            .to_string(),
-    );
-    lines.push(format!(
-        "Našiel som email:  \n**Od:** {sender_fmt}  \n**Komu:** {komu}  \n**Prijaté:** {dt}  \n**Predmet:** {}",
-        msg.subject
-    ));
-
-    if wants_attachment {
-        lines.push(
-            "\n\n**Prílohy:** Kontrola príloh vyžaduje čitateľný lokálny Mail index alebo stiahnutý .emlx súbor."
-                .to_string(),
-        );
-        return;
-    }
-
-    let body = match &msg.body {
-        Some(body) if !body.trim().is_empty() => Some(body.clone()),
-        _ => apple_mail_connector::body_via_applescript(&msg.subject).await,
-    };
-    if let Some(body) = body {
-        let truncated = compact_mail_body_preserving_line_items(&body, 2000);
-        lines.push(format!("\n\n**Obsah:**\n\n{truncated}"));
-    } else {
-        lines.push("\n\n**Obsah:** TELO EMAILU SA NEPODARILO NAČÍTAŤ. Toto nie je šablóna — nič nevymýšľaj ani nedoplňaj.".to_string());
-    }
-}
-
-/// Detects intent with an LLM classifier and pre-fetches the right Mail / Notes
-/// data so the response LLM can answer with real facts.
-///
-/// Returns `(tool_ctx, pdf_paths, mail_ref)`:
-/// - `tool_ctx`: optional text block injected into the LLM prompt.
-/// - `pdf_paths`: (filename, path) pairs for mail attachment chips.
-/// - `mail_ref`: stable reference to the best-matched mail message, used to
-///   render the "Otvoriť mail" button in the UI.
-/// Format the last `max_turns` user/assistant messages as a compact snippet
-/// for coreference resolution in intent classifiers.
-fn format_history_snippet(history: &[Message], max_turns: usize) -> String {
-    const MAX_CHARS: usize = 200;
-    history
-        .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .rev()
-        .take(max_turns)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|m| {
-            let label = if m.role == "user" {
-                "[User]"
-            } else {
-                "[Assistant]"
-            };
-            let body: String = m.content.chars().take(MAX_CHARS).collect();
-            format!("{}: {}", label, body)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn normalize_contact_match(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .map(|c| match c {
-            'á' | 'à' | 'ä' | 'â' => 'a',
-            'č' => 'c',
-            'ď' => 'd',
-            'é' | 'ě' | 'è' | 'ë' | 'ê' => 'e',
-            'í' | 'ì' | 'ï' | 'î' => 'i',
-            'ľ' | 'ĺ' => 'l',
-            'ň' => 'n',
-            'ó' | 'ô' | 'ö' | 'ò' | 'õ' => 'o',
-            'ŕ' => 'r',
-            'š' => 's',
-            'ť' => 't',
-            'ú' | 'ů' | 'ü' | 'ù' | 'û' => 'u',
-            'ý' | 'ÿ' => 'y',
-            'ž' => 'z',
-            other => other,
-        })
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn infer_whatsapp_contact_from_text(message: &str) -> Option<String> {
-    let low = message.to_lowercase();
-    let markers = [
-        "most recent message with ",
-        "most recent messages with ",
-        "most recent text with ",
-        "latest message with ",
-        "latest messages with ",
-        "latest text with ",
-        "last message with ",
-        "last messages with ",
-        "last text with ",
-        "chat history with ",
-        "i have a chat with ",
-        "have a chat with ",
-        "chat with ",
-        "písali s ",
-        "pisali s ",
-        "písal ",
-        "pisal ",
-    ];
-    let (pos, marker) = markers
-        .iter()
-        .filter_map(|marker| low.find(marker).map(|pos| (pos, *marker)))
-        .min_by_key(|(pos, _)| *pos)?;
-    let mut contact = message[pos + marker.len()..].trim().to_string();
-    for suffix in [
-        " on whatsapp",
-        " in whatsapp",
-        " on whatspp",
-        " in whatspp",
-        " cez whatsapp",
-        " na whatsappe",
-        " na whatsapp",
-    ] {
-        let contact_low = contact.to_lowercase();
-        if let Some(idx) = contact_low.find(suffix) {
-            contact.truncate(idx);
-        }
-    }
-    let contact = contact
-        .trim_matches(|c: char| c.is_whitespace() || c == '?' || c == '.' || c == ',' || c == ':')
-        .to_string();
-    if contact.is_empty() {
-        None
-    } else {
-        Some(contact)
-    }
-}
-
-fn normalize_whatsapp_intent(mut intent: WhatsappIntent, message: &str) -> WhatsappIntent {
-    if let Some(contact) = infer_whatsapp_contact_from_text(message) {
-        if matches!(
-            intent.action,
-            WhatsappAction::None | WhatsappAction::ListRecent | WhatsappAction::Search
-        ) || intent.contact_name.is_none()
-        {
-            intent.action = WhatsappAction::ReadHistory;
-            intent.contact_name = Some(contact);
-            intent.keywords.clear();
-        }
-    }
-    intent
-}
-
-fn find_matching_whatsapp_chat<'a>(
-    chats: &'a [WhatsappChat],
-    contact_query: &str,
-) -> Option<&'a WhatsappChat> {
-    let query_norm = normalize_contact_match(contact_query);
-    if query_norm.is_empty() {
-        return None;
-    }
-    chats.iter().find(|c| {
-        c.name
-            .as_deref()
-            .map(|name| {
-                let name_norm = normalize_contact_match(name);
-                name_norm.contains(&query_norm) || query_norm.contains(&name_norm)
-            })
-            .unwrap_or(false)
-    })
-}
-
-fn find_matching_whatsapp_contact<'a>(
-    contacts: &'a [WhatsappContact],
-    contact_query: &str,
-) -> Option<&'a WhatsappContact> {
-    let query_norm = normalize_contact_match(contact_query);
-    if query_norm.is_empty() {
-        return None;
-    }
-    contacts.iter().find(|c| {
-        [
-            c.name.as_deref(),
-            c.push_name.as_deref(),
-            c.phone.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|value| {
-            let value_norm = normalize_contact_match(value);
-            value_norm.contains(&query_norm) || query_norm.contains(&value_norm)
-        })
-    })
-}
-
-// ── Route executor (evidence pipeline) ───────────────────────────────────────
-
-/// Result of executing a validated `RoutePlan`: ranked evidence rendered as a
-/// prompt block, plus coreference refs and the set of sources this pipeline
-/// handled (used to suppress the legacy per-connector branches).
-#[derive(Default)]
-struct RouteExecution {
-    evidence_block: Option<String>,
-    mail_ref: Option<MailRef>,
-    file_ref: Option<FileRef>,
-    whatsapp_ref: Option<WhatsappRef>,
-    handled: HashSet<RouteSource>,
-}
-
-/// "YYYY-MM-DD" (local) → inclusive unix-second bounds.
-fn iso_date_to_unix_range(from: Option<&str>, to: Option<&str>) -> (Option<i64>, Option<i64>) {
-    use chrono::TimeZone as _;
-    let parse = |s: &str, h: u32, m: u32, sec: u32| {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(h, m, sec))
-            .and_then(|dt| chrono::Local.from_local_datetime(&dt).single())
-            .map(|dt| dt.timestamp())
-    };
-    (
-        from.and_then(|s| parse(s, 0, 0, 0)),
-        to.and_then(|s| parse(s, 23, 59, 59)),
-    )
-}
-
-/// Execute the read-only searches of a `RoutePlan::Search` in parallel with
-/// per-tool timeouts, normalise everything into `Evidence`, rank + dedup +
-/// embed-rerank, and render the size-capped block the synthesizer will see.
-///
-/// Only sources whose tools passed the approval gate run. Open-intent and
-/// untargeted turns return `default()` so the legacy flows (approval-gated
-/// open, unread lists, follow-up refs) keep handling them.
-#[allow(clippy::too_many_arguments)]
-async fn execute_route_plan(
-    plan: &RoutePlan,
-    allowed_tools: &HashSet<String>,
-    db: &Arc<Mutex<Connection>>,
-    mail: &Option<MailConnector>,
-    fs: &Option<FsConnector>,
-    whatsapp: &Arc<WhatsappConnector>,
-    ollama: &OllamaClient,
-) -> RouteExecution {
-    use std::time::Duration;
-
-    let RoutePlan::Search {
-        searches,
-        intent_type,
-        read_top,
-    } = plan
-    else {
-        return RouteExecution::default();
-    };
-    if matches!(intent_type, RouteIntentType::Open) {
-        return RouteExecution::default();
-    }
-    let targeted = searches
-        .iter()
-        .any(|s| !s.query.trim().is_empty() || s.person.is_some() || s.date_from.is_some());
-    if !targeted {
-        return RouteExecution::default();
-    }
-
-    let mail_plan = searches
-        .iter()
-        .find(|s| s.source == RouteSource::AppleMail)
-        .filter(|_| mail.is_some() && allowed_tools.contains("mail_inbox"));
-    let file_plan = searches
-        .iter()
-        .find(|s| s.source == RouteSource::Files)
-        .filter(|_| fs.is_some() && allowed_tools.contains("filesystem.search_files"));
-    let wa_plan = searches.iter().find(|s| s.source == RouteSource::Whatsapp);
-
-    let mail_fut = async {
-        let (Some(p), Some(mc)) = (mail_plan, mail.clone()) else {
-            return (false, Vec::new());
-        };
-        let (date_from, date_to) =
-            iso_date_to_unix_range(p.date_from.as_deref(), p.date_to.as_deref());
-        let filter = MailSearchFilter {
-            sender: p.person.clone(),
-            subject: None,
-            date_from,
-            date_to,
-            limit: p.limit,
-            keywords: p.query.split_whitespace().map(String::from).collect(),
-        };
-        let msgs = match tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || mc.search_messages(&filter)),
-        )
-        .await
-        {
-            Ok(Ok(Ok(m))) => m,
-            _ => Vec::new(),
-        };
-        let evs = msgs
-            .into_iter()
-            .map(|m| {
-                let mut ev = Evidence::new(
-                    RouteSource::AppleMail,
-                    m.subject.clone(),
-                    m.rowid.to_string(),
-                )
-                .with_snippet(m.body.clone().unwrap_or_else(|| m.subject.clone()));
-                ev.author = Some(m.sender_display.clone().unwrap_or_else(|| m.sender.clone()));
-                ev.date = chrono::DateTime::from_timestamp(m.received_at, 0)
-                    .map(|d| d.format("%Y-%m-%d").to_string());
-                ev.location = Some(m.mailbox_url.clone());
-                ev.metadata = serde_json::json!({
-                    "message_id": m.message_id,
-                    "sender": m.sender,
-                    "attachments": m.attachments.len(),
-                });
-                ev
-            })
-            .collect();
-        (true, evs)
-    };
-
-    let file_fut = async {
-        let (Some(p), Some(fc)) = (file_plan, fs.clone()) else {
-            return (false, Vec::new());
-        };
-        let mut terms: Vec<String> = p.query.split_whitespace().map(String::from).collect();
-        if let Some(person) = &p.person {
-            terms.push(person.clone());
-        }
-        if terms.is_empty() {
-            return (true, Vec::new());
-        }
-        let req = FileSearchRequest {
-            query: p.query.clone(),
-            terms,
-            roots: None,
-            search_names: true,
-            search_contents: true,
-            extensions: p.file_type.clone().map(|e| vec![e]),
-            include_hidden: false,
-            max_results: p.limit,
-            max_depth: Some(8),
-        };
-        let policy = fc.policy.clone();
-        let results = match tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(move || fs_search::search_files_sync(&policy, req)),
-        )
-        .await
-        {
-            Ok(Ok(Ok(r))) => r.results,
-            _ => Vec::new(),
-        };
-        let evs = results
-            .into_iter()
-            .map(|f| {
-                let mut ev =
-                    Evidence::new(RouteSource::Files, f.display_name.clone(), f.path.clone())
-                        .with_snippet(f.matched_line.clone().unwrap_or_else(|| f.path.clone()));
-                ev.date = f.modified_at.clone();
-                ev.location = f.parent.clone();
-                ev.metadata = serde_json::json!({
-                    "kind": format!("{:?}", f.kind).to_lowercase(),
-                    "mime": f.mime,
-                });
-                ev
-            })
-            .collect();
-        (true, evs)
-    };
-
-    let wa_fut = async {
-        let Some(p) = wa_plan else {
-            return (false, Vec::new(), None);
-        };
-        let terms: Vec<String> = p
-            .query
-            .split_whitespace()
-            .filter(|w| w.len() > 2)
-            .map(|s| s.to_lowercase())
-            .collect();
-        let ready = matches!(
-            whatsapp.status().await.map(|s| s.status),
-            Ok(WhatsappConnectionStatus::Ready)
-        );
-        // Person-targeted: resolve the chat live and scan recent messages.
-        if ready {
-            if let Some(person) = &p.person {
-                let resolved = match whatsapp.list_chats(200).await {
-                    Ok(chats) => find_matching_whatsapp_chat(&chats, person).map(|c| {
-                        (
-                            c.id.clone(),
-                            c.name.clone().unwrap_or_else(|| person.clone()),
-                        )
-                    }),
-                    Err(_) => None,
-                };
-                let resolved = match resolved {
-                    Some(r) => Some(r),
-                    None => whatsapp.list_contacts(500).await.ok().and_then(|contacts| {
-                        find_matching_whatsapp_contact(&contacts, person).map(|c| {
-                            (
-                                c.id.clone(),
-                                c.name
-                                    .clone()
-                                    .or_else(|| c.push_name.clone())
-                                    .unwrap_or_else(|| person.clone()),
-                            )
-                        })
-                    }),
-                };
-                if let Some((chat_id, chat_name)) = resolved {
-                    let msgs = tokio::time::timeout(
-                        Duration::from_secs(15),
-                        whatsapp.chat_messages(&chat_id, 50, None),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|r| r.ok())
-                    .unwrap_or_default();
-                    let mut hits: Vec<_> = msgs
-                        .iter()
-                        .filter(|m| {
-                            terms.is_empty() || {
-                                let b = m.body.to_lowercase();
-                                terms.iter().any(|t| b.contains(t))
-                            }
-                        })
-                        .collect();
-                    hits.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
-                    let evs: Vec<Evidence> = hits
-                        .into_iter()
-                        .take(p.limit)
-                        .map(|m| {
-                            let mut ev = Evidence::new(
-                                RouteSource::Whatsapp,
-                                format!("Chat: {chat_name}"),
-                                m.id.clone(),
-                            )
-                            .with_snippet(m.body.clone());
-                            ev.author = Some(if m.from_me {
-                                "me".to_string()
-                            } else {
-                                chat_name.clone()
-                            });
-                            ev.date = chrono::DateTime::from_timestamp(m.timestamp, 0)
-                                .map(|d| d.format("%Y-%m-%d").to_string());
-                            ev.location = Some(chat_name.clone());
-                            ev.metadata = serde_json::json!({"chat_id": m.chat_id});
-                            ev
-                        })
-                        .collect();
-                    let wref = WhatsappRef {
-                        chat_id,
-                        contact_name: Some(chat_name),
-                        snippet: evs.first().map(|e| e.snippet.clone()),
-                        source: "route_search".to_string(),
-                        last_message_timestamp: None,
-                    };
-                    return (true, evs, Some(wref));
-                }
-            }
-        }
-        // Fallback: cached WhatsApp messages in SQLite.
-        let rows = search_whatsapp_cache(db, &terms, p.limit).await;
-        let evs = rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let mut ev = Evidence::new(
-                    RouteSource::Whatsapp,
-                    format!("Message from {}", r.sender),
-                    format!("cache:{i}"),
-                )
-                .with_snippet(r.body);
-                ev.author = Some(r.sender);
-                ev
-            })
-            .collect();
-        (true, evs, None)
-    };
-
-    let ((mail_ran, mail_evs), (file_ran, file_evs), (wa_ran, wa_evs, whatsapp_ref)) =
-        tokio::join!(mail_fut, file_fut, wa_fut);
-
-    let mut searched: Vec<(RouteSource, usize)> = Vec::new();
-    let mut handled = HashSet::new();
-    for (ran, source, count) in [
-        (mail_ran, RouteSource::AppleMail, mail_evs.len()),
-        (file_ran, RouteSource::Files, file_evs.len()),
-        (wa_ran, RouteSource::Whatsapp, wa_evs.len()),
-    ] {
-        if ran {
-            searched.push((source, count));
-            handled.insert(source);
-        }
-    }
-    if handled.is_empty() {
-        // Plan wanted private sources but none could run (connector missing /
-        // tool not permitted). Tell the model the truth so it doesn't invent
-        // a "privacy restrictions" refusal.
-        let wanted: Vec<&str> = searches.iter().map(|s| s.source.as_str()).collect();
-        if wanted.is_empty() {
-            return RouteExecution::default();
-        }
-        return RouteExecution {
-            evidence_block: Some(format!(
-                "## Local search evidence\n\
-                 The user asked to search: {}. These local sources are currently \
-                 unavailable to the assistant (connector not accessible or not \
-                 permitted — Apple Mail requires Full Disk Access). Tell the user \
-                 the search could not be run and that access can be enabled in \
-                 bagent Settings / macOS System Settings. Do NOT claim privacy or \
-                 legal restrictions prevent searching — this app searches these \
-                 sources locally by design.\n",
-                wanted.join(", ")
-            )),
-            ..RouteExecution::default()
-        };
-    }
-
-    let budgets = bagent_agent::RouteBudgets::default();
-    let query = searches
-        .iter()
-        .map(|s| s.query.as_str())
-        .find(|q| !q.trim().is_empty())
-        .unwrap_or("")
-        .to_string();
-    let person = searches.iter().find_map(|s| s.person.clone());
-    let prio: HashMap<RouteSource, u8> = searches.iter().map(|s| (s.source, s.priority)).collect();
-    let items: Vec<Evidence> = mail_evs
-        .into_iter()
-        .chain(file_evs)
-        .chain(wa_evs)
-        .collect();
-    let mut ranked = bagent_agent::rank(
-        &query,
-        person.as_deref(),
-        |s| *prio.get(&s).unwrap_or(&3),
-        items,
-        budgets.max_evidence_items,
-    );
-    if let Err(e) = bagent_agent::embed_rerank(ollama, DEFAULT_EMBED_MODEL, &query, &mut ranked).await
-    {
-        tracing::debug!("embed rerank skipped: {e}");
-    }
-
-    // Auto-read the top hit when the intent needs content and it clearly wins.
-    let mut full_content: Option<String> = None;
-    if *read_top {
-        let clear_winner = ranked.len() == 1
-            || ranked
-                .get(1)
-                .map(|second| ranked[0].confidence - second.confidence > 0.15)
-                .unwrap_or(false);
-        // A mail body is one cheap emlx read — always surface the top hit's
-        // content so "find the email from X" can describe what's inside, even
-        // when several mails from the same sender rank closely. Files keep the
-        // strict gate (full-file reads are heavier and noisier).
-        let top_is_mail = ranked
-            .first()
-            .map(|t| t.source == RouteSource::AppleMail)
-            .unwrap_or(false);
-        if clear_winner || top_is_mail {
-            if let Some(top) = ranked.first() {
-                full_content = match top.source {
-                    RouteSource::AppleMail => match (mail.clone(), top.object_id.parse::<i64>()) {
-                        (Some(mc), Ok(rowid)) => {
-                            tokio::task::spawn_blocking(move || mc.get_message(rowid))
-                                .await
-                                .ok()
-                                .and_then(|r| r.ok())
-                                .flatten()
-                                .and_then(|m| m.body)
-                                .map(|b| b.chars().take(4000).collect())
-                        }
-                        _ => None,
-                    },
-                    RouteSource::Files => {
-                        if let Some(fc) = fs.clone() {
-                            let req = ReadTextRequest {
-                                path: top.object_id.clone(),
-                                max_bytes: None,
-                                around_line: None,
-                            };
-                            let policy = fc.policy.clone();
-                            tokio::task::spawn_blocking(move || {
-                                fs_search::read_text_sync(&policy, req)
-                            })
-                            .await
-                            .ok()
-                            .and_then(|r| r.ok())
-                            .map(|r| r.content.chars().take(4000).collect())
-                        } else {
-                            None
-                        }
-                    }
-                    // Chat messages are already the content.
-                    RouteSource::Whatsapp => None,
-                };
-            }
-        }
-    }
-
-    let mail_ref = ranked
-        .iter()
-        .find(|e| e.source == RouteSource::AppleMail)
-        .and_then(|e| {
-            e.object_id.parse::<i64>().ok().map(|rowid| MailRef {
-                rowid,
-                message_id: e
-                    .metadata
-                    .get("message_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                subject: e.title.clone(),
-                sender: e.author.clone().unwrap_or_default(),
-                auto_open: false,
-            })
-        });
-    let file_ref = ranked
-        .iter()
-        .find(|e| e.source == RouteSource::Files)
-        .map(|e| FileRef {
-            path: e.object_id.clone(),
-            display_name: e.title.clone(),
-            kind: e
-                .metadata
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("file")
-                .to_string(),
-        });
-
-    // Audit result shape only — titles/ids, never snippets.
-    audit_fs(
-        db,
-        "route_executed",
-        &serde_json::json!({
-            "searched": searched.iter().map(|(s, n)| (s.as_str(), n)).collect::<Vec<_>>(),
-            "evidence_count": ranked.len(),
-            "read_top": full_content.is_some(),
-        }),
-    );
-
-    RouteExecution {
-        evidence_block: Some(bagent_agent::render_evidence_context(
-            &searched,
-            &ranked,
-            full_content.as_deref(),
-        )),
-        mail_ref,
-        file_ref,
-        whatsapp_ref,
-        handled,
-    }
-}
-
-async fn fetch_tool_context(
-    message: &str,
-    history: &[Message],
-    last_mail_ref: Option<&MailRef>,
-    last_odoo_ref: Option<&OdooRecordRef>,
-    last_whatsapp_ref: Option<&WhatsappRef>,
-    reference_resolution: &ReferenceResolution,
-    task_type: &str,
-    candidate_skill_names: &[String],
-    allowed_tools: &std::collections::HashSet<String>,
-    route_handled: &HashSet<RouteSource>,
-    db: Arc<Mutex<Connection>>,
-    mail: Option<MailConnector>,
-    notes: Option<NotesConnector>,
-    ollama: OllamaClient,
-    model: String,
-    memory: Arc<MemoryStore>,
-    odoo: Arc<RwLock<Option<OdooConnector>>>,
-    whatsapp: Arc<WhatsappConnector>,
-    pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
-    rules: Arc<RuleEngine>,
-) -> ToolContextResult {
-    let low = message.to_lowercase();
-    let planner_selected_whatsapp =
-        task_type == "whatsapp" || candidate_skill_names.iter().any(|s| s == "whatsapp");
-    let mentions_whatsapp = planner_selected_whatsapp
-        || [
-            "whatsapp",
-            "whatspp",
-            "whatsap",
-            "whatapp",
-            " wa ",
-            "wa:",
-            "na whatsappe",
-            "cez whatsapp",
-        ]
-        .iter()
-        .any(|kw| low.contains(kw));
-
-    // Cheap keyword gate — only run the LLM classifier when the turn looks mail-related.
-    let mail_keyword_match = [
-        "email",
-        "mail",
-        "správ",
-        "inbox",
-        "schránk",
-        "doručen",
-        "posledn",
-        "prečítaj",
-        "read",
-        "sender",
-        "odosielate",
-        "nazvom",
-        "názvom",
-        "mailbox",
-        "prilohu",
-        "prílohu",
-        "predmet",
-        "pošt",
-        "message",
-        "odoslan",
-        "poslany",
-        "prijat",
-    ]
-    .iter()
-    .any(|kw| low.contains(kw));
-    let mail_followup_match = last_mail_ref.is_some()
-        && [
-            "tento mail",
-            "táto správa",
-            "ten mail",
-            "tú správu",
-            "this mail",
-            "this email",
-            "its attachment",
-            "tej správy",
-            "prilohy",
-            "prílohy",
-            "has it",
-            "má prílohy",
-            "ma prilohy",
-        ]
-        .iter()
-        .any(|kw| low.contains(kw));
-    let looks_like_mail = allowed_tools.contains("mail_inbox")
-        && !route_handled.contains(&RouteSource::AppleMail)
-        && (task_type == "mail_search"
-            || reference_resolution.resolved_connector.as_deref() == Some("mail")
-            || (!mentions_whatsapp && (mail_keyword_match || mail_followup_match)));
-
-    // On battery: sync on-demand when user asks about mail (background sync is paused)
-    if looks_like_mail && !is_on_ac_power() {
-        if let Some(ref mc) = mail {
-            tracing::info!("mail on-demand sync (battery)");
-            let _ = mail_sync_inner(db.clone(), mc.clone(), memory.clone()).await;
-        }
-    }
-
-    let wants_notes = allowed_tools.contains("notes_list")
-        && ["poznámk", "note", "zápis", "zapisal", "napísal"]
-            .iter()
-            .any(|kw| low.contains(kw));
-
-    let history_snippet = {
-        let base = format_history_snippet(history, 4);
-        let with_mail = match last_mail_ref {
-            Some(r) => format!(
-                "[LastFoundMail]: rowid={} sender=\"{}\" subject=\"{}\"\n{}",
-                r.rowid, r.sender, r.subject, base
-            ),
-            None => base,
-        };
-        let with_odoo = match last_odoo_ref {
-            Some(r) => format!(
-                "[LastFoundOdooRecord]: model=\"{}\" id={} name=\"{}\"\n{}",
-                r.model, r.id, r.name, with_mail
-            ),
-            None => with_mail,
-        };
-        match last_whatsapp_ref {
-            Some(r) => format!(
-                "[LastFoundWhatsapp]: chat_id=\"{}\" contact=\"{}\" source=\"{}\" snippet=\"{}\"\n{}",
-                r.chat_id,
-                r.contact_name.as_deref().unwrap_or(""),
-                r.source,
-                r.snippet.as_deref().unwrap_or(""),
-                with_odoo
-            ),
-            None => with_odoo,
-        }
-    };
-
-    let mut parts: Vec<String> = Vec::new();
-    let mut pdf_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
-    let mut found_mail_ref: Option<MailRef> = None;
-    let mut found_odoo_ref: Option<OdooRecordRef> = None;
-    let mut found_whatsapp_ref: Option<WhatsappRef> = None;
-    let mut mail_search_trace = MailSearchDebugTrace {
-        looked_like_mail: looks_like_mail,
-        mail_connector_available: mail.is_some(),
-        ..Default::default()
-    };
-
-    // ── Mail ─────────────────────────────────────────────────────────────────
-    if looks_like_mail {
-        let mut mail_already_handled = false;
-        if resolver_requests_full_mail_record(reference_resolution) {
-            let target_rowid = reference_resolution
-                .target_ref
-                .as_deref()
-                .and_then(|s| s.parse::<i64>().ok())
-                .or_else(|| last_mail_ref.map(|r| r.rowid));
-            if let Some(rowid) = target_rowid {
-                let mut lines = Vec::new();
-                let found = enrich_message(rowid, &mail, false, &mut lines).await;
-                pdf_paths.extend(found);
-                if !lines.is_empty() {
-                    parts.push(format!("Nájdený email (Apple Mail):\n{}", lines.join("\n")));
-                    if let Some(lmr) = last_mail_ref {
-                        found_mail_ref = Some(MailRef {
-                            rowid,
-                            message_id: lmr.message_id.clone(),
-                            subject: lmr.subject.clone(),
-                            sender: lmr.sender.clone(),
-                            auto_open: false,
-                        });
-                    }
-                    mail_already_handled = true;
-                }
-            }
-        }
-
-        if !mail_already_handled {
-            let intent = MailIntentClassifier::new(ollama.clone(), model.clone())
-                .classify(message, &history_snippet)
-                .await
-                .unwrap_or_default();
-
-            tracing::debug!("mail_intent: {:?}", intent);
-
-            // Safety-net: if classifier said list_recent but filters are present → treat as search.
-            // This catches the common mis-classification of "recent mails from <sender>".
-            let effective_action = if intent.action == "list_recent"
-                && (intent.sender.is_some()
-                    || intent.subject.is_some()
-                    || !intent.keywords.is_empty())
-            {
-                "search"
-            } else {
-                intent.action.as_str()
-            };
-            mail_search_trace.effective_action = Some(effective_action.to_string());
-            mail_search_trace.intent = serde_json::to_value(&intent).ok();
-
-            match effective_action {
-                "none" => {}
-
-                "list_recent" => {
-                    let today_mailbox = asks_today_mailbox(&low);
-                    let msgs = if today_mailbox {
-                        let (date_from, date_to) = local_date_range(0)
-                            .map(|(s, e)| (Some(s), Some(e)))
-                            .unwrap_or((None, None));
-                        search_mail_messages_traced(
-                            &mail,
-                            MailSearchFilter {
-                                sender: None,
-                                subject: None,
-                                date_from,
-                                date_to,
-                                limit: 20,
-                                keywords: vec![],
-                            },
-                            "list_recent_today",
-                            &mut mail_search_trace,
-                        )
-                        .await
-                    } else {
-                        fetch_recent_mails(&db, &mail, 10).await
-                    };
-                    if !msgs.is_empty() {
-                        let lines: Vec<String> = msgs
-                            .iter()
-                            .map(|m| {
-                                let from = m.sender_display.as_deref().unwrap_or(&m.sender);
-                                let status = if m.is_read { "✓" } else { "●" };
-                                format!(
-                                    "  {status} [{}] Od: {} | Predmet: {}",
-                                    relative_date(m.received_at),
-                                    from,
-                                    m.subject
-                                )
-                            })
-                            .collect();
-                        parts.push(format!(
-                            "{}:\n{}",
-                            if today_mailbox {
-                                "Dnešné emaily (Apple Mail)"
-                            } else {
-                                "Posledné emaily (Apple Mail)"
-                            },
-                            lines.join("\n")
-                        ));
-                    } else {
-                        parts.push(if today_mailbox {
-                            "Dnešné emaily (Apple Mail): žiadne správy nenájdené.".to_string()
-                        } else {
-                            "Posledné emaily (Apple Mail): žiadne správy nenájdené.".to_string()
-                        });
-                    }
-                }
-
-                "search" | "read_attachment" | "open" => {
-                    let is_attachment =
-                        intent.action == "read_attachment" || intent.wants_attachment;
-                    let wants_open = intent.action == "open"
-                        || ["otvor", "otvoriť", "open it", "show me", "ukáž mi"]
-                            .iter()
-                            .any(|kw| low.contains(kw));
-
-                    // Short-circuit: "má tento mail prílohy?" with no new search filters
-                    // → use the last found mail's rowid directly, skip re-search.
-                    let no_search_filters = intent.sender.is_none()
-                        && intent.subject.is_none()
-                        && intent.date.is_none()
-                        && intent.keywords.is_empty();
-                    if is_attachment && no_search_filters {
-                        if let Some(ref lmr) = last_mail_ref {
-                            tracing::info!(
-                                "attachment short-circuit via last_mail_ref rowid={}",
-                                lmr.rowid
-                            );
-                            if let Some(ref mc) = mail {
-                                let mc2 = mc.clone();
-                                let rowid = lmr.rowid;
-                                // get_message populates attachments from emlx parsing
-                                let full_msg =
-                                    tokio::task::spawn_blocking(move || mc2.get_message(rowid))
-                                        .await
-                                        .ok()
-                                        .and_then(|r| r.ok())
-                                        .flatten();
-
-                                let attach_list = full_msg
-                                    .as_ref()
-                                    .map(|m| m.attachments.clone())
-                                    .unwrap_or_default();
-
-                                if attach_list.is_empty() {
-                                    parts.push(format!(
-                                        "Email \"{}\" (od: {}) nemá žiadne prílohy.",
-                                        lmr.subject, lmr.sender
-                                    ));
-                                } else {
-                                    let att_lines: Vec<String> = attach_list
-                                        .iter()
-                                        .map(|a| {
-                                            format!(
-                                                "  • {} ({}, {} B)",
-                                                a.filename, a.mimetype, a.size
-                                            )
-                                        })
-                                        .collect();
-                                    parts.push(format!(
-                                        "Prílohy emailu \"{}\" (od: {}):\n{}",
-                                        lmr.subject,
-                                        lmr.sender,
-                                        att_lines.join("\n")
-                                    ));
-                                    // Stage PDF attachment paths for chips
-                                    for (idx, a) in attach_list.iter().enumerate() {
-                                        if a.mimetype.contains("pdf") {
-                                            if let Some(ref mc3) = mail {
-                                                let mc3 = mc3.clone();
-                                                let rid = lmr.rowid;
-                                                if let Ok(Some((_, bytes))) =
-                                                    tokio::task::spawn_blocking(move || {
-                                                        mc3.get_message_attachment(rid, idx).ok()
-                                                    })
-                                                    .await
-                                                {
-                                                    let tmp = std::env::temp_dir().join(format!(
-                                                        "bagent_att_{}_{}.pdf",
-                                                        rid, idx
-                                                    ));
-                                                    if std::fs::write(&tmp, &bytes).is_ok() {
-                                                        pdf_paths.push((a.filename.clone(), tmp));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    found_mail_ref = Some(MailRef {
-                                        rowid: lmr.rowid,
-                                        message_id: lmr.message_id.clone(),
-                                        subject: lmr.subject.clone(),
-                                        sender: lmr.sender.clone(),
-                                        auto_open: false,
-                                    });
-                                }
-                            }
-                            // Done — skip the normal search path
-                        }
-                    }
-
-                    // Only run the full search if we didn't short-circuit above
-                    let already_handled =
-                        is_attachment && no_search_filters && last_mail_ref.is_some();
-                    if !already_handled {
-                        let (date_from, date_to) = intent
-                            .date
-                            .as_deref()
-                            .and_then(parse_date_to_range)
-                            .map(|(s, e)| (Some(s), Some(e)))
-                            .unwrap_or((None, None));
-
-                        // When user says "recent"/"posledné"/"nové" but no explicit date, add a
-                        // 30-day window so we don't scan the entire inbox history.
-                        let date_from = date_from.or_else(|| {
-                            let has_recent_word =
-                                ["recent", "posledn", "nové", "najnov", "latest", "new"]
-                                    .iter()
-                                    .any(|kw| low.contains(kw));
-                            if has_recent_word && intent.date.is_none() {
-                                Some(chrono::Utc::now().timestamp() - 30 * 24 * 3600)
-                            } else {
-                                None
-                            }
-                        });
-
-                        // Stop-words that should never be used as SQL search filters.
-                        let mail_stopwords = [
-                            "recent", "mail", "email", "new", "latest", "inbox", "nové", "posledn",
-                            "správ", "schránk",
-                        ];
-                        let meaningful_keywords: Vec<String> = intent
-                            .keywords
-                            .iter()
-                            .filter(|kw| {
-                                !mail_stopwords
-                                    .iter()
-                                    .any(|sw| kw.to_lowercase().contains(sw))
-                            })
-                            .cloned()
-                            .collect();
-
-                        // If LLM put the search term in keywords instead of sender/subject,
-                        // promote the first meaningful keyword to sender as a fallback.
-                        let effective_sender = intent.sender.clone().or_else(|| {
-                            if intent.subject.is_none() && !meaningful_keywords.is_empty() {
-                                Some(meaningful_keywords[0].clone())
-                            } else {
-                                None
-                            }
-                        });
-
-                        // Only use keywords as SQL filters when sender AND subject are both known
-                        // (avoids false-positive AND clauses filtering out valid results).
-                        let filter_keywords: Vec<String> =
-                            if effective_sender.is_some() || intent.subject.is_some() {
-                                vec![]
-                            } else {
-                                meaningful_keywords.clone()
-                            };
-
-                        let filter = MailSearchFilter {
-                            sender: effective_sender,
-                            subject: intent.subject.clone(),
-                            date_from,
-                            date_to,
-                            limit: 10,
-                            keywords: filter_keywords,
-                        };
-
-                        let had_date_filter =
-                            filter.date_from.is_some() || filter.date_to.is_some();
-                        let mut broad_terms = Vec::new();
-                        push_search_term(&mut broad_terms, filter.sender.as_deref());
-                        push_search_term(&mut broad_terms, filter.subject.as_deref());
-                        for kw in &meaningful_keywords {
-                            push_search_term(&mut broad_terms, Some(kw));
-                        }
-
-                        let mut msgs = search_mail_messages_traced(
-                            &mail,
-                            filter.clone(),
-                            "exact",
-                            &mut mail_search_trace,
-                        )
-                        .await;
-
-                        // Fallback 1: retry ambiguous company/person terms across sender and subject.
-                        // Example: "moneys3" may be classified as sender, while Apple Mail stores
-                        // "Money S3" in display name or subject.
-                        if msgs.is_empty() && !broad_terms.is_empty() {
-                            let broad = MailSearchFilter {
-                                sender: None,
-                                subject: None,
-                                date_from: filter.date_from,
-                                date_to: filter.date_to,
-                                limit: 10,
-                                keywords: broad_terms.clone(),
-                            };
-                            msgs = search_mail_messages_traced(
-                                &mail,
-                                broad,
-                                "broad_terms_same_date",
-                                &mut mail_search_trace,
-                            )
-                            .await;
-                        }
-
-                        // Fallback 2: retry email-address senders by local-part/name/domain tokens.
-                        if msgs.is_empty() {
-                            let mut sender_terms = Vec::new();
-                            push_sender_fallback_terms(&mut sender_terms, filter.sender.as_deref());
-                            if !sender_terms.is_empty() {
-                                let sender_broad = MailSearchFilter {
-                                    sender: None,
-                                    subject: filter.subject.clone(),
-                                    date_from: filter.date_from,
-                                    date_to: filter.date_to,
-                                    limit: 10,
-                                    keywords: sender_terms,
-                                };
-                                msgs = search_mail_messages_traced(
-                                    &mail,
-                                    sender_broad,
-                                    "sender_email_terms_same_date",
-                                    &mut mail_search_trace,
-                                )
-                                .await;
-                            }
-                        }
-
-                        // Fallback 3: if no results and we had a date filter, retry without it.
-                        if msgs.is_empty() && had_date_filter {
-                            let wider = MailSearchFilter {
-                                sender: filter.sender.clone(),
-                                subject: filter.subject.clone(),
-                                date_from: None,
-                                date_to: None,
-                                limit: 10,
-                                keywords: filter.keywords.clone(),
-                            };
-                            msgs = search_mail_messages_traced(
-                                &mail,
-                                wider,
-                                "date_relaxed",
-                                &mut mail_search_trace,
-                            )
-                            .await;
-                        }
-
-                        // Fallback 4: combine both relaxations when each one alone failed.
-                        if msgs.is_empty() && had_date_filter && !broad_terms.is_empty() {
-                            let wider_broad = MailSearchFilter {
-                                sender: None,
-                                subject: None,
-                                date_from: None,
-                                date_to: None,
-                                limit: 10,
-                                keywords: broad_terms.clone(),
-                            };
-                            msgs = search_mail_messages_traced(
-                                &mail,
-                                wider_broad,
-                                "broad_terms_date_relaxed",
-                                &mut mail_search_trace,
-                            )
-                            .await;
-                        }
-
-                        if msgs.is_empty() && had_date_filter {
-                            let mut sender_terms = Vec::new();
-                            push_sender_fallback_terms(&mut sender_terms, filter.sender.as_deref());
-                            if !sender_terms.is_empty() {
-                                let wider_sender_broad = MailSearchFilter {
-                                    sender: None,
-                                    subject: filter.subject.clone(),
-                                    date_from: None,
-                                    date_to: None,
-                                    limit: 10,
-                                    keywords: sender_terms,
-                                };
-                                msgs = search_mail_messages_traced(
-                                    &mail,
-                                    wider_sender_broad,
-                                    "sender_email_terms_date_relaxed",
-                                    &mut mail_search_trace,
-                                )
-                                .await;
-                            }
-                        }
-
-                        let msgs = msgs;
-
-                        if msgs.is_empty() {
-                            mail_search_trace.miss_reason =
-                                Some("all_mail_search_attempts_empty".to_string());
-                            let mut why = Vec::new();
-                            if let Some(ref s) = intent.sender {
-                                why.push(format!("odosielateľ: {s}"));
-                            }
-                            if let Some(ref s) = intent.subject {
-                                why.push(format!("predmet: {s}"));
-                            }
-                            if let Some(ref d) = intent.date {
-                                why.push(format!("dátum: {d}"));
-                            }
-                            parts.push(format!(
-                                "Vyhľadávanie v Apple Mail ({}) — žiadny email nenájdený. \
-                         Email neexistuje v lokálnej schránke alebo nebol stiahnutý cez IMAP.",
-                                if why.is_empty() {
-                                    "bez filtrov".to_string()
-                                } else {
-                                    why.join(", ")
-                                }
-                            ));
-                        } else {
-                            let mut lines: Vec<String> = msgs
-                                .iter()
-                                .map(|m| {
-                                    let from = m.sender_display.as_deref().unwrap_or(&m.sender);
-                                    let status = if m.is_read { "✓" } else { "●" };
-                                    format!(
-                                        "  {status} [{}] Od: {} <{}> | Predmet: {}",
-                                        relative_date(m.received_at),
-                                        from,
-                                        m.sender,
-                                        m.subject
-                                    )
-                                })
-                                .collect();
-
-                            // Find best match: prefer message whose body contains a keyword.
-                            let mut best_rowid = msgs[0].rowid;
-                            if !intent.keywords.is_empty() {
-                                'outer: for msg_item in &msgs {
-                                    if let Some(ref mc) = mail {
-                                        let mc2 = mc.clone();
-                                        let rid = msg_item.rowid;
-                                        if let Some(full) = tokio::task::spawn_blocking(move || {
-                                            mc2.get_message(rid)
-                                        })
-                                        .await
-                                        .ok()
-                                        .and_then(|r| r.ok())
-                                        .flatten()
-                                        {
-                                            if let Some(ref body) = full.body {
-                                                let body_low = body.to_lowercase();
-                                                if intent
-                                                    .keywords
-                                                    .iter()
-                                                    .any(|kw| body_low.contains(kw.as_str()))
-                                                {
-                                                    best_rowid = msg_item.rowid;
-                                                    break 'outer;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            let best_msg = msgs
-                                .iter()
-                                .find(|m| m.rowid == best_rowid)
-                                .unwrap_or(&msgs[0]);
-                            if best_rowid < 0 {
-                                enrich_applescript_message(best_msg, is_attachment, &mut lines)
-                                    .await;
-                            } else {
-                                let found =
-                                    enrich_message(best_rowid, &mail, is_attachment, &mut lines)
-                                        .await;
-                                pdf_paths.extend(found);
-                            }
-                            mail_search_trace.selected_rowid = Some(best_rowid);
-
-                            found_mail_ref = Some(MailRef {
-                                rowid: best_rowid,
-                                message_id: best_msg.message_id.clone(),
-                                subject: best_msg.subject.clone(),
-                                sender: best_msg.sender.clone(),
-                                auto_open: wants_open,
-                            });
-
-                            parts.push(format!(
-                                "Nájdené emaily (Apple Mail):\n{}",
-                                lines.join("\n")
-                            ));
-                        }
-                    } // end if !already_handled
-                }
-
-                _ => {
-                    let msgs = fetch_recent_mails(&db, &mail, 10).await;
-                    if !msgs.is_empty() {
-                        let lines: Vec<String> = msgs
-                            .iter()
-                            .map(|m| {
-                                let from = m.sender_display.as_deref().unwrap_or(&m.sender);
-                                let status = if m.is_read { "✓" } else { "●" };
-                                format!(
-                                    "  {status} [{}] Od: {} | Predmet: {}",
-                                    relative_date(m.received_at),
-                                    from,
-                                    m.subject
-                                )
-                            })
-                            .collect();
-                        parts.push(format!(
-                            "Posledné emaily (Apple Mail):\n{}",
-                            lines.join("\n")
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Notes ─────────────────────────────────────────────────────────────────
-    if wants_notes {
-        if let Some(n) = notes {
-            let nc = n.clone();
-            if let Ok(Ok(items)) = tokio::task::spawn_blocking(move || nc.list_notes(5)).await {
-                if !items.is_empty() {
-                    let lines: Vec<String> = items
-                        .iter()
-                        .map(|note| {
-                            let folder = note.folder.as_deref().unwrap_or("Notes");
-                            let snip = note.snippet.as_deref().unwrap_or("");
-                            format!("  [{}] {} — {}", folder, note.title, snip)
-                        })
-                        .collect();
-                    parts.push(format!(
-                        "Posledné poznámky (Apple Notes):\n{}",
-                        lines.join("\n")
-                    ));
-                }
-            }
-        }
-    }
-
-    // ── AeroSpace window management ───────────────────────────────────────────
-    // Cheap keyword gate — only invoke the classifier when the turn looks
-    // like a window/workspace management request.
-    let looks_like_window = [
-        "plochu",
-        "ploch",
-        "workspace",
-        "prepni",
-        "presuň",
-        "presun",
-        "zameraj",
-        "otvor na ploch",
-    ]
-    .iter()
-    .any(|kw| low.contains(kw));
-
-    if looks_like_window {
-        if let Ok(intent) = WindowIntentClassifier::new(ollama.clone(), model.clone())
-            .classify(message, &history_snippet)
-            .await
-        {
-            tracing::debug!("window_intent: {:?}", intent);
-            if intent.action != "none" {
-                if let Ok(note) = run_aerospace_intent(&intent).await {
-                    // Background action completed — signal caller to skip LLM streaming
-                    // and show a brief confirmation in the voice notch instead.
-                    tracing::info!("window action taken: {}", note);
-                    return ToolContextResult {
-                        action_taken: Some(note),
-                        mail_search_trace: if mail_search_trace.looked_like_mail {
-                            Some(mail_search_trace)
-                        } else {
-                            None
-                        },
-                        ..Default::default()
-                    };
-                }
-            }
-        }
-    }
-
-    // ── Odoo ──────────────────────────────────────────────────────────────────
-    {
-        let odoo_guard = odoo.read().await;
-        let odoo_configured = odoo_guard.is_some();
-        drop(odoo_guard);
-
-        // Keyword gate — independent of the context_planner's is_odoo(), because
-        // "faktúra" routes to invoice_analysis there (→ hits this branch too).
-        let planner_selected_odoo = task_type == "odoo_lookup"
-            || candidate_skill_names.iter().any(|s| s == "odoo-readonly");
-        let looks_like_odoo = odoo_configured
-            && (planner_selected_odoo
-                || [
-                    "odoo",
-                    "faktúr",
-                    "faktura",
-                    "invoice",
-                    "partner",
-                    "kontakt",
-                    "zákazník",
-                    "zakaznik",
-                    "helpdesk",
-                    "tiket",
-                    "ticket",
-                    "úloh",
-                    "uloh",
-                    "objednávk",
-                ]
-                .iter()
-                .any(|kw| low.contains(kw))
-                || (last_odoo_ref.is_some()
-                    && [
-                        "otvor to",
-                        "otvor ho",
-                        "otvor ju",
-                        "open it",
-                        "otvoriť",
-                        "ten záznam",
-                        "that record",
-                        "show in odoo",
-                    ]
-                    .iter()
-                    .any(|kw| low.contains(kw))));
-
-        if looks_like_odoo {
-            let odoo_guard = odoo.read().await;
-            if let Some(ref conn) = *odoo_guard {
-                let intent = OdooIntentClassifier::new(ollama.clone(), model.clone())
-                    .classify(message, &history_snippet)
-                    .await
-                    .unwrap_or_default();
-
-                tracing::debug!("odoo_intent: {:?}", intent);
-
-                match intent.action {
-                    OdooAction::SearchContacts => {
-                        let query = intent.query.as_deref().unwrap_or("");
-                        match conn.search_partners(query, 5).await {
-                            Ok(r) => {
-                                parts.push(format!("## Živé dáta z Odoo — partneri\n{}", r.text));
-                                if let (Some(id), Some(name)) =
-                                    (r.first_id, r.first_name.as_deref())
-                                {
-                                    found_odoo_ref = Some(conn.record_ref("res.partner", id, name));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Odoo search_partners error: {e}");
-                                parts.push("Odoo partner vyhľadávanie nedostupné.".into());
-                            }
-                        }
-                    }
-
-                    OdooAction::GetInvoices => match conn.my_invoices(intent.open_only, 10).await {
-                        Ok(r) => {
-                            let header = if intent.open_only {
-                                "neuhradené faktúry"
-                            } else {
-                                "faktúry"
-                            };
-                            parts.push(format!("## Živé dáta z Odoo — {header}\n{}", r.text));
-                            if let (Some(id), Some(name)) = (r.first_id, r.first_name.as_deref()) {
-                                found_odoo_ref = Some(conn.record_ref("account.move", id, name));
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Odoo my_invoices error: {e}");
-                            parts.push("Odoo faktúry nedostupné.".into());
-                        }
-                    },
-
-                    OdooAction::ListTickets => {
-                        match conn.my_helpdesk_tickets(intent.open_only, 10).await {
-                            Ok(r) => {
-                                let header = if intent.open_only {
-                                    "otvorené helpdesk tikety"
-                                } else {
-                                    "helpdesk tikety"
-                                };
-                                parts.push(format!("## Živé dáta z Odoo — {header}\n{}", r.text));
-                                if let (Some(id), Some(name)) =
-                                    (r.first_id, r.first_name.as_deref())
-                                {
-                                    found_odoo_ref =
-                                        Some(conn.record_ref("helpdesk.ticket", id, name));
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Odoo my_helpdesk_tickets error: {e}");
-                                parts.push("Odoo helpdesk nedostupný.".into());
-                            }
-                        }
-                    }
-
-                    OdooAction::GetRecord => {
-                        if let (Some(model_str), Some(id)) =
-                            (intent.query.as_deref(), intent.record_id)
-                        {
-                            match conn.get_record(model_str, id).await {
-                                Ok(Some(r)) => {
-                                    parts.push(format!("## Živé dáta z Odoo — záznam\n{}", r.text));
-                                    let name = r.first_name.as_deref().unwrap_or("Záznam");
-                                    found_odoo_ref = Some(conn.record_ref(model_str, id, name));
-                                }
-                                Ok(None) => {
-                                    parts
-                                        .push(format!("Odoo: záznam {model_str} #{id} nenájdený."));
-                                }
-                                Err(e) => {
-                                    tracing::warn!("Odoo get_record error: {e}");
-                                    parts.push("Odoo záznam nedostupný.".into());
-                                }
-                            }
-                        }
-                    }
-
-                    OdooAction::Open => {
-                        // Resolve the record to open: from intent or last_odoo_ref.
-                        let target_ref = last_odoo_ref.cloned().or_else(|| found_odoo_ref.clone());
-                        if let Some(ref r) = target_ref {
-                            let url = r.url.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = fs_open::open_url_in_safari(&url).await {
-                                    tracing::warn!("odoo open_url_in_safari error: {e}");
-                                }
-                            });
-                            found_odoo_ref = target_ref;
-                        } else {
-                            parts.push(
-                                "Odoo: žiadny záznam na otvorenie. Najprv vyhľadajte záznam."
-                                    .into(),
-                            );
-                        }
-                    }
-
-                    OdooAction::None => {}
-                }
-            }
-        }
-    }
-
-    // ── WhatsApp (Phase 11) ───────────────────────────────────────────────────
-    {
-        // Keyword gate — only run classifier when turn looks WhatsApp-related.
-        let looks_like_whatsapp = {
-            let explicit = [
-                "whatsapp",
-                "whatspp",
-                "whatsap",
-                "whatapp",
-                " wa ",
-                "na whatsappe",
-                "cez whatsapp",
-                "na wa",
-            ];
-            let send_signals = [
-                "napíš mu",
-                "napíš jej",
-                "pošli mu správu",
-                "pošli jej správu",
-                "napíš petrovi",
-                "napíš katke",
-                "write to ",
-                "send to ",
-            ];
-            let find_signals = [
-                "kde mi písal",
-                "kde mi písala",
-                "čo mi písal",
-                "čo mi písala",
-                "čo sme si písali",
-                "nájdi správu od",
-                "find message from",
-                "chat history",
-                "last messages with",
-                "last message with",
-                "latest messages with",
-                "latest message with",
-                "most recent messages with",
-                "most recent message with",
-                "most recent text with",
-                "latest text with",
-                "last text with",
-                "what did i talk about with",
-                "what did we talk about with",
-                "what did i discuss with",
-            ];
-            let has_mail = low.contains("mail") || low.contains("email");
-            let followup_signals = [
-                "what did i talk about with",
-                "what did we talk about with",
-                "what did i discuss with",
-                "last messages",
-                "last chat",
-                "čo sme riešili",
-                "čo sme si písali",
-                "posledné správy",
-                "posledne spravy",
-            ];
-            !route_handled.contains(&RouteSource::Whatsapp)
-                && (explicit.iter().any(|k| low.contains(k))
-                    || planner_selected_whatsapp
-                    || reference_resolution.resolved_connector.as_deref() == Some("whatsapp")
-                    || (send_signals.iter().any(|k| low.contains(k)) && !has_mail)
-                    || (find_signals.iter().any(|k| low.contains(k)) && !has_mail)
-                    || (last_whatsapp_ref.is_some()
-                        && followup_signals.iter().any(|k| low.contains(k))
-                        && !has_mail))
-        };
-
-        if looks_like_whatsapp {
-            // Check bridge accessibility (cheap — no HTTP call when not started).
-            let wa_status = whatsapp.status().await;
-            let is_ready = matches!(
-                wa_status.as_ref().map(|s| &s.status),
-                Ok(WhatsappConnectionStatus::Ready)
-            );
-            let is_qr = matches!(
-                wa_status.as_ref().map(|s| &s.status),
-                Ok(WhatsappConnectionStatus::Qr)
-            );
-            let is_missing_node = matches!(
-                wa_status.as_ref().map(|s| &s.status),
-                Ok(WhatsappConnectionStatus::MissingNode)
-            );
-            let is_not_installed = matches!(
-                wa_status.as_ref().map(|s| &s.status),
-                Ok(WhatsappConnectionStatus::BridgeNotInstalled)
-            );
-
-            if is_qr {
-                parts.push(
-                    "## WhatsApp\nWhatsApp čaká na QR kód — prejdi do Nastavení a naskenuj QR."
-                        .into(),
-                );
-            } else if is_missing_node {
-                parts.push(
-                    "## WhatsApp\nNode.js nie je nainštalovaný — WhatsApp bridge nedostupný."
-                        .into(),
-                );
-            } else if is_not_installed {
-                parts.push("## WhatsApp\nWhatsApp bridge nie je nainštalovaný — spusti `make whatsapp-bridge-install`.".into());
-            } else if !is_ready {
-                parts.push(
-                    "## WhatsApp\nWhatsApp nie je pripojený — v Nastaveniach sa pripojiť.".into(),
-                );
-            } else {
-                let timestamp_handled = reference_resolution.resolved_connector.as_deref()
-                    == Some("whatsapp")
-                    && reference_resolution.requested_operation == "fetch_timestamp";
-                if timestamp_handled {
-                    if let Some(last_ref) = last_whatsapp_ref {
-                        let latest_ts = match last_ref.last_message_timestamp {
-                            Some(ts) => Some(ts),
-                            None => whatsapp
-                                .chat_messages(&last_ref.chat_id, 1, None)
-                                .await
-                                .ok()
-                                .and_then(|msgs| msgs.into_iter().max_by_key(|m| m.timestamp))
-                                .map(|m| m.timestamp),
-                        };
-                        let contact = last_ref
-                            .contact_name
-                            .as_deref()
-                            .unwrap_or("posledný WhatsApp chat");
-                        match latest_ts {
-                            Some(ts) => {
-                                parts.push(format!(
-                                    "## WhatsApp — čas posledného chatu s {contact} (PII)\nPosledná dostupná správa v tomto chate je z: {}.",
-                                    format_unix_local(ts)
-                                ));
-                                found_whatsapp_ref = Some(WhatsappRef {
-                                    chat_id: last_ref.chat_id.clone(),
-                                    contact_name: last_ref.contact_name.clone(),
-                                    snippet: last_ref.snippet.clone(),
-                                    source: "reference_timestamp".to_string(),
-                                    last_message_timestamp: Some(ts),
-                                });
-                            }
-                            None => parts.push(format!(
-                                "## WhatsApp — čas posledného chatu s {contact} (PII)\nČas správy nie je dostupný."
-                            )),
-                        }
-                    } else {
-                        parts.push(
-                            "## WhatsApp\nNemám uložený posledný WhatsApp chat, na ktorý by sa dalo odkázať."
-                                .into(),
-                        );
-                    }
-                }
-                if !timestamp_handled {
-                    // Classify intent
-                    let wa_intent = WhatsappIntentClassifier::new(ollama.clone(), model.clone())
-                        .classify(message, &history_snippet)
-                        .await
-                        .unwrap_or_default();
-                    let mut wa_intent = normalize_whatsapp_intent(wa_intent, message);
-                    if reference_resolution.resolved_connector.as_deref() == Some("whatsapp")
-                        && reference_resolution.confidence >= 0.60
-                        && matches!(
-                            reference_resolution.requested_operation.as_str(),
-                            "answer_from_current_context" | "fetch_more_history" | "analyze_tone"
-                        )
-                        && matches!(wa_intent.action, WhatsappAction::None)
-                    {
-                        if let Some(last_ref) = last_whatsapp_ref {
-                            wa_intent.action = WhatsappAction::ReadHistory;
-                            wa_intent.chat_id = Some(last_ref.chat_id.clone());
-                            wa_intent.contact_name = last_ref.contact_name.clone();
-                            wa_intent.limit = Some(if reference_resolution.needs_live_fetch {
-                                50
-                            } else {
-                                10
-                            });
-                        }
-                    }
-
-                    tracing::debug!("whatsapp_intent: {:?}", wa_intent);
-
-                    match wa_intent.action {
-                        WhatsappAction::ListRecent => match whatsapp.list_chats(10).await {
-                            Ok(chats) if !chats.is_empty() => {
-                                let wants_unread = [
-                                    "unread",
-                                    "not read",
-                                    "neprečít",
-                                    "neprecit",
-                                    "nové správy",
-                                    "nove spravy",
-                                ]
-                                .iter()
-                                .any(|k| low.contains(k));
-                                let visible_chats = chats
-                                    .iter()
-                                    .filter(|c| !wants_unread || c.unread_count > 0)
-                                    .collect::<Vec<_>>();
-                                if visible_chats.is_empty() {
-                                    parts.push(
-                                    "## WhatsApp — neprečítané chaty (PII)\nŽiadne neprečítané WhatsApp chaty nenájdené."
-                                        .into(),
-                                );
-                                } else {
-                                    if let Some(first_chat) = visible_chats.first() {
-                                        found_whatsapp_ref = Some(WhatsappRef {
-                                            chat_id: first_chat.id.clone(),
-                                            contact_name: first_chat.name.clone(),
-                                            snippet: first_chat.last_message_preview.clone(),
-                                            source: if wants_unread {
-                                                "list_unread".to_string()
-                                            } else {
-                                                "list_recent".to_string()
-                                            },
-                                            last_message_timestamp: first_chat.timestamp,
-                                        });
-                                    }
-                                    let lines: Vec<String> = visible_chats
-                                        .iter()
-                                        .map(|c| {
-                                            let name = c.name.as_deref().unwrap_or("—");
-                                            let unread = if c.unread_count > 0 {
-                                                format!(" [{}]", c.unread_count)
-                                            } else {
-                                                String::new()
-                                            };
-                                            let preview = c
-                                                .last_message_preview
-                                                .as_deref()
-                                                .unwrap_or("")
-                                                .chars()
-                                                .take(60)
-                                                .collect::<String>();
-                                            format!("  • {name}{unread}: {preview}")
-                                        })
-                                        .collect();
-                                    parts.push(format!(
-                                        "## WhatsApp — {} (PII)\n{}",
-                                        if wants_unread {
-                                            "neprečítané chaty"
-                                        } else {
-                                            "posledné chaty"
-                                        },
-                                        lines.join("\n")
-                                    ));
-                                }
-                            }
-                            Ok(_) => parts.push("WhatsApp: žiadne chaty nenájdené.".into()),
-                            Err(e) => {
-                                tracing::warn!("WhatsApp list_chats error: {e}");
-                                parts.push("WhatsApp chaty nedostupné.".into());
-                            }
-                        },
-
-                        WhatsappAction::Search => {
-                            // Search cached messages (LIKE + recency)
-                            let keywords = if wa_intent.keywords.is_empty() {
-                                message
-                                    .split_whitespace()
-                                    .filter(|w| w.len() > 3)
-                                    .take(5)
-                                    .map(|s| s.to_string())
-                                    .collect::<Vec<_>>()
-                            } else {
-                                wa_intent.keywords.clone()
-                            };
-                            let results = search_whatsapp_cache(&db, &keywords, 8).await;
-                            if !results.is_empty() {
-                                let lines: Vec<String> = results
-                                    .iter()
-                                    .map(|r| {
-                                        let body_preview =
-                                            r.body.chars().take(300).collect::<String>();
-                                        format!(
-                                            "  [{sender}] {body}",
-                                            sender = r.sender,
-                                            body = body_preview
-                                        )
-                                    })
-                                    .collect();
-                                parts.push(format!(
-                                    "## WhatsApp — hľadanie (PII)\n{}",
-                                    lines.join("\n")
-                                ));
-                            } else {
-                                // Fallback: live bridge recent chats
-                                match whatsapp.list_chats(5).await {
-                                    Ok(chats) if !chats.is_empty() => {
-                                        let lines: Vec<String> = chats
-                                            .iter()
-                                            .filter_map(|c| {
-                                                c.last_message_preview.as_deref().map(|p| {
-                                                    let name = c.name.as_deref().unwrap_or("—");
-                                                    format!(
-                                                        "  • {name}: {}",
-                                                        p.chars().take(80).collect::<String>()
-                                                    )
-                                                })
-                                            })
-                                            .collect();
-                                        if !lines.is_empty() {
-                                            parts.push(format!(
-                                                "## WhatsApp — posledné správy (PII)\n{}",
-                                                lines.join("\n")
-                                            ));
-                                        } else {
-                                            parts.push(format!(
-                                                "WhatsApp: žiadne správy nenájdené pre: {}.",
-                                                keywords.join(", ")
-                                            ));
-                                        }
-                                    }
-                                    _ => {
-                                        parts.push(format!(
-                                            "WhatsApp: žiadne správy nenájdené pre: {}.",
-                                            keywords.join(", ")
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-
-                        WhatsappAction::ReadHistory => {
-                            // Try to resolve contact → chat
-                            let contact_query = wa_intent
-                                .contact_name
-                                .as_deref()
-                                .or(wa_intent.phone.as_deref())
-                                .unwrap_or("");
-                            let resolved_chat_from_ref =
-                                wa_intent.chat_id.as_ref().map(|chat_id| {
-                                    (
-                                        chat_id.clone(),
-                                        wa_intent
-                                            .contact_name
-                                            .clone()
-                                            .unwrap_or_else(|| "WhatsApp chat".to_string()),
-                                    )
-                                });
-                            if !contact_query.is_empty() || resolved_chat_from_ref.is_some() {
-                                // Search chats for name match
-                                let resolved_from_chats = if resolved_chat_from_ref.is_some() {
-                                    Ok(resolved_chat_from_ref)
-                                } else {
-                                    match whatsapp.list_chats(200).await {
-                                        Ok(chats) => Ok(
-                                            if let Some(chat) =
-                                                find_matching_whatsapp_chat(&chats, contact_query)
-                                            {
-                                                Some((
-                                                    chat.id.clone(),
-                                                    chat.name.clone().unwrap_or_else(|| {
-                                                        contact_query.to_string()
-                                                    }),
-                                                ))
-                                            } else {
-                                                match whatsapp.list_contacts(500).await {
-                                                    Ok(contacts) => find_matching_whatsapp_contact(
-                                                        &contacts,
-                                                        contact_query,
-                                                    )
-                                                    .map(|contact| {
-                                                        (
-                                                            contact.id.clone(),
-                                                            contact
-                                                                .name
-                                                                .clone()
-                                                                .or_else(|| {
-                                                                    contact.push_name.clone()
-                                                                })
-                                                                .unwrap_or_else(|| {
-                                                                    contact_query.to_string()
-                                                                }),
-                                                        )
-                                                    }),
-                                                    Err(e) => {
-                                                        tracing::warn!(
-                                                    "WhatsApp list_contacts fallback error: {e}"
-                                                );
-                                                        None
-                                                    }
-                                                }
-                                            },
-                                        ),
-                                        Err(e) => Err(e),
-                                    }
-                                };
-                                match resolved_from_chats {
-                                    Ok(resolved) => {
-                                        if let Some((chat_id, chat_name)) = resolved {
-                                            let limit = wa_intent.limit.unwrap_or(10) as usize;
-                                            match whatsapp
-                                                .chat_messages(&chat_id, limit, None)
-                                                .await
-                                            {
-                                                Ok(msgs) if !msgs.is_empty() => {
-                                                    let lines: Vec<String> = msgs
-                                                        .iter()
-                                                        .rev()
-                                                        .take(8)
-                                                        .map(|m| {
-                                                            let sender = if m.from_me {
-                                                                "Ja"
-                                                            } else {
-                                                                &chat_name
-                                                            };
-                                                            let body = m
-                                                                .body
-                                                                .chars()
-                                                                .take(300)
-                                                                .collect::<String>();
-                                                            format!(
-                                                                "  [{}] [{sender}]: {body}",
-                                                                format_unix_local(m.timestamp)
-                                                            )
-                                                        })
-                                                        .collect();
-                                                    parts.push(format!("## WhatsApp — história s {chat_name} (PII)\n{}", lines.join("\n")));
-                                                    let latest_ts =
-                                                        msgs.iter().map(|m| m.timestamp).max();
-                                                    found_whatsapp_ref = Some(WhatsappRef {
-                                                        chat_id: chat_id.clone(),
-                                                        contact_name: Some(chat_name.clone()),
-                                                        snippet: lines.first().cloned(),
-                                                        source: "read_history".to_string(),
-                                                        last_message_timestamp: latest_ts,
-                                                    });
-
-                                                    // Cache messages in DB for future searches
-                                                    let msgs_to_cache = msgs.clone();
-                                                    let db_cache = db.clone();
-                                                    let chat_name_str = chat_name.clone();
-                                                    tokio::spawn(async move {
-                                                        cache_whatsapp_messages(
-                                                            &db_cache,
-                                                            &msgs_to_cache,
-                                                            &chat_name_str,
-                                                        )
-                                                        .await;
-                                                    });
-                                                }
-                                                Ok(_) => parts.push(format!(
-                                                    "WhatsApp: žiadne správy s {}.",
-                                                    contact_query
-                                                )),
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "WhatsApp chat_messages error: {e}"
-                                                    );
-                                                    parts.push(
-                                                        "WhatsApp história nedostupná.".into(),
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            parts.push(format!(
-                                                "WhatsApp: kontakt \"{}\" nenájdený.",
-                                                contact_query
-                                            ));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("WhatsApp list_chats error: {e}");
-                                        parts.push("WhatsApp chaty nedostupné.".into());
-                                    }
-                                }
-                            } else {
-                                parts.push("WhatsApp: uveď meno kontaktu.".into());
-                            }
-                        }
-
-                        WhatsappAction::DraftSend => {
-                            let contact = wa_intent
-                                .contact_name
-                                .as_deref()
-                                .or(wa_intent.phone.as_deref());
-                            let text = wa_intent.message_text.as_deref().unwrap_or("");
-
-                            if text.is_empty() {
-                                parts.push("WhatsApp: text správy chýba.".into());
-                            } else if contact.is_none() {
-                                parts.push("WhatsApp: príjemca správy chýba.".into());
-                            } else {
-                                let contact_str = contact.unwrap().to_string();
-                                let text_str = text.to_string();
-
-                                // Resolve chat JID from contact name
-                                let chat_id_opt = match whatsapp.list_chats(200).await {
-                                    Ok(chats) => find_matching_whatsapp_chat(&chats, &contact_str)
-                                        .map(|c| c.id.clone()),
-                                    Err(_) => None,
-                                };
-
-                                let target_opt: Option<WhatsappSendTarget> = match chat_id_opt {
-                                    Some(id) => Some(WhatsappSendTarget::ChatId(id)),
-                                    None => wa_intent.phone.clone().map(WhatsappSendTarget::Phone),
-                                };
-                                if target_opt.is_none() {
-                                    parts.push(format!(
-                                        "WhatsApp: kontakt \"{}\" nenájdený. Uveď telefónne číslo.",
-                                        contact_str
-                                    ));
-                                }
-                                if let Some(target) = target_opt {
-                                    let recipient_display = &contact_str;
-                                    // Check rules gate — Forbidden blocks immediately
-                                    let rules_level = rules.check("whatsapp.send_message", "{}");
-                                    if matches!(rules_level, ApprovalLevel::Forbidden) {
-                                        parts.push(
-                                            "WhatsApp: posielanie správ je zakázané pravidlami."
-                                                .into(),
-                                        );
-                                    } else {
-                                        // Approval flow (trap #1: always request regardless of Auto/Ask)
-                                        let text_preview = if text_str.len() > 60 {
-                                            format!(
-                                                "{}… ({} znakov)",
-                                                &text_str[..60],
-                                                text_str.len()
-                                            )
-                                        } else {
-                                            text_str.clone()
-                                        };
-                                        let audit_description = format!(
-                                            "WhatsApp správa — Príjemca: {} | Náhľad: {}",
-                                            recipient_display, text_preview
-                                        );
-
-                                        // We don't have a tx sender here (called outside SSE stream context
-                                        // in the REST-style tool-context path). Use None → Swift polls /approvals/pending.
-                                        let approved = request_approval_core(
-                                            &db,
-                                            &pending_approvals,
-                                            "whatsapp.send_message",
-                                            &audit_description,
-                                            None,
-                                        )
-                                        .await;
-
-                                        if !approved {
-                                            parts.push(format!(
-                                        "WhatsApp: odoslanie správy pre \"{}\" bolo zamietnuté.",
-                                        recipient_display
-                                    ));
-                                        } else {
-                                            match whatsapp.send_message(target, &text_str).await {
-                                                Ok(msg_ref) => {
-                                                    tracing::info!(message_id = %msg_ref.message_id, "WhatsApp message sent via tool context");
-                                                    parts.push(format!(
-                                                "WhatsApp: správa pre \"{}\" bola odoslaná (id: {}).",
-                                                recipient_display, msg_ref.message_id
-                                            ));
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "WhatsApp send error in tool ctx: {e}"
-                                                    );
-                                                    parts.push(format!(
-                                                        "WhatsApp: odoslanie zlyhalo — {}",
-                                                        e
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } // end DraftSend
-
-                        WhatsappAction::None => {}
-                    }
-                }
-            }
-        }
-    }
-
-    let ctx = if parts.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "## Živé dáta z tvojich aplikácií\n\
-             Ak sú nájdené dáta, odpovedaj z nich priamo a presne.\n\
-             Ak email alebo obsah nie je nájdený, povedz to používateľovi jasne.\n\n{}",
-            parts.join("\n\n")
-        ))
-    };
-
-    ToolContextResult {
-        tool_ctx: ctx,
-        mail_pdf_paths: pdf_paths,
-        mail_ref: found_mail_ref,
-        action_taken: None,
-        odoo_ref: found_odoo_ref,
-        whatsapp_ref: found_whatsapp_ref,
-        mail_search_trace: if mail_search_trace.looked_like_mail {
-            Some(mail_search_trace)
-        } else {
-            None
-        },
-    }
-}
 
 // ── WhatsApp DB helpers ───────────────────────────────────────────────────────
 
-/// Simple row returned by `search_whatsapp_cache`.
-struct WaCacheRow {
-    sender: String,
-    body: String,
-}
 
-/// Search the messages cache for WhatsApp messages matching `keywords` via LIKE.
-/// Returns up to `limit` rows ordered by recency (newest first).
-async fn search_whatsapp_cache(
-    db: &Arc<Mutex<Connection>>,
-    keywords: &[String],
-    limit: usize,
-) -> Vec<WaCacheRow> {
-    if keywords.is_empty() {
-        return vec![];
-    }
-    let Ok(db) = db.try_lock() else {
-        return vec![];
-    };
 
-    // Build a LIKE clause for each keyword: body LIKE '%kw%'
-    let clauses: Vec<String> = keywords
-        .iter()
-        .map(|k| format!("body LIKE '%{}%'", k.replace('\'', "''")))
-        .collect();
-    let where_clause = clauses.join(" OR ");
-    let sql = format!(
-        "SELECT sender, body FROM messages \
-         WHERE source = 'whatsapp' AND ({where_clause}) \
-         ORDER BY received_at DESC LIMIT {limit}"
-    );
-
-    let mut stmt = match db.prepare(&sql) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("search_whatsapp_cache prepare error: {e}");
-            return vec![];
-        }
-    };
-    stmt.query_map([], |row| {
-        Ok(WaCacheRow {
-            sender: row.get::<_, String>(0).unwrap_or_default(),
-            body: row.get::<_, String>(1).unwrap_or_default(),
-        })
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
-}
-
-/// Upsert WhatsApp messages into the messages table (idempotent on external_id).
-/// chat_name goes into `subject`; `metadata_json` stores chat_id / from_me / has_media.
-async fn cache_whatsapp_messages(
-    db: &Arc<Mutex<Connection>>,
-    msgs: &[whatsapp_connector::WhatsappMessage],
-    chat_name: &str,
-) {
-    let Ok(db) = db.try_lock() else {
-        return;
-    };
-    for msg in msgs {
-        let meta = serde_json::json!({
-            "chat_id": msg.chat_id,
-            "from_me": msg.from_me,
-            "has_media": msg.has_media,
-            "to": msg.to,
-        });
-        let _ = db.execute(
-            "INSERT OR IGNORE INTO messages \
-             (source, external_id, subject, body, sender, received_at, metadata_json) \
-             VALUES ('whatsapp', ?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                msg.id,
-                chat_name,
-                msg.body,
-                msg.from,
-                msg.timestamp,
-                meta.to_string(),
-            ],
-        );
-    }
-}
 
 // ── AeroSpace executor ────────────────────────────────────────────────────────
 
@@ -7737,164 +4641,8 @@ async fn run_aerospace(args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Execute a `WindowIntent` using the aerospace CLI.
-/// Returns a short SK confirmation string to inject into the LLM context,
-/// or an empty string if the binary is absent (silent degrade).
-async fn run_aerospace_intent(intent: &bagent_agent::WindowIntent) -> anyhow::Result<String> {
-    match intent.action.as_str() {
-        "focus_workspace" => {
-            if let Some(ref ws) = intent.workspace {
-                match run_aerospace(&["workspace", ws]).await {
-                    Ok(_) => return Ok(format!("Prepnuté na plochu {ws}.")),
-                    Err(e) => {
-                        tracing::warn!("aerospace focus_workspace: {e}");
-                        return Ok(String::new());
-                    }
-                }
-            }
-        }
 
-        "open_app" => {
-            let app = intent.app.as_deref().unwrap_or("Mail");
-            // 1. Launch (or focus) the application
-            let _ = tokio::process::Command::new("open")
-                .args(["-a", app])
-                .output()
-                .await;
 
-            if let Some(ref ws) = intent.workspace {
-                // 2. Poll until the window appears, then move it
-                let bundle_id = app_to_bundle_id(app);
-                let ws_str = ws.clone();
-                let app_str = app.to_string();
-                tokio::spawn(async move {
-                    for _ in 0..30 {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        let Ok(list) = run_aerospace(&[
-                            "list-windows",
-                            "--all",
-                            "--app-bundle-id",
-                            &bundle_id,
-                            "--format",
-                            "%{window-id}",
-                        ])
-                        .await
-                        else {
-                            continue;
-                        };
-                        let wid = list.lines().next().unwrap_or("").trim().to_string();
-                        if wid.is_empty() {
-                            continue;
-                        }
-                        // Try with --window-id first (AeroSpace 0.15+), fall back to focus+move
-                        let moved = run_aerospace(&[
-                            "move-node-to-workspace",
-                            "--window-id",
-                            &wid,
-                            &ws_str,
-                        ])
-                        .await;
-                        if moved.is_err() {
-                            let _ = run_aerospace(&["focus", "--window-id", &wid]).await;
-                            let _ = run_aerospace(&["move-node-to-workspace", &ws_str]).await;
-                        }
-                        tracing::info!(
-                            "aerospace: moved {app_str} (wid={wid}) to workspace {ws_str}"
-                        );
-                        break;
-                    }
-                });
-                return Ok(format!("Otváram {app} a presúvam na plochu {ws}."));
-            } else {
-                return Ok(format!("Otváram {app}."));
-            }
-        }
-
-        "move_app" => {
-            let app = intent.app.as_deref().unwrap_or("Mail");
-            let ws = intent.workspace.as_deref().unwrap_or("1");
-            let bundle_id = app_to_bundle_id(app);
-            let Ok(list) = run_aerospace(&[
-                "list-windows",
-                "--all",
-                "--app-bundle-id",
-                &bundle_id,
-                "--format",
-                "%{window-id}",
-            ])
-            .await
-            else {
-                tracing::warn!("aerospace move_app: could not list windows");
-                return Ok(String::new());
-            };
-            let wid = list.lines().next().unwrap_or("").trim().to_string();
-            if !wid.is_empty() {
-                let moved =
-                    run_aerospace(&["move-node-to-workspace", "--window-id", &wid, ws]).await;
-                if moved.is_err() {
-                    let _ = run_aerospace(&["focus", "--window-id", &wid]).await;
-                    let _ = run_aerospace(&["move-node-to-workspace", ws]).await;
-                }
-                return Ok(format!("Okno {app} presunuté na plochu {ws}."));
-            }
-        }
-
-        "focus_app" => {
-            let app = intent.app.as_deref().unwrap_or("Mail");
-            let bundle_id = app_to_bundle_id(app);
-            let Ok(list) = run_aerospace(&[
-                "list-windows",
-                "--all",
-                "--app-bundle-id",
-                &bundle_id,
-                "--format",
-                "%{window-id}",
-            ])
-            .await
-            else {
-                return Ok(String::new());
-            };
-            let wid = list.lines().next().unwrap_or("").trim().to_string();
-            if !wid.is_empty() {
-                let _ = run_aerospace(&["focus", "--window-id", &wid]).await;
-                return Ok(format!("Zameraný na {app}."));
-            }
-        }
-
-        _ => {}
-    }
-    Ok(String::new())
-}
-
-/// Map common app display names to their bundle IDs for `aerospace list-windows`.
-fn app_to_bundle_id(app: &str) -> String {
-    match app.to_lowercase().as_str() {
-        "mail" => "com.apple.mail".to_string(),
-        "safari" => "com.apple.Safari".to_string(),
-        "notes" => "com.apple.Notes".to_string(),
-        "finder" => "com.apple.finder".to_string(),
-        "terminal" => "com.apple.Terminal".to_string(),
-        "xcode" => "com.apple.dt.Xcode".to_string(),
-        "vscode" | "visual studio code" => "com.microsoft.VSCode".to_string(),
-        "slack" => "com.tinyspeck.slackmacgap".to_string(),
-        _ => format!("com.apple.{}", app.to_lowercase()),
-    }
-}
-
-fn relative_date(unix: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let diff = now.saturating_sub(unix);
-    match diff / 3600 {
-        0 => "práve teraz".to_string(),
-        1 => "pred 1 hodinou".to_string(),
-        2..=23 => format!("pred {} hodinami", diff / 3600),
-        24..=47 => "včera".to_string(),
-        hours => format!("pred {} dňami", hours / 24),
-    }
-}
 
 // ── Context management ────────────────────────────────────────────────────────
 
@@ -8014,183 +4762,352 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
-    #[test]
-    fn infers_contact_from_latest_whatsapp_message_request() {
-        assert_eq!(
-            infer_whatsapp_contact_from_text("whats my latest message with Slavka on whatsapp")
-                .as_deref(),
-            Some("Slavka")
-        );
-        assert_eq!(
-            infer_whatsapp_contact_from_text("i have a chat with Slávka Múčková").as_deref(),
-            Some("Slávka Múčková")
-        );
+
+
+
+
+
+
+
+
+
+
+}
+
+// ── Tool-loop dispatch helpers ────────────────────────────────────────────────
+// Thin wrappers over the connectors; the loop in `chat` gates them via the
+// rules engine / approvals before calling.
+
+fn json_str_arg(args: &serde_json::Value, key: &str) -> Option<String> {
+    args[key]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn json_day_ts(args: &serde_json::Value, key: &str, end_of_day: bool) -> Option<i64> {
+    let d = chrono::NaiveDate::parse_from_str(args[key].as_str()?, "%Y-%m-%d").ok()?;
+    let t = if end_of_day {
+        d.and_hms_opt(23, 59, 59)?
+    } else {
+        d.and_hms_opt(0, 0, 0)?
+    };
+    Some(t.and_utc().timestamp())
+}
+
+fn mail_headers_json(msgs: &[apple_mail_connector::MailMessage]) -> String {
+    let items: Vec<serde_json::Value> = msgs
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "rowid": m.rowid,
+                "subject": m.subject,
+                "sender": m.sender,
+                "sender_name": m.sender_display,
+                "date": chrono::DateTime::from_timestamp(m.received_at, 0)
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_default(),
+                "is_read": m.is_read,
+            })
+        })
+        .collect();
+    serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+}
+
+async fn mail_search_once(
+    mail: &MailConnector,
+    sender: Option<String>,
+    subject: Option<String>,
+    keywords: Vec<String>,
+    date_from: Option<i64>,
+    date_to: Option<i64>,
+    limit: usize,
+) -> anyhow::Result<Vec<apple_mail_connector::MailMessage>> {
+    let m = mail.clone();
+    Ok(tokio::task::spawn_blocking(move || {
+        m.search_messages(&MailSearchFilter {
+            sender,
+            subject,
+            date_from,
+            date_to,
+            limit,
+            keywords,
+        })
+    })
+    .await??)
+}
+
+fn mail_ref_from(m: &apple_mail_connector::MailMessage) -> MailRef {
+    MailRef {
+        rowid: m.rowid,
+        message_id: m.message_id.clone(),
+        subject: m.subject.clone(),
+        sender: m.sender.clone(),
+        auto_open: false,
     }
+}
 
-    #[test]
-    fn normalizes_whatsapp_intent_to_read_history_when_contact_is_present() {
-        let intent = WhatsappIntent {
-            action: WhatsappAction::ListRecent,
-            ..Default::default()
-        };
-        let normalized =
-            normalize_whatsapp_intent(intent, "whats my latest message with Slavka on whatsapp");
-        assert_eq!(normalized.action, WhatsappAction::ReadHistory);
-        assert_eq!(normalized.contact_name.as_deref(), Some("Slavka"));
-    }
+async fn tool_mail_search(
+    mail: &MailConnector,
+    args: &serde_json::Value,
+) -> (String, Option<MailRef>) {
+    let sender = json_str_arg(args, "sender");
+    let subject = json_str_arg(args, "subject");
+    let keywords: Vec<String> = args["keywords"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let date_from = json_day_ts(args, "date_from", false);
+    let date_to = json_day_ts(args, "date_to", true);
+    let limit = args["limit"].as_u64().unwrap_or(10).min(25) as usize;
 
-    #[test]
-    fn whatsapp_chat_match_is_diacritic_insensitive() {
-        let chats = vec![WhatsappChat {
-            id: "1@c.us".to_string(),
-            name: Some("Slávka Múčková".to_string()),
-            is_group: false,
-            unread_count: 0,
-            timestamp: None,
-            last_message_preview: Some("ahoj".to_string()),
-        }];
-        let matched = find_matching_whatsapp_chat(&chats, "Slavka").unwrap();
-        assert_eq!(matched.id, "1@c.us");
-    }
+    let mut msgs = match mail_search_once(
+        mail,
+        sender.clone(),
+        subject.clone(),
+        keywords,
+        date_from,
+        date_to,
+        limit,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return (format!("Mail search error: {e}"), None),
+    };
 
-    #[test]
-    fn whatsapp_contact_match_is_diacritic_insensitive() {
-        let contacts = vec![WhatsappContact {
-            id: "421900000000@c.us".to_string(),
-            name: Some("Slávka Múčková".to_string()),
-            push_name: None,
-            phone: Some("+421900000000".to_string()),
-            is_business: false,
-        }];
-        let matched = find_matching_whatsapp_contact(&contacts, "Slavka Muckova").unwrap();
-        assert_eq!(matched.id, "421900000000@c.us");
-    }
-
-    #[test]
-    fn today_mailbox_query_is_detected() {
-        assert!(asks_today_mailbox("whats in my todays mailbox"));
-        assert!(asks_today_mailbox("čo mám dnes v pošte"));
-        assert!(!asks_today_mailbox("what is today"));
-    }
-
-    #[test]
-    fn explicit_mail_date_uses_local_day_range() {
-        use chrono::{Datelike, Local};
-
-        let today = Local::now().date_naive();
-        let iso = today.format("%Y-%m-%d").to_string();
-        let parsed = parse_date_to_range(&iso).expect("parse local date");
-        let local_today = local_date_range(0).expect("local today range");
-
-        assert_eq!(parsed, local_today);
-        assert_eq!(
-            chrono::DateTime::from_timestamp(parsed.0, 0)
-                .unwrap()
-                .with_timezone(&Local)
-                .day(),
-            today.day()
-        );
-    }
-
-    #[test]
-    fn sender_fallback_terms_expand_email_address() {
-        let mut terms = Vec::new();
-        push_sender_fallback_terms(&mut terms, Some("radoslava.nemethova@tenenet.sk"));
-
-        assert!(terms.contains(&"radoslava.nemethova".to_string()));
-        assert!(terms.contains(&"radoslava".to_string()));
-        assert!(terms.contains(&"nemethova".to_string()));
-        assert!(terms.contains(&"tenenet".to_string()));
-    }
-
-    #[test]
-    fn mail_detail_source_needed_full_record_targets_mail() {
-        let resolution = ReferenceResolution {
-            resolved_connector: None,
-            resolved_entity_type: Some("mail".to_string()),
-            source_needed: "full_record".to_string(),
-            target_connector: Some("mail".to_string()),
-            target_ref: Some("42".to_string()),
-            confidence: 0.61,
-            ..Default::default()
-        };
-        assert!(resolver_requests_full_mail_record(&resolution));
-    }
-
-    #[test]
-    fn mail_detail_preserves_table_like_rows_after_truncation_boundary() {
-        let mut body = String::new();
-        body.push_str(&"Introductory prose without structured rows. ".repeat(80));
-        body.push_str("\n\n");
-        for idx in 1..=6 {
-            body.push_str(&format!(
-                "{idx}. Generic line item  {} ks  {:>.2} EUR\n",
-                idx,
-                idx as f32 * 3.5
-            ));
+    if msgs.is_empty() {
+        if let Some(ref s) = sender {
+            // LIKE can't bridge "Tomas Juricek" ↔ tomas.juricek@novem.sk —
+            // retry with the sender split into AND-ed keyword tokens.
+            let toks: Vec<String> = s
+                .split(['@', '.', ' ', ',', '<', '>'])
+                .map(str::trim)
+                .filter(|t| t.len() >= 2)
+                .map(str::to_lowercase)
+                .collect();
+            if !toks.is_empty() {
+                if let Ok(v) =
+                    mail_search_once(mail, None, subject.clone(), toks, date_from, date_to, limit)
+                        .await
+                {
+                    msgs = v;
+                }
+            }
         }
-
-        let compacted = compact_mail_body_preserving_line_items(&body, 600);
-        assert!(compacted.contains("zachované štruktúrované riadky"));
-        assert!(compacted.contains("Generic line item"));
-        assert!(compacted.contains("6. Generic line item"));
     }
 
-    #[test]
-    fn reference_resolution_selects_whatsapp_and_disables_memory_for_tone() {
-        let mut plan = ContextPlan::default();
-        let resolution = ReferenceResolution {
-            is_followup: true,
-            resolved_connector: Some("whatsapp".to_string()),
-            resolved_entity_type: Some("chat".to_string()),
-            resolved_entity_id: Some("abc@lid".to_string()),
-            requested_operation: "analyze_tone".to_string(),
-            source_needed: "more_history".to_string(),
-            target_connector: Some("whatsapp".to_string()),
-            target_ref: Some("abc@lid".to_string()),
-            confidence: 0.91,
-            needs_live_fetch: true,
-            standalone_query: "Are there signs of flirting in the latest WhatsApp chat?"
-                .to_string(),
-            ..Default::default()
-        };
-        apply_reference_resolution_to_plan(
-            &mut plan,
-            &resolution,
-            "Are there signs of flirting in the latest WhatsApp chat?",
-        );
-        assert_eq!(plan.task_type, "whatsapp");
-        assert_eq!(plan.selected_connector.as_deref(), Some("whatsapp"));
-        assert!(!plan.needs_memory);
-        assert_eq!(plan.candidate_skill_names, vec!["whatsapp"]);
+    if msgs.is_empty() {
+        return ("No mail messages matched.".to_string(), None);
     }
+    let mail_ref = msgs.first().map(mail_ref_from);
+    (mail_headers_json(&msgs), mail_ref)
+}
 
-    #[test]
-    fn whatsapp_query_not_overridden_to_mail_by_resolver() {
-        // Planner correctly chose whatsapp; resolver returned mail (e.g. synthesised
-        // from entity_type=message). The guard should preserve the whatsapp plan.
-        let mut plan = ContextPlan {
-            task_type: "whatsapp".to_string(),
-            selected_connector: Some("whatsapp".to_string()),
-            candidate_skill_names: vec!["whatsapp".to_string()],
-            ..Default::default()
-        };
-        let resolution = ReferenceResolution {
-            is_followup: false,
-            resolved_connector: Some("mail".to_string()),
-            target_connector: Some("mail".to_string()),
-            confidence: 0.60,
-            standalone_query: "when did i decide to go out with Slavka on whatsapp".to_string(),
-            ..Default::default()
-        };
-        apply_reference_resolution_to_plan(
-            &mut plan,
-            &resolution,
-            "when did i decide to go out with Slavka on whatsapp",
-        );
-        // Resolver's mail override must be suppressed because the turn names whatsapp
-        assert_eq!(plan.task_type, "whatsapp");
-        assert_eq!(plan.selected_connector.as_deref(), Some("whatsapp"));
-        assert_eq!(plan.candidate_skill_names, vec!["whatsapp"]);
+async fn tool_mail_list_inbox(mail: &MailConnector, args: &serde_json::Value) -> String {
+    let limit = args["limit"].as_u64().unwrap_or(10).min(25) as usize;
+    let unread_only = args["unread_only"].as_bool().unwrap_or(false);
+    let m = mail.clone();
+    match tokio::task::spawn_blocking(move || m.list_inbox(limit, unread_only)).await {
+        Ok(Ok(msgs)) if msgs.is_empty() => "Inbox query returned no messages.".to_string(),
+        Ok(Ok(msgs)) => mail_headers_json(&msgs),
+        Ok(Err(e)) => format!("Mail error: {e}"),
+        Err(e) => format!("Mail error: {e}"),
+    }
+}
+
+async fn tool_mail_read(
+    mail: &MailConnector,
+    args: &serde_json::Value,
+) -> (String, Option<MailRef>) {
+    let Some(rowid) = args["rowid"].as_i64() else {
+        return ("rowid is required.".to_string(), None);
+    };
+    let m = mail.clone();
+    match tokio::task::spawn_blocking(move || m.get_message(rowid)).await {
+        Ok(Ok(Some(msg))) => {
+            let body: String = msg
+                .body
+                .as_deref()
+                .unwrap_or("[message body not cached locally]")
+                .chars()
+                .take(4000)
+                .collect();
+            let date = chrono::DateTime::from_timestamp(msg.received_at, 0)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
+            let r = mail_ref_from(&msg);
+            (
+                format!(
+                    "From: {}\nSubject: {}\nDate: {}\n\n{}",
+                    msg.sender, msg.subject, date, body
+                ),
+                Some(r),
+            )
+        }
+        Ok(Ok(None)) => ("No message with that rowid.".to_string(), None),
+        Ok(Err(e)) => (format!("Mail error: {e}"), None),
+        Err(e) => (format!("Mail error: {e}"), None),
+    }
+}
+
+async fn tool_mail_open(mail: &MailConnector, args: &serde_json::Value) -> String {
+    let Some(rowid) = args["rowid"].as_i64() else {
+        return "rowid is required.".to_string();
+    };
+    let m = mail.clone();
+    let msg = match tokio::task::spawn_blocking(move || m.get_message(rowid)).await {
+        Ok(Ok(Some(msg))) => msg,
+        Ok(Ok(None)) => return "No message with that rowid.".to_string(),
+        Ok(Err(e)) => return format!("Mail error: {e}"),
+        Err(e) => return format!("Mail error: {e}"),
+    };
+    match apple_mail_connector::open_message(msg.message_id.as_deref(), &msg.subject, &msg.sender)
+        .await
+    {
+        Ok(_) => format!("Opened in Mail.app: {}", msg.subject),
+        Err(e) => format!("Could not open Mail.app: {e}"),
+    }
+}
+
+async fn tool_notes_search(notes: &NotesConnector, args: &serde_json::Value) -> String {
+    let Some(query) = json_str_arg(args, "query") else {
+        return "query is required.".to_string();
+    };
+    let limit = args["limit"].as_u64().unwrap_or(10).min(25) as usize;
+    let n = notes.clone();
+    match tokio::task::spawn_blocking(move || n.search_notes(&query, limit)).await {
+        Ok(Ok(found)) if found.is_empty() => "No notes matched.".to_string(),
+        Ok(Ok(found)) => {
+            let items: Vec<serde_json::Value> = found
+                .iter()
+                .map(|note| {
+                    serde_json::json!({
+                        "coredata_id": note.coredata_id,
+                        "title": note.title,
+                        "snippet": note.snippet,
+                        "folder": note.folder,
+                        "modified": chrono::DateTime::from_timestamp(note.modified_at, 0)
+                            .map(|d| d.to_rfc3339())
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect();
+            serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+        }
+        Ok(Err(e)) => format!("Notes error: {e}"),
+        Err(e) => format!("Notes error: {e}"),
+    }
+}
+
+async fn tool_notes_read(notes: &NotesConnector, args: &serde_json::Value) -> String {
+    let Some(id) = json_str_arg(args, "coredata_id") else {
+        return "coredata_id is required.".to_string();
+    };
+    match notes.get_note_body(&id).await {
+        Ok(Some(body)) => body.chars().take(4000).collect(),
+        Ok(None) => "Note body unavailable (locked or missing).".to_string(),
+        Err(e) => format!("Notes error: {e}"),
+    }
+}
+
+async fn tool_whatsapp_list_chats(wa: &WhatsappConnector, args: &serde_json::Value) -> String {
+    let limit = args["limit"].as_u64().unwrap_or(20).min(50) as usize;
+    match wa.list_chats(limit).await {
+        Ok(chats) if chats.is_empty() => "No WhatsApp chats found.".to_string(),
+        Ok(chats) => {
+            let items: Vec<serde_json::Value> = chats
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "chat_id": c.id,
+                        "name": c.name,
+                        "is_group": c.is_group,
+                        "unread": c.unread_count,
+                        "last_message": c.last_message_preview,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+        }
+        Err(e) => format!("WhatsApp unavailable: {e}"),
+    }
+}
+
+async fn tool_whatsapp_chat_messages(
+    wa: &WhatsappConnector,
+    args: &serde_json::Value,
+) -> (String, Option<WhatsappRef>) {
+    let Some(chat_id) = json_str_arg(args, "chat_id") else {
+        return ("chat_id is required.".to_string(), None);
+    };
+    let limit = args["limit"].as_u64().unwrap_or(20).min(50) as usize;
+    match wa.chat_messages(&chat_id, limit, None).await {
+        Ok(msgs) if msgs.is_empty() => ("No messages in that chat.".to_string(), None),
+        Ok(msgs) => {
+            let items: Vec<serde_json::Value> = msgs
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "from": if m.from_me { "me" } else { m.from.as_str() },
+                        "body": m.body.chars().take(500).collect::<String>(),
+                        "timestamp": m.timestamp,
+                        "has_media": m.has_media,
+                    })
+                })
+                .collect();
+            let wa_ref = WhatsappRef {
+                chat_id: chat_id.clone(),
+                contact_name: None,
+                snippet: msgs.last().map(|m| m.body.chars().take(120).collect()),
+                source: "tool_loop".to_string(),
+                last_message_timestamp: msgs.last().map(|m| m.timestamp),
+            };
+            (
+                serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string()),
+                Some(wa_ref),
+            )
+        }
+        Err(e) => (format!("WhatsApp unavailable: {e}"), None),
+    }
+}
+
+async fn tool_odoo(
+    odoo: &OdooConnector,
+    tool: &str,
+    args: &serde_json::Value,
+) -> (String, Option<OdooRecordRef>) {
+    let limit = args["limit"].as_u64().unwrap_or(10).min(25) as u32;
+    let open_only = args["open_only"].as_bool().unwrap_or(false);
+    let result = match tool {
+        "odoo_search_partners" => match json_str_arg(args, "query") {
+            Some(q) => odoo.search_partners(&q, limit).await.map(Some),
+            None => return ("query is required.".to_string(), None),
+        },
+        "odoo_my_invoices" => odoo.my_invoices(open_only, limit).await.map(Some),
+        "odoo_my_helpdesk_tickets" => odoo.my_helpdesk_tickets(open_only, limit).await.map(Some),
+        "odoo_get_record" => {
+            let model = json_str_arg(args, "model").unwrap_or_default();
+            let Some(id) = args["id"].as_i64() else {
+                return ("id is required.".to_string(), None);
+            };
+            odoo.get_record(&model, id).await
+        }
+        _ => return (format!("Unknown Odoo tool: {tool}"), None),
+    };
+    match result {
+        Ok(Some(r)) => {
+            let odoo_ref = r
+                .first_id
+                .map(|id| odoo.record_ref(&r.model, id, r.first_name.as_deref().unwrap_or("")));
+            (r.text, odoo_ref)
+        }
+        Ok(None) => ("Record not found.".to_string(), None),
+        Err(e) => (format!("Odoo error: {e}"), None),
     }
 }

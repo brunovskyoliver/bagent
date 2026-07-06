@@ -279,6 +279,8 @@ struct DaemonClient: Sendable {
         case memorySaved(id: String)
         case approvalRequested(id: String, tool: String, description: String?)
         case toolBlocked(tool: String)
+        /// The agent loop is executing a tool this turn (transient status).
+        case toolCall(tool: String)
         case mailAttachments([MailAttachmentRef])
         case mailFound(MailRef)
         case fileFound(FileRef)
@@ -483,6 +485,10 @@ struct DaemonClient: Sendable {
                         case "tool_blocked":
                             if let tool = event.tool {
                                 continuation.yield(.toolBlocked(tool: tool))
+                            }
+                        case "tool_call":
+                            if let tool = event.tool {
+                                continuation.yield(.toolCall(tool: tool))
                             }
                         case "mail_attachments":
                             if let atts = event.attachments, !atts.isEmpty {

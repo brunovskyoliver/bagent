@@ -55,7 +55,7 @@ make whatsapp-bridge-install   # from apps/macos/ — installs Node deps + Chrom
 
 ```bash
 ollama pull qwen3:8b        # default chat model (passes SK diacritics)
-ollama pull qwen3:0.6b      # route/intent classifier (fast, think disabled)
+ollama pull qwen3:0.6b      # screen-intent / memory-extractor classifier (fast, think disabled)
 ollama pull bge-m3          # embeddings (Phase 3+, evidence rerank)
 ollama pull qwen2.5vl:7b   # vision / screen-context (Phase 7+, ~6 GB)
 ```
@@ -81,13 +81,13 @@ Ollama  ·  Connectors  ·  SQLite (refinery migrations)
 
 | Crate | Purpose |
 |---|---|
-| `crates/daemon` | axum server, route handlers, `AppState`, SQLite migrations, `fetch_tool_context` dispatcher |
-| `crates/agent` | `PromptBuilder` (9-layer), intent classifiers (mail/odoo/window/file/screen/whatsapp), `ContextPlanner`, `ReferenceResolver`, `TaskRater`, `MemoryExtractor` |
+| `crates/daemon` | axum server, route handlers, `AppState`, SQLite migrations, agentic tool loop + gated tool dispatch |
+| `crates/agent` | `PromptBuilder`, `ScreenIntentClassifier`, `TaskRater`, `MemoryExtractor`, correction/feedback classifiers |
 | `crates/memory` | `MemoryStore` (SQLite+FTS5+cosine), `selector`, `markdown_mirror` |
 | `crates/rules` | YAML rules engine (`auto` / `ask` / `forbidden`); hot-reloads every 5 s |
 | `crates/skills` | `SKILL.md` loader + selector; scanned at startup from `skills/` |
 | `crates/attachments` | Content extraction pipeline (text/PDF/image) |
-| `crates/connectors/ollama` | `OllamaClient` — chat_stream, embed, summarize, generate_json |
+| `crates/connectors/ollama` | `OllamaClient` — chat_stream, chat_stream_with_tools, embed, summarize, generate_json |
 | `crates/connectors/apple_mail` | Envelope Index SQLite reader, emlx parser, AppleScript fallback, `MailSearchFilter` |
 | `crates/connectors/apple_notes` | NoteStore SQLite + JXA body retrieval |
 | `crates/connectors/odoo` | MCP client via `rmcp 1.8` — spawns `uvx mcp-server-odoo` as child process |
@@ -107,16 +107,21 @@ Ollama  ·  Connectors  ·  SQLite (refinery migrations)
 | `ScreenContextProvider.swift` | ScreenCaptureKit capture → Vision OCR → base64 for `/chat` |
 | `SettingsView.swift` | All settings: model picker, connectors, permissions, rules, memory, skills, debug |
 
-### Planning / context layer
+### Agentic tool loop
 
-Every `/chat` request runs through a planning layer before prompt assembly:
+Every `/chat` request runs an agentic tool-calling loop — qwen3:8b sees native
+tool definitions and decides what to call; there is no keyword routing or
+intent classifier:
 
-1. `ContextPlanner` — deterministic keyword gates (mail / file / odoo / screen / window / whatsapp) with Ollama JSON-mode fallback → `ContextPlan { task_type, needs_*, language_hint }`
-2. Route plan (`crates/agent/src/routing.rs`) — bilingual deterministic hints + qwen3:0.6b slim JSON classifier (think off, careful qwen3:8b retry on weak/invalid output) merged by `build_route` into a validated `RoutePlan` (privacy gate fails closed, budgets clamped, destructive verbs → clarify). Emitted as a `route_plan` SSE event and audited.
-3. `SkillSelector` — picks up to 3 matching `SKILL.md` files from `skills/`
-4. `MemorySelector` + corrections + cross-session recall run in `tokio::join!`
-5. `execute_route_plan` (daemon) — parallel read-only mail/files/whatsapp searches per plan → normalized `Evidence` → deterministic rank + dedup + bge-m3 rerank (`crates/agent/src/evidence.rs`), capped at 12 items; auto-reads the top hit for summarize/read intents. Legacy `fetch_tool_context` branches handle follow-ups, unread lists, opens, odoo/notes/screen/window.
-6. `PromptBuilder::build` assembles 9 layers (identity, style, glossary, correction, memory, tool-data, attachment, session summary, recent turns); the tool-data layer carries the evidence block with evidence-only grounding rules
+1. `PromptBuilder::build` assembles the system prompt (identity, style, glossary, skills, attachment/screen context, recent tool refs for follow-ups like "open it")
+2. Tool registry is built per turn from available connectors: `mail_search` / `mail_list_inbox` / `mail_read` / `mail_open`, `filesystem_*`, `notes_*`, `whatsapp_*`, `odoo_*`, `macos_*` (daemon `chat` handler)
+3. Loop (max 5 rounds, 8 tool calls/turn): `chat_stream_with_tools` streams deltas + tool calls → each call is gated in the dispatcher (rules engine `auto`/`ask`/`forbidden`, PathPolicy inside the fs connector, approval modal for writes, `audit_entries` row per call) → results fed back as `role:"tool"` messages → repeat until a round emits no tool calls (that round's stream is the final answer)
+4. Each tool call emits a `tool_call` SSE event (UI shows "🔎 Hľadám v pošte…"); `mail_found`/`file_opened`/`odoo_found` events keep the notch chips working
+5. `mail_search` normalizes sender args internally: an empty result with a `sender` retries with the sender tokenized into AND keywords (bridges "Tomas Juricek" ↔ `tomas.juricek@novem.sk`)
+6. Vision turns (image attachment / screen capture) skip tools — the vision model answers directly from injected context
+7. Model output is never trusted for authorization — the dispatcher enforces every gate; unknown tools and exhausted budgets return corrective tool results
+
+Tool dispatch helpers live at the bottom of `crates/daemon/src/main.rs` (`tool_mail_search`, `tool_odoo`, …); live regression tests in `crates/connectors/ollama/tests/tool_loop.rs`.
 
 ### Slovak / English bilingual rules
 

@@ -55,6 +55,15 @@ pub struct ToolCall {
     pub function: ToolCallFunction,
 }
 
+/// An event from a streaming chat with tools enabled.
+#[derive(Debug, Clone)]
+pub enum ChatStreamEvent {
+    /// A content token.
+    Delta(String),
+    /// Tool calls emitted in this chunk (may arrive across several chunks).
+    ToolCalls(Vec<ToolCall>),
+}
+
 /// The result of a single non-streaming `chat_once_with_tools` call.
 #[derive(Debug)]
 pub enum ChatTurn {
@@ -270,6 +279,72 @@ impl OllamaClient {
                         if let Some(token) = v["message"]["content"].as_str() {
                             if !token.is_empty() {
                                 yield token.to_string();
+                            }
+                        }
+                        if v["done"].as_bool().unwrap_or(false) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Streaming chat with tool definitions — yields content deltas and any
+    /// tool calls the model emits. The caller runs the agentic loop: collect
+    /// `ToolCalls`, execute, append `role:"tool"` results, call again.
+    pub fn chat_stream_with_tools(
+        &self,
+        model: String,
+        messages: Vec<Message>,
+        tools: Vec<ToolDef>,
+    ) -> impl futures_core::Stream<Item = Result<ChatStreamEvent>> + Send {
+        let http = self.http.clone();
+        let base_url = self.base_url.clone();
+
+        async_stream::try_stream! {
+            let resp = http
+                .post(format!("{}/api/chat", base_url))
+                .json(&serde_json::json!({
+                    "model": model,
+                    "messages": messages,
+                    "tools": tools,
+                    "stream": true,
+                    "keep_alive": -1,
+                    "think": false
+                }))
+                .send()
+                .await
+                .context("POST /api/chat (tools)")?;
+
+            let mut stream = resp.bytes_stream();
+            let mut buf = String::new();
+
+            while let Some(item) = stream.next().await {
+                let chunk = item.context("stream read error")?;
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+
+                while let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].trim().to_string();
+                    buf = buf[pos + 1..].to_string();
+                    if line.is_empty() { continue; }
+
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if let Some(err) = v["error"].as_str() {
+                            Err(anyhow::anyhow!("ollama error: {err}"))?;
+                        }
+                        if let Some(calls_val) = v["message"]["tool_calls"].as_array() {
+                            let calls: Vec<ToolCall> = calls_val
+                                .iter()
+                                .filter_map(|c| serde_json::from_value(c.clone()).ok())
+                                .collect();
+                            if !calls.is_empty() {
+                                yield ChatStreamEvent::ToolCalls(calls);
+                            }
+                        }
+                        if let Some(token) = v["message"]["content"].as_str() {
+                            if !token.is_empty() {
+                                yield ChatStreamEvent::Delta(token.to_string());
                             }
                         }
                         if v["done"].as_bool().unwrap_or(false) {

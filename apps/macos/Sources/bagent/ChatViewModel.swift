@@ -126,6 +126,8 @@ final class ChatViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var inputText: String = ""
     @Published var isThinking = false
+    /// Transient tool-loop status ("🔎 Searching mail…") shown next to the thinking indicator.
+    @Published var toolStatus: String? = nil
     @Published var isExpanded = false
     @Published var chatSurfaceMode: ChatSurfaceMode = .collapsed
     @Published var notchInteractionMode: NotchInteractionMode = .collapsed
@@ -733,6 +735,20 @@ final class ChatViewModel: ObservableObject {
         cmuxDeparting.removeAll { $0.id == id }
     }
 
+    // MARK: - Tool loop status
+
+    static func toolStatusLabel(for tool: String) -> String {
+        switch tool {
+        case let t where t.hasPrefix("mail"): return "🔎 Hľadám v pošte…"
+        case let t where t.hasPrefix("filesystem"): return "🔎 Hľadám súbory…"
+        case let t where t.hasPrefix("notes"): return "🔎 Hľadám v poznámkach…"
+        case let t where t.hasPrefix("whatsapp"): return "🔎 WhatsApp…"
+        case let t where t.hasPrefix("odoo"): return "🔎 Odoo…"
+        case let t where t.hasPrefix("macos"): return "⚙️ macOS…"
+        default: return "⚙️ \(tool)…"
+        }
+    }
+
     // MARK: - Connector actions (left-wing icons)
 
     /// Clickable connector results found during the latest response. Rendered
@@ -1132,6 +1148,7 @@ final class ChatViewModel: ObservableObject {
                             isThinking = false
                             first = false
                         }
+                        toolStatus = nil
                         messages[idx].content += t
                         streamingChunk += 1
                         // Auto-open Mail after the first sentence has appeared in the response.
@@ -1154,6 +1171,9 @@ final class ChatViewModel: ObservableObject {
                         pendingApprovals.append(item)
                     case .toolBlocked:
                         break
+                    case .toolCall(let tool):
+                        isThinking = true
+                        toolStatus = Self.toolStatusLabel(for: tool)
                     case .mailAttachments(let refs):
                         let chips = refs.map { ref in
                             ChatAttachment(
@@ -1192,6 +1212,7 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].taskRating = (level: level, score: score, reasons: reasons, privacyRisk: privacyRisk)
                     case .done(let returnedSessionId):
                         if let sid = returnedSessionId { sessionId = sid }
+                        toolStatus = nil
                         if first { isThinking = false }
                         streamingAssistantMessageId = nil
                         if first && notchInteractionMode == .thinking {
@@ -1217,6 +1238,7 @@ final class ChatViewModel: ObservableObject {
                 }
             } catch {
                 isThinking = false
+                toolStatus = nil
                 streamingAssistantMessageId = nil
                 if chatSurfaceMode == .thinkingHidden {
                     chatSurfaceMode = .collapsed

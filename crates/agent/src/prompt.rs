@@ -9,8 +9,21 @@ use bagent_memory::MemoryHit;
 use ollama_connector::Message;
 use serde::{Deserialize, Serialize};
 
-// Re-exports for daemon usage
-pub use crate::context_planner::ResponseLanguageHint;
+/// What kind of response language should the assistant target?
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseLanguageHint {
+    /// Default: assistant speaks English unless the user writes Slovak.
+    EnglishDefault,
+    /// Mirror whatever language the user used in this turn.
+    MatchUser,
+    /// Match the language of the source content being worked on (mail, notes, etc.).
+    MatchSourceContent,
+    /// Slovak is required regardless of the user's input language.
+    SlovakRequired,
+    /// Specific language override from the user.
+    UserSpecified(String),
+}
 
 /// A skill chosen for the current prompt turn.
 /// Mirrors `bagent_skills::selector::SelectedSkill` so agent crate

@@ -2267,9 +2267,16 @@ struct ExpandedChatView: View {
                                 .id(msg.id)
                         }
                         if viewModel.isThinking {
-                            ThinkingIndicator()
-                                .padding(.leading, 4)
-                                .id("thinking")
+                            HStack(spacing: 8) {
+                                ThinkingIndicator()
+                                if let status = viewModel.toolStatus {
+                                    Text(status)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .padding(.leading, 4)
+                            .id("thinking")
                         }
                         // Bottom sentinel — used to detect when the user scrolled away.
                         Color.clear.frame(height: 1).id("_bottom_sentinel")
