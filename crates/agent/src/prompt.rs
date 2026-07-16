@@ -153,6 +153,8 @@ impl PromptBuilder {
         let mut messages: Vec<Message> = Vec::new();
         let mut layers: Vec<PromptLayerTrace> = Vec::new();
 
+        push_system_layer(&mut messages, &mut layers, "web_guidance", &web_guidance());
+
         if let Some(ctx) = tool_ctx {
             push_system_layer(&mut messages, &mut layers, "live_tool_context", &ctx);
         }
@@ -214,6 +216,23 @@ impl Default for PromptBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Current date + web-tool usage rules, so time-sensitive answers come from
+/// web_search instead of model memory.
+fn web_guidance() -> String {
+    // ponytail: system tz; chrono-tz only if the daemon ever runs off-device
+    let now = chrono::Local::now();
+    format!(
+        "Today is {}.\n\
+         Web rules:\n\
+         - For questions about facts, news, people in office, prices, dates, opening hours, menus, or schedules — anything that may have changed over time — ALWAYS call web_search first. Never answer such questions from memory.\n\
+         - If the user's message contains a URL, call web_fetch on that URL before answering.\n\
+         - If a fetched page's Links section lists a link that likely holds the answer (e.g. a daily-menu or news subpage), call web_fetch on that link too.\n\
+         - Cite the source URL in your answer. If the web results do not contain the answer, say the answer was not found instead of guessing.\n\
+         - Do NOT use web tools for casual conversation, coding help, or questions about the user's own mail, files, notes, or messages.",
+        now.format("%A, %Y-%m-%d, %H:%M (local time)")
+    )
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -306,7 +325,8 @@ mod tests {
         assert!(!sent_prompt.contains("OLD_SESSION_SUMMARY"));
         assert!(!sent_prompt.contains("TENENET"));
         assert!(!sent_prompt.contains("NEVER_INJECT_SKILL_BODY"));
-        assert_eq!(built.trace.layers.len(), 2);
+        // web_guidance + live_tool_context + attachment_context
+        assert_eq!(built.trace.layers.len(), 3);
         assert_eq!(built.trace.conversation_recall_injected, false);
     }
 
@@ -341,7 +361,9 @@ mod tests {
             .trace
             .selected_skill_names
             .contains(&"sk-business-email".to_string()));
-        assert!(built.messages.is_empty());
+        // Only the always-on web_guidance layer is injected.
+        assert_eq!(built.messages.len(), 1);
+        assert!(built.messages[0].content.contains("Web rules"));
     }
 
     #[tokio::test]

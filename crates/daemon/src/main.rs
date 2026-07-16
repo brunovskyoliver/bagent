@@ -97,8 +97,9 @@ struct RuntimeRefs {
 #[derive(Deserialize)]
 struct ChatRequest {
     message: String,
+    /// Sliding-window conversation history (user/assistant turns, oldest first).
+    /// Clamped server-side to 10 turns / 8k chars.
     #[serde(default)]
-    #[allow(dead_code)]
     history: Vec<Message>,
     model: Option<String>,
     session_id: Option<String>,
@@ -1884,7 +1885,30 @@ async fn chat(
             }
         };
 
-        let history: Vec<Message> = Vec::new();
+        // Sliding-window conversation history supplied by the client so
+        // follow-ups ("what other options do I have?") resolve. Clamped here —
+        // the client is trusted UI but the caps are the contract.
+        const HISTORY_MAX_TURNS: usize = 10;
+        const HISTORY_MAX_TURN_CHARS: usize = 1_500;
+        const HISTORY_MAX_TOTAL_CHARS: usize = 8_000;
+        let mut history: Vec<Message> = req
+            .history
+            .iter()
+            .rev()
+            .filter(|m| {
+                (m.role == "user" || m.role == "assistant") && !m.content.trim().is_empty()
+            })
+            .take(HISTORY_MAX_TURNS)
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: m.content.chars().take(HISTORY_MAX_TURN_CHARS).collect(),
+                ..Message::user("")
+            })
+            .collect();
+        history.reverse();
+        while history.iter().map(|m| m.content.len()).sum::<usize>() > HISTORY_MAX_TOTAL_CHARS {
+            history.remove(0);
+        }
         let session_summary = None;
         let runtime_snapshot = load_runtime_refs(&runtime_refs, &session_id).await;
         let last_mail_ref = runtime_snapshot.mail;
@@ -2153,7 +2177,7 @@ async fn chat(
                 &corrections,
                 tool_ctx,
                 att_data.ctx,
-                history,
+                history.clone(),
                 session_summary,
                 recall_candidates,
                 false,
@@ -2163,6 +2187,22 @@ async fn chat(
             .await
         {
             Ok(mut built) => {
+                // History goes between system layers and the current user turn.
+                // PromptBuilder stays stateless; the window is spliced here.
+                if !history.is_empty() {
+                    let hist_chars: usize = history.iter().map(|m| m.content.len()).sum();
+                    built.trace.layers.push(bagent_agent::PromptLayerTrace {
+                        name: "conversation_history".to_string(),
+                        role: "user/assistant".to_string(),
+                        included: true,
+                        chars: hist_chars,
+                        preview: preview_text(
+                            &history.last().map(|m| m.content.clone()).unwrap_or_default(),
+                            240,
+                        ),
+                    });
+                    built.messages.extend(history.clone());
+                }
                 if att_data.images_b64.is_empty() {
                     built.messages.push(Message::user(&user_message));
                 } else {
@@ -2200,14 +2240,16 @@ async fn chat(
                 built.messages
             }
             Err(_) => {
+                let mut msgs = history.clone();
                 if att_data.images_b64.is_empty() {
-                    vec![Message::user(&user_message)]
+                    msgs.push(Message::user(&user_message));
                 } else {
-                    vec![Message::user_with_images(
+                    msgs.push(Message::user_with_images(
                         &user_message,
                         att_data.images_b64.clone(),
-                    )]
+                    ));
                 }
+                msgs
             }
         };
 
@@ -2239,6 +2281,8 @@ async fn chat(
                     "mail_search",
                     "Search the user's Apple Mail. Returns message headers (rowid, subject, sender, date). \
                      Use mail_read with a rowid to get a message body. \
+                     When the user asks what a mail says or about its content, immediately follow up \
+                     with mail_read on the best-matching rowid — reading is safe, never ask permission first. \
                      Put the sender's email address or name in `sender` when the user asks about mail from someone. \
                      IMPORTANT: Never describe a message that this tool did not return.",
                     serde_json::json!({
@@ -2266,7 +2310,8 @@ async fn chat(
                 ));
                 tools.push(OllamaToolDef::function(
                     "mail_read",
-                    "Read the full body of a mail message by rowid (from mail_search / mail_list_inbox).",
+                    "Read the full body of a mail message by rowid (from mail_search / mail_list_inbox). \
+                     Call this without asking whenever the user wants a message's content, summary, or details.",
                     serde_json::json!({
                         "type": "object",
                         "properties": {"rowid": {"type": "integer"}},
@@ -2400,6 +2445,37 @@ async fn chat(
                     }),
                 ));
             }
+            tools.push(OllamaToolDef::function(
+                "web_search",
+                "Search the public web (DuckDuckGo + Wikipedia). Returns result lines: title | url | snippet. \
+                 Use for facts, current events, prices, or to identify an entity (e.g. what company makes a product) \
+                 before searching mail or files. Follow up with web_fetch on the best URL when snippets are not enough. \
+                 IMPORTANT: Answer factual questions ONLY from these results, cite the source URL, \
+                 and say the answer was not found rather than guessing.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query, in the language most likely to have results (usually English)."},
+                        "lang": {"type": "string", "description": "Wikipedia language code, 'en' or 'sk'. Default 'en'."}
+                    },
+                    "required": ["query"]
+                }),
+            ));
+            tools.push(OllamaToolDef::function(
+                "web_fetch",
+                "Download a web page by URL and return its readable text (capped), \
+                 plus a Links section of same-site links. Use on a URL from web_search \
+                 or one the user provided. When the answer lives on a subpage (daily menu, \
+                 news article), call web_fetch again on the most promising listed link. \
+                 IMPORTANT: Never describe page content this tool did not return.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Full http(s) URL to fetch."}
+                    },
+                    "required": ["url"]
+                }),
+            ));
             tools.push(OllamaToolDef::function(
                 "macos_switch_workspace",
                 "Switch to an AeroSpace window-manager workspace by name/number.",
@@ -3039,6 +3115,62 @@ async fn chat(
                                                     format!("Error: {e}")
                                                 }
                                             }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ── Web (read-only; queries leave the device) ─────
+                            tool @ ("web_search" | "web_fetch") => {
+                                let rule_name = if tool == "web_search" {
+                                    "web.search"
+                                } else {
+                                    "web.fetch"
+                                };
+                                match rules.check(rule_name, "{}") {
+                                    ApprovalLevel::Forbidden => {
+                                        let _ = tx
+                                            .send(Ok(Event::default().data(
+                                                serde_json::json!({"type":"tool_blocked","tool": rule_name})
+                                                    .to_string(),
+                                            )))
+                                            .await;
+                                        "Web access blocked by rules.".to_string()
+                                    }
+                                    level => {
+                                        let approved = match level {
+                                            ApprovalLevel::Ask => {
+                                                request_tool_approval(
+                                                    &db,
+                                                    &pending_approvals,
+                                                    &tx,
+                                                    rule_name,
+                                                    &format!(
+                                                        "Web: {}",
+                                                        args["query"]
+                                                            .as_str()
+                                                            .or(args["url"].as_str())
+                                                            .unwrap_or("?")
+                                                    ),
+                                                )
+                                                .await
+                                            }
+                                            _ => true,
+                                        };
+                                        if !approved {
+                                            "Web access not approved by the user.".to_string()
+                                        } else {
+                                            let result = if tool == "web_search" {
+                                                tool_web_search(args).await
+                                            } else {
+                                                tool_web_fetch(args).await
+                                            };
+                                            audit_fs(
+                                                &db,
+                                                &rule_name.replace('.', "_"),
+                                                &serde_json::json!({"ok": true}),
+                                            );
+                                            result
                                         }
                                     }
                                 }
@@ -4714,6 +4846,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn html_to_text_strips_tags_and_script_bodies() {
+        let html = "<html><head><style>.x{color:red}</style><script>var a=1;</script></head>\
+                    <body><p>Hello &amp; <b>world</b></p><noscript>enable js</noscript></body></html>";
+        assert_eq!(html_to_text(html), "Hello & world");
+    }
+
+    #[test]
+    fn extract_links_resolves_same_site_and_skips_junk() {
+        let base = reqwest::Url::parse("https://www.example.sk/index.html").unwrap();
+        let html = r##"<body>
+            <a href="/denne-menu">Denné <b>menu</b></a>
+            <a href="kontakt.html">Kontakt</a>
+            <a href="https://www.example.sk/denne-menu#dnes">Menu again</a>
+            <a href="https://other.com/x">External</a>
+            <a href="#top">Top</a>
+            <a href="mailto:a@b.sk">Mail</a>
+            <a href="javascript:void(0)">JS</a>
+            <a href="/empty"></a>
+        </body>"##;
+        let links = extract_links(html, &base, 30);
+        assert_eq!(
+            links,
+            vec![
+                ("Denné menu".to_string(), "https://www.example.sk/denne-menu".to_string()),
+                ("Kontakt".to_string(), "https://www.example.sk/kontakt.html".to_string()),
+            ]
+        );
+        assert_eq!(extract_links(html, &base, 1).len(), 1);
+    }
+
+    #[test]
+    fn parse_ddg_lite_extracts_results_and_decodes_redirect_urls() {
+        let html = r#"<table>
+            <tr><td>1.&nbsp;</td><td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=abc" class='result-link'>Example Title</a></td></tr>
+            <tr><td>&nbsp;</td><td class='result-snippet'>A snippet about <b>things</b>.</td></tr>
+            <tr><td>2.&nbsp;</td><td><a rel="nofollow" href="https://direct.example.org/" class='result-link'>Direct</a></td></tr>
+        </table>"#;
+        let results = parse_ddg_lite(html, 6);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "Example Title");
+        assert_eq!(results[0].1, "https://example.com/page");
+        assert_eq!(results[0].2, "A snippet about things ."); // tag stripper inserts a space per tag
+        assert_eq!(results[1].1, "https://direct.example.org/");
+    }
+
+    #[test]
+    fn private_hosts_are_rejected() {
+        for h in ["localhost", "127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1", "[::1]", "printer.local", ""] {
+            assert!(is_private_host(h), "{h} should be private");
+        }
+        for h in ["example.com", "8.8.8.8", "en.wikipedia.org"] {
+            assert!(!is_private_host(h), "{h} should be public");
+        }
+    }
+
+    #[test]
     fn purge_legacy_context_data_clears_memory_chat_and_mirror() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -4930,11 +5118,20 @@ async fn tool_mail_read(
     };
     let m = mail.clone();
     match tokio::task::spawn_blocking(move || m.get_message(rowid)).await {
-        Ok(Ok(Some(msg))) => {
+        Ok(Ok(Some(mut msg))) => {
+            // emlx not cached → on-demand AppleScript fetch (same as mail_message handler)
+            if msg.body.is_none() {
+                if let Some(body) = apple_mail_connector::body_via_applescript(&msg.subject).await
+                {
+                    msg.body = Some(body);
+                }
+            }
             let body: String = msg
                 .body
                 .as_deref()
-                .unwrap_or("[message body not cached locally]")
+                .unwrap_or(
+                    "[body unavailable locally — call mail_open with this rowid to open it in Mail.app]",
+                )
                 .chars()
                 .take(4000)
                 .collect();
@@ -4973,6 +5170,355 @@ async fn tool_mail_open(mail: &MailConnector, args: &serde_json::Value) -> Strin
         Ok(_) => format!("Opened in Mail.app: {}", msg.subject),
         Err(e) => format!("Could not open Mail.app: {e}"),
     }
+}
+
+// ── Web tools ────────────────────────────────────────────────────────────────
+// ponytail: naive HTML/text handling — swap for a readability crate if answer
+// quality disappoints. DNS-rebinding is not defended against, only literal
+// private hosts/IPs are rejected (per hop via the redirect policy).
+
+fn is_private_host(host: &str) -> bool {
+    let h = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    if h.is_empty() || h == "localhost" || h.ends_with(".local") {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00
+        }
+        Err(_) => false,
+    }
+}
+
+fn web_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let private = attempt
+                .url()
+                .host_str()
+                .map(is_private_host)
+                .unwrap_or(true);
+            if private || attempt.previous().len() > 5 {
+                attempt.error("redirect blocked")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .user_agent(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/128.0",
+        )
+        .build()
+        .unwrap_or_default()
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Strip tags (dropping script/style/noscript bodies), decode common entities,
+/// collapse whitespace.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut skip_tag: Option<String> = None;
+    for (idx, chunk) in html.split('<').enumerate() {
+        if idx == 0 {
+            out.push_str(chunk);
+            continue;
+        }
+        let (tag_part, text) = match chunk.find('>') {
+            Some(i) => (&chunk[..i], &chunk[i + 1..]),
+            None => (chunk, ""),
+        };
+        let tag_name: String = tag_part
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if let Some(ref skip) = skip_tag {
+            if tag_part.starts_with('/') && tag_name == *skip {
+                skip_tag = None;
+            }
+            continue;
+        }
+        if matches!(tag_name.as_str(), "script" | "style" | "noscript")
+            && !tag_part.starts_with('/')
+            && !tag_part.ends_with('/')
+        {
+            skip_tag = Some(tag_name);
+            continue;
+        }
+        out.push(' ');
+        out.push_str(text);
+    }
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#039;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// DDG lite redirect hrefs wrap the target in `uddg=<urlencoded>`.
+fn normalize_ddg_href(href: &str) -> String {
+    if let Some(pos) = href.find("uddg=") {
+        let enc = href[pos + 5..].split('&').next().unwrap_or("");
+        return percent_decode(enc);
+    }
+    if let Some(stripped) = href.strip_prefix("//") {
+        return format!("https://{stripped}");
+    }
+    href.to_string()
+}
+
+/// Parse DuckDuckGo lite results: (title, url, snippet) triples.
+fn parse_ddg_lite(html: &str, max: usize) -> Vec<(String, String, String)> {
+    const ANCHOR: &str = "<a rel=\"nofollow\" href=\"";
+    let mut out = Vec::new();
+    let mut rest = html;
+    while out.len() < max {
+        let Some(a_pos) = rest.find(ANCHOR) else { break };
+        let after = &rest[a_pos + ANCHOR.len()..];
+        let Some(href_end) = after.find('"') else { break };
+        let href = &after[..href_end];
+        let (Some(gt), Some(a_close)) = (after.find('>'), after.find("</a>")) else {
+            break;
+        };
+        let title = if gt < a_close {
+            html_to_text(&after[gt + 1..a_close])
+        } else {
+            String::new()
+        };
+        let mut snippet = String::new();
+        if let Some(sn_pos) = after.find("result-snippet") {
+            let sn = &after[sn_pos..];
+            if let (Some(gt2), Some(close)) = (sn.find('>'), sn.find("</td>")) {
+                if gt2 < close {
+                    snippet = html_to_text(&sn[gt2 + 1..close]);
+                }
+            }
+        }
+        let url = normalize_ddg_href(href);
+        if url.starts_with("http") && !title.is_empty() {
+            out.push((title, url, snippet));
+        }
+        rest = &after[a_close + 4..];
+    }
+    out
+}
+
+async fn tool_web_search(args: &serde_json::Value) -> String {
+    let Some(query) = json_str_arg(args, "query") else {
+        return "query is required.".to_string();
+    };
+    let lang = match json_str_arg(args, "lang").as_deref() {
+        Some("sk") => "sk",
+        _ => "en",
+    };
+    let client = web_http_client();
+    let mut lines: Vec<String> = Vec::new();
+
+    // Wikipedia first: structured JSON, high precision for encyclopedic queries.
+    let wiki_url = format!("https://{lang}.wikipedia.org/w/rest.php/v1/search/page");
+    if let Ok(resp) = client
+        .get(&wiki_url)
+        .query(&[("q", query.as_str()), ("limit", "2")])
+        .send()
+        .await
+    {
+        if let Ok(v) = resp.json::<serde_json::Value>().await {
+            for page in v["pages"].as_array().into_iter().flatten() {
+                let title = page["title"].as_str().unwrap_or_default();
+                if title.is_empty() {
+                    continue;
+                }
+                let key = page["key"].as_str().unwrap_or(title);
+                let desc = page["description"].as_str().unwrap_or_default();
+                let excerpt = html_to_text(page["excerpt"].as_str().unwrap_or_default());
+                lines.push(format!(
+                    "{title} | https://{lang}.wikipedia.org/wiki/{key} | {desc} {excerpt}"
+                ));
+            }
+        }
+    }
+
+    // DuckDuckGo lite for general web results.
+    match client
+        .get("https://lite.duckduckgo.com/lite/")
+        .query(&[("q", query.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.text().await {
+            Ok(body) => {
+                for (title, url, snippet) in parse_ddg_lite(&body, 6) {
+                    lines.push(format!("{title} | {url} | {snippet}"));
+                }
+            }
+            Err(e) => lines.push(format!("(DuckDuckGo error: {e})")),
+        },
+        Err(e) => lines.push(format!("(DuckDuckGo error: {e})")),
+    }
+
+    if lines.is_empty() {
+        return format!(
+            "No web results for \"{query}\". Tell the user the answer was not found online — do not guess."
+        );
+    }
+    format!("Web results (title | url | snippet):\n{}", lines.join("\n"))
+}
+
+/// Same-site links ("anchor text", absolute URL) from raw HTML, so the model
+/// can follow a homepage to the page that actually holds the answer.
+fn extract_links(html: &str, base: &reqwest::Url, max: usize) -> Vec<(String, String)> {
+    const MAX_ANCHOR_CHARS: usize = 60;
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(host) = base.host_str().map(str::to_string) else {
+        return out;
+    };
+    let mut rest = html;
+    while out.len() < max {
+        let Some(a_pos) = rest.find("<a ") else { break };
+        let tag_rest = &rest[a_pos..];
+        let Some(tag_end) = tag_rest.find('>') else { break };
+        let Some(close) = tag_rest.find("</a>") else { break };
+        let tag = &tag_rest[..tag_end];
+        let inner = if tag_end < close {
+            &tag_rest[tag_end + 1..close]
+        } else {
+            ""
+        };
+        rest = &tag_rest[close + 4..];
+        let href = ["href=\"", "href='"].iter().find_map(|pat| {
+            let start = tag.find(pat)? + pat.len();
+            let quote = pat.chars().last().unwrap();
+            let end = tag[start..].find(quote)?;
+            Some(&tag[start..start + end])
+        });
+        let Some(href) = href else { continue };
+        if href.starts_with('#') || href.starts_with("javascript:") || href.starts_with("mailto:")
+        {
+            continue;
+        }
+        let Ok(mut abs) = base.join(href) else {
+            continue;
+        };
+        if abs.host_str() != Some(host.as_str()) {
+            continue;
+        }
+        abs.set_fragment(None);
+        let url_s = abs.to_string();
+        let text = html_to_text(inner)
+            .chars()
+            .take(MAX_ANCHOR_CHARS)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if text.is_empty() || !seen.insert(url_s.clone()) {
+            continue;
+        }
+        out.push((text, url_s));
+    }
+    out
+}
+
+async fn tool_web_fetch(args: &serde_json::Value) -> String {
+    let Some(url) = json_str_arg(args, "url") else {
+        return "url is required.".to_string();
+    };
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return "Only http(s) URLs can be fetched.".to_string();
+    }
+    let authority = url.split('/').nth(2).unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if host_port.starts_with('[') {
+        host_port.split(']').next().unwrap_or(host_port)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    if is_private_host(host) {
+        return "Fetching local/private addresses is not allowed.".to_string();
+    }
+
+    let client = web_http_client();
+    let mut resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => return format!("Fetch failed: {e}"),
+    };
+    let final_url = resp.url().clone();
+    if !resp.status().is_success() {
+        return format!("Fetch failed: HTTP {}", resp.status());
+    }
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !(ct.is_empty() || ct.contains("text/") || ct.contains("json") || ct.contains("xml")) {
+        return format!("Unsupported content type: {ct}");
+    }
+
+    const MAX_BYTES: usize = 2_000_000;
+    const MAX_CHARS: usize = 6_000;
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                body.extend_from_slice(&chunk);
+                if body.len() >= MAX_BYTES {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return format!("Fetch failed while reading body: {e}"),
+        }
+    }
+    let body_str = String::from_utf8_lossy(&body);
+    let readable = html_to_text(&body_str);
+    let capped: String = readable.chars().take(MAX_CHARS).collect();
+    let mut links_section = String::new();
+    for (text, link) in extract_links(&body_str, &final_url, 30) {
+        if links_section.is_empty() {
+            links_section.push_str("\n\nLinks (same site — web_fetch a promising one when the answer is on a subpage):");
+        }
+        links_section.push_str(&format!("\n- {text} — {link}"));
+    }
+    if capped.trim().is_empty() && links_section.is_empty() {
+        return format!("Source: {url}\n(No readable text found on the page.)");
+    }
+    let note = if readable.len() > capped.len() {
+        " [truncated]"
+    } else {
+        ""
+    };
+    format!("Source: {url}\n{capped}{note}{links_section}")
 }
 
 async fn tool_notes_search(notes: &NotesConnector, args: &serde_json::Value) -> String {

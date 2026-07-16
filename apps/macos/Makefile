@@ -4,6 +4,14 @@ BUNDLE     = $(APP_NAME).app
 REPO_ROOT  = ../..
 DAEMON_DEV = $(REPO_ROOT)/target/debug/bagentd
 DAEMON_REL = $(REPO_ROOT)/target/release/bagentd
+# Stable signing identity: ad-hoc ("-") signatures use a per-build cdhash as the
+# designated requirement, so every rebuild invalidates TCC grants (Accessibility,
+# Screen Recording). A real identity keys the grant to identifier+team instead.
+# Falls back to ad-hoc when no identity is available.
+SIGN_ID   := $(shell security find-identity -v -p codesigning 2>/dev/null | grep -o '"Apple Development: [^"]*"' | head -1)
+ifeq ($(SIGN_ID),)
+SIGN_ID   := -
+endif
 
 .PHONY: run build daemon bundle clean whatsapp-bridge-install
 
@@ -12,7 +20,7 @@ DAEMON_REL = $(REPO_ROOT)/target/release/bagentd
 # sign with a stable identifier so the mic grant is attributed consistently.
 run: daemon-dev
 	swift build
-	codesign --force --sign - --identifier sk.bagent.app .build/debug/bagent
+	codesign --force --sign $(SIGN_ID) --identifier sk.bagent.app .build/debug/bagent
 	@cleanup() { \
 	  pid_file="$$HOME/Library/Application Support/bagent/daemon.pid"; \
 	  if [ -f "$$pid_file" ]; then \
@@ -74,7 +82,7 @@ bundle: build daemon
   <key>NSMicrophoneUsageDescription</key> <string>bagent uses the microphone to transcribe your voice on-device with Whisper. Audio never leaves your Mac.</string>\n\
   <key>NSScreenCaptureUsageDescription</key> <string>bagent captures your screen on demand to answer questions about what is displayed. Screenshots are processed in memory and never saved to disk.</string>\n\
 </dict></plist>\n' > "$(BUNDLE)/Contents/Info.plist"
-	codesign --force --sign - "$(BUNDLE)"
+	codesign --force --sign $(SIGN_ID) "$(BUNDLE)"
 	@echo "✓  $(BUNDLE) ready — open $(BUNDLE) or drag to Applications"
 
 clean:

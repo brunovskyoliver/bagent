@@ -24,6 +24,11 @@ enum NotchWrapMetrics {
     static let voiceBridgeHeight: CGFloat = 120  // voice mode — fits wave + 2 text lines
     static let cmuxWingWidth: CGFloat     = 84   // cmux banner — fits one-line event title
     static let cmuxBridgeHeight: CGFloat  = 19   // single caption line, minimal growth
+    static let settingsWingWidth: CGFloat   = 205  // /settings surface
+    static let settingsBridgeHeight: CGFloat = 252
+    static let wheelWingWidth: CGFloat    = 196  // paste wheel — 5 chips along the arc
+    static let wheelBridgeHeight: CGFloat = 36   // thin strip; the dome carries the height
+    static let wheelBulgeDepth: CGFloat   = 96   // circular-arc dome below the strip
     static let maxWingWidth: CGFloat      = 260
     static let maxBridgeHeight: CGFloat   = 280
     static let surfaceDuration: Double     = 0.58
@@ -43,13 +48,6 @@ private enum NotchOutputLayout {
     static let contentVerticalInset: CGFloat = 14
     static let minTextWidth: CGFloat = 120
     static let resizeThreshold: CGFloat = 14
-    /// Output scroll viewport height once the notch bridge is fully grown.
-    /// Mirrors the layout chain in NotchWrapView: bridge height minus contentVerticalInset.
-    /// While the viewport is below this, `bridgeHeight(text:visibleWidth:message:)`
-    /// guarantees the text fits, so the panel grows instead of scrolling.
-    static var maxViewportHeight: CGFloat {
-        NotchWrapMetrics.outputMaxBridgeHeight - contentVerticalInset
-    }
     static func font() -> NSFont { NSFont.systemFont(ofSize: 13, weight: .regular) }
 
     static func responseText(
@@ -60,10 +58,6 @@ private enum NotchOutputLayout {
         latestText.isEmpty
             ? (isStreaming || isThinking ? "Thinking" : "Done")
             : latestText
-    }
-
-    static func reservedWidth(for message: ChatMessage?) -> CGFloat {
-        message?.debugTraceId == nil ? CGFloat(0) : CGFloat(34)
     }
 
     /// Width of the widest rendered line when nothing wraps — drives the
@@ -82,8 +76,8 @@ private enum NotchOutputLayout {
     /// [outputMinWingWidth, outputWingWidth]. Inverts the visible-width formula
     /// used by the output surface. The +16 slack absorbs measurement rounding
     /// so text measured to exactly fit doesn't wrap at the rendered width.
-    static func wingWidth(text: String, notchWidth: CGFloat, message: ChatMessage?) -> CGFloat {
-        let contentWidth = longestLineWidth(text) + reservedWidth(for: message) + 16
+    static func wingWidth(text: String, notchWidth: CGFloat) -> CGFloat {
+        let contentWidth = longestLineWidth(text) + 16
         let visibleWidth = contentWidth / NotchWrapMetrics.inlineContentScale
         let wing = (visibleWidth - notchWidth) / 2
         return min(NotchWrapMetrics.outputWingWidth,
@@ -101,10 +95,9 @@ private enum NotchOutputLayout {
 
     static func bridgeHeight(
         text: String,
-        visibleWidth: CGFloat,
-        message: ChatMessage?
+        visibleWidth: CGFloat
     ) -> CGFloat {
-        let textWidth = max(minTextWidth, visibleWidth - reservedWidth(for: message))
+        let textWidth = max(minTextWidth, visibleWidth)
         let wanted = ceil(textHeight(text, width: textWidth) + chromePadding + bottomSlack)
         return min(
             NotchWrapMetrics.outputMaxBridgeHeight,
@@ -120,12 +113,19 @@ private struct NotchWrapBorderShape: Shape {
     let notchWidth: CGFloat
     let notchHeight: CGFloat
     let cornerRadius: CGFloat
+    var bulgeDepth: CGFloat = 0
+    var bulgeSweep: CGFloat = 0
 
-    var animatableData: AnimatablePair<CGFloat, CGFloat> {
-        get { AnimatablePair(wingWidth, bridgeHeight) }
+    var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>>> {
+        get {
+            AnimatablePair(wingWidth,
+                           AnimatablePair(bridgeHeight, AnimatablePair(bulgeDepth, bulgeSweep)))
+        }
         set {
             wingWidth = newValue.first
-            bridgeHeight = newValue.second
+            bridgeHeight = newValue.second.first
+            bulgeDepth = newValue.second.second.first
+            bulgeSweep = newValue.second.second.second
         }
     }
 
@@ -135,9 +135,24 @@ private struct NotchWrapBorderShape: Shape {
         let x = notchOffset - wingWidth
         let w = 2 * wingWidth + notchWidth
         let h = notchHeight + br
+        let depth = max(0, bulgeDepth)
+        let sweep = min(1, max(0, bulgeSweep))
 
         var path = Path()
         path.move(to: CGPoint(x: x + w, y: 0))
+        if depth > 0.5, sweep > 0.01 {
+            path.addLine(to: CGPoint(x: x + w, y: h))
+            let frontier = NotchWrapShape.domePoint(t: sweep, x: x, w: w, h: h, depth: depth)
+            path.addLine(to: CGPoint(x: frontier.x, y: h))
+            path.addLine(to: frontier)
+            let steps = max(2, Int(48 * sweep))
+            for i in stride(from: steps - 1, through: 0, by: -1) {
+                let t = sweep * CGFloat(i) / CGFloat(steps)
+                path.addLine(to: NotchWrapShape.domePoint(t: t, x: x, w: w, h: h, depth: depth))
+            }
+            path.addLine(to: CGPoint(x: x, y: 0))
+            return path
+        }
         path.addLine(to: CGPoint(x: x + w, y: h - r))
         path.addArc(
             center: CGPoint(x: x + w - r, y: h - r),
@@ -191,6 +206,9 @@ struct NotchWrapView: View {
     // Explicit @State so withAnimation directly tweens the shape's animatableData.
     @State private var wingWidth: CGFloat    = NotchWrapMetrics.idleWingWidth
     @State private var bridgeHeight: CGFloat = NotchWrapMetrics.idleBridgeHeight
+    @State private var bulgeDepth: CGFloat   = 0
+    @State private var bulgeSweep: CGFloat   = 0
+    @State private var wheelContentOpacity: CGFloat = 0
     @State private var targetWingWidth: CGFloat = NotchWrapMetrics.idleWingWidth
     @State private var targetBridgeHeight: CGFloat = NotchWrapMetrics.idleBridgeHeight
     @State private var isHovered = false
@@ -214,6 +232,9 @@ struct NotchWrapView: View {
     @State private var outputWingRatchet: CGFloat = NotchWrapMetrics.outputMinWingWidth
     @State private var outputStatusReturnStartPos: CGPoint = .zero
     @State private var outputStatusReturnStartBridgeHeight: CGFloat = NotchWrapMetrics.outputMinBridgeHeight
+    /// Multiple left-wing icons rest as an overlapped deck; hover fans them out.
+    @State private var leftWingFanned = false
+    @State private var leftWingRestackWork: DispatchWorkItem?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     // Panel is sized for voice mode (the widest/tallest state) so the frame never needs
@@ -228,7 +249,9 @@ struct NotchWrapView: View {
     private var status: AgentStatus { viewModel.agentStatus }
     private var isInlineActive: Bool {
         viewModel.notchInteractionMode == .input || viewModel.notchInteractionMode == .output
+            || viewModel.notchInteractionMode == .settings
     }
+    private var isSettingsActive: Bool { viewModel.notchInteractionMode == .settings }
 
     /// Transient cmux banner (5s after an agent event, latest wins).
     private var isCmuxBannerActive: Bool {
@@ -262,11 +285,19 @@ struct NotchWrapView: View {
     }
 
     private func inlineWingWidth(for mode: NotchInteractionMode) -> CGFloat {
-        mode == .output ? outputWingWidth() : NotchWrapMetrics.inlineWingWidth
+        switch mode {
+        case .output:   return outputWingWidth()
+        case .settings: return NotchWrapMetrics.settingsWingWidth
+        default:        return NotchWrapMetrics.inlineWingWidth
+        }
     }
 
     private func inlineBridgeHeight(for mode: NotchInteractionMode) -> CGFloat {
-        mode == .output ? outputBridgeHeight() : NotchWrapMetrics.inlineBridgeHeight
+        switch mode {
+        case .output:   return outputBridgeHeight()
+        case .settings: return NotchWrapMetrics.settingsBridgeHeight
+        default:        return NotchWrapMetrics.inlineBridgeHeight
+        }
     }
 
     private var outputResponseText: String {
@@ -278,24 +309,39 @@ struct NotchWrapView: View {
     }
 
     private func outputWingWidth() -> CGFloat {
+        // Ratchet only grows and is clamped to outputWingWidth — once maxed
+        // the (full-text parse + layout) measure can't change the answer.
+        if outputWingRatchet >= NotchWrapMetrics.outputWingWidth {
+            return outputWingRatchet
+        }
         let wanted = NotchOutputLayout.wingWidth(
             text: outputResponseText,
-            notchWidth: notchWidth,
-            message: viewModel.latestAssistantMessage
+            notchWidth: notchWidth
         )
         if wanted > outputWingRatchet { outputWingRatchet = wanted }
         return outputWingRatchet
     }
 
     private func outputBridgeHeight() -> CGFloat {
+        // Streaming text only grows, so a bridge already pinned at max stays
+        // there — skip the full-text height measure. Post-stream calls still
+        // measure exactly (final fit may shrink).
+        if viewModel.isLatestAssistantStreaming,
+           targetBridgeHeight >= NotchWrapMetrics.outputMaxBridgeHeight {
+            return NotchWrapMetrics.outputMaxBridgeHeight
+        }
         // Height must be measured at the same width the text will render at,
         // so wrap width and measured height always agree.
         let visibleWidth = (notchWidth + 2 * outputWingWidth()) * NotchWrapMetrics.inlineContentScale
-        return NotchOutputLayout.bridgeHeight(
+        let base = NotchOutputLayout.bridgeHeight(
             text: outputResponseText,
-            visibleWidth: visibleWidth,
-            message: viewModel.latestAssistantMessage
+            visibleWidth: visibleWidth
         )
+        // Browse header row (‹n/N› + prompt) sits above the response text.
+        let browseExtra: CGFloat = viewModel.historyBrowseIndex == nil ? 0 : 20
+        // Tool-status chip also sits above the response text during streaming.
+        let toolChipExtra: CGFloat = viewModel.toolStatus == nil ? 0 : 20
+        return min(NotchWrapMetrics.outputMaxBridgeHeight, base + browseExtra + toolChipExtra)
     }
 
     private func estimatedNotchTextHeight(_ text: String, width: CGFloat) -> CGFloat {
@@ -304,8 +350,21 @@ struct NotchWrapView: View {
 
     private func refreshOutputSurfaceIfNeeded(force: Bool = false) {
         guard viewModel.notchInteractionMode == .output, !isVoiceActive else { return }
+        // Streaming text only grows — once the panel is pinned at max in both
+        // dimensions nothing a new token adds can change the surface, so skip
+        // the (full-text parse + layout) measurement entirely. Without this,
+        // every token past ~max-height re-measured and re-refreshed the panel.
+        if !force, viewModel.isLatestAssistantStreaming,
+           targetWingWidth >= NotchWrapMetrics.outputWingWidth,
+           targetBridgeHeight >= NotchWrapMetrics.outputMaxBridgeHeight {
+            return
+        }
         let nextWing = outputWingWidth()
         let nextBridge = outputBridgeHeight()
+        // The "== max" arms keep the panel re-fitting on every flush once one
+        // dimension is pinned, so the growing bridge always leads the text —
+        // suppressing them made the text overflow between threshold steps and
+        // visibly bounce between bottom-pin and top-anchor.
         let shouldResize = force
             || !viewModel.isLatestAssistantStreaming
             || abs(nextBridge - targetBridgeHeight) >= NotchOutputLayout.resizeThreshold
@@ -327,6 +386,9 @@ struct NotchWrapView: View {
         if isVoiceActive {
             targetWing = NotchWrapMetrics.voiceWingWidth
             targetBridge = NotchWrapMetrics.voiceBridgeHeight
+        } else if viewModel.pasteWheelActive {
+            targetWing = NotchWrapMetrics.wheelWingWidth
+            targetBridge = NotchWrapMetrics.wheelBridgeHeight
         } else if isInlineActive {
             targetWing = inlineWingWidth(for: viewModel.notchInteractionMode)
             targetBridge = inlineBridgeHeight(for: viewModel.notchInteractionMode)
@@ -364,12 +426,58 @@ struct NotchWrapView: View {
             }
         }
 
-        withAnimation(surfaceAnimation) {
+        // Wheel morphs use a snappier spring than the ambient surface ease —
+        // the hold gesture already cost 0.5s, the reveal must feel instant.
+        let targetBulge: CGFloat = (viewModel.pasteWheelActive && !isVoiceActive)
+            ? NotchWrapMetrics.wheelBulgeDepth : 0
+        let wheelInvolved = targetBulge > 0 || bulgeDepth > 0
+        let animation: Animation = wheelInvolved && !reduceMotion
+            ? .spring(response: 0.34, dampingFraction: 0.82)
+            : surfaceAnimation
+        withAnimation(animation) {
             wingWidth = targetWing
             bridgeHeight = targetBridge
         }
+        // The dome doesn't grow downward — it draws itself across, left→right.
+        // Depth is set instantly (invisible at sweep 0); the sweep does the reveal.
+        if targetBulge > 0 {
+            var instant = Transaction()
+            instant.disablesAnimations = true
+            withTransaction(instant) { bulgeDepth = targetBulge }
+            if bulgeSweep < 1 {
+                withAnimation(reduceMotion
+                    ? .easeOut(duration: 0.12)
+                    : .easeInOut(duration: 0.50)) {
+                    bulgeSweep = 1
+                }
+            }
+        } else if bulgeSweep > 0 || bulgeDepth > 0 {
+            // Retract right→left, then flatten what's left.
+            withAnimation(reduceMotion ? .easeOut(duration: 0.10) : .easeInOut(duration: 0.30)) {
+                bulgeSweep = 0
+            }
+            withAnimation(.easeOut(duration: 0.16).delay(reduceMotion ? 0 : 0.24)) {
+                bulgeDepth = 0
+            }
+        }
         updateInlineOpacity(active: isInlineActive && !isVoiceActive)
         updateCmuxOpacity(active: isCmuxSurfaceActive)
+    }
+
+    private func updateWheelOpacity(active: Bool) {
+        if active {
+            let delay = reduceMotion ? 0.0 : 0.14
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard viewModel.pasteWheelActive else { return }
+                withAnimation(.easeOut(duration: reduceMotion ? 0.10 : 0.20)) {
+                    wheelContentOpacity = 1
+                }
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.12)) {
+                wheelContentOpacity = 0
+            }
+        }
     }
 
     private func updateStatusDotTravelState() {
@@ -509,7 +617,9 @@ struct NotchWrapView: View {
             notchOffset: notchOffset,
             notchWidth: notchWidth,
             notchHeight: notchHeight,
-            cornerRadius: NotchWrapMetrics.cornerRadius
+            cornerRadius: NotchWrapMetrics.cornerRadius,
+            bulgeDepth: bulgeDepth,
+            bulgeSweep: bulgeSweep
         )
     }
 
@@ -519,7 +629,11 @@ struct NotchWrapView: View {
             let contentWing = wingWidth
             let contentBridge = bridgeHeight
             ZStack(alignment: .topLeading) {
-                InlineNotchContent(viewModel: viewModel)
+                InlineNotchContent(
+                    viewModel: viewModel,
+                    outputGrowthPhase: viewModel.isLatestAssistantStreaming
+                        && targetBridgeHeight < NotchWrapMetrics.outputMaxBridgeHeight
+                )
                     .frame(
                         width: (notchWidth + 2 * contentWing) * NotchWrapMetrics.inlineContentScale,
                         height: max(1, contentBridge - NotchOutputLayout.contentVerticalInset)
@@ -566,7 +680,9 @@ struct NotchWrapView: View {
     @ViewBuilder
     private var leftWingIconLayer: some View {
         if leftWingIconCount > 0 {
-            HStack(spacing: Self.leftWingIconSpacing) {
+            HStack(spacing: leftWingStacked
+                ? -(Self.leftWingIconSize - Self.leftWingStackedStep)
+                : Self.leftWingIconSpacing) {
                 ForEach(Array(visibleConnectorActions.enumerated()), id: \.element.id) { index, action in
                     Button {
                         viewModel.performConnectorAction(action, slotIndex: index)
@@ -575,6 +691,12 @@ struct NotchWrapView: View {
                                           size: Self.leftWingIconSize)
                     }
                     .buttonStyle(.plain)
+                    .rotationEffect(
+                        .degrees(leftWingStacked
+                            ? Double(visibleConnectorActions.count - index) * -4
+                            : 0),
+                        anchor: .bottom
+                    )
                     .help(action.kind.accessibilityLabel)
                     .accessibilityLabel(action.kind.accessibilityLabel)
                 }
@@ -582,30 +704,79 @@ struct NotchWrapView: View {
                     CmuxIconView(kind: notification.kind, reduceMotion: reduceMotion)
                         .opacity(isCmuxSurfaceActive ? cmuxContentOpacity : 1)
                 }
+                // Transient "trace copied" confirmation (option+click).
+                if viewModel.traceCopiedFlash {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: Self.leftWingIconSize * 0.8, weight: .semibold))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .green)
+                        .frame(width: Self.leftWingIconSize, height: Self.leftWingIconSize)
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                        .accessibilityLabel("Trace skopírovaný do schránky")
+                }
             }
+            .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.68),
+                       value: leftWingStacked)
+            .padding(6)
+            .contentShape(Rectangle())
+            .onHover { hovering in setLeftWingFanned(hovering) }
             .position(x: notchOffset - Self.leftWingRowInset - leftWingRowWidth / 2, y: iconY)
+        }
+    }
+
+    /// Fan on hover-enter immediately; restack after a short debounce so the
+    /// wing resize can't oscillate under the cursor.
+    private func setLeftWingFanned(_ fanned: Bool) {
+        leftWingRestackWork?.cancel()
+        leftWingRestackWork = nil
+        if fanned {
+            guard !leftWingFanned else { return }
+            leftWingFanned = true
+            if !isVoiceActive { refreshSurface() }
+        } else {
+            guard leftWingFanned else { return }
+            let work = DispatchWorkItem {
+                leftWingFanned = false
+                if !isVoiceActive { refreshSurface() }
+            }
+            leftWingRestackWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
         }
     }
 
     private static let leftWingIconSize: CGFloat = 18
     private static let leftWingIconSpacing: CGFloat = 6
+    /// Visible sliver of each icon beneath the next one in the stacked deck.
+    private static let leftWingStackedStep: CGFloat = 5
     /// Gap between the row's right edge and the notch's left edge.
     private static let leftWingRowInset: CGFloat = 8
 
-    /// Connector icons hide only for voice and the expanded chat panel — unlike
-    /// the cmux icon they stay through inline input/output.
+    /// Deck rests stacked whenever more than one icon is present and the
+    /// pointer isn't over the row. A single icon renders exactly as before.
+    private var leftWingStacked: Bool {
+        !leftWingFanned && leftWingIconCount > 1
+    }
+
+    /// Connector icons hide only for voice — they stay through inline
+    /// input/output and the expanded chat panel so results are actionable
+    /// the moment they stream in.
     private var visibleConnectorActions: [ConnectorAction] {
-        guard !isVoiceActive, !viewModel.isExpanded else { return [] }
+        guard !isVoiceActive else { return [] }
         return viewModel.pendingConnectorActions
     }
 
     private var leftWingIconCount: Int {
-        visibleConnectorActions.count + (showsCmuxLeftIcon ? 1 : 0)
+        visibleConnectorActions.count
+            + (showsCmuxLeftIcon ? 1 : 0)
+            + (viewModel.traceCopiedFlash ? 1 : 0)
     }
 
     private var leftWingRowWidth: CGFloat {
         let n = CGFloat(leftWingIconCount)
         guard n > 0 else { return 0 }
+        if leftWingStacked {
+            return Self.leftWingIconSize + (n - 1) * Self.leftWingStackedStep
+        }
         return n * Self.leftWingIconSize + (n - 1) * Self.leftWingIconSpacing
     }
 
@@ -675,7 +846,12 @@ struct NotchWrapView: View {
     }
 
     /// Click-through on a cmux banner/reveal focuses the cmux workspace/tab.
+    /// Option+click in any state copies the session/debug trace instead.
     private func handleTap() {
+        if NSApp.currentEvent?.modifierFlags.contains(.option) == true {
+            viewModel.copyDebugTrace()
+            return
+        }
         if isCmuxSurfaceActive, let notification = displayedCmuxNotification {
             viewModel.focusCmux(notification)
             refreshSurface()
@@ -757,7 +933,9 @@ struct NotchWrapView: View {
                 notchOffset: notchOffset,
                 notchWidth: notchWidth,
                 notchHeight: notchHeight,
-                cornerRadius: NotchWrapMetrics.cornerRadius
+                cornerRadius: NotchWrapMetrics.cornerRadius,
+                bulgeDepth: bulgeDepth,
+                bulgeSweep: bulgeSweep
             )
             .fill(.black)
 
@@ -767,7 +945,9 @@ struct NotchWrapView: View {
                 notchOffset: notchOffset,
                 notchWidth: notchWidth,
                 notchHeight: notchHeight,
-                cornerRadius: NotchWrapMetrics.cornerRadius
+                cornerRadius: NotchWrapMetrics.cornerRadius,
+                bulgeDepth: bulgeDepth,
+                bulgeSweep: bulgeSweep
             )
             .stroke(
                 NotchWrapMetrics.notchBorderColor.opacity(
@@ -779,10 +959,14 @@ struct NotchWrapView: View {
             leftWingIconLayer
             iconDepartureLayer
 
-            // Left icon — only when chat open, hovered, or voice active (idle = blank notch)
-            if showsLeftStatusIcon {
+            // Left icon — only when chat open, hovered, or voice active (idle = blank notch).
+            // In settings mode it shows the current page's icon; DrawInSymbol's
+            // symbolEffect(.replace) animates the swap between pages.
+            if showsLeftStatusIcon || isSettingsActive {
                 DrawInSymbol(
-                    systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles",
+                    systemName: isSettingsActive
+                        ? viewModel.notchSettingsPage.symbolName
+                        : (viewModel.selectedSourceMode?.symbolName ?? "sparkles"),
                     trigger: hoverIconRevealID,
                     duration: NotchWrapMetrics.surfaceDuration,
                     reduceMotion: reduceMotion
@@ -824,6 +1008,23 @@ struct NotchWrapView: View {
             cmuxBannerLayer
             statusDotLayer
             cmuxDotLayer
+            pasteWheelLayer
+        }
+    }
+
+    /// Clipboard wheel chips laid along the bulged bottom edge.
+    @ViewBuilder
+    private var pasteWheelLayer: some View {
+        if viewModel.pasteWheelActive || wheelContentOpacity > 0 {
+            PasteWheelView(
+                viewModel: viewModel,
+                notchOffset: notchOffset,
+                notchWidth: notchWidth,
+                notchHeight: notchHeight
+            )
+            .opacity(wheelContentOpacity)
+            .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+            .clipShape(animatedNotchClipShape)
         }
     }
 
@@ -837,7 +1038,9 @@ struct NotchWrapView: View {
                 notchOffset: notchOffset,
                 notchWidth: notchWidth,
                 notchHeight: notchHeight,
-                cornerRadius: NotchWrapMetrics.cornerRadius
+                cornerRadius: NotchWrapMetrics.cornerRadius,
+                bulgeDepth: bulgeDepth,
+                bulgeSweep: bulgeSweep
             )
         )
         .onTapGesture { handleTap() }
@@ -874,6 +1077,10 @@ struct NotchWrapView: View {
             isVoiceActive = active
             setVoiceState(active: active)
         }
+        .onChange(of: viewModel.pasteWheelActive) { _, active in
+            refreshSurface()
+            updateWheelOpacity(active: active)
+        }
         .onChange(of: viewModel.notchInteractionMode) { _, mode in
             if mode != .output { outputWingRatchet = NotchWrapMetrics.outputMinWingWidth }
             if !isVoiceActive { refreshSurface() }
@@ -882,6 +1089,9 @@ struct NotchWrapView: View {
             if !isVoiceActive { refreshSurface() }
         }
         .onChange(of: viewModel.pendingConnectorActions) {
+            if !isVoiceActive { refreshSurface() }
+        }
+        .onChange(of: viewModel.traceCopiedFlash) {
             if !isVoiceActive { refreshSurface() }
         }
     }
@@ -965,14 +1175,16 @@ private struct DrawInSymbol: View {
 struct InlineNotchContent: View {
     @ObservedObject var viewModel: ChatViewModel
     let showsInputLeadingIcon: Bool
+    let outputGrowthPhase: Bool
     @FocusState private var inputFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var placeholderRevealID = UUID()
     @State private var inlineFocusRetryID = UUID()
 
-    init(viewModel: ChatViewModel, showsInputLeadingIcon: Bool = true) {
+    init(viewModel: ChatViewModel, showsInputLeadingIcon: Bool = true, outputGrowthPhase: Bool = false) {
         self.viewModel = viewModel
         self.showsInputLeadingIcon = showsInputLeadingIcon
+        self.outputGrowthPhase = outputGrowthPhase
     }
 
     private var canSend: Bool {
@@ -990,6 +1202,8 @@ struct InlineNotchContent: View {
                 thinkingRow
             case .output:
                 outputView
+            case .settings:
+                NotchSettingsContent(viewModel: viewModel)
             case .collapsed:
                 EmptyView()
             }
@@ -1053,9 +1267,11 @@ struct InlineNotchContent: View {
             ThinkingIndicator()
                 .scaleEffect(0.74)
             VStack(alignment: .leading, spacing: 3) {
-                Text("Thinking")
+                Text(viewModel.toolStatus ?? "Thinking")
                     .font(.system(size: 14, weight: .regular))
                     .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                    .lineLimit(1)
+                    .animation(.easeOut(duration: 0.18), value: viewModel.toolStatus)
                 if !viewModel.latestUserText.isEmpty {
                     Text(viewModel.latestUserText)
                         .font(.system(size: 12, weight: .regular))
@@ -1074,28 +1290,44 @@ struct InlineNotchContent: View {
             isStreaming: viewModel.isLatestAssistantStreaming,
             isThinking: viewModel.isThinking
         )
-        let latestMessage = viewModel.latestAssistantMessage
         return VStack(alignment: .leading, spacing: 6) {
-            ZStack(alignment: .topTrailing) {
-                LatestAssistantOutputScrollView(
-                    text: text,
-                    messageId: viewModel.latestAssistantMessageId,
-                    isStreaming: viewModel.isLatestAssistantStreaming,
-                    reduceMotion: reduceMotion
-                )
-                .padding(.leading, latestMessage?.debugTraceId == nil ? 0 : 34)
-                .frame(maxWidth: .infinity)
-                .frame(maxHeight: .infinity)
-                .accessibilityLabel("Latest assistant response")
-                .accessibilityValue(text)
-
-                if latestMessage?.debugTraceId != nil {
-                    NotchDebugCopyButton(viewModel: viewModel)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                        .transition(.opacity.combined(with: .scale(scale: 0.94, anchor: .topLeading)))
+            // History-browse header (↑/↓ on empty input): position + the prompt
+            // that produced the browsed answer.
+            if let pos = viewModel.historyBrowsePosition {
+                HStack(spacing: 6) {
+                    Text("‹ \(pos.0)/\(pos.1) ›")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                    if let prompt = viewModel.historyBrowsePrompt {
+                        Text(prompt)
+                            .font(.system(size: 11))
+                            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
                 }
+                .transition(.opacity)
             }
-
+            // Action chip: which tool the model is using, visible through streaming.
+            if let status = viewModel.toolStatus {
+                Text(status)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                    .lineLimit(1)
+                    .transition(.opacity)
+                    .animation(.easeOut(duration: 0.18), value: viewModel.toolStatus)
+            }
+            LatestAssistantOutputScrollView(
+                text: text,
+                messageId: viewModel.latestAssistantMessageId,
+                isStreaming: viewModel.isLatestAssistantStreaming,
+                growthPhase: outputGrowthPhase,
+                reduceMotion: reduceMotion
+            )
+            .frame(maxWidth: .infinity)
+            .frame(maxHeight: .infinity)
+            .accessibilityLabel("Latest assistant response")
+            .accessibilityValue(text)
         }
     }
 
@@ -1128,6 +1360,7 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
     let text: String
     let messageId: UUID?
     let isStreaming: Bool
+    let growthPhase: Bool
     let reduceMotion: Bool
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -1173,7 +1406,7 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = context.coordinator.textView else { return }
+        guard context.coordinator.textView != nil else { return }
         let coordinator = context.coordinator
         let messageChanged = coordinator.messageId != messageId
 
@@ -1183,9 +1416,10 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
             coordinator.lastText = nil
         }
 
+        coordinator.growthPhase = growthPhase
         if coordinator.lastText != text {
             coordinator.lastText = text
-            textView.textStorage?.setAttributedString(attributedText(text))
+            coordinator.applyText(text)
         }
 
         coordinator.resizeTextView()
@@ -1204,10 +1438,6 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
         Coordinator()
     }
 
-    private func attributedText(_ text: String) -> NSAttributedString {
-        NotchMarkdown.attributedString(text)
-    }
-
     @MainActor
     final class Coordinator: NSObject {
         weak var scrollView: NSScrollView?
@@ -1215,7 +1445,35 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
         var messageId: UUID?
         var lastText: String?
         var userScrolledAway = false
+        var growthPhase = false
         private var lastClipSize: NSSize = .zero
+        // Source text up to (and incl.) the last rendered "\n", and the UTF-16
+        // length its render occupies in the text storage.
+        private var finalizedSource = ""
+        private var finalizedRendered = 0
+
+        /// Incremental streaming render. `NotchMarkdown` styles are strictly
+        /// line-scoped, so lines before the last newline never restyle as new
+        /// tokens arrive — only the tail needs re-rendering and TextKit only
+        /// relays the edited range. A full `setAttributedString` per token
+        /// relaid the entire document: O(n²) over a long stream.
+        func applyText(_ text: String) {
+            guard let storage = textView?.textStorage else { return }
+            if !text.hasPrefix(finalizedSource) {
+                finalizedSource = ""
+                finalizedRendered = 0
+            }
+            let tail = String(text.dropFirst(finalizedSource.count))
+            storage.replaceCharacters(
+                in: NSRange(location: finalizedRendered, length: storage.length - finalizedRendered),
+                with: NotchMarkdown.attributedString(tail)
+            )
+            if let nl = tail.lastIndex(of: "\n") {
+                let completed = String(tail[...nl])
+                finalizedSource += completed
+                finalizedRendered += NotchMarkdown.attributedString(completed).length
+            }
+        }
 
         /// Called only for scroll-wheel/trackpad events (including momentum),
         /// never for programmatic pins — so it is the single source of truth
@@ -1242,20 +1500,28 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
         ///   downward to reveal new lines. Bottom-pinning here would drag the
         ///   text down with the animating panel edge while token pins push it
         ///   up — the vertical jumping this replaces.
-        /// - Scroll phase (viewport fully grown): pin to the bottom so new
-        ///   lines scroll into view. Never overrides a user's manual scroll.
+        /// - Scroll phase (panel target at max height): pin to the bottom so
+        ///   new lines scroll into view. Never overrides a user's manual
+        ///   scroll. The phase signal is `growthPhase` (from the panel's
+        ///   *target* height, set by SwiftUI) — not momentary overflow against
+        ///   the animating clip: mid-animation the clip lags the text by a
+        ///   line, so overflow flip-flops per line (bottom-pin jump up, then
+        ///   slide back to top anchor — the jitter this replaces). Overflow is
+        ///   still checked once pinning, because siblings above the scroll
+        ///   view (tool-status chip, browse header) shrink the clip below the
+        ///   theoretical max.
         func applyAutoScroll() {
             guard !userScrolledAway else { return }
-            if viewportFullyGrown() {
+            if !growthPhase && contentOverflows() {
                 pinToBottom()
             } else {
                 scrollTo(y: 0)
             }
         }
 
-        func viewportFullyGrown() -> Bool {
-            guard let scrollView else { return false }
-            return scrollView.contentView.bounds.height >= NotchOutputLayout.maxViewportHeight - 1
+        func contentOverflows() -> Bool {
+            guard let scrollView, let documentView = scrollView.documentView else { return false }
+            return documentView.bounds.height > scrollView.contentView.bounds.height + 1
         }
 
         func resizeTextView() {
@@ -1300,44 +1566,6 @@ private final class UserTrackingScrollView: NSScrollView {
     override func scrollWheel(with event: NSEvent) {
         super.scrollWheel(with: event)
         onUserScroll?()
-    }
-}
-
-private struct NotchDebugCopyButton: View {
-    @ObservedObject var viewModel: ChatViewModel
-    @State private var isHovered = false
-    @State private var isLoading = false
-
-    var body: some View {
-        Button {
-            guard !isLoading else { return }
-            isLoading = true
-            Task {
-                let payload = await viewModel.latestDebugClipboardPayload()
-                copyToPasteboard(payload)
-                isLoading = false
-            }
-        } label: {
-            Image(systemName: isLoading ? "arrow.triangle.2.circlepath" : "wrench.and.screwdriver.fill")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(isHovered ? 0.95 : 0.72))
-                .frame(width: 24, height: 24)
-                .background(
-                    Circle()
-                        .fill(Color.black.opacity(isHovered ? 0.52 : 0.38))
-                        .overlay(Circle().stroke(Color.cyan.opacity(isHovered ? 0.58 : 0.32), lineWidth: 0.6))
-                )
-        }
-        .buttonStyle(.plain)
-        .help("Copy latest session and debug trace")
-        .accessibilityLabel("Copy latest session and debug trace")
-        .disabled(isLoading)
-        .onHover { hovering in
-            withAnimation(.spring(response: 0.22, dampingFraction: 0.78)) {
-                isHovered = hovering
-            }
-            hovering ? NSCursor.pointingHand.push() : NSCursor.pop()
-        }
     }
 }
 

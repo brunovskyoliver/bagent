@@ -29,7 +29,14 @@ enum NotchMarkdown {
         var strike = false
     }
 
+    // Single-entry memo: during streaming the same full text is parsed by the
+    // width measure, the height measure, and the render path in one update.
+    // Main-thread only (all callers are AppKit/SwiftUI view code).
+    nonisolated(unsafe) private static var lastInput: String?
+    nonisolated(unsafe) private static var lastOutput: NSAttributedString?
+
     static func attributedString(_ text: String) -> NSAttributedString {
+        if text == lastInput, let lastOutput { return lastOutput }
         let out = NSMutableAttributedString()
         let lines = text.components(separatedBy: "\n")
         for (idx, line) in lines.enumerated() {
@@ -38,6 +45,8 @@ enum NotchMarkdown {
                 out.append(NSAttributedString(string: "\n"))
             }
         }
+        lastInput = text
+        lastOutput = out
         return out
     }
 

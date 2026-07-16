@@ -83,6 +83,40 @@ enum NotchInteractionMode: Equatable {
     case input
     case thinking
     case output
+    case settings
+}
+
+/// Pages of the notch-style settings surface (`/settings`).
+enum NotchSettingsPage: Int, CaseIterable, Equatable {
+    case general
+    case permissions
+    case model
+    case connectors
+
+    var title: String {
+        switch self {
+        case .general:     return "Všeobecné"
+        case .permissions: return "Povolenia"
+        case .model:       return "Model"
+        case .connectors:  return "Konektory"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .general:     return "gearshape"
+        case .permissions: return "lock.shield"
+        case .model:       return "cpu"
+        case .connectors:  return "puzzlepiece.extension"
+        }
+    }
+
+    var next: NotchSettingsPage {
+        NotchSettingsPage(rawValue: (rawValue + 1) % Self.allCases.count) ?? .general
+    }
+    var previous: NotchSettingsPage {
+        NotchSettingsPage(rawValue: (rawValue + Self.allCases.count - 1) % Self.allCases.count) ?? .general
+    }
 }
 
 enum SourceMode: String, CaseIterable, Equatable, Identifiable {
@@ -172,6 +206,29 @@ final class ChatViewModel: ObservableObject {
     /// animates to its hover state before the chat panel appears.
     @Published var pillHovered = false
 
+    /// Current page of the notch settings surface.
+    @Published var notchSettingsPage: NotchSettingsPage = .general
+
+    /// Open the notch-style settings surface (`/settings` command).
+    func openNotchSettings() {
+        inputText = ""
+        historyBrowseIndex = nil
+        notchSettingsPage = .general
+        notchInteractionMode = .settings
+    }
+
+    // MARK: - Clipboard paste wheel (hold right ⌘)
+    @Published var pasteWheelActive = false
+    /// Snapshot of clipboard history taken when the wheel opens (newest first).
+    @Published var pasteWheelItems: [ClipboardItem] = []
+    /// Slot flashed briefly on selection before the raindrop departs.
+    @Published var pasteWheelFlashSlot: Int? = nil
+    /// Wired by NotchWindowController — chip hover pins the wheel,
+    /// click pastes a slot, drag-out dismisses without pasting.
+    var onPasteWheelPinned: (() -> Void)?
+    var onPasteWheelChipClicked: ((Int) -> Void)?
+    var onPasteWheelDragStarted: (() -> Void)?
+
     // MARK: - Scroll viewport persistence (Phase 1B)
     /// The id of the message that was topmost-visible when the panel last collapsed.
     /// `nil` means "no saved position" → scroll to bottom on open.
@@ -187,15 +244,78 @@ final class ChatViewModel: ObservableObject {
     }
 
     var latestAssistantText: String {
-        messages.last(where: { $0.role == .assistant })?.content ?? ""
+        latestAssistantMessage?.content ?? ""
     }
 
+    /// The message the notch output surface shows: the browsed past response
+    /// while ↑/↓ history browsing is active, otherwise the newest assistant turn.
     var latestAssistantMessage: ChatMessage? {
-        messages.last(where: { $0.role == .assistant })
+        if let idx = historyBrowseIndex, assistantResponses.indices.contains(idx) {
+            return assistantResponses[idx]
+        }
+        return messages.last(where: { $0.role == .assistant })
     }
 
     var latestAssistantMessageId: UUID? {
-        messages.last(where: { $0.role == .assistant })?.id
+        latestAssistantMessage?.id
+    }
+
+    // MARK: - Response history browsing (↑/↓ on empty notch input)
+
+    /// Index into `assistantResponses` while browsing; nil = not browsing.
+    @Published var historyBrowseIndex: Int? = nil
+
+    var assistantResponses: [ChatMessage] {
+        messages.filter {
+            $0.role == .assistant
+                && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    /// "(current, total)" for the n/N position hint; nil when not browsing.
+    var historyBrowsePosition: (Int, Int)? {
+        guard let idx = historyBrowseIndex else { return nil }
+        return (idx + 1, assistantResponses.count)
+    }
+
+    /// User prompt that produced the browsed answer; nil when not browsing.
+    var historyBrowsePrompt: String? {
+        guard let idx = historyBrowseIndex, assistantResponses.indices.contains(idx) else {
+            return nil
+        }
+        let browsedId = assistantResponses[idx].id
+        guard let mi = messages.firstIndex(where: { $0.id == browsedId }) else { return nil }
+        return messages[..<mi].last(where: { $0.role == .user })?.content
+    }
+
+    /// ↑ on empty input: step to an older response. Returns true if consumed.
+    func browseOlderResponse() -> Bool {
+        guard inputText.isEmpty, !isThinking else { return false }
+        guard notchInteractionMode == .input || historyBrowseIndex != nil else { return false }
+        let list = assistantResponses
+        guard !list.isEmpty else { return false }
+        let next = (historyBrowseIndex ?? list.count) - 1
+        guard next >= 0 else { return true } // already at oldest — swallow the key
+        historyBrowseIndex = next
+        notchInteractionMode = .output
+        return true
+    }
+
+    /// ↓ while browsing: step newer; past the newest exits back to input.
+    func browseNewerResponse() -> Bool {
+        guard let idx = historyBrowseIndex else { return false }
+        if idx + 1 < assistantResponses.count {
+            historyBrowseIndex = idx + 1
+        } else {
+            exitHistoryBrowse()
+        }
+        return true
+    }
+
+    func exitHistoryBrowse() {
+        guard historyBrowseIndex != nil else { return }
+        historyBrowseIndex = nil
+        notchInteractionMode = .input
     }
 
     var isLatestAssistantStreaming: Bool {
@@ -744,6 +864,8 @@ final class ChatViewModel: ObservableObject {
         case let t where t.hasPrefix("notes"): return "🔎 Hľadám v poznámkach…"
         case let t where t.hasPrefix("whatsapp"): return "🔎 WhatsApp…"
         case let t where t.hasPrefix("odoo"): return "🔎 Odoo…"
+        case "web_search": return "🌐 Hľadám na webe…"
+        case "web_fetch": return "🌐 Čítam stránku…"
         case let t where t.hasPrefix("macos"): return "⚙️ macOS…"
         default: return "⚙️ \(tool)…"
         }
@@ -778,6 +900,8 @@ final class ChatViewModel: ObservableObject {
             if let url = URL(string: "whatsapp://") {
                 NSWorkspace.shared.open(url)
             }
+        case .file(let ref):
+            Task { try? await client.revealInFinder(path: ref.path) }
         }
         if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             connectorDeparting.append(ConnectorDeparture(kind: action.kind, slotIndex: slotIndex))
@@ -788,6 +912,32 @@ final class ChatViewModel: ObservableObject {
     /// The notch reports the connector fly-off finished; drop the token.
     func finishConnectorDeparture(_ id: UUID) {
         connectorDeparting.removeAll { $0.id == id }
+    }
+
+    // MARK: - Debug trace copy (option+click on the notch)
+
+    /// Transient "copied" checkmark in the left wing after option+click.
+    @Published var traceCopiedFlash = false
+    private var traceFlashTask: Task<Void, Never>?
+
+    /// Option+click anywhere on the notch/panel: copy the latest session +
+    /// debug trace to the clipboard and flash the left-wing checkmark.
+    func copyDebugTrace() {
+        traceFlashTask?.cancel()
+        traceFlashTask = Task {
+            let payload = await latestDebugClipboardPayload()
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(payload, forType: .string)
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.68)) {
+                traceCopiedFlash = true
+            }
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.3)) {
+                traceCopiedFlash = false
+            }
+        }
     }
     // Session ID persisted in UserDefaults so it survives app restarts
     private var sessionId: String? {
@@ -1068,6 +1218,10 @@ final class ChatViewModel: ObservableObject {
     func send() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !pendingAttachments.isEmpty else { return }
+        if text.lowercased() == "/settings" || text.lowercased() == "/nastavenia" {
+            openNotchSettings()
+            return
+        }
         guard !isThinking else { return }
         let sourceMode = selectedSourceMode
         let wasInputOnly = chatSurfaceMode == .inputOnly
@@ -1075,12 +1229,20 @@ final class ChatViewModel: ObservableObject {
             sessionId = nil
         }
         inputText = ""
+        historyBrowseIndex = nil
         pendingConnectorActions = []
         let model = selectedModel
         let sid = sessionId
         let attachments = pendingAttachments
         pendingAttachments = []
         let attachmentIds = attachments.map { $0.id }
+        // Sliding-window history so the model can resolve follow-ups.
+        // Daemon clamps again (10 turns / 8k chars) — these caps must match.
+        let history: [DaemonClient.HistoryTurn] = messages
+            .filter { !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .suffix(10)
+            .map { .init(role: $0.role == .user ? "user" : "assistant",
+                         content: String($0.content.prefix(1500))) }
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.attachments = attachments
         messages.append(userMsg)
@@ -1127,10 +1289,23 @@ final class ChatViewModel: ObservableObject {
                     }
                 }
 
-                let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds, screenContext: screenCtx, sourceMode: sourceMode)
+                let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds, screenContext: screenCtx, sourceMode: sourceMode, history: history)
                 var first = true
                 var didAutoOpen = false
+                // Tokens are coalesced to ~30 Hz: per-token @Published writes
+                // re-evaluate the whole notch view graph, which turns long
+                // streams O(n²) and makes rendering lag behind generation.
+                var pendingTokens = ""
+                var lastFlush = Date.distantPast
+                @MainActor func flushTokens() {
+                    guard !pendingTokens.isEmpty else { return }
+                    messages[idx].content += pendingTokens
+                    pendingTokens = ""
+                    streamingChunk += 1
+                    lastFlush = Date()
+                }
                 for try await event in stream {
+                    if case .token = event {} else { flushTokens() }
                     switch event {
                     case .debugTrace(let trace):
                         messages[idx].debugTraceId = trace.prompt_trace_id
@@ -1143,14 +1318,18 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].debugConversationRecallInjected = trace.conversation_recall_injected
                         if let sid = trace.session_id { sessionId = sid }
                     case .token(let t):
+                        let isFirst = first
                         if first {
                             onFirstAssistantToken?()
                             isThinking = false
                             first = false
                         }
-                        toolStatus = nil
-                        messages[idx].content += t
-                        streamingChunk += 1
+                        // toolStatus intentionally NOT cleared here — the action chip
+                        // stays visible while the answer streams; cleared on .done.
+                        pendingTokens += t
+                        if isFirst || Date().timeIntervalSince(lastFlush) >= 0.033 {
+                            flushTokens()
+                        }
                         // Auto-open Mail after the first sentence has appeared in the response.
                         if !didAutoOpen,
                            let ref = messages[idx].mailRef,
@@ -1191,6 +1370,7 @@ final class ChatViewModel: ObservableObject {
                         upsertConnectorAction(ConnectorAction(kind: .mail, payload: .mail(ref)))
                     case .fileFound(let ref):
                         messages[idx].fileRef = ref
+                        upsertConnectorAction(ConnectorAction(kind: .file, payload: .file(ref)))
                     case .odooFound(let ref):
                         messages[idx].odooRef = ref
                         upsertConnectorAction(ConnectorAction(kind: .odoo, payload: .odoo(ref)))
@@ -1226,6 +1406,7 @@ final class ChatViewModel: ObservableObject {
                         if wasVoiceTurn && voiceModeEnabled { onVoiceTurnComplete?() }
                     }
                 }
+                flushTokens()
                 if first {
                     isThinking = false
                     streamingAssistantMessageId = nil

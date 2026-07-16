@@ -52,10 +52,16 @@ final class NotchWindowController: NSObject {
     private var hasNotch = false
     private let usesNotchSurface = true
     private var localKeyMonitor: Any?
+    private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
     /// Monitors used for the inline voice surface (click-away + Escape).
     private var voiceMouseMonitor: Any?
     private var voiceKeyMonitor: Any?
+    /// Clipboard paste wheel (hold right ⌘).
+    private let clipboardHistory = ClipboardHistory()
+    private let pasteTap = PasteEventTap()
+    /// Click-away monitor active while the wheel is pinned (mouse mode).
+    private var wheelMouseMonitor: Any?
     /// Pending auto-dismiss of the transient cmux banner (5s after presenting).
     private var cmuxBannerDismissWork: DispatchWorkItem?
 
@@ -171,6 +177,103 @@ final class NotchWindowController: NSObject {
             }
 
         setupFullscreenMonitoring()
+        setupPasteWheel()
+    }
+
+    // MARK: - Clipboard paste wheel (hold right ⌘)
+
+    static let pasteWheelEnabledKey = "pasteWheelEnabled"
+    /// Default-on; SettingsView writes the same key.
+    private var pasteWheelEnabled: Bool {
+        UserDefaults.standard.object(forKey: Self.pasteWheelEnabledKey) == nil
+            || UserDefaults.standard.bool(forKey: Self.pasteWheelEnabledKey)
+    }
+
+    private func setupPasteWheel() {
+        clipboardHistory.start()
+
+        pasteTap.canOpenWheel = { [weak self] in
+            guard let self else { return false }
+            // Never intercept pastes into bagent's own windows (settings, chat).
+            let selfFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                == ProcessInfo.processInfo.processIdentifier
+            return self.pasteWheelEnabled
+                && !selfFrontmost
+                && self.chatViewModel.notchInteractionMode == .collapsed
+                && !self.isVoiceShowing
+                && !self.isExpanded
+                && !self.isInputShowing
+                && !self.notchHiddenForFullscreen
+                && !self.clipboardHistory.items.isEmpty
+        }
+        pasteTap.onWheelOpen = { [weak self] in self?.presentPasteWheel() }
+        pasteTap.onDigit = { [weak self] slot in self?.commitPasteWheel(slot: slot) }
+        pasteTap.onCommit = { [weak self] in self?.commitPasteWheel(slot: 0) }
+        pasteTap.onCancel = { [weak self] in self?.dismissPasteWheel() }
+
+        chatViewModel.onPasteWheelPinned = { [weak self] in self?.pinPasteWheel() }
+        chatViewModel.onPasteWheelChipClicked = { [weak self] slot in
+            self?.commitPasteWheel(slot: slot)
+        }
+        // A drag-out took the content with it — the OS drop is the delivery,
+        // no paste.
+        chatViewModel.onPasteWheelDragStarted = { [weak self] in self?.dismissPasteWheel() }
+
+        pasteTap.start()
+    }
+
+    func presentPasteWheel() {
+        guard !chatViewModel.pasteWheelActive else { return }
+        chatViewModel.pasteWheelItems = clipboardHistory.items
+        chatViewModel.pasteWheelFlashSlot = nil
+        chatViewModel.pasteWheelActive = true
+        // Panel must stay non-key: the paste target keeps focus the whole time.
+        showStatusPanel()
+    }
+
+    func dismissPasteWheel() {
+        pasteTap.reset()
+        if let m = wheelMouseMonitor { NSEvent.removeMonitor(m); wheelMouseMonitor = nil }
+        guard chatViewModel.pasteWheelActive else { return }
+        chatViewModel.pasteWheelActive = false
+        chatViewModel.pasteWheelFlashSlot = nil
+    }
+
+    /// Mouse entered the wheel — keyboard release no longer commits; click-away
+    /// dismisses (Escape is handled by the event tap).
+    private func pinPasteWheel() {
+        guard chatViewModel.pasteWheelActive else { return }
+        pasteTap.pin()
+        guard wheelMouseMonitor == nil else { return }
+        wheelMouseMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            let loc = NSEvent.mouseLocation
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if !self.statusPanel.frame.contains(loc) { self.dismissPasteWheel() }
+            }
+        }
+    }
+
+    /// Paste the item in `slot`: promote + write to pasteboard, then a
+    /// synthetic ⌘V to the frontmost app right away.
+    private func commitPasteWheel(slot: Int) {
+        guard chatViewModel.pasteWheelActive else { return }
+        guard chatViewModel.pasteWheelItems.indices.contains(slot) else {
+            dismissPasteWheel()
+            return
+        }
+        let item = chatViewModel.pasteWheelItems[slot]
+        chatViewModel.pasteWheelFlashSlot = slot
+        clipboardHistory.promote(item)
+        clipboardHistory.writeToPasteboard(item)
+        PasteEventTap.postSyntheticPaste()
+
+        // Chip flash reads for ~0.12s, then the wheel folds.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.dismissPasteWheel()
+        }
     }
 
     // MARK: - Geometry
@@ -574,6 +677,16 @@ final class NotchWindowController: NSObject {
             }
         }
 
+        // Option+click anywhere in the chat/status panels copies the debug trace.
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            guard let self,
+                  event.modifierFlags.contains(.option),
+                  event.window === self.chatPanel || event.window === self.statusPanel
+            else { return event }
+            self.chatViewModel.copyDebugTrace()
+            return nil
+        }
+
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
             if event.type == .flagsChanged {
@@ -583,7 +696,42 @@ final class NotchWindowController: NSObject {
                 }
                 return event
             }
-            if event.keyCode == 53 { self.collapse(); return nil }
+            if event.keyCode == 53 {
+                // Esc exits response-history browsing before collapsing the notch.
+                if self.chatViewModel.historyBrowseIndex != nil {
+                    self.chatViewModel.exitHistoryBrowse()
+                    return nil
+                }
+                self.collapse()
+                return nil
+            }
+            // ←/→ switch settings pages while the /settings surface is open.
+            if self.chatViewModel.notchInteractionMode == .settings {
+                if event.keyCode == 123 {
+                    self.chatViewModel.notchSettingsPage = self.chatViewModel.notchSettingsPage.previous
+                    return nil
+                }
+                if event.keyCode == 124 {
+                    self.chatViewModel.notchSettingsPage = self.chatViewModel.notchSettingsPage.next
+                    return nil
+                }
+            }
+            // ↑/↓ on empty notch input browse past assistant responses.
+            // Arrow keys always carry .function + .numericPad — ignore those.
+            if event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                .subtracting([.function, .numericPad]).isEmpty {
+                if event.keyCode == 126, self.chatViewModel.browseOlderResponse() { return nil }
+                if event.keyCode == 125, self.chatViewModel.browseNewerResponse() { return nil }
+            }
+            // Any printable key while browsing returns to the input and types it.
+            if self.chatViewModel.historyBrowseIndex != nil,
+               !event.modifierFlags.contains(.command),
+               let chars = event.characters,
+               chars.rangeOfCharacter(from: .alphanumerics.union(.punctuationCharacters).union(.symbols).union(.whitespaces)) != nil {
+                self.chatViewModel.exitHistoryBrowse()
+                self.chatViewModel.inputText += chars
+                return nil
+            }
             if let index = sourceModeCommandDigitIndex(for: event),
                self.selectVisibleSourceMode(at: index) {
                 return nil
@@ -636,6 +784,7 @@ final class NotchWindowController: NSObject {
         isInputShowing = false
         chatViewModel.chatSurfaceMode = .thinkingHidden
         if let m = localKeyMonitor { NSEvent.removeMonitor(m); localKeyMonitor = nil }
+        if let m = localMouseMonitor { NSEvent.removeMonitor(m); localMouseMonitor = nil }
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
         chatPanel.styleMask = [.borderless, .nonactivatingPanel]
 
@@ -660,6 +809,7 @@ final class NotchWindowController: NSObject {
         resetNotchHoverState()
 
         if let m = localKeyMonitor    { NSEvent.removeMonitor(m); localKeyMonitor    = nil }
+        if let m = localMouseMonitor  { NSEvent.removeMonitor(m); localMouseMonitor  = nil }
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
         chatPanel.styleMask = [.borderless, .nonactivatingPanel]
         statusPanel.styleMask = [.borderless, .nonactivatingPanel]
@@ -686,7 +836,7 @@ final class NotchWindowController: NSObject {
 
     private var statusPanelAllowedOverFullscreen: Bool {
         switch chatViewModel.notchInteractionMode {
-        case .input, .output:
+        case .input, .output, .settings:
             return true
         case .collapsed, .thinking:
             return false
@@ -749,6 +899,7 @@ final class NotchWindowController: NSObject {
 
         if shouldHide {
             if isVoiceShowing { dismissVoice() }
+            if chatViewModel.pasteWheelActive { dismissPasteWheel() }
             if chatViewModel.notchInteractionMode != .output,
                isExpanded || isInputShowing || isNotchInteractionShowing {
                 collapse()

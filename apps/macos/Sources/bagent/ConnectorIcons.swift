@@ -8,6 +8,7 @@ enum ConnectorKind: String, CaseIterable {
     case whatsapp
     case odoo
     case mail
+    case file
 }
 
 /// A pending, clickable connector result (found mail / odoo record / whatsapp
@@ -17,6 +18,7 @@ struct ConnectorAction: Identifiable, Equatable {
         case mail(DaemonClient.MailRef)
         case odoo(DaemonClient.OdooRef)
         case whatsapp(DaemonClient.WhatsappRef)
+        case file(DaemonClient.FileRef)
     }
 
     let id = UUID()
@@ -73,6 +75,11 @@ struct ConnectorIconView: View {
                     NotchIconSwing.animation(for: angle)
                 }
                 .onAppear { swingTrigger.toggle() }
+                // Keep ringing until handled — the timer dies with the view
+                // when the action is clicked or cleared.
+                .onReceive(Timer.publish(every: 4, on: .main, in: .common).autoconnect()) { _ in
+                    swingTrigger.toggle()
+                }
         }
     }
 
@@ -109,6 +116,10 @@ struct ConnectorIconView: View {
                 .font(.system(size: size * 0.72, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
                 .baselineOffset(size * 0.06)
+        case .file:
+            Image(systemName: "doc.fill")
+                .font(.system(size: size * 0.52, weight: .semibold))
+                .foregroundStyle(.white)
         }
     }
 
@@ -123,6 +134,9 @@ struct ConnectorIconView: View {
         case .odoo:
             return [Color(red: 0.53, green: 0.35, blue: 0.48),
                     Color(red: 0.44, green: 0.29, blue: 0.40)]
+        case .file:
+            return [Color(red: 0.56, green: 0.62, blue: 0.72),
+                    Color(red: 0.40, green: 0.46, blue: 0.58)]
         }
     }
 }
@@ -133,6 +147,7 @@ extension ConnectorKind {
         case .mail:     return "Otvoriť mail"
         case .odoo:     return "Otvoriť Odoo záznam"
         case .whatsapp: return "Otvoriť WhatsApp"
+        case .file:     return "Zobraziť súbor vo Finderi"
         }
     }
 }

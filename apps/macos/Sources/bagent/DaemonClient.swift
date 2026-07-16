@@ -400,13 +400,19 @@ struct DaemonClient: Sendable {
         }
     }
 
+    struct HistoryTurn: Encodable {
+        let role: String
+        let content: String
+    }
+
     func chatStream(
         text: String,
         sessionId: String?,
         model: String,
         attachmentIds: [String] = [],
         screenContext: ScreenContextFields? = nil,
-        sourceMode: SourceMode? = nil
+        sourceMode: SourceMode? = nil,
+        history: [HistoryTurn] = []
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -422,6 +428,8 @@ struct DaemonClient: Sendable {
                         let model: String
                         let session_id: String?
                         let attachment_ids: [String]
+                        // Sliding-window conversation history (oldest first)
+                        let history: [HistoryTurn]
                         // Screen context (Phase 7) — ephemeral, never persisted
                         let screen_image_b64: String?
                         let screen_ocr_text: String?
@@ -434,6 +442,7 @@ struct DaemonClient: Sendable {
                         model: model,
                         session_id: sessionId,
                         attachment_ids: attachmentIds,
+                        history: history,
                         screen_image_b64: screenContext?.imagePNGBase64,
                         screen_ocr_text: screenContext?.ocrText.isEmpty == false ? screenContext?.ocrText : nil,
                         active_app: screenContext?.activeApp,

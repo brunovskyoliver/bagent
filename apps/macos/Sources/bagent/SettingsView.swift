@@ -5,6 +5,7 @@ struct SettingsView: View {
     @ObservedObject var viewModel: ChatViewModel
     @ObservedObject private var permissions: PermissionsManager
     @ObservedObject private var speech: SpeechController
+    @AppStorage(NotchWindowController.pasteWheelEnabledKey) private var pasteWheelEnabled = true
 
     init(viewModel: ChatViewModel) {
         self.viewModel = viewModel
@@ -191,6 +192,29 @@ struct SettingsView: View {
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Divider().padding(.vertical, 2)
+
+                HStack(spacing: 8) {
+                    Image(systemName: pasteWheelEnabled ? "clipboard.fill" : "clipboard")
+                        .font(.system(size: 13))
+                        .foregroundStyle(pasteWheelEnabled && permissions.hasAccessibility
+                                         ? Color.accentColor : Color.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Koleso schránky")
+                            .font(.system(size: 12))
+                        Text(permissions.hasAccessibility
+                             ? "Podržanie pravého ⌘ otvorí 5 posledných položiek schránky v notchi."
+                             : "Vyžaduje Accessibility povolenie (vyššie).")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $pasteWheelEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .accessibilityLabel("Koleso schránky")
                 }
 
                 HStack(spacing: 8) {

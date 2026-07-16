@@ -114,12 +114,13 @@ tool definitions and decides what to call; there is no keyword routing or
 intent classifier:
 
 1. `PromptBuilder::build` assembles the system prompt (identity, style, glossary, skills, attachment/screen context, recent tool refs for follow-ups like "open it")
-2. Tool registry is built per turn from available connectors: `mail_search` / `mail_list_inbox` / `mail_read` / `mail_open`, `filesystem_*`, `notes_*`, `whatsapp_*`, `odoo_*`, `macos_*` (daemon `chat` handler)
+2. Tool registry is built per turn from available connectors: `mail_search` / `mail_list_inbox` / `mail_read` / `mail_open`, `filesystem_*`, `notes_*`, `whatsapp_*`, `odoo_*`, `macos_*`, plus always-on `web_search` / `web_fetch` (DuckDuckGo lite + Wikipedia REST, no API key; rules actions `web.search` / `web.fetch` default `auto`, private hosts blocked) (daemon `chat` handler)
 3. Loop (max 5 rounds, 8 tool calls/turn): `chat_stream_with_tools` streams deltas + tool calls → each call is gated in the dispatcher (rules engine `auto`/`ask`/`forbidden`, PathPolicy inside the fs connector, approval modal for writes, `audit_entries` row per call) → results fed back as `role:"tool"` messages → repeat until a round emits no tool calls (that round's stream is the final answer)
 4. Each tool call emits a `tool_call` SSE event (UI shows "🔎 Hľadám v pošte…"); `mail_found`/`file_opened`/`odoo_found` events keep the notch chips working
 5. `mail_search` normalizes sender args internally: an empty result with a `sender` retries with the sender tokenized into AND keywords (bridges "Tomas Juricek" ↔ `tomas.juricek@novem.sk`)
 6. Vision turns (image attachment / screen capture) skip tools — the vision model answers directly from injected context
 7. Model output is never trusted for authorization — the dispatcher enforces every gate; unknown tools and exhausted budgets return corrective tool results
+8. Follow-ups: the Swift client sends a sliding window of prior turns in `ChatRequest.history` (last 10 user/assistant turns, clamped server-side to 8k chars) which the handler splices before the current user turn; `PromptBuilder` itself stays stateless
 
 Tool dispatch helpers live at the bottom of `crates/daemon/src/main.rs` (`tool_mail_search`, `tool_odoo`, …); live regression tests in `crates/connectors/ollama/tests/tool_loop.rs`.
 
