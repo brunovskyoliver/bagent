@@ -92,6 +92,7 @@ enum NotchSettingsPage: Int, CaseIterable, Equatable {
     case permissions
     case model
     case connectors
+    case setup
 
     var title: String {
         switch self {
@@ -99,6 +100,7 @@ enum NotchSettingsPage: Int, CaseIterable, Equatable {
         case .permissions: return "Povolenia"
         case .model:       return "Model"
         case .connectors:  return "Konektory"
+        case .setup:       return "Nastavenie"
         }
     }
 
@@ -108,6 +110,7 @@ enum NotchSettingsPage: Int, CaseIterable, Equatable {
         case .permissions: return "lock.shield"
         case .model:       return "cpu"
         case .connectors:  return "puzzlepiece.extension"
+        case .setup:       return "slider.horizontal.3"
         }
     }
 
@@ -170,15 +173,6 @@ final class ChatViewModel: ObservableObject {
     @Published var hoveredSourceMode: SourceMode? = nil
     @Published var isSourcePickerForced = false
     @Published var hasNotch = false
-    @Published var showSettings = false
-    @Published var showMemory = false
-    @Published var showSkills = false
-    @Published var showDebug = false
-    @Published var debugConversationPayload: String? = nil
-    @Published var isLoadingDebug = false
-    @Published var memorySearchQuery: String = ""
-    @Published var filteredMemoryItems: [MemoryItem] = []
-    @Published var memoryKindFilter: String = ""  // "" = all kinds
     @Published var availableModels: [String] = ["qwen2.5:7b"]
     @Published var visionModelAvailable: Bool = false
     /// Set true when an image is attached and the vision model isn't available —
@@ -188,18 +182,11 @@ final class ChatViewModel: ObservableObject {
     @Published var isSyncing = false
     @Published var lastSyncResult: String? = nil
     @Published var streamingChunk: Int = 0
-    @Published var memoryItems: [MemoryItem] = []
-    @Published var isLoadingMemory = false
-    @Published var skills: [SkillItem] = []
-    @Published var isLoadingSkills = false
     @Published var pendingApprovals: [ApprovalItem] = []
     /// Files queued to send with the next message.
     @Published var pendingAttachments: [ChatAttachment] = []
     /// True while uploading a file to the daemon.
     @Published var isUploadingAttachment = false
-    @Published var usageStats: DaemonClient.UsageStats? = nil
-    @Published var isLoadingUsage = false
-    @Published var isClearingCache = false
     @Published var streamingAssistantMessageId: UUID? = nil
 
     /// Set to true by NotchWindowController before expanding so the pill
@@ -493,10 +480,6 @@ final class ChatViewModel: ObservableObject {
         whatsappQrString = nil
         whatsappDebugPayload = nil
         withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
-            showMemory = false
-            showSkills = false
-            showDebug = false
-            showSettings = false
             showWhatsappPairing = true
         }
         Task {
@@ -645,26 +628,6 @@ final class ChatViewModel: ObservableObject {
         isLoadingWhatsappDebug = false
     }
 
-    /// Preferred microphone name. Empty string = "System default" (no swap).
-    /// Persisted across launches; pushed to `speech.preferredInputName` on change and at init.
-    @Published var selectedMicrophone: String = UserDefaults.standard.string(forKey: "bagent.microphone") ?? "" {
-        didSet {
-            UserDefaults.standard.set(selectedMicrophone, forKey: "bagent.microphone")
-            speech.preferredInputName = selectedMicrophone.isEmpty ? nil : selectedMicrophone
-        }
-    }
-
-    @Published var chatWindowW: CGFloat = ChatViewModel.savedSize("bagent.chat.w", 400) {
-        didSet { UserDefaults.standard.set(Double(chatWindowW), forKey: "bagent.chat.w") }
-    }
-    @Published var chatWindowH: CGFloat = ChatViewModel.savedSize("bagent.chat.h", 520) {
-        didSet { UserDefaults.standard.set(Double(chatWindowH), forKey: "bagent.chat.h") }
-    }
-
-    private static func savedSize(_ key: String, _ fallback: CGFloat) -> CGFloat {
-        let v = UserDefaults.standard.double(forKey: key)
-        return CGFloat(v > 0 ? v : Double(fallback))
-    }
 
     var topSourceModes: [SourceMode] {
         SourceMode.allCases.sorted { lhs, rhs in
@@ -706,42 +669,10 @@ final class ChatViewModel: ObservableObject {
     private let client = DaemonClient()
     let permissions = PermissionsManager()
 
-    // MARK: - Voice input
-    @Published var voiceModeEnabled: Bool = UserDefaults.standard.object(forKey: "bagent.voiceMode.enabled") as? Bool ?? true {
-        didSet {
-            UserDefaults.standard.set(voiceModeEnabled, forKey: "bagent.voiceMode.enabled")
-            if !voiceModeEnabled {
-                speech.cancel()
-                isVoiceRecording = false
-                isVoiceNotchActive = false
-                voiceTurnActive = false
-                speechCancellables.removeAll()
-                onVoiceModeDisabled?()
-            }
-        }
-    }
-    /// On-device Whisper STT. Shared by the inline mic button and the voice overlay.
-    let speech = SpeechController()
-    /// True while the inline (chat-input) mic is recording into `inputText`.
-    @Published var isVoiceRecording = false
-    private var speechCancellables: Set<AnyCancellable> = []
-    /// Set by the voice overlay handoff: marks the next turn as voice-initiated so
-    /// the hands-free loop re-opens voice mode once the assistant replies.
-    var voiceTurnActive = false
-    /// Invoked after a voice-initiated turn finishes streaming (re-presents voice).
-    var onVoiceTurnComplete: (() -> Void)?
-    /// Invoked when Settings disables voice while an overlay/session may be active.
-    var onVoiceModeDisabled: (() -> Void)?
     /// Invoked after an input-only turn is submitted so AppKit can collapse the panel.
     var onInputOnlySubmitted: (() -> Void)?
     /// Invoked when the first assistant token arrives so AppKit can reveal output.
     var onFirstAssistantToken: (() -> Void)?
-    /// Drives notch expansion into voice mode (no separate panel).
-    @Published var isVoiceNotchActive: Bool = false
-    /// Brief confirmation message shown in the notch after a silent background action.
-    @Published var voiceActionMessage: String? = nil
-    /// Called when the daemon executed a background action instead of streaming LLM.
-    var onVoiceActionTaken: ((String) -> Void)?
 
     // MARK: - cmux notifications
 
@@ -950,12 +881,6 @@ final class ChatViewModel: ObservableObject {
     // MARK: - Init
 
     init() {
-        // Push the persisted mic preference into the speech controller so it is
-        // available the first time a voice session starts (didSet doesn't fire for
-        // inline stored-property initializers).
-        let savedMic = UserDefaults.standard.string(forKey: "bagent.microphone") ?? ""
-        speech.preferredInputName = savedMic.isEmpty ? nil : savedMic
-
         startHealthMonitor()
         startCmuxMonitor()
         Task { await refreshHealth() }
@@ -968,8 +893,6 @@ final class ChatViewModel: ObservableObject {
         inputText = ""
         isThinking = false
         streamingAssistantMessageId = nil
-        showSettings = false
-        showDebug = false
         pendingAttachments = []
         pendingConnectorActions = []
         selectedSourceMode = nil
@@ -998,23 +921,6 @@ final class ChatViewModel: ObservableObject {
                 })
             }
         } catch {}
-    }
-
-    func loadUsage() async {
-        isLoadingUsage = true
-        do {
-            usageStats = try await client.usage()
-        } catch {}
-        isLoadingUsage = false
-    }
-
-    func clearMailCache() async {
-        isClearingCache = true
-        do {
-            try await client.clearMailCache()
-            await loadUsage()
-        } catch {}
-        isClearingCache = false
     }
 
     func syncMail() async {
@@ -1062,89 +968,6 @@ final class ChatViewModel: ObservableObject {
                 try? await Task.sleep(for: .seconds(3))
             }
         }
-    }
-
-    func loadMemoryItems() async {
-        isLoadingMemory = true
-        do {
-            memoryItems = try await client.memoryItems()
-            applyMemoryFilter()
-        } catch {}
-        isLoadingMemory = false
-    }
-
-    func deleteMemoryItem(id: String) async {
-        do {
-            try await client.memoryDelete(id: id)
-            memoryItems.removeAll { $0.id == id }
-            filteredMemoryItems.removeAll { $0.id == id }
-        } catch {}
-    }
-
-    func searchMemory(query: String) async {
-        isLoadingMemory = true
-        do {
-            if query.trimmingCharacters(in: .whitespaces).isEmpty {
-                memoryItems = try await client.memoryItems()
-                applyMemoryFilter()
-            } else {
-                let hits = try await client.memorySearch(query: query,
-                                                         namespace: memoryKindFilter.isEmpty ? nil : memoryKindFilter)
-                // MemoryHit is flat (id, namespace, kind, text, score) — map to MemoryItem shape
-                filteredMemoryItems = hits.map { h in
-                    MemoryItem(id: h.id, namespace: h.namespace, kind: h.kind,
-                               language: "und", text: h.text, source_ref: nil, created_at: "", use_count: 0,
-                               status: nil, source: nil, confidence: nil, importance: nil, sensitivity: nil)
-                }
-            }
-        } catch {}
-        isLoadingMemory = false
-    }
-
-    func applyMemoryFilter() {
-        if memoryKindFilter.isEmpty {
-            filteredMemoryItems = memoryItems
-        } else {
-            filteredMemoryItems = memoryItems.filter { $0.kind == memoryKindFilter }
-        }
-    }
-
-    func loadSkills() async {
-        isLoadingSkills = true
-        do {
-            skills = try await client.skills()
-        } catch {}
-        isLoadingSkills = false
-    }
-
-    func toggleMemoryPanel() {
-        showMemory = false
-    }
-
-    func toggleSkillsPanel() {
-        showSkills = false
-    }
-
-    func toggleSettingsPanel() {
-        showSettings = false
-    }
-
-    func toggleDebugPanel() {
-        showDebug = false
-    }
-
-    func loadDebugConversation() async {
-        guard let sessionId else {
-            debugConversationPayload = "No conversation id yet."
-            return
-        }
-        isLoadingDebug = true
-        do {
-            debugConversationPayload = try await client.debugConversation(id: sessionId)
-        } catch {
-            debugConversationPayload = "Chyba: \(error.localizedDescription)"
-        }
-        isLoadingDebug = false
     }
 
     func loadDebugTrace(for messageId: UUID) async {
@@ -1213,6 +1036,7 @@ final class ChatViewModel: ObservableObject {
         conversation_debug:
         \(conversationPayload)
         """
+
     }
 
     func send() {
@@ -1253,10 +1077,6 @@ final class ChatViewModel: ObservableObject {
         if wasInputOnly {
             onInputOnlySubmitted?()
         }
-
-        // Only the turn immediately following a voice handoff loops back to voice.
-        let wasVoiceTurn = voiceTurnActive
-        voiceTurnActive = false
 
         Task {
             let assistantMsg = ChatMessage(role: .assistant, content: "")
@@ -1383,11 +1203,9 @@ final class ChatViewModel: ObservableObject {
                         isThinking = false
                         streamingAssistantMessageId = nil
                         messages[idx].content = message
-                        voiceActionMessage = message
                         if notchInteractionMode == .thinking {
                             notchInteractionMode = .output
                         }
-                        onVoiceActionTaken?(message)
                     case .taskRating(let level, let score, let reasons, let privacyRisk):
                         messages[idx].taskRating = (level: level, score: score, reasons: reasons, privacyRisk: privacyRisk)
                     case .done(let returnedSessionId):
@@ -1402,8 +1220,6 @@ final class ChatViewModel: ObservableObject {
                             chatSurfaceMode = .collapsed
                         }
                         Task { await loadDebugTrace(for: messages[idx].id) }
-                        // Hands-free loop: re-open voice mode after a voice-initiated reply.
-                        if wasVoiceTurn && voiceModeEnabled { onVoiceTurnComplete?() }
                     }
                 }
                 flushTokens()
@@ -1431,80 +1247,6 @@ final class ChatViewModel: ObservableObject {
             }
         }
     }
-
-    // MARK: - Voice input
-
-    /// Estimates how long the user needs to read the last assistant response
-    /// before voice re-entry. Based on ≈150 WPM, clamped 1.5–7 s.
-    func voiceTurnResumeDelay() -> TimeInterval {
-        let text = messages.last(where: { $0.role == .assistant })?.content ?? ""
-        let wordCount = text.split(separator: " ").count
-        let reading = Double(wordCount) / 150.0 * 60.0
-        return max(1.5, min(7.0, reading))
-    }
-
-    /// Feed a finalized voice transcript through the normal chat pipeline.
-    func submitTranscript(_ text: String) {
-        guard voiceModeEnabled else { return }
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return }
-        inputText = t
-        send()
-    }
-
-    /// Inline mic: toggle recording into the text field (does not open the overlay).
-    func toggleInlineVoice() {
-        guard voiceModeEnabled else { return }
-        if speech.isRunning {
-            speech.finalize()
-        } else {
-            startInlineVoice()
-        }
-    }
-
-    private func startInlineVoice() {
-        guard voiceModeEnabled else { return }
-        speechCancellables.removeAll()
-        isVoiceRecording = true
-
-        // Final transcript lands in the field, editable like typed text.
-        speech.onFinalTranscript = { [weak self] text in
-            guard let self else { return }
-            self.inputText = text
-            self.isVoiceRecording = false
-        }
-
-        // Live-fill the field with the running transcript.
-        speech.$partialText
-            .receive(on: RunLoop.main)
-            .sink { [weak self] text in
-                guard let self, self.isVoiceRecording, !text.isEmpty else { return }
-                self.inputText = text
-            }
-            .store(in: &speechCancellables)
-
-        // Clear the recording flag when the session ends or errors.
-        speech.$state
-            .receive(on: RunLoop.main)
-            .sink { [weak self] st in
-                guard let self else { return }
-                switch st {
-                case .done, .idle, .error: self.isVoiceRecording = false
-                default: break
-                }
-            }
-            .store(in: &speechCancellables)
-
-        Task { await speech.startSession(mode: .inline) }
-    }
-
-    func cancelInlineVoice() {
-        speech.cancel()
-        isVoiceRecording = false
-        speechCancellables.removeAll()
-    }
-
-    // MARK: - Approvals
 
     func startApprovalPolling() {
         approvalPollTask?.cancel()

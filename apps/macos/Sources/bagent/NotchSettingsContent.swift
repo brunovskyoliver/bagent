@@ -88,19 +88,230 @@ struct NotchSettingsContent: View {
         case .permissions: permissionsPage
         case .model:       modelPage
         case .connectors:  connectorsPage
+        case .setup:       setupPage
         }
+    }
+
+    // Setup is the only page that scrolls — credentials + rules don't fit the notch.
+    private var setupPage: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                odooGroup
+                codexGroup
+                whatsappGroup
+                rulesGroup
+            }
+            .padding(.trailing, 4)
+            .padding(.bottom, 8)
+        }
+        .scrollIndicators(.never)
+        .task { await loadRules() }
+    }
+
+    private var odooGroup: some View {
+        settingsGroup("Odoo") {
+            field("URL", text: $viewModel.odooURL, placeholder: "https://firma.odoo.com")
+            field("Databáza", text: $viewModel.odooDB, placeholder: "firma")
+            field("Používateľ", text: $viewModel.odooUser, placeholder: "user@example.com")
+            field("API kľúč", text: $viewModel.odooAPIKey, placeholder: "z Odoo → API Keys", secure: true)
+            field("uvx cesta", text: $viewModel.odooUvxPath, placeholder: "voliteľné")
+            actionRow(
+                busy: viewModel.isTestingOdoo,
+                busyLabel: "Testujem… (prvé spustenie môže trvať minútu)",
+                result: viewModel.odooTestResult,
+                button: "Testovať",
+                disabled: viewModel.odooURL.isEmpty || viewModel.odooDB.isEmpty
+                    || viewModel.odooAPIKey.isEmpty,
+                action: { viewModel.configureOdoo() }
+            )
+            note("API kľúč sa nikdy nezapíše na disk — iba Keychain a env MCP child procesu.")
+        }
+    }
+
+    private var codexGroup: some View {
+        settingsGroup("Codex") {
+            field("Binárka", text: $viewModel.codexBinaryPath, placeholder: "automaticky z $PATH")
+            actionRow(
+                busy: viewModel.isTestingCodex,
+                busyLabel: "Testujem…",
+                result: viewModel.codexTestResult,
+                button: "Testovať",
+                disabled: false,
+                action: { viewModel.testCodex() }
+            )
+        }
+    }
+
+    private var whatsappGroup: some View {
+        settingsGroup("WhatsApp") {
+            let status = viewModel.whatsappStatus?.status ?? "stopped"
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(status == "ready" ? Color.white.opacity(0.85) : Color.white.opacity(0.25))
+                    .frame(width: 7, height: 7)
+                Text(viewModel.whatsappStatus?.me_name ?? status)
+                    .font(.system(size: 12))
+                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                Spacer()
+                if viewModel.isConnectingWhatsapp {
+                    Text("Spúšťam…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                } else if status == "ready" || status == "authenticated" {
+                    notchButton("Odpojiť") { viewModel.disconnectWhatsapp() }
+                } else {
+                    notchButton("Pripojiť") { viewModel.connectWhatsapp() }
+                }
+            }
+            if viewModel.whatsappStatus?.needs_qr == true {
+                notchButton("Zobraziť QR") {
+                    viewModel.showWhatsappPairing = true
+                    viewModel.refreshWhatsappQr()
+                }
+            }
+            if let msg = viewModel.whatsappStatusMessage {
+                note(msg)
+            }
+            note("Neoficiálny WhatsApp Web bridge. Odoslanie správy vždy vyžaduje schválenie.")
+        }
+    }
+
+    private var rulesGroup: some View {
+        settingsGroup("Pravidlá (rules.yaml)") {
+            TextEditor(text: $rulesYaml)
+                .font(.system(size: 11, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .background(Color.white.opacity(0.06))
+                .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                .frame(height: 140)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .disabled(isLoadingRules)
+            HStack(spacing: 8) {
+                if let err = rulesError {
+                    Text(err)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.red.opacity(0.9))
+                        .lineLimit(2)
+                } else if rulesSaved {
+                    Text("Uložené")
+                        .font(.system(size: 11))
+                        .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                }
+                Spacer()
+                notchButton("Uložiť") { Task { await saveRules() } }
+                    .disabled(isLoadingRules || rulesYaml.isEmpty)
+            }
+        }
+    }
+
+    // MARK: - Rules state
+
+    @State private var rulesYaml: String = ""
+    @State private var rulesError: String?
+    @State private var rulesSaved = false
+    @State private var isLoadingRules = false
+
+    private func loadRules() async {
+        guard rulesYaml.isEmpty else { return }
+        isLoadingRules = true
+        if let yaml = try? await DaemonClient().rulesYaml() { rulesYaml = yaml }
+        isLoadingRules = false
+    }
+
+    private func saveRules() async {
+        rulesError = nil
+        rulesSaved = false
+        do {
+            try await DaemonClient().saveRules(yaml: rulesYaml)
+            rulesSaved = true
+            try? await Task.sleep(for: .seconds(3))
+            rulesSaved = false
+        } catch DaemonError.serverError(let msg) {
+            rulesError = msg
+        } catch {
+            rulesError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Setup row builders
+
+    private func settingsGroup<C: View>(_ title: String,
+                                        @ViewBuilder content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            content()
+        }
+    }
+
+    private func field(_ label: String, text: Binding<String>,
+                       placeholder: String, secure: Bool = false) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                .frame(width: 78, alignment: .leading)
+            Group {
+                if secure {
+                    SecureField(placeholder, text: text)
+                } else {
+                    TextField(placeholder, text: text)
+                }
+            }
+            .textFieldStyle(.plain)
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(Color.white.opacity(0.06),
+                        in: RoundedRectangle(cornerRadius: 5))
+        }
+    }
+
+    @ViewBuilder
+    private func actionRow(busy: Bool, busyLabel: String, result: String?,
+                           button: String, disabled: Bool,
+                           action: @escaping () -> Void) -> some View {
+        HStack(spacing: 8) {
+            if busy {
+                Text(busyLabel)
+                    .font(.system(size: 11))
+                    .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+            } else if let result {
+                Text(result)
+                    .font(.system(size: 11))
+                    .foregroundStyle(result.hasPrefix("✓")
+                        ? NotchWrapMetrics.notchTextSecondary
+                        : Color.red.opacity(0.9))
+                    .lineLimit(2)
+            }
+            Spacer()
+            notchButton(button, action: action)
+                .disabled(busy || disabled)
+        }
+    }
+
+    private func notchButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.plain)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(Color.white.opacity(0.9))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(Color.white.opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: 5))
+    }
+
+    private func note(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10))
+            .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var generalPage: some View {
         VStack(alignment: .leading, spacing: 15) {
-            toggleRow(
-                icon: "waveform.circle",
-                title: "Hlasový režim",
-                subtitle: viewModel.voiceModeEnabled
-                    ? "⌥Space otvorí hlasový vstup"
-                    : "⌥Space otvorí textový chat",
-                isOn: $viewModel.voiceModeEnabled
-            )
             toggleRow(
                 icon: "clipboard",
                 title: "Koleso schránky",
@@ -122,12 +333,6 @@ struct NotchSettingsContent: View {
         VStack(alignment: .leading, spacing: 14) {
             permissionRow("Full Disk Access", granted: permissions.hasFullDiskAccess) {
                 permissions.openPrivacySettings()
-            }
-            permissionRow("Mikrofón", granted: permissions.hasMicrophoneAccess) {
-                Task {
-                    await permissions.requestMicrophoneAccess()
-                    if !permissions.hasMicrophoneAccess { permissions.openMicrophoneSettings() }
-                }
             }
             permissionRow("Snímanie obrazovky", granted: permissions.hasScreenRecording) {
                 permissions.requestScreenRecording()

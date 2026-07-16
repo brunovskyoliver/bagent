@@ -133,14 +133,18 @@ Replace HTTP with a UDS at `~/Library/Application Support/bagent/daemon.sock`. S
 
 ---
 
-## Model Router
+## Model selection
 
-See [`MODEL_ROUTER.md`](MODEL_ROUTER.md) for full routing table and prompt templates.
+There is no routing pipeline — it was replaced by an agentic tool-calling loop
+(the model sees native tool definitions and decides what to call). `MODEL_ROUTER.md`
+described the old design and has been removed.
 
-Summary:
-- Local Ollama → classification, summarization, embeddings, Slovak text, single-source tasks.
-- Codex CLI → advanced cross-source business/admin reasoning (Phase 8, approval-gated).
-- Cloud LLM → complex reasoning, user opt-in, privacy-filtered.
+- Local Ollama (`qwen3:8b`) → chat + tool calls; `qwen3:0.6b` → classifiers; `bge-m3` → embeddings.
+- Vision (`qwen2.5vl:7b`) → image/screen turns; these skip tools.
+- Codex CLI → advanced cross-source tasks, approval-gated.
+- Cloud LLM → opt-in only.
+
+See the "Agentic tool loop" section of `CLAUDE.md` for the loop itself.
 
 ---
 

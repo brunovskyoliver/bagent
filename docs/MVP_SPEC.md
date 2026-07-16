@@ -150,7 +150,7 @@ POST /connectors/apple_mail/sync
 2. Daemon detects language `sk`.
 3. `mail_list_inbox(unread_only: true, limit: 10)` called (auto — read-only).
 4. For each message: `mail_get_message(id)` called (auto).
-5. Prompt assembled with Slovak summarization template (see MODEL_ROUTER.md).
+5. Prompt assembled with Slovak summarization template.
 6. Ollama `qwen2.5:7b` generates streaming summary.
 7. Response streamed to UI.
 8. Audit entry: action=`model_invoke`, model=`qwen2.5:7b`, language=`sk`, connector=`apple_mail`.

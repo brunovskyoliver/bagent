@@ -43,7 +43,7 @@ swift build
 make clean
 ```
 
-**Note:** `swift run` lacks Info.plist → microphone and screen-recording permissions are denied. Voice and screen-context features **must** be tested via `make bundle && open bagent.app`.
+**Note:** `swift run` lacks Info.plist → screen-recording permissions are denied. Screen-context features **must** be tested via `make bundle && open bagent.app`.
 
 ### WhatsApp bridge (one-time setup)
 
@@ -97,15 +97,18 @@ Ollama  ·  Connectors  ·  SQLite (refinery migrations)
 
 ### Swift app structure
 
+**The notch is the only UI** — one `NSPanel`, no chat window, no settings window,
+no menu-bar item. Read `docs/UI_DESIGN.md` before any UI change.
+
 | File | Role |
 |---|---|
-| `AppDelegate.swift` | App lifecycle; `⌥Space` hotkey double-press logic |
-| `NotchWindowController.swift` | `NSPanel` geometry (notch-wrap + non-notch), 3-phase expand animation |
-| `ChatViewModel.swift` | `@MainActor ObservableObject`; all daemon calls; session/attachment/voice/screen state |
+| `AppDelegate.swift` | App lifecycle; `⌥Space` toggles the notch input |
+| `NotchWindowController.swift` | The single `BagentPanel`: geometry, monitors, present/collapse, paste wheel |
+| `ChatView.swift` | `NotchWrapView` + `InlineNotchContent` — every notch state renders here |
+| `NotchSettingsContent.swift` | Settings pages (general / permissions / model / connectors / setup) |
+| `ChatViewModel.swift` | `@MainActor ObservableObject`; all daemon calls; session/attachment/screen state; `notchInteractionMode` |
 | `DaemonClient.swift` | HTTP + SSE client; all REST/SSE types |
-| `SpeechController.swift` | WhisperKit `AudioStreamTranscriber`; state machine `idle→loadingModel→listening→finalizing→done` |
 | `ScreenContextProvider.swift` | ScreenCaptureKit capture → Vision OCR → base64 for `/chat` |
-| `SettingsView.swift` | All settings: model picker, connectors, permissions, rules, memory, skills, debug |
 
 ### Agentic tool loop
 

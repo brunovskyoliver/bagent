@@ -16,7 +16,7 @@ endif
 .PHONY: run build daemon bundle clean whatsapp-bridge-install
 
 # Dev run: builds daemon first, then the Swift app. The Info.plist is embedded in
-# the binary (see Package.swift) so microphone/TCC works without bundling. Ad-hoc
+# the binary (see Package.swift) so screen-capture TCC works without bundling. Ad-hoc
 # sign with a stable identifier so the mic grant is attributed consistently.
 run: daemon-dev
 	swift build
@@ -79,7 +79,6 @@ bundle: build daemon
   <key>NSPrincipalClass</key>    <string>NSApplication</string>\n\
   <key>LSUIElement</key>         <true/>\n\
   <key>NSHighResolutionCapable</key> <true/>\n\
-  <key>NSMicrophoneUsageDescription</key> <string>bagent uses the microphone to transcribe your voice on-device with Whisper. Audio never leaves your Mac.</string>\n\
   <key>NSScreenCaptureUsageDescription</key> <string>bagent captures your screen on demand to answer questions about what is displayed. Screenshots are processed in memory and never saved to disk.</string>\n\
 </dict></plist>\n' > "$(BUNDLE)/Contents/Info.plist"
 	codesign --force --sign $(SIGN_ID) "$(BUNDLE)"

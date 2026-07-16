@@ -1,6 +1,5 @@
 import AppKit
 import ApplicationServices
-import AVFoundation
 import CoreGraphics
 import SwiftUI
 
@@ -8,7 +7,6 @@ import SwiftUI
 final class PermissionsManager: ObservableObject {
 
     @Published private(set) var hasFullDiskAccess: Bool = false
-    @Published private(set) var hasMicrophoneAccess: Bool = false
     @Published private(set) var hasScreenRecording: Bool = false
     @Published private(set) var hasAccessibility: Bool = false
 
@@ -22,7 +20,6 @@ final class PermissionsManager: ObservableObject {
         hasFullDiskAccess = FileManager.default.isReadableFile(
             atPath: Self.mailProbe.path
         )
-        hasMicrophoneAccess = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         // CGPreflightScreenCaptureAccess probes TCC without prompting the user
         hasScreenRecording = CGPreflightScreenCaptureAccess()
         hasAccessibility   = AXIsProcessTrusted()
@@ -30,19 +27,6 @@ final class PermissionsManager: ObservableObject {
 
     func openPrivacySettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
-        NSWorkspace.shared.open(url)
-    }
-
-    /// Request microphone access (no-op prompt if already determined), then refresh.
-    func requestMicrophoneAccess() async {
-        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
-            _ = await AVCaptureDevice.requestAccess(for: .audio)
-        }
-        refresh()
-    }
-
-    func openMicrophoneSettings() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!
         NSWorkspace.shared.open(url)
     }
 

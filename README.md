@@ -79,11 +79,11 @@ bagent/
 
 ## Status
 
-**Planning phase.** No buildable code yet.
+Working. The UI is the notch surface only — see [`docs/UI_DESIGN.md`](docs/UI_DESIGN.md)
+before touching anything visual. Chat runs through an agentic tool-calling loop
+(no routing pipeline).
 
-Current activity: architecture docs + roadmap. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
-
-Next step: Phase 0 research spikes (notch geometry, Ollama Slovak benchmark, Mail DB schema).
+Build: `cargo build --workspace`, then `make bundle && open bagent.app` from `apps/macos/`.
 
 ---
 
@@ -92,11 +92,11 @@ Next step: Phase 0 research spikes (notch geometry, Ollama Slovak benchmark, Mai
 | Doc | Contents |
 |---|---|
 | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Full system design, IPC, tool layer, packaging |
-| [`ROADMAP.md`](docs/ROADMAP.md) | Phased plan (Phase 0–10) with acceptance criteria |
-| [`MVP_SPEC.md`](docs/MVP_SPEC.md) | First release scope, UI wireframes, SK fixtures |
+| [`UI_DESIGN.md`](docs/UI_DESIGN.md) | **The notch surface** — states, metrics, animation, what not to add |
+| [`ROADMAP.md`](docs/ROADMAP.md) | Phased plan (historical; phases 0–10) |
+| [`MVP_SPEC.md`](docs/MVP_SPEC.md) | First release scope (historical) |
 | [`RULES.md`](docs/RULES.md) | What the agent may do auto, ask, or is forbidden |
 | [`CONNECTORS.md`](docs/CONNECTORS.md) | Per-connector specs (Mail, Notes, Odoo, Ollama, …) |
-| [`MODEL_ROUTER.md`](docs/MODEL_ROUTER.md) | Routing strategy, prompt templates, SK handling |
 | [`DATA_MODEL.md`](docs/DATA_MODEL.md) | SQLite schema (DDL), FTS5, embeddings, audit |
 | [`SECURITY.md`](docs/SECURITY.md) | Threat model, mitigations, OWASP LLM Top 10 |
 | [`TODO.md`](TODO.md) | Prioritized task list |
