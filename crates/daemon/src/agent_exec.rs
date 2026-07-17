@@ -34,9 +34,10 @@ pub(crate) enum ExecOrigin {
     /// Interactive chat with the user watching the stream.
     Chat,
     /// Unattended scheduled/run-now automation.
-    #[allow(dead_code)] // constructed by the automations scheduler
     Automation {
+        automation_id: String,
         automation_name: String,
+        run_id: String,
     },
 }
 
@@ -49,9 +50,26 @@ impl ExecOrigin {
     fn describe(&self, description: &str) -> String {
         match self {
             ExecOrigin::Chat => description.to_string(),
-            ExecOrigin::Automation { automation_name } => {
+            ExecOrigin::Automation { automation_name, .. } => {
                 format!("Automatizácia „{automation_name}“: {description}")
             }
+        }
+    }
+
+    /// Structured provenance stored on each pending approval this execution
+    /// creates. `None` for interactive chat.
+    pub(crate) fn provenance_json(&self) -> Option<String> {
+        match self {
+            ExecOrigin::Chat => None,
+            ExecOrigin::Automation { automation_id, automation_name, run_id } => Some(
+                json!({
+                    "kind": "automation",
+                    "automation_id": automation_id,
+                    "automation_name": automation_name,
+                    "run_id": run_id,
+                })
+                .to_string(),
+            ),
         }
     }
 }
@@ -590,6 +608,7 @@ pub(crate) async fn run_agent_loop(
                                             db,
                                             pending_approvals,
                                             sink,
+                                            origin,
                                             "mail_inbox",
                                             &origin.describe("Čítanie poštovej schránky (Apple Mail)"),
                                         )
@@ -669,6 +688,7 @@ pub(crate) async fn run_agent_loop(
                                 db,
                                 pending_approvals,
                                 sink,
+                                origin,
                                 "whatsapp.send_message",
                                 &origin.describe(&format!("WhatsApp → {chat_id}: {text}")),
                             )
@@ -729,6 +749,7 @@ pub(crate) async fn run_agent_loop(
                                     db,
                                     pending_approvals,
                                     sink,
+                                    origin,
                                     "macos.switch_workspace",
                                     &origin.describe(&format!(
                                         "Prepnúť workspace: {}",
@@ -878,6 +899,7 @@ pub(crate) async fn run_agent_loop(
                                     db,
                                     pending_approvals,
                                     sink,
+                                    origin,
                                     rule_name,
                                     &origin.describe(&format!(
                                         "Open: {}",
@@ -1011,6 +1033,7 @@ pub(crate) async fn run_agent_loop(
                                             db,
                                             pending_approvals,
                                             sink,
+                                            origin,
                                             rule_name,
                                             &origin.describe(&format!(
                                                 "Web: {}",

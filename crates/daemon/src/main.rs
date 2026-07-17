@@ -726,6 +726,7 @@ async fn main() -> Result<()> {
         )
         .route("/automations/:id/enable", post(automations_api::automation_enable))
         .route("/automations/:id/disable", post(automations_api::automation_disable))
+        .route("/automations/:id/run-now", post(automations_api::automation_run_now))
         .route("/automations/:id/runs", get(automations_api::automation_runs))
         // Phase 4B — Sessions
         .route("/sessions", post(session_create).get(sessions_list))
@@ -1764,7 +1765,7 @@ async fn approvals_pending(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.lock().await;
     let items: Vec<serde_json::Value> = db
         .prepare(
-            "SELECT id, tool_name, description, expires_at, created_at \
+            "SELECT id, tool_name, description, expires_at, created_at, origin_json \
              FROM pending_approvals \
              WHERE decision IS NULL AND expires_at > datetime('now') \
              ORDER BY created_at",
@@ -1772,12 +1773,15 @@ async fn approvals_pending(State(state): State<AppState>) -> impl IntoResponse {
         .ok()
         .and_then(|mut s| {
             s.query_map([], |row| {
+                let origin: Option<String> = row.get(5)?;
                 Ok(serde_json::json!({
                     "id":          row.get::<_, String>(0)?,
                     "tool_name":   row.get::<_, String>(1)?,
                     "description": row.get::<_, Option<String>>(2)?,
                     "expires_at":  row.get::<_, String>(3)?,
                     "created_at":  row.get::<_, String>(4)?,
+                    "origin":      origin
+                        .and_then(|o| serde_json::from_str::<serde_json::Value>(&o).ok()),
                 }))
             })
             .ok()
@@ -2942,6 +2946,7 @@ async fn request_approval_core(
     tool_name: &str,
     description: &str,
     sink: Option<&agent_exec::EventSink>,
+    origin_json: Option<String>,
 ) -> bool {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -2949,9 +2954,9 @@ async fn request_approval_core(
 
     if let Ok(db) = db.try_lock() {
         let _ = db.execute(
-            "INSERT INTO pending_approvals (id, tool_name, description, expires_at, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![id, tool_name, description, expires_at, now],
+            "INSERT INTO pending_approvals (id, tool_name, description, expires_at, created_at, origin_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, tool_name, description, expires_at, now, origin_json],
         );
     }
 
@@ -3015,10 +3020,12 @@ async fn request_tool_approval(
     db: &Arc<Mutex<Connection>>,
     pending: &Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     sink: &agent_exec::EventSink,
+    origin: &agent_exec::ExecOrigin,
     tool_name: &str,
     description: &str,
 ) -> bool {
-    request_approval_core(db, pending, tool_name, description, Some(sink)).await
+    request_approval_core(db, pending, tool_name, description, Some(sink), origin.provenance_json())
+        .await
 }
 
 // ── Codex handlers (Phase 8) ─────────────────────────────────────────────────
@@ -3190,6 +3197,7 @@ async fn codex_run_task_handler(
         "codex.run_task",
         &approval_description,
         None, // REST path — Swift polls GET /approvals/pending
+        None,
     )
     .await;
 
@@ -3692,6 +3700,7 @@ async fn whatsapp_send_handler(
         "whatsapp.send_message",
         &audit_description, // stored in audit_entries — redacted (trap #2)
         None,               // REST path; no SSE channel
+        None,
     )
     .await;
 
