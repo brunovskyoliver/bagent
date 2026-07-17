@@ -27,5 +27,10 @@ let package = Package(
                 ]),
             ]
         ),
+        .testTarget(
+            name: "bagentTests",
+            dependencies: ["bagent"],
+            path: "Tests/bagentTests"
+        ),
     ]
 )

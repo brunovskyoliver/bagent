@@ -84,6 +84,26 @@
 - `serde` / `serde_json` for all wire formats.
 - `tracing` + `tracing-subscriber` for structured logs.
 
+### Daemon residency (launchd)
+
+The daemon is a per-user launchd agent, not a child of the notch app, so
+scheduled automations keep running after the app exits.
+
+- On every app launch, `DaemonLauncher` writes
+  `~/Library/LaunchAgents/com.bagent.daemon.plist` (current binary path +
+  model env from UserDefaults) and does `launchctl bootout` + `bootstrap` —
+  a deterministic restart into the current binary. This covers app relaunch,
+  packaging, and upgrades.
+- App exit does **not** stop the daemon.
+- Crashes are restarted by launchd (`KeepAlive.SuccessfulExit=false`); a
+  clean exit or explicit `launchctl bootout gui/$UID/com.bagent.daemon`
+  (`DaemonLauncher.shutdownDaemon()`) stays down.
+- Discovery contract unchanged: the daemon writes `daemon.port`,
+  `daemon.token`, and `daemon.pid` in Application Support regardless of who
+  started it. Daemon logs go to `~/Library/Logs/bagent/daemon.log`.
+- Migration: a pre-launchd daemon recorded in `daemon.pid` that launchd does
+  not own is SIGTERMed once at app launch.
+
 ### Core Crates
 
 ```

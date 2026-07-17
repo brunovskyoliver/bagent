@@ -1,12 +1,72 @@
 import Foundation
 import Darwin
 
+/// Builds the LaunchAgent plist for the daemon. Pure — unit-testable.
+enum DaemonLaunchAgent {
+    static let label = "com.bagent.daemon"
+
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    static var logURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/bagent/daemon.log")
+    }
+
+    /// launchd property list. KeepAlive on crash only: a clean exit (explicit
+    /// shutdown, `launchctl bootout`) stays down; a crash is restarted by
+    /// launchd with its default throttle.
+    static func plistContent(binaryPath: String, environment: [String: String]) -> String {
+        let envEntries = environment
+            .sorted { $0.key < $1.key }
+            .map { "        <key>\($0.key)</key>\n        <string>\($0.value)</string>" }
+            .joined(separator: "\n")
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>\(label)</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>\(binaryPath)</string>
+            </array>
+            <key>EnvironmentVariables</key>
+            <dict>
+        \(envEntries)
+            </dict>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <dict>
+                <key>SuccessfulExit</key>
+                <false/>
+            </dict>
+            <key>StandardOutPath</key>
+            <string>\(logURL.path)</string>
+            <key>StandardErrorPath</key>
+            <string>\(logURL.path)</string>
+        </dict>
+        </plist>
+        """
+    }
+}
+
+/// Manages daemon residency via a per-user launchd agent.
+///
+/// Lifecycle contract:
+/// - App launch reinstalls the LaunchAgent (current binary path + model env)
+///   and restarts the daemon — deterministic upgrade/packaging behavior.
+/// - App exit leaves the daemon running so scheduled automations continue.
+/// - Crashes are restarted by launchd (`KeepAlive.SuccessfulExit=false`).
+/// - Explicit shutdown is `shutdownDaemon()` (launchctl bootout).
+/// - Port/token discovery is unchanged: the daemon itself writes
+///   `daemon.port` / `daemon.token` / `daemon.pid` in Application Support.
 @MainActor
 final class DaemonLauncher {
-    private var process: Process?
-    private var stopping = false
-    private var restartCount = 0
-    private var windowStart: Date = .distantPast
     /// Handle to the Ollama process we may have spawned. Kept alive so we don't
     /// spawn a second instance if `launch()` is called more than once.
     private var ollamaProcess: Process?
@@ -19,8 +79,107 @@ final class DaemonLauncher {
             print("[bagentd] binary not found — run `cargo build` first")
             return
         }
-        terminateRecordedDaemon()
-        startProcess(url: url)
+        terminateLegacyChildDaemon()
+        installAndStart(binary: url)
+    }
+
+    /// Intentionally does not stop the daemon: scheduled automations keep
+    /// running after the notch app exits.
+    func stop() {}
+
+    /// Explicit shutdown — unloads the agent; launchd will not restart it.
+    func shutdownDaemon() {
+        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(DaemonLaunchAgent.label)"])
+    }
+
+    // MARK: - launchd
+
+    private func installAndStart(binary: URL) {
+        let env = [
+            "BAGENT_DEFAULT_MODEL": UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen2.5:7b",
+            "BAGENT_CLASSIFIER_MODEL": UserDefaults.standard.string(forKey: "bagent.classifier_model") ?? "qwen3:0.6b",
+            "BAGENT_VISION_MODEL": "qwen2.5vl:7b",
+        ]
+        let plist = DaemonLaunchAgent.plistContent(binaryPath: binary.path, environment: env)
+        let plistURL = DaemonLaunchAgent.plistURL
+        do {
+            try FileManager.default.createDirectory(
+                at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: DaemonLaunchAgent.logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try plist.write(to: plistURL, atomically: true, encoding: .utf8)
+        } catch {
+            print("[bagentd] failed to write LaunchAgent: \(error)")
+            return
+        }
+        // Deterministic restart into the current binary + env on every app
+        // launch (same semantics the app had when it owned the process).
+        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(DaemonLaunchAgent.label)"])
+        let status = runLaunchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
+        print(status == 0
+            ? "[bagentd] launchd agent bootstrapped"
+            : "[bagentd] launchctl bootstrap failed (\(status))")
+    }
+
+    @discardableResult
+    private func runLaunchctl(_ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            p.waitUntilExit()
+            return p.terminationStatus
+        } catch {
+            print("[bagentd] launchctl \(args.first ?? "") failed: \(error)")
+            return -1
+        }
+    }
+
+    /// Pre-launchd app versions spawned bagentd as a child and recorded its
+    /// pid. Kill such a daemon once so launchd becomes the single owner.
+    private func terminateLegacyChildDaemon() {
+        let pidURL = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!
+            .appendingPathComponent("bagent")
+            .appendingPathComponent("daemon.pid")
+        guard let raw = try? String(contentsOf: pidURL, encoding: .utf8),
+              let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 0 else { return }
+        // Only kill daemons that are NOT launchd-managed (launchd-managed pids
+        // are listed under our label).
+        if launchdManagedPid() == pid { return }
+        if kill(pid, 0) == 0 {
+            print("[bagentd] terminating legacy child daemon pid \(pid)")
+            kill(pid, SIGTERM)
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        try? FileManager.default.removeItem(at: pidURL)
+    }
+
+    /// Current daemon pid according to launchd, or nil when not running.
+    private func launchdManagedPid() -> Int32? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["print", "gui/\(getuid())/\(DaemonLaunchAgent.label)"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              let out = String(data: data, encoding: .utf8) else { return nil }
+        for line in out.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("pid = "), let pid = Int32(trimmed.dropFirst(6)) {
+                return pid
+            }
+        }
+        return nil
     }
 
     // MARK: - Ollama autostart
@@ -86,78 +245,7 @@ final class DaemonLauncher {
         return nil
     }
 
-    func stop() {
-        stopping = true
-        process?.terminate()
-        process = nil
-    }
-
-    // MARK: - Private
-
-    private func startProcess(url: URL) {
-        let p = Process()
-        p.executableURL = url
-        var environment = ProcessInfo.processInfo.environment
-        environment["BAGENT_DEFAULT_MODEL"] = UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen2.5:7b"
-        environment["BAGENT_CLASSIFIER_MODEL"] = UserDefaults.standard.string(forKey: "bagent.classifier_model") ?? "qwen3:0.6b"
-        environment["BAGENT_VISION_MODEL"] = "qwen2.5vl:7b"
-        p.environment = environment
-        // terminationHandler is called on an arbitrary thread; dispatch back to @MainActor.
-        p.terminationHandler = { proc in
-            // Normal exit (our own stop()) — don't restart.
-            guard proc.terminationStatus != 0 || proc.terminationReason == .uncaughtSignal else { return }
-            Task { @MainActor [weak self] in
-                self?.handleCrash(url: url)
-            }
-        }
-        do {
-            try p.run()
-            process = p
-            print("[bagentd] started pid \(p.processIdentifier)")
-        } catch {
-            print("[bagentd] failed to start: \(error)")
-        }
-    }
-
-    private func terminateRecordedDaemon() {
-        let pidURL = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first!
-            .appendingPathComponent("bagent")
-            .appendingPathComponent("daemon.pid")
-        guard let raw = try? String(contentsOf: pidURL, encoding: .utf8),
-              let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-              pid > 0 else { return }
-
-        if kill(pid, 0) == 0 {
-            print("[bagentd] terminating previous pid \(pid)")
-            kill(pid, SIGTERM)
-            Thread.sleep(forTimeInterval: 0.25)
-        }
-        try? FileManager.default.removeItem(at: pidURL)
-    }
-
-    private func handleCrash(url: URL) {
-        guard !stopping else { return }
-
-        let now = Date()
-        if now.timeIntervalSince(windowStart) > 60 {
-            restartCount = 0
-            windowStart = now
-        }
-        restartCount += 1
-
-        guard restartCount <= 3 else {
-            print("[bagentd] ≥3 crashes/min — giving up")
-            return
-        }
-        print("[bagentd] crashed — restart \(restartCount)/3")
-
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(500))
-            self.startProcess(url: url)
-        }
-    }
+    // MARK: - Binary discovery
 
     private func findBinary() -> URL? {
         if let execURL = Bundle.main.executableURL {
