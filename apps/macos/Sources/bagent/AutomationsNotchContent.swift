@@ -25,6 +25,14 @@ struct AutomationsNotchContent: View {
                 if let a = viewModel.selectedAutomation {
                     deleteConfirmView(a).transition(contentTransition)
                 }
+            case .editorTask:
+                editorTaskView.transition(contentTransition)
+            case .editorSchedule:
+                editorScheduleView.transition(contentTransition)
+            case .editorReview:
+                editorReviewView.transition(contentTransition)
+            case .editorSaving:
+                editorSavingView.transition(.opacity)
             }
             if let error = viewModel.automationsError {
                 Text(error)
@@ -66,6 +74,10 @@ struct AutomationsNotchContent: View {
         case .list: return "Automatizácie"
         case .detail: return viewModel.selectedAutomation?.name ?? "Automatizácia"
         case .deleteConfirmation: return "Vymazať?"
+        case .editorTask: return viewModel.automationDraft.editingID == nil ? "Nová · úloha" : "Úprava · úloha"
+        case .editorSchedule: return "Kedy"
+        case .editorReview: return "Zhrnutie"
+        case .editorSaving: return "Ukladám…"
         }
     }
 
@@ -222,6 +234,209 @@ struct AutomationsNotchContent: View {
         .buttonStyle(.plain)
         .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
         .accessibilityLabel(title)
+    }
+
+    // MARK: Editor
+
+    private var editorTaskView: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            editorField("Názov", text: Binding(
+                get: { viewModel.automationDraft.name },
+                set: { viewModel.automationDraft.name = $0 }
+            ), placeholder: "napr. Ranná pošta", label: "Názov automatizácie")
+            editorField("Úloha", text: Binding(
+                get: { viewModel.automationDraft.prompt },
+                set: { viewModel.automationDraft.prompt = $0 }
+            ), placeholder: "napr. nájdi neprečítané maily a zhrň urgentné", label: "Úloha automatizácie")
+            Spacer(minLength: 0)
+            editorNav(nextEnabled: viewModel.automationDraftTaskValid)
+        }
+    }
+
+    private func editorField(
+        _ title: String, text: Binding<String>, placeholder: String, label: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+            TextField(placeholder, text: text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                .accessibilityLabel(label)
+        }
+    }
+
+    private var editorScheduleView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 5) {
+                dayChip("Dnes", choice: .today)
+                dayChip("Zajtra", choice: .tomorrow)
+                dayChip("Dátum", choice: customChoice)
+            }
+            if case .custom = viewModel.automationDraft.day {
+                stepperRow(
+                    label: customDateLabel,
+                    accessibility: "Vybraný dátum \(customDateLabel)",
+                    minus: { shiftCustomDay(-1) },
+                    plus: { shiftCustomDay(1) }
+                )
+            }
+            stepperRow(
+                label: String(format: "%02d:%02d", viewModel.automationDraft.hour, viewModel.automationDraft.minute),
+                accessibility: "Čas spustenia",
+                minus: { shiftTime(-15) },
+                plus: { shiftTime(15) }
+            )
+            Text(TimeZone.current.identifier)
+                .font(.system(size: 9))
+                .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                .accessibilityLabel("Časové pásmo \(TimeZone.current.identifier)")
+            Spacer(minLength: 0)
+            editorNav(nextEnabled: true)
+        }
+    }
+
+    private var customChoice: AutomationDayChoice {
+        if case .custom(let d) = viewModel.automationDraft.day { return .custom(d) }
+        let dayAfter = Calendar.current.date(byAdding: .day, value: 2, to: Date()) ?? Date()
+        return .custom(dayAfter)
+    }
+
+    private var customDateLabel: String {
+        guard case .custom(let d) = viewModel.automationDraft.day else { return "—" }
+        let cal = Calendar.current
+        return "\(cal.component(.day, from: d)).\(cal.component(.month, from: d))."
+    }
+
+    private func dayChip(_ title: String, choice: AutomationDayChoice) -> some View {
+        let selected: Bool
+        switch (viewModel.automationDraft.day, choice) {
+        case (.today, .today), (.tomorrow, .tomorrow), (.custom, .custom): selected = true
+        default: selected = false
+        }
+        return Button(title) {
+            viewModel.automationDraft.day = choice
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 11, weight: .medium))
+        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(Color.white.opacity(selected ? 0.12 : 0.06), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityLabel("Deň: \(title)")
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private func stepperRow(
+        label: String, accessibility: String,
+        minus: @escaping () -> Void, plus: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 8) {
+            stepperButton("minus", label: "Menej") { minus() }
+            Text(label)
+                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                .frame(minWidth: 52)
+                .accessibilityLabel(accessibility + " " + label)
+            stepperButton("plus", label: "Viac") { plus() }
+        }
+    }
+
+    private func stepperButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .semibold))
+                .frame(width: 20, height: 20)
+                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+        .accessibilityLabel(label)
+    }
+
+    private func shiftTime(_ minutes: Int) {
+        var total = viewModel.automationDraft.hour * 60 + viewModel.automationDraft.minute + minutes
+        total = ((total % 1440) + 1440) % 1440
+        viewModel.automationDraft.hour = total / 60
+        viewModel.automationDraft.minute = total % 60
+    }
+
+    private func shiftCustomDay(_ delta: Int) {
+        guard case .custom(let d) = viewModel.automationDraft.day,
+              let shifted = Calendar.current.date(byAdding: .day, value: delta, to: d),
+              shifted > Calendar.current.startOfDay(for: Date())
+        else { return }
+        viewModel.automationDraft.day = .custom(shifted)
+    }
+
+    private var editorReviewView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(viewModel.automationDraftSummary)
+                .font(.system(size: 12))
+                .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                .lineLimit(3)
+                .padding(7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                .accessibilityLabel("Zhrnutie: \(viewModel.automationDraftSummary)")
+            Toggle(isOn: Binding(
+                get: { viewModel.automationDraft.enabled },
+                set: { viewModel.automationDraft.enabled = $0 }
+            )) {
+                Text("Zapnutá")
+                    .font(.system(size: 11))
+                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .accessibilityLabel("Automatizácia zapnutá")
+            Spacer(minLength: 0)
+            editorNav(
+                nextEnabled: true,
+                nextTitle: viewModel.automationDraft.editingID == nil ? "Vytvoriť" : "Uložiť"
+            )
+        }
+    }
+
+    private var editorSavingView: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            Text("Ukladám…")
+                .font(.system(size: 12))
+                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityLabel("Ukladám automatizáciu")
+    }
+
+    private func editorNav(nextEnabled: Bool, nextTitle: String = "Ďalej") -> some View {
+        HStack(spacing: 8) {
+            Button("Späť") { _ = viewModel.automationsGoBack() }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                .accessibilityLabel("Späť")
+            Button(nextTitle) { viewModel.automationEditorNext() }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(nextEnabled ? .black : NotchWrapMetrics.notchTextFaint)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+                .background(
+                    Color.white.opacity(nextEnabled ? 0.9 : 0.08),
+                    in: RoundedRectangle(cornerRadius: 6))
+                .disabled(!nextEnabled)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .accessibilityLabel(nextTitle)
+        }
     }
 
     // MARK: Delete confirmation

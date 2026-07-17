@@ -93,6 +93,80 @@ enum AutomationsSurfaceState: Equatable {
     case list
     case detail(String)
     case deleteConfirmation(String)
+    // Step-based editor (create + edit). Divided into compact steps instead
+    // of scrolling — each fits the fixed notch bridge.
+    case editorTask
+    case editorSchedule
+    case editorReview
+    case editorSaving
+}
+
+/// Which day a run-once automation fires. Backend stays authoritative for
+/// validation; this only builds the request.
+enum AutomationDayChoice: Equatable {
+    case today
+    case tomorrow
+    case custom(Date)
+}
+
+/// Editor draft — typed state, no scattered booleans.
+struct AutomationDraft: Equatable {
+    var editingID: String? = nil
+    var name = ""
+    var prompt = ""
+    var day: AutomationDayChoice = .today
+    var hour: Int
+    var minute: Int
+    var enabled = true
+
+    /// Default: the next full hour.
+    init(now: Date = Date(), calendar: Calendar = .current) {
+        let next = calendar.date(byAdding: .hour, value: 1, to: now) ?? now
+        hour = calendar.component(.hour, from: next)
+        minute = 0
+    }
+}
+
+enum AutomationDraftBuilder {
+    /// Resolve the draft's local wall-clock choice to a concrete Date.
+    static func scheduledDate(
+        _ draft: AutomationDraft, calendar: Calendar = .current, now: Date = Date()
+    ) -> Date? {
+        let base: Date
+        switch draft.day {
+        case .today: base = now
+        case .tomorrow:
+            guard let t = calendar.date(byAdding: .day, value: 1, to: now) else { return nil }
+            base = t
+        case .custom(let d): base = d
+        }
+        var comps = calendar.dateComponents([.year, .month, .day], from: base)
+        comps.hour = draft.hour
+        comps.minute = draft.minute
+        comps.second = 0
+        return calendar.date(from: comps)
+    }
+
+    static func isoUTC(_ date: Date) -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f.string(from: date)
+    }
+
+    /// Wire draft for POST /automations (run-once).
+    static func wireDraft(
+        _ draft: AutomationDraft, timezone: String = TimeZone.current.identifier,
+        calendar: Calendar = .current, now: Date = Date()
+    ) -> DaemonClient.AutomationDraft? {
+        guard let at = scheduledDate(draft, calendar: calendar, now: now) else { return nil }
+        return DaemonClient.AutomationDraft(
+            name: draft.name.trimmingCharacters(in: .whitespacesAndNewlines),
+            prompt: draft.prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+            timezone: timezone,
+            schedule: .once(at: isoUTC(at)),
+            enabled: draft.enabled
+        )
+    }
 }
 
 /// Pages of the notch-style settings surface (`/settings`).
@@ -249,7 +323,9 @@ final class ChatViewModel: ObservableObject {
                 if !automations.contains(where: { $0.id == id }) {
                     automationsSurface = .list
                 }
-            case .list:
+            case .list, .editorTask, .editorSchedule, .editorReview, .editorSaving:
+                // Editor keeps its draft through concurrent SSE updates; an
+                // edited record deleted elsewhere fails at save with 404.
                 break
             }
         } catch {
@@ -261,7 +337,7 @@ final class ChatViewModel: ObservableObject {
         switch automationsSurface {
         case .detail(let id), .deleteConfirmation(let id):
             return automations.first { $0.id == id }
-        case .list:
+        default:
             return automations[safe: automationsSelectionIndex]
         }
     }
@@ -275,6 +351,18 @@ final class ChatViewModel: ObservableObject {
         case .detail:
             automationsSurface = .list
             return true
+        case .editorTask:
+            // Leaving the editor discards the draft.
+            automationsSurface = automationDraft.editingID.map { .detail($0) } ?? .list
+            return true
+        case .editorSchedule:
+            automationsSurface = .editorTask
+            return true
+        case .editorReview:
+            automationsSurface = .editorSchedule
+            return true
+        case .editorSaving:
+            return true // saving is brief; swallow Escape
         case .list:
             return false
         }
@@ -341,9 +429,106 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Editor entry points — implemented with the creation flow (issue #10).
-    func startAutomationCreation() {}
-    func startAutomationEdit(_ automation: AutomationRecord) {}
+    // MARK: Automation editor (create + edit)
+
+    @Published var automationDraft = AutomationDraft()
+
+    func startAutomationCreation() {
+        automationDraft = AutomationDraft()
+        automationsError = nil
+        automationsSurface = .editorTask
+    }
+
+    func startAutomationEdit(_ automation: AutomationRecord) {
+        var draft = AutomationDraft()
+        draft.editingID = automation.id
+        draft.name = automation.name
+        draft.prompt = automation.prompt
+        draft.enabled = automation.enabled
+        if case .once = automation.schedule,
+           let date = AutomationTimeFormat.parse(automation.nextRunAt) {
+            let cal = Calendar.current
+            if cal.isDateInToday(date) {
+                draft.day = .today
+            } else if cal.isDateInTomorrow(date) {
+                draft.day = .tomorrow
+            } else {
+                draft.day = .custom(date)
+            }
+            draft.hour = cal.component(.hour, from: date)
+            draft.minute = cal.component(.minute, from: date)
+        }
+        automationDraft = draft
+        automationsError = nil
+        automationsSurface = .editorTask
+    }
+
+    var automationDraftTaskValid: Bool {
+        !automationDraft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !automationDraft.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Advance the editor one step; validation errors keep the current step.
+    func automationEditorNext() {
+        switch automationsSurface {
+        case .editorTask:
+            guard automationDraftTaskValid else {
+                automationsError = "Zadaj názov aj úlohu"
+                return
+            }
+            automationsError = nil
+            automationsSurface = .editorSchedule
+        case .editorSchedule:
+            guard let at = AutomationDraftBuilder.scheduledDate(automationDraft), at > Date() else {
+                automationsError = "Čas už uplynul"
+                return
+            }
+            automationsError = nil
+            automationsSurface = .editorReview
+        case .editorReview:
+            saveAutomationDraft()
+        default:
+            break
+        }
+    }
+
+    /// Concise review line: task — schedule — zone.
+    var automationDraftSummary: String {
+        let when = AutomationDraftBuilder.scheduledDate(automationDraft)
+            .flatMap { AutomationTimeFormat.shortLocal(AutomationDraftBuilder.isoUTC($0)) } ?? "—"
+        return "\(automationDraft.name) — jednorazovo \(when) (\(TimeZone.current.identifier))"
+    }
+
+    /// Persist via the daemon; success is claimed only after it confirms.
+    func saveAutomationDraft() {
+        guard let wire = AutomationDraftBuilder.wireDraft(automationDraft) else {
+            automationsError = "Neplatný dátum"
+            return
+        }
+        automationsSurface = .editorSaving
+        automationsError = nil
+        let editingID = automationDraft.editingID
+        Task {
+            do {
+                if let id = editingID {
+                    _ = try await client.patchAutomation(id: id, DaemonClient.AutomationPatch(
+                        name: wire.name, prompt: wire.prompt, timezone: wire.timezone,
+                        schedule: wire.schedule, enabled: wire.enabled))
+                } else {
+                    _ = try await client.createAutomation(wire)
+                }
+                await refreshAutomations()
+                automationsSurface = .list
+            } catch {
+                if case DaemonError.serverError(let message) = error {
+                    automationsError = message
+                } else {
+                    automationsError = "Daemon nedostupný — skús znova"
+                }
+                automationsSurface = .editorReview
+            }
+        }
+    }
 
     // MARK: - Slash-command suggestions
 
