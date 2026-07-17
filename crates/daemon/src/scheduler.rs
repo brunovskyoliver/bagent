@@ -42,13 +42,21 @@ fn audit(conn: &Connection, action: &str, meta: serde_json::Value) {
 }
 
 /// Advance an automation past `now` (NULL for exhausted one-shots).
-fn advance_next_run(conn: &Connection, a: &Automation, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+fn advance_next_run(
+    conn: &Connection,
+    a: &Automation,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
     let next = parse_timezone(&a.timezone)
         .ok()
         .and_then(|tz| a.schedule.next_occurrence(tz, now));
     let _ = conn.execute(
         "UPDATE automations SET next_run_at=?2, updated_at=?3 WHERE id=?1",
-        params![a.id.to_string(), next.map(|t| t.to_rfc3339()), now.to_rfc3339()],
+        params![
+            a.id.to_string(),
+            next.map(|t| t.to_rfc3339()),
+            now.to_rfc3339()
+        ],
     );
     next
 }
@@ -97,14 +105,26 @@ pub(crate) fn scheduler_step(
     let mut claimed = Vec::new();
     for id in due_ids {
         let Ok(a) = repo_get(conn, &id) else { continue };
-        let Some(scheduled_for) = a.next_run_at else { continue };
+        let Some(scheduled_for) = a.next_run_at else {
+            continue;
+        };
 
         match missed_run_decision(scheduled_for, now) {
             MissedRunDecision::SkipStale => {
-                record_skip(conn, &a, scheduled_for, bagent_automations::AutomationRunStatus::SkippedStale, now);
-                audit(conn, "automation_run_skipped_stale", json!({
-                    "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
-                }));
+                record_skip(
+                    conn,
+                    &a,
+                    scheduled_for,
+                    bagent_automations::AutomationRunStatus::SkippedStale,
+                    now,
+                );
+                audit(
+                    conn,
+                    "automation_run_skipped_stale",
+                    json!({
+                        "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
+                    }),
+                );
                 advance_next_run(conn, &a, now);
             }
             MissedRunDecision::CatchUp => {
@@ -112,18 +132,32 @@ pub(crate) fn scheduler_step(
                 match repo_claim_run(conn, &a, scheduled_for, is_catch_up, false, now) {
                     Ok(run) => {
                         if is_catch_up {
-                            audit(conn, "automation_run_catch_up", json!({
-                                "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
-                            }));
+                            audit(
+                                conn,
+                                "automation_run_catch_up",
+                                json!({
+                                    "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
+                                }),
+                            );
                         }
                         advance_next_run(conn, &a, now);
                         claimed.push((a, run));
                     }
                     Err(RepoError::ActiveRun) => {
-                        record_skip(conn, &a, scheduled_for, bagent_automations::AutomationRunStatus::SkippedOverlap, now);
-                        audit(conn, "automation_run_overlap_skip", json!({
-                            "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
-                        }));
+                        record_skip(
+                            conn,
+                            &a,
+                            scheduled_for,
+                            bagent_automations::AutomationRunStatus::SkippedOverlap,
+                            now,
+                        );
+                        audit(
+                            conn,
+                            "automation_run_overlap_skip",
+                            json!({
+                                "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
+                            }),
+                        );
                         advance_next_run(conn, &a, now);
                     }
                     Err(e) => {
@@ -150,7 +184,11 @@ pub(crate) fn recover_on_startup(conn: &Connection, now: DateTime<Utc>) -> usize
         )
         .unwrap_or(0);
     if abandoned > 0 {
-        audit(conn, "automation_runs_abandoned", json!({"count": abandoned}));
+        audit(
+            conn,
+            "automation_runs_abandoned",
+            json!({"count": abandoned}),
+        );
         let _ = conn.execute(
             "UPDATE automations SET last_run_status='abandoned', last_run_at=?1 \
              WHERE id IN (SELECT automation_id FROM automation_runs WHERE status='abandoned' AND finished_at=?1)",
@@ -164,7 +202,11 @@ pub(crate) fn recover_on_startup(conn: &Connection, now: DateTime<Utc>) -> usize
         )
         .unwrap_or(0);
     if denied > 0 {
-        audit(conn, "approvals_denied_on_restart", json!({"count": denied}));
+        audit(
+            conn,
+            "approvals_denied_on_restart",
+            json!({"count": denied}),
+        );
     }
     abandoned
 }
@@ -215,7 +257,7 @@ pub(crate) async fn run_scheduler(state: AppState) {
             match next_due_at(&conn) {
                 Some(t) => {
                     let until = (t - Utc::now()).num_seconds().max(0) as u64;
-                    until.min(MAX_SLEEP_CHUNK_SECS).max(1)
+                    until.clamp(1, MAX_SLEEP_CHUNK_SECS)
                 }
                 None => IDLE_SLEEP_SECS,
             }
@@ -236,7 +278,9 @@ mod tests {
 
     fn test_conn() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
-        crate::embedded::migrations::runner().run(&mut conn).unwrap();
+        crate::embedded::migrations::runner()
+            .run(&mut conn)
+            .unwrap();
         conn
     }
 
@@ -244,7 +288,12 @@ mod tests {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
     }
 
-    fn once(conn: &Connection, name: &str, at: DateTime<Utc>, created: DateTime<Utc>) -> Automation {
+    fn once(
+        conn: &Connection,
+        name: &str,
+        at: DateTime<Utc>,
+        created: DateTime<Utc>,
+    ) -> Automation {
         repo_create(
             conn,
             name,
@@ -281,7 +330,10 @@ mod tests {
         let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0));
         assert_eq!(claimed.len(), 1);
         assert!(claimed[0].1.is_catch_up);
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, None);
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            None
+        );
     }
 
     #[test]
@@ -294,7 +346,10 @@ mod tests {
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, AutomationRunStatus::SkippedStale);
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, None);
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            None
+        );
     }
 
     #[test]
@@ -302,11 +357,21 @@ mod tests {
         let conn = test_conn();
         let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
         // A manual run is still active when the scheduled instant arrives.
-        repo_claim_run(&conn, &a, t(2026, 7, 18, 5, 0), false, true, t(2026, 7, 18, 5, 0)).unwrap();
+        repo_claim_run(
+            &conn,
+            &a,
+            t(2026, 7, 18, 5, 0),
+            false,
+            true,
+            t(2026, 7, 18, 5, 0),
+        )
+        .unwrap();
         let claimed = scheduler_step(&conn, t(2026, 7, 18, 6, 0));
         assert!(claimed.is_empty());
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
-        assert!(runs.iter().any(|r| r.status == AutomationRunStatus::SkippedOverlap));
+        assert!(runs
+            .iter()
+            .any(|r| r.status == AutomationRunStatus::SkippedOverlap));
     }
 
     #[test]
@@ -321,7 +386,15 @@ mod tests {
     fn restart_recovery_abandons_runs_and_denies_stale_approvals() {
         let conn = test_conn();
         let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
-        let run = repo_claim_run(&conn, &a, t(2026, 7, 18, 6, 0), false, false, t(2026, 7, 18, 6, 0)).unwrap();
+        let run = repo_claim_run(
+            &conn,
+            &a,
+            t(2026, 7, 18, 6, 0),
+            false,
+            false,
+            t(2026, 7, 18, 6, 0),
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO pending_approvals (id, tool_name, description, expires_at, created_at) \
              VALUES ('ap1', 'whatsapp.send_message', 'x', '2099-01-01T00:00:00Z', '2026-07-18T06:00:00Z')",
@@ -335,11 +408,23 @@ mod tests {
         assert_eq!(runs[0].status, AutomationRunStatus::Abandoned);
         assert_eq!(runs[0].id, run.id);
         let decision: Option<String> = conn
-            .query_row("SELECT decision FROM pending_approvals WHERE id='ap1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT decision FROM pending_approvals WHERE id='ap1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(decision.as_deref(), Some("deny"));
         // The abandoned run releases the claim: the automation can run again.
-        assert!(repo_claim_run(&conn, &a, t(2026, 7, 18, 7, 0), true, false, t(2026, 7, 18, 7, 0)).is_ok());
+        assert!(repo_claim_run(
+            &conn,
+            &a,
+            t(2026, 7, 18, 7, 0),
+            true,
+            false,
+            t(2026, 7, 18, 7, 0)
+        )
+        .is_ok());
     }
 
     #[test]
@@ -353,18 +438,26 @@ mod tests {
             "p",
             "Europe/Bratislava",
             &AutomationSchedule::Recurring {
-                rule: RecurrenceRule::Daily { time: "08:00:00".parse().unwrap() },
+                rule: RecurrenceRule::Daily {
+                    time: "08:00:00".parse().unwrap(),
+                },
             },
             true,
             t(2026, 10, 23, 12, 0),
         )
         .unwrap();
         // Sat 2026-10-24: 08:00 CEST = 06:00 UTC.
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 10, 24, 6, 0)));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 10, 24, 6, 0))
+        );
         let claimed = scheduler_step(&conn, t(2026, 10, 24, 6, 0));
         assert_eq!(claimed.len(), 1);
         // Advanced to Sun 2026-10-25: 08:00 CET = 07:00 UTC — local time, not +24h UTC.
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 10, 25, 7, 0)));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 10, 25, 7, 0))
+        );
         // No catch-up loop: an immediate second pass claims nothing.
         assert!(scheduler_step(&conn, t(2026, 10, 24, 6, 1)).is_empty());
     }
@@ -378,16 +471,24 @@ mod tests {
             "hourly",
             "p",
             "Europe/Bratislava",
-            &AutomationSchedule::Recurring { rule: RecurrenceRule::EveryNHours { hours: 2 } },
+            &AutomationSchedule::Recurring {
+                rule: RecurrenceRule::EveryNHours { hours: 2 },
+            },
             true,
             t(2026, 7, 17, 10, 0),
         )
         .unwrap();
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 17, 12, 0)));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 7, 17, 12, 0))
+        );
         let claimed = scheduler_step(&conn, t(2026, 7, 17, 12, 0));
         assert_eq!(claimed.len(), 1);
         // Advanced two hours past the dispatch instant.
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 17, 14, 0)));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 7, 17, 14, 0))
+        );
         // The run fails — outcome persists, schedule is NOT pulled earlier.
         crate::automations_api::repo_finish_run(
             &conn,
@@ -414,7 +515,9 @@ mod tests {
             "p",
             "Europe/Bratislava",
             &AutomationSchedule::Recurring {
-                rule: RecurrenceRule::Daily { time: "08:00:00".parse().unwrap() },
+                rule: RecurrenceRule::Daily {
+                    time: "08:00:00".parse().unwrap(),
+                },
             },
             true,
             t(2026, 7, 17, 0, 0),
@@ -428,7 +531,10 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, AutomationRunStatus::SkippedStale);
         // Next occurrence: tomorrow 08:00 local (06:00 UTC in July).
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 26, 6, 0)));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 7, 26, 6, 0))
+        );
     }
 
     #[test]
@@ -443,18 +549,26 @@ mod tests {
             "p",
             "Europe/Bratislava",
             &AutomationSchedule::Recurring {
-                rule: RecurrenceRule::Weekdays { time: "08:00:00".parse().unwrap() },
+                rule: RecurrenceRule::Weekdays {
+                    time: "08:00:00".parse().unwrap(),
+                },
             },
             true,
             t(2026, 3, 27, 6, 0),
         )
         .unwrap();
         // Fri 08:00 CET = 07:00 UTC.
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 3, 27, 7, 0)));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 3, 27, 7, 0))
+        );
         let claimed = scheduler_step(&conn, t(2026, 3, 27, 7, 0));
         assert_eq!(claimed.len(), 1);
         // Weekend skipped, and Monday is CEST: 08:00 = 06:00 UTC.
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 3, 30, 6, 0)));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 3, 30, 6, 0))
+        );
     }
 
     #[test]
@@ -468,27 +582,41 @@ mod tests {
             "p",
             "Europe/Bratislava",
             &AutomationSchedule::Recurring {
-                rule: RecurrenceRule::Weekly { day: Weekday::Fri, time: "07:45:00".parse().unwrap() },
+                rule: RecurrenceRule::Weekly {
+                    day: Weekday::Fri,
+                    time: "07:45:00".parse().unwrap(),
+                },
             },
             true,
             t(2026, 7, 16, 0, 0),
         )
         .unwrap();
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 17, 5, 45)));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 7, 17, 5, 45))
+        );
 
         // Wakes 4 hours late (restart): one catch-up, advanced to next Friday.
         let claimed = scheduler_step(&conn, t(2026, 7, 17, 9, 45));
         assert_eq!(claimed.len(), 1);
         assert!(claimed[0].1.is_catch_up);
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 24, 5, 45)));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 7, 24, 5, 45))
+        );
 
         // Next Friday arrives while the catch-up run is still active → overlap
         // skip recorded, schedule advances again.
         let claimed2 = scheduler_step(&conn, t(2026, 7, 24, 5, 45));
         assert!(claimed2.is_empty());
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
-        assert!(runs.iter().any(|r| r.status == AutomationRunStatus::SkippedOverlap));
-        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 31, 5, 45)));
+        assert!(runs
+            .iter()
+            .any(|r| r.status == AutomationRunStatus::SkippedOverlap));
+        assert_eq!(
+            repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
+            Some(t(2026, 7, 31, 5, 45))
+        );
     }
 
     #[test]
@@ -499,10 +627,9 @@ mod tests {
             r#"{"type":"weekly","day":"friday","time":"07:45:00"}"#
         )
         .is_err());
-        let empty: bagent_automations::RecurrenceRule = serde_json::from_str(
-            r#"{"type":"selected_weekdays","days":[],"time":"07:45:00"}"#,
-        )
-        .unwrap();
+        let empty: bagent_automations::RecurrenceRule =
+            serde_json::from_str(r#"{"type":"selected_weekdays","days":[],"time":"07:45:00"}"#)
+                .unwrap();
         assert!(empty.validate().is_err());
     }
 
@@ -517,7 +644,10 @@ mod tests {
 
         // Edit while running: allowed, applies from the next occurrence — the
         // in-flight run keeps its captured prompt/context.
-        let patch = AutomationPatch { prompt: Some("nový prompt".into()), ..Default::default() };
+        let patch = AutomationPatch {
+            prompt: Some("nový prompt".into()),
+            ..Default::default()
+        };
         assert!(repo_update(&conn, &id, &patch, t(2026, 7, 18, 6, 5)).is_ok());
 
         // Disable while running: the run finishes, but nothing new is claimed.
@@ -527,8 +657,12 @@ mod tests {
         // Delete while running: deterministic 409 until the run finishes.
         assert!(matches!(repo_delete(&conn, &id), Err(RepoError::ActiveRun)));
         crate::automations_api::repo_finish_run(
-            &conn, &claimed[0].1.id.to_string(), &id,
-            AutomationRunStatus::Completed, Some("ok"), t(2026, 7, 18, 6, 10),
+            &conn,
+            &claimed[0].1.id.to_string(),
+            &id,
+            AutomationRunStatus::Completed,
+            Some("ok"),
+            t(2026, 7, 18, 6, 10),
         )
         .unwrap();
         assert!(repo_delete(&conn, &id).is_ok());
@@ -539,17 +673,26 @@ mod tests {
         let conn = test_conn();
         let secret_prompt = "SECRET-PROMPT-najdi vsetky faktury od ACME";
         let a = repo_create(
-            &conn, "Faktúry", secret_prompt, "Europe/Bratislava",
-            &AutomationSchedule::Once { at: t(2026, 7, 18, 6, 0) },
-            true, t(2026, 7, 17, 0, 0),
+            &conn,
+            "Faktúry",
+            secret_prompt,
+            "Europe/Bratislava",
+            &AutomationSchedule::Once {
+                at: t(2026, 7, 18, 6, 0),
+            },
+            true,
+            t(2026, 7, 17, 0, 0),
         )
         .unwrap();
         // Catch-up claim (3 h late) so lifecycle audit rows exist to inspect.
         let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0));
         assert_eq!(claimed.len(), 1);
         crate::automations_api::repo_finish_run(
-            &conn, &claimed[0].1.id.to_string(), &a.id.to_string(),
-            AutomationRunStatus::Failed, Some("Model error: connection refused"),
+            &conn,
+            &claimed[0].1.id.to_string(),
+            &a.id.to_string(),
+            AutomationRunStatus::Failed,
+            Some("Model error: connection refused"),
             t(2026, 7, 18, 9, 1),
         )
         .unwrap();
@@ -568,7 +711,10 @@ mod tests {
         }
         // Run rows keep only the concise redacted summary.
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
-        assert_eq!(runs[0].result_summary.as_deref(), Some("Model error: connection refused"));
+        assert_eq!(
+            runs[0].result_summary.as_deref(),
+            Some("Model error: connection refused")
+        );
     }
 
     #[test]

@@ -95,6 +95,17 @@ Ollama  ·  Connectors  ·  SQLite (refinery migrations)
 | `crates/connectors/whatsapp` | Node.js bridge subprocess (whatsapp-web.js + QR auth) |
 | `crates/connectors/codex` | Subprocess wrapper for Codex CLI (sandboxed, approval-gated) |
 
+### Scheduled automations
+
+`/automations` in the notch manages persisted cron-like agent tasks. The
+scheduler is daemon-owned (survives app exit via the launchd agent); schedules
+are typed (once / every-N-hours / daily / weekdays / selected / weekly) with
+IANA-zone DST-correct recurrence, a 24h single-catch-up policy, atomic overlap
+claims, 2-run concurrency, and unattended safety (side-effecting tools always
+require fresh approval; approvals carry automation provenance). Key code:
+`crates/automations` (semantics), `crates/daemon/src/{automations_api,scheduler,agent_exec}.rs`,
+`apps/macos/Sources/bagent/Automation*.swift`. Full spec: `docs/AUTOMATIONS.md`.
+
 ### Swift app structure
 
 **The notch is the only UI** — one `NSPanel`, no chat window, no settings window,

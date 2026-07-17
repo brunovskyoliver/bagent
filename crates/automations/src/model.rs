@@ -76,9 +76,12 @@ pub struct Automation {
 impl Automation {
     /// Validate user-editable fields. The backend is authoritative — the UI
     /// never decides validity.
-    pub fn validate(name: &str, prompt: &str, schedule: &AutomationSchedule, tz: &str)
-        -> Result<(), ScheduleError>
-    {
+    pub fn validate(
+        name: &str,
+        prompt: &str,
+        schedule: &AutomationSchedule,
+        tz: &str,
+    ) -> Result<(), ScheduleError> {
         if name.trim().is_empty() || name.chars().count() > MAX_NAME_CHARS {
             return Err(ScheduleError::EmptyName);
         }
@@ -180,7 +183,9 @@ mod tests {
     use crate::schedule::{AutomationSchedule, RecurrenceRule, ScheduleError};
 
     fn schedule() -> AutomationSchedule {
-        AutomationSchedule::Recurring { rule: RecurrenceRule::EveryNHours { hours: 2 } }
+        AutomationSchedule::Recurring {
+            rule: RecurrenceRule::EveryNHours { hours: 2 },
+        }
     }
 
     #[test]
@@ -197,7 +202,9 @@ mod tests {
             Automation::validate("Mail check", "do it", &schedule(), "Nope/Nope"),
             Err(ScheduleError::InvalidTimeZone(_))
         ));
-        assert!(Automation::validate("Mail check", "do it", &schedule(), "Europe/Bratislava").is_ok());
+        assert!(
+            Automation::validate("Mail check", "do it", &schedule(), "Europe/Bratislava").is_ok()
+        );
     }
 
     #[test]

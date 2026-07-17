@@ -89,6 +89,8 @@ Build: `cargo build --workspace`, then `make bundle && open bagent.app` from `ap
 
 ## Docs
 
+- [`docs/AUTOMATIONS.md`](docs/AUTOMATIONS.md) — scheduled automations: `/automations` flow, recurrence + DST semantics, missed-run/overlap/restart policies, unattended approval safety, API, SSE, retention
+
 | Doc | Contents |
 |---|---|
 | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Full system design, IPC, tool layer, packaging |

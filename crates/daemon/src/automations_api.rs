@@ -180,7 +180,8 @@ pub(crate) fn repo_update(
     if let Some(enabled) = patch.enabled {
         a.enabled = enabled;
     }
-    Automation::validate(&a.name, &a.prompt, &a.schedule, &a.timezone).map_err(RepoError::Invalid)?;
+    Automation::validate(&a.name, &a.prompt, &a.schedule, &a.timezone)
+        .map_err(RepoError::Invalid)?;
     // Recompute only when the schedule/zone changed — a prompt/name edit on an
     // already-exhausted one-shot must not fail or resurrect it.
     if patch.schedule.is_some() || patch.timezone.is_some() {
@@ -249,7 +250,10 @@ pub(crate) fn repo_delete(conn: &Connection, id: &str) -> Result<(), RepoError> 
     let changed = conn.execute("DELETE FROM automations WHERE id=?1", params![id])?;
     // ON DELETE CASCADE needs foreign_keys=ON; enforce manually so run rows
     // never orphan regardless of connection pragmas.
-    conn.execute("DELETE FROM automation_runs WHERE automation_id=?1", params![id])?;
+    conn.execute(
+        "DELETE FROM automation_runs WHERE automation_id=?1",
+        params![id],
+    )?;
     if changed == 0 {
         return Err(RepoError::NotFound);
     }
@@ -365,7 +369,12 @@ pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<
 
 /// Concise redacted lifecycle event: ids/status/next-run only, no prompts or
 /// summaries — clients refetch the authoritative record.
-fn publish_automation_event(state: &AppState, event_type: &str, a_id: &str, extra: serde_json::Value) {
+fn publish_automation_event(
+    state: &AppState,
+    event_type: &str,
+    a_id: &str,
+    extra: serde_json::Value,
+) {
     let mut ev = json!({"type": event_type, "automation_id": a_id});
     if let (Some(obj), Some(x)) = (ev.as_object_mut(), extra.as_object()) {
         for (k, v) in x {
@@ -385,7 +394,10 @@ fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
             StatusCode::CONFLICT,
             Json(json!({"error": "automation has an active run"})),
         ),
-        RepoError::Invalid(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
+        RepoError::Invalid(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        ),
         RepoError::Db(e) => {
             tracing::error!("automations db error: {e}");
             (
@@ -451,7 +463,10 @@ pub(crate) async fn automations_create(
                 &a.id.to_string(),
                 json!({"next_run_at": a.next_run_at.map(ts)}),
             );
-            (StatusCode::CREATED, Json(serde_json::to_value(&a).unwrap_or_default()))
+            (
+                StatusCode::CREATED,
+                Json(serde_json::to_value(&a).unwrap_or_default()),
+            )
         }
         Err(e) => repo_error_response(e),
     }
@@ -463,7 +478,10 @@ pub(crate) async fn automation_get(
 ) -> impl IntoResponse {
     let conn = state.db.lock().await;
     match repo_get(&conn, &id) {
-        Ok(a) => (StatusCode::OK, Json(serde_json::to_value(&a).unwrap_or_default())),
+        Ok(a) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&a).unwrap_or_default()),
+        ),
         Err(e) => repo_error_response(e),
     }
 }
@@ -491,7 +509,10 @@ pub(crate) async fn automation_patch(
                 &a.id.to_string(),
                 json!({"next_run_at": a.next_run_at.map(ts)}),
             );
-            (StatusCode::OK, Json(serde_json::to_value(&a).unwrap_or_default()))
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&a).unwrap_or_default()),
+            )
         }
         Err(e) => repo_error_response(e),
     }
@@ -543,17 +564,28 @@ async fn set_enabled(
         Ok(a) => {
             audit_fs(
                 &state.db,
-                if enabled { "automation_enable" } else { "automation_disable" },
+                if enabled {
+                    "automation_enable"
+                } else {
+                    "automation_disable"
+                },
                 &json!({"id": id}),
             );
             state.automations_changed.notify_waiters();
             publish_automation_event(
                 &state,
-                if enabled { "automation_enabled" } else { "automation_disabled" },
+                if enabled {
+                    "automation_enabled"
+                } else {
+                    "automation_disabled"
+                },
                 &id,
                 json!({"next_run_at": a.next_run_at.map(ts)}),
             );
-            (StatusCode::OK, Json(serde_json::to_value(&a).unwrap_or_default()))
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&a).unwrap_or_default()),
+            )
         }
         Err(e) => repo_error_response(e),
     }
@@ -682,7 +714,10 @@ pub(crate) fn outcome_to_status(
             if outcome.approvals_denied > 0 {
                 (
                     AutomationRunStatus::Partial,
-                    format!("{summary}\n({} akcií nebolo schválených)", outcome.approvals_denied),
+                    format!(
+                        "{summary}\n({} akcií nebolo schválených)",
+                        outcome.approvals_denied
+                    ),
                 )
             } else {
                 (AutomationRunStatus::Completed, summary)
@@ -692,15 +727,20 @@ pub(crate) fn outcome_to_status(
             AutomationRunStatus::Failed,
             format!("Model error: {}", e.chars().take(200).collect::<String>()),
         ),
-        Err(ExecError::SinkClosed) => {
-            (AutomationRunStatus::Failed, "Execution aborted.".to_string())
-        }
+        Err(ExecError::SinkClosed) => (
+            AutomationRunStatus::Failed,
+            "Execution aborted.".to_string(),
+        ),
     }
 }
 
 /// Execute a claimed run through the shared agent loop and persist the
 /// outcome. Holds no DB lock during model/connector work.
-pub(crate) async fn execute_automation_run(state: AppState, automation: Automation, run: AutomationRun) {
+pub(crate) async fn execute_automation_run(
+    state: AppState,
+    automation: Automation,
+    run: AutomationRun,
+) {
     // Bounded concurrency across scheduled and manual runs. The claim row
     // already exists, so a queued run simply starts a little later.
     let _permit = state.run_slots.clone().acquire_owned().await;
@@ -870,7 +910,9 @@ mod tests {
 
     fn test_conn() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
-        crate::embedded::migrations::runner().run(&mut conn).unwrap();
+        crate::embedded::migrations::runner()
+            .run(&mut conn)
+            .unwrap();
         conn
     }
 
@@ -879,14 +921,28 @@ mod tests {
     }
 
     fn once_at(h: u32) -> AutomationSchedule {
-        AutomationSchedule::Once { at: Utc.with_ymd_and_hms(2026, 7, 18, h, 0, 0).unwrap() }
+        AutomationSchedule::Once {
+            at: Utc.with_ymd_and_hms(2026, 7, 18, h, 0, 0).unwrap(),
+        }
     }
 
     #[test]
     fn create_get_list_roundtrip() {
         let conn = test_conn();
-        let a = repo_create(&conn, "Ranná pošta", "skontroluj neprečítané maily", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
-        assert_eq!(a.next_run_at, Some(Utc.with_ymd_and_hms(2026, 7, 18, 6, 0, 0).unwrap()));
+        let a = repo_create(
+            &conn,
+            "Ranná pošta",
+            "skontroluj neprečítané maily",
+            "Europe/Bratislava",
+            &once_at(6),
+            true,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            a.next_run_at,
+            Some(Utc.with_ymd_and_hms(2026, 7, 18, 6, 0, 0).unwrap())
+        );
         let got = repo_get(&conn, &a.id.to_string()).unwrap();
         assert_eq!(got, a);
         assert_eq!(repo_list(&conn).unwrap().len(), 1);
@@ -896,7 +952,15 @@ mod tests {
     fn create_rejects_invalid_input() {
         let conn = test_conn();
         assert!(matches!(
-            repo_create(&conn, "", "p", "Europe/Bratislava", &once_at(6), true, now()),
+            repo_create(
+                &conn,
+                "",
+                "p",
+                "Europe/Bratislava",
+                &once_at(6),
+                true,
+                now()
+            ),
             Err(RepoError::Invalid(ScheduleError::EmptyName))
         ));
         assert!(matches!(
@@ -904,13 +968,17 @@ mod tests {
             Err(RepoError::Invalid(ScheduleError::InvalidTimeZone(_)))
         ));
         // One-shot in the past has no next occurrence.
-        let past = AutomationSchedule::Once { at: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap() };
+        let past = AutomationSchedule::Once {
+            at: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
+        };
         assert!(matches!(
             repo_create(&conn, "n", "p", "Europe/Bratislava", &past, true, now()),
             Err(RepoError::Invalid(ScheduleError::NoNextOccurrence))
         ));
         // Sub-hour interval rejected.
-        let fast = AutomationSchedule::Recurring { rule: RecurrenceRule::EveryNHours { hours: 0 } };
+        let fast = AutomationSchedule::Recurring {
+            rule: RecurrenceRule::EveryNHours { hours: 0 },
+        };
         assert!(matches!(
             repo_create(&conn, "n", "p", "Europe/Bratislava", &fast, true, now()),
             Err(RepoError::Invalid(ScheduleError::InvalidInterval))
@@ -920,7 +988,16 @@ mod tests {
     #[test]
     fn patch_updates_and_recomputes_next_run() {
         let conn = test_conn();
-        let a = repo_create(&conn, "n", "p", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        let a = repo_create(
+            &conn,
+            "n",
+            "p",
+            "Europe/Bratislava",
+            &once_at(6),
+            true,
+            now(),
+        )
+        .unwrap();
         let patch = AutomationPatch {
             name: Some("Nový názov".into()),
             schedule: Some(once_at(9)),
@@ -928,7 +1005,10 @@ mod tests {
         };
         let updated = repo_update(&conn, &a.id.to_string(), &patch, now()).unwrap();
         assert_eq!(updated.name, "Nový názov");
-        assert_eq!(updated.next_run_at, Some(Utc.with_ymd_and_hms(2026, 7, 18, 9, 0, 0).unwrap()));
+        assert_eq!(
+            updated.next_run_at,
+            Some(Utc.with_ymd_and_hms(2026, 7, 18, 9, 0, 0).unwrap())
+        );
         assert!(matches!(
             repo_update(&conn, "missing", &AutomationPatch::default(), now()),
             Err(RepoError::NotFound)
@@ -938,7 +1018,16 @@ mod tests {
     #[test]
     fn enable_disable_and_delete() {
         let conn = test_conn();
-        let a = repo_create(&conn, "n", "p", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        let a = repo_create(
+            &conn,
+            "n",
+            "p",
+            "Europe/Bratislava",
+            &once_at(6),
+            true,
+            now(),
+        )
+        .unwrap();
         let id = a.id.to_string();
         let off = repo_set_enabled(&conn, &id, false, now()).unwrap();
         assert!(!off.enabled);
@@ -952,7 +1041,16 @@ mod tests {
     #[test]
     fn delete_conflicts_with_active_run_and_runs_are_bounded() {
         let conn = test_conn();
-        let a = repo_create(&conn, "n", "p", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        let a = repo_create(
+            &conn,
+            "n",
+            "p",
+            "Europe/Bratislava",
+            &once_at(6),
+            true,
+            now(),
+        )
+        .unwrap();
         let id = a.id.to_string();
         let run = AutomationRun {
             id: AutomationRunId::new(),
@@ -968,14 +1066,26 @@ mod tests {
         repo_insert_run(&conn, &run).unwrap();
         assert!(matches!(repo_delete(&conn, &id), Err(RepoError::ActiveRun)));
 
-        repo_finish_run(&conn, &run.id.to_string(), &id, AutomationRunStatus::Completed, Some("hotovo"), now()).unwrap();
+        repo_finish_run(
+            &conn,
+            &run.id.to_string(),
+            &id,
+            AutomationRunStatus::Completed,
+            Some("hotovo"),
+            now(),
+        )
+        .unwrap();
         let a2 = repo_get(&conn, &id).unwrap();
         assert_eq!(a2.last_run_status, Some(AutomationRunStatus::Completed));
         assert_eq!(a2.last_result_summary.as_deref(), Some("hotovo"));
 
         // History is bounded to the retention cap.
         for _ in 0..(policy::RUN_HISTORY_RETAINED + 10) {
-            let r = AutomationRun { id: AutomationRunId::new(), started_at: None, ..run.clone() };
+            let r = AutomationRun {
+                id: AutomationRunId::new(),
+                started_at: None,
+                ..run.clone()
+            };
             repo_insert_run(&conn, &r).unwrap();
             conn.execute(
                 "UPDATE automation_runs SET status='completed' WHERE id=?1",
@@ -1003,7 +1113,16 @@ mod tests {
     #[test]
     fn claim_is_atomic_per_automation() {
         let conn = test_conn();
-        let a = repo_create(&conn, "n", "p", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        let a = repo_create(
+            &conn,
+            "n",
+            "p",
+            "Europe/Bratislava",
+            &once_at(6),
+            true,
+            now(),
+        )
+        .unwrap();
         let first = repo_claim_run(&conn, &a, now(), false, true, now()).unwrap();
         assert_eq!(first.status, AutomationRunStatus::Running);
         // Second claim while the first is active → conflict.
@@ -1012,29 +1131,49 @@ mod tests {
             Err(RepoError::ActiveRun)
         ));
         // Finishing releases the claim.
-        repo_finish_run(&conn, &first.id.to_string(), &a.id.to_string(), AutomationRunStatus::Completed, Some("ok"), now()).unwrap();
+        repo_finish_run(
+            &conn,
+            &first.id.to_string(),
+            &a.id.to_string(),
+            AutomationRunStatus::Completed,
+            Some("ok"),
+            now(),
+        )
+        .unwrap();
         assert!(repo_claim_run(&conn, &a, now(), true, false, now()).is_ok());
     }
 
     #[test]
     fn outcome_mapping_covers_denied_failed_and_summary_cap() {
-        let ok = Ok(ExecOutcome { final_text: "Hotovo, 3 maily.".into(), tool_calls_used: 2, approvals_denied: 0 });
+        let ok = Ok(ExecOutcome {
+            final_text: "Hotovo, 3 maily.".into(),
+            tool_calls_used: 2,
+            approvals_denied: 0,
+        });
         let (s, sum) = outcome_to_status(&ok);
         assert_eq!(s, AutomationRunStatus::Completed);
         assert_eq!(sum, "Hotovo, 3 maily.");
 
-        let denied = Ok(ExecOutcome { final_text: "Čiastočne.".into(), tool_calls_used: 2, approvals_denied: 1 });
+        let denied = Ok(ExecOutcome {
+            final_text: "Čiastočne.".into(),
+            tool_calls_used: 2,
+            approvals_denied: 1,
+        });
         let (s, sum) = outcome_to_status(&denied);
         assert_eq!(s, AutomationRunStatus::Partial);
         assert!(sum.contains("nebolo schválených"));
 
-        let failed: Result<ExecOutcome, ExecError> = Err(ExecError::Model("connection refused".into()));
+        let failed: Result<ExecOutcome, ExecError> =
+            Err(ExecError::Model("connection refused".into()));
         let (s, _) = outcome_to_status(&failed);
         assert_eq!(s, AutomationRunStatus::Failed);
 
         // Persisted summaries are clamped to the 2000-char policy cap.
         let long = "x".repeat(5000);
-        assert_eq!(policy::clamp_result_summary(&long).chars().count(), policy::MAX_RESULT_SUMMARY_CHARS);
+        assert_eq!(
+            policy::clamp_result_summary(&long).chars().count(),
+            policy::MAX_RESULT_SUMMARY_CHARS
+        );
     }
 
     #[test]
@@ -1071,7 +1210,16 @@ mod tests {
     #[test]
     fn recent_runs_ordering_and_limit() {
         let conn = test_conn();
-        let a = repo_create(&conn, "n", "p", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        let a = repo_create(
+            &conn,
+            "n",
+            "p",
+            "Europe/Bratislava",
+            &once_at(6),
+            true,
+            now(),
+        )
+        .unwrap();
         for i in 0..5 {
             let r = AutomationRun {
                 id: AutomationRunId::new(),

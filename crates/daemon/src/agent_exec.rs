@@ -16,15 +16,17 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use bagent_rules::{ApprovalLevel, RuleEngine};
-use filesystem_connector::{open as fs_open, search as fs_search, FileSearchRequest, OpenResponse, ReadTextRequest};
+use filesystem_connector::{
+    open as fs_open, search as fs_search, FileSearchRequest, OpenResponse, ReadTextRequest,
+};
 use whatsapp_connector::WhatsappSendTarget;
 
 use crate::{
     audit_fs, json_str_arg, request_tool_approval, run_aerospace, save_last_file_ref,
-    save_last_mail_ref, save_last_odoo_ref, save_last_whatsapp_ref, sha256_str, tool_mail_list_inbox,
-    tool_mail_open, tool_mail_read, tool_mail_search, tool_notes_read, tool_notes_search, tool_odoo,
-    tool_web_fetch, tool_web_search, tool_whatsapp_chat_messages, tool_whatsapp_list_chats, AppState,
-    FileRef,
+    save_last_mail_ref, save_last_odoo_ref, save_last_whatsapp_ref, sha256_str,
+    tool_mail_list_inbox, tool_mail_open, tool_mail_read, tool_mail_search, tool_notes_read,
+    tool_notes_search, tool_odoo, tool_web_fetch, tool_web_search, tool_whatsapp_chat_messages,
+    tool_whatsapp_list_chats, AppState, FileRef,
 };
 
 /// Where an execution came from. Trusted metadata — set by the daemon, never
@@ -50,7 +52,9 @@ impl ExecOrigin {
     fn describe(&self, description: &str) -> String {
         match self {
             ExecOrigin::Chat => description.to_string(),
-            ExecOrigin::Automation { automation_name, .. } => {
+            ExecOrigin::Automation {
+                automation_name, ..
+            } => {
                 format!("Automatizácia „{automation_name}“: {description}")
             }
         }
@@ -61,7 +65,11 @@ impl ExecOrigin {
     pub(crate) fn provenance_json(&self) -> Option<String> {
         match self {
             ExecOrigin::Chat => None,
-            ExecOrigin::Automation { automation_id, automation_name, run_id } => Some(
+            ExecOrigin::Automation {
+                automation_id,
+                automation_name,
+                run_id,
+            } => Some(
                 json!({
                     "kind": "automation",
                     "automation_id": automation_id,
@@ -119,17 +127,30 @@ pub(crate) enum ToolKind {
 /// unattended runs fail closed on it.
 pub(crate) fn classify_tool(name: &str) -> Option<ToolKind> {
     match name {
-        "mail_search" | "mail_list_inbox" | "mail_read" | "notes_search" | "notes_read"
-        | "filesystem_search_files" | "filesystem_read_text" | "whatsapp_list_chats"
-        | "whatsapp_chat_messages" | "odoo_search_partners" | "odoo_my_invoices"
-        | "odoo_my_helpdesk_tickets" | "odoo_get_record" | "web_search" | "web_fetch" => {
-            Some(ToolKind::ReadOnly)
-        }
-        "mail_open" | "filesystem_open_file" | "filesystem_open_file_with"
-        | "filesystem_reveal_in_finder" | "filesystem_open_folder" | "macos_open_app"
-        | "macos_focus_app" | "macos_switch_workspace" | "whatsapp_send_message" => {
-            Some(ToolKind::SideEffect)
-        }
+        "mail_search"
+        | "mail_list_inbox"
+        | "mail_read"
+        | "notes_search"
+        | "notes_read"
+        | "filesystem_search_files"
+        | "filesystem_read_text"
+        | "whatsapp_list_chats"
+        | "whatsapp_chat_messages"
+        | "odoo_search_partners"
+        | "odoo_my_invoices"
+        | "odoo_my_helpdesk_tickets"
+        | "odoo_get_record"
+        | "web_search"
+        | "web_fetch" => Some(ToolKind::ReadOnly),
+        "mail_open"
+        | "filesystem_open_file"
+        | "filesystem_open_file_with"
+        | "filesystem_reveal_in_finder"
+        | "filesystem_open_folder"
+        | "macos_open_app"
+        | "macos_focus_app"
+        | "macos_switch_workspace"
+        | "whatsapp_send_message" => Some(ToolKind::SideEffect),
         _ => None,
     }
 }
@@ -144,7 +165,10 @@ pub(crate) struct Gate<'a> {
 
 impl<'a> Gate<'a> {
     pub(crate) fn new(rules: &'a RuleEngine, origin: &ExecOrigin) -> Self {
-        Self { rules, unattended: origin.unattended() }
+        Self {
+            rules,
+            unattended: origin.unattended(),
+        }
     }
 
     pub(crate) fn level(
@@ -518,7 +542,11 @@ pub(crate) async fn run_agent_loop(
                 }
             }
         }
-        return Ok(ExecOutcome { final_text: full_response, tool_calls_used, approvals_denied });
+        return Ok(ExecOutcome {
+            final_text: full_response,
+            tool_calls_used,
+            approvals_denied,
+        });
     }
 
     let mut found_file_ref: Option<FileRef> = None;
@@ -533,7 +561,8 @@ pub(crate) async fn run_agent_loop(
         } else {
             tools.clone()
         };
-        let stream = ollama.chat_stream_with_tools(model.to_string(), messages.clone(), round_tools);
+        let stream =
+            ollama.chat_stream_with_tools(model.to_string(), messages.clone(), round_tools);
         tokio::pin!(stream);
 
         let mut round_text = String::new();
@@ -572,7 +601,11 @@ pub(crate) async fn run_agent_loop(
             let args = &call.function.arguments;
             tracing::info!("tool loop call {}: {} {:?}", tool_calls_used, fn_name, args);
             let _ = sink.emit(json!({"type":"tool_call","tool": fn_name})).await;
-            audit_fs(db, "tool_call", &json!({"tool": fn_name, "unattended": origin.unattended()}));
+            audit_fs(
+                db,
+                "tool_call",
+                &json!({"tool": fn_name, "unattended": origin.unattended()}),
+            );
 
             let tool_kind = classify_tool(fn_name);
 
@@ -608,7 +641,8 @@ pub(crate) async fn run_agent_loop(
                                             sink,
                                             origin,
                                             "mail_inbox",
-                                            &origin.describe("Čítanie poštovej schránky (Apple Mail)"),
+                                            &origin
+                                                .describe("Čítanie poštovej schránky (Apple Mail)"),
                                         )
                                         .await
                                     }
@@ -620,7 +654,8 @@ pub(crate) async fn run_agent_loop(
                                 } else {
                                     match tool {
                                         "mail_search" => {
-                                            let (result, mail_ref) = tool_mail_search(m, args).await;
+                                            let (result, mail_ref) =
+                                                tool_mail_search(m, args).await;
                                             if let Some(ref r) = mail_ref {
                                                 let _ = sink
                                                     .emit(json!({
@@ -632,7 +667,8 @@ pub(crate) async fn run_agent_loop(
                                                         "auto_open": false,
                                                     }))
                                                     .await;
-                                                save_last_mail_ref(runtime_refs, session_id, r).await;
+                                                save_last_mail_ref(runtime_refs, session_id, r)
+                                                    .await;
                                             }
                                             result
                                         }
@@ -640,7 +676,8 @@ pub(crate) async fn run_agent_loop(
                                         "mail_read" => {
                                             let (result, mail_ref) = tool_mail_read(m, args).await;
                                             if let Some(ref r) = mail_ref {
-                                                save_last_mail_ref(runtime_refs, session_id, r).await;
+                                                save_last_mail_ref(runtime_refs, session_id, r)
+                                                    .await;
                                             }
                                             result
                                         }
@@ -655,7 +692,9 @@ pub(crate) async fn run_agent_loop(
                     tool @ ("notes_search" | "notes_read") => match notes {
                         None => "Apple Notes connector unavailable.".to_string(),
                         Some(n) => match gate.level("notes_search", args, ToolKind::ReadOnly) {
-                            ApprovalLevel::Forbidden => "Notes access blocked by rules.".to_string(),
+                            ApprovalLevel::Forbidden => {
+                                "Notes access blocked by rules.".to_string()
+                            }
                             _ => {
                                 if tool == "notes_search" {
                                     tool_notes_search(n, args).await
@@ -707,11 +746,15 @@ pub(crate) async fn run_agent_loop(
                     }
 
                     // ── Odoo (read-only; writes are forbidden by rules) ─
-                    tool @ ("odoo_search_partners" | "odoo_my_invoices"
-                    | "odoo_my_helpdesk_tickets" | "odoo_get_record") => {
+                    tool @ ("odoo_search_partners"
+                    | "odoo_my_invoices"
+                    | "odoo_my_helpdesk_tickets"
+                    | "odoo_get_record") => {
                         let guard = state.odoo.read().await;
                         match guard.as_ref() {
-                            None => "Odoo not connected — connect it in Settings first.".to_string(),
+                            None => {
+                                "Odoo not connected — connect it in Settings first.".to_string()
+                            }
                             Some(o) => {
                                 let (result, odoo_ref) = tool_odoo(o, tool, args).await;
                                 if let Some(ref r) = odoo_ref {
@@ -733,7 +776,8 @@ pub(crate) async fn run_agent_loop(
 
                     // ── Window management (AeroSpace) ─────────────────
                     "macos_switch_workspace" => {
-                        let level = gate.level("macos.switch_workspace", args, ToolKind::SideEffect);
+                        let level =
+                            gate.level("macos.switch_workspace", args, ToolKind::SideEffect);
                         let approved = match level {
                             ApprovalLevel::Forbidden => {
                                 let _ = sink
@@ -797,9 +841,12 @@ pub(crate) async fn run_agent_loop(
                                         .filter_map(|v| v.as_str().map(|s| s.to_string()))
                                         .collect()
                                 });
-                            let search_contents = args["search_contents"].as_bool().unwrap_or(false);
-                            let max_results =
-                                args["max_results"].as_u64().map(|n| n as usize).unwrap_or(10);
+                            let search_contents =
+                                args["search_contents"].as_bool().unwrap_or(false);
+                            let max_results = args["max_results"]
+                                .as_u64()
+                                .map(|n| n as usize)
+                                .unwrap_or(10);
 
                             let req = FileSearchRequest {
                                 query,
@@ -837,7 +884,8 @@ pub(crate) async fn run_agent_loop(
                                             });
                                         }
                                     }
-                                    serde_json::to_string(&resp).unwrap_or_else(|_| "[]".to_string())
+                                    serde_json::to_string(&resp)
+                                        .unwrap_or_else(|_| "[]".to_string())
                                 }
                                 Ok(Err(e)) => format!("{{\"error\":\"{}\"}}", e),
                                 Err(e) => format!("{{\"error\":\"{}\"}}", e),
@@ -849,7 +897,11 @@ pub(crate) async fn run_agent_loop(
                         None => "Filesystem connector unavailable.".to_string(),
                         Some(fs_c) => {
                             let path = args["path"].as_str().unwrap_or("").to_string();
-                            let req = ReadTextRequest { path, max_bytes: None, around_line: None };
+                            let req = ReadTextRequest {
+                                path,
+                                max_bytes: None,
+                                around_line: None,
+                            };
                             let policy = fs_c.policy.clone();
                             match tokio::task::spawn_blocking(move || {
                                 fs_search::read_text_sync(&policy, req)
@@ -1013,7 +1065,11 @@ pub(crate) async fn run_agent_loop(
 
                     // ── Web (read-only; queries leave the device) ─────
                     tool @ ("web_search" | "web_fetch") => {
-                        let rule_name = if tool == "web_search" { "web.search" } else { "web.fetch" };
+                        let rule_name = if tool == "web_search" {
+                            "web.search"
+                        } else {
+                            "web.fetch"
+                        };
                         match gate.level(rule_name, args, ToolKind::ReadOnly) {
                             ApprovalLevel::Forbidden => {
                                 let _ = sink
@@ -1053,7 +1109,11 @@ pub(crate) async fn run_agent_loop(
                                     } else {
                                         tool_web_fetch(args).await
                                     };
-                                    audit_fs(db, &rule_name.replace('.', "_"), &json!({"ok": true}));
+                                    audit_fs(
+                                        db,
+                                        &rule_name.replace('.', "_"),
+                                        &json!({"ok": true}),
+                                    );
                                     result
                                 }
                             }
@@ -1075,7 +1135,11 @@ pub(crate) async fn run_agent_loop(
         save_last_file_ref(runtime_refs, session_id, fref).await;
     }
 
-    Ok(ExecOutcome { final_text: full_response, tool_calls_used, approvals_denied })
+    Ok(ExecOutcome {
+        final_text: full_response,
+        tool_calls_used,
+        approvals_denied,
+    })
 }
 
 #[cfg(test)]
@@ -1087,13 +1151,28 @@ mod tests {
         // The registry names — build_tools needs a full AppState, so the list
         // is mirrored here; classify_tool is the contract under test.
         for name in [
-            "mail_search", "mail_list_inbox", "mail_read", "mail_open",
-            "filesystem_search_files", "filesystem_read_text", "filesystem_open_file",
-            "filesystem_open_file_with", "filesystem_reveal_in_finder", "macos_open_app",
-            "notes_search", "notes_read", "web_search", "web_fetch",
-            "macos_switch_workspace", "whatsapp_list_chats", "whatsapp_chat_messages",
-            "whatsapp_send_message", "odoo_search_partners", "odoo_my_invoices",
-            "odoo_my_helpdesk_tickets", "odoo_get_record",
+            "mail_search",
+            "mail_list_inbox",
+            "mail_read",
+            "mail_open",
+            "filesystem_search_files",
+            "filesystem_read_text",
+            "filesystem_open_file",
+            "filesystem_open_file_with",
+            "filesystem_reveal_in_finder",
+            "macos_open_app",
+            "notes_search",
+            "notes_read",
+            "web_search",
+            "web_fetch",
+            "macos_switch_workspace",
+            "whatsapp_list_chats",
+            "whatsapp_chat_messages",
+            "whatsapp_send_message",
+            "odoo_search_partners",
+            "odoo_my_invoices",
+            "odoo_my_helpdesk_tickets",
+            "odoo_get_record",
         ] {
             assert!(classify_tool(name).is_some(), "unclassified tool: {name}");
         }
@@ -1109,13 +1188,23 @@ mod tests {
     #[test]
     fn side_effects_are_side_effects() {
         for name in [
-            "mail_open", "filesystem_open_file", "filesystem_open_file_with",
-            "filesystem_reveal_in_finder", "macos_open_app", "macos_focus_app",
-            "macos_switch_workspace", "whatsapp_send_message",
+            "mail_open",
+            "filesystem_open_file",
+            "filesystem_open_file_with",
+            "filesystem_reveal_in_finder",
+            "macos_open_app",
+            "macos_focus_app",
+            "macos_switch_workspace",
+            "whatsapp_send_message",
         ] {
             assert_eq!(classify_tool(name), Some(ToolKind::SideEffect), "{name}");
         }
-        for name in ["mail_search", "web_fetch", "odoo_get_record", "filesystem_read_text"] {
+        for name in [
+            "mail_search",
+            "web_fetch",
+            "odoo_get_record",
+            "filesystem_read_text",
+        ] {
             assert_eq!(classify_tool(name), Some(ToolKind::ReadOnly), "{name}");
         }
     }
@@ -1124,13 +1213,28 @@ mod tests {
     fn unattended_escalates_auto_side_effects_to_ask() {
         use ApprovalLevel::*;
         // Unattended + side effect + auto → ask (fresh approval required).
-        assert!(matches!(escalate_for_test(true, ToolKind::SideEffect, Auto), Ask));
+        assert!(matches!(
+            escalate_for_test(true, ToolKind::SideEffect, Auto),
+            Ask
+        ));
         // Forbidden always stays forbidden.
-        assert!(matches!(escalate_for_test(true, ToolKind::SideEffect, Forbidden), Forbidden));
+        assert!(matches!(
+            escalate_for_test(true, ToolKind::SideEffect, Forbidden),
+            Forbidden
+        ));
         // Reads keep their rules verdict unattended.
-        assert!(matches!(escalate_for_test(true, ToolKind::ReadOnly, Auto), Auto));
+        assert!(matches!(
+            escalate_for_test(true, ToolKind::ReadOnly, Auto),
+            Auto
+        ));
         // Attended behavior unchanged.
-        assert!(matches!(escalate_for_test(false, ToolKind::SideEffect, Auto), Auto));
-        assert!(matches!(escalate_for_test(false, ToolKind::ReadOnly, Ask), Ask));
+        assert!(matches!(
+            escalate_for_test(false, ToolKind::SideEffect, Auto),
+            Auto
+        ));
+        assert!(matches!(
+            escalate_for_test(false, ToolKind::ReadOnly, Ask),
+            Ask
+        ));
     }
 }

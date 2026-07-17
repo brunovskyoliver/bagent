@@ -7,10 +7,10 @@
 use std::path::PathBuf;
 
 use rmcp::{
-    RoleClient, ServiceExt,
     model::{Content, RawContent},
     service::RunningService,
     transport::TokioChildProcess,
+    RoleClient, ServiceExt,
 };
 use tokio::process::Command;
 
@@ -233,10 +233,7 @@ mod tests {
     #[test]
     fn extract_name_bold_markdown() {
         let text = "1. **Tenenet s.r.o.** (ID: 5)\n   Email: x";
-        assert_eq!(
-            extract_first_name(text).as_deref(),
-            Some("Tenenet s.r.o.")
-        );
+        assert_eq!(extract_first_name(text).as_deref(), Some("Tenenet s.r.o."));
     }
 
     #[test]

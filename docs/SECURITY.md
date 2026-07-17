@@ -12,6 +12,7 @@ Threat model and mitigations for the bagent macOS assistant.
 4. **Least privilege.** Each connector requests only the permissions it needs; requests them at first use; explains why.
 5. **Deny by default.** Unclassified tool calls default to `Ask`; unknown write operations default to `Forbidden`.
 6. **Defense in depth.** Multiple independent layers: rules engine → approval modal → audit log → OS sandbox.
+7. **Unattended runs never write.** A scheduled automation may do permitted read-only work unattended, but every side-effecting tool call requires a fresh, single-action human approval (auto-deny after 60 s; approvals never survive a daemon restart). Unknown tools fail closed unattended; mail/web/tool results are treated as untrusted prompt-injection vectors and the stored prompt is not a policy override. See `docs/AUTOMATIONS.md`.
 
 ---
 

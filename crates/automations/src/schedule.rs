@@ -88,8 +88,12 @@ pub enum RecurrenceRule {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AutomationSchedule {
     /// Run once at the given UTC instant.
-    Once { at: DateTime<Utc> },
-    Recurring { rule: RecurrenceRule },
+    Once {
+        at: DateTime<Utc>,
+    },
+    Recurring {
+        rule: RecurrenceRule,
+    },
 }
 
 /// Parse and validate an IANA time-zone identifier.
@@ -120,9 +124,9 @@ impl RecurrenceRule {
     fn matches_weekday(&self, day: chrono::Weekday) -> bool {
         match self {
             RecurrenceRule::EveryNHours { .. } | RecurrenceRule::Daily { .. } => true,
-            RecurrenceRule::Weekdays { .. } => Weekday::WEEKDAYS
-                .iter()
-                .any(|w| w.to_chrono() == day),
+            RecurrenceRule::Weekdays { .. } => {
+                Weekday::WEEKDAYS.iter().any(|w| w.to_chrono() == day)
+            }
             RecurrenceRule::SelectedWeekdays { days, .. } => {
                 days.iter().any(|w| w.to_chrono() == day)
             }
@@ -151,11 +155,7 @@ impl AutomationSchedule {
     }
 
     /// First occurrence strictly after `after`, or `None` (one-shot in the past).
-    pub fn next_occurrence(
-        &self,
-        tz: Tz,
-        after: DateTime<Utc>,
-    ) -> Option<DateTime<Utc>> {
+    pub fn next_occurrence(&self, tz: Tz, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
             AutomationSchedule::Once { at } => (*at > after).then_some(*at),
             AutomationSchedule::Recurring { rule } => match rule {
@@ -256,7 +256,9 @@ mod tests {
 
     #[test]
     fn once_in_future_fires_once() {
-        let s = AutomationSchedule::Once { at: utc("2026-07-20T07:30:00Z") };
+        let s = AutomationSchedule::Once {
+            at: utc("2026-07-20T07:30:00Z"),
+        };
         assert_eq!(
             s.next_occurrence(tz(), utc("2026-07-19T00:00:00Z")),
             Some(utc("2026-07-20T07:30:00Z"))
@@ -267,7 +269,9 @@ mod tests {
 
     #[test]
     fn every_n_hours_is_fixed_duration() {
-        let s = AutomationSchedule::Recurring { rule: RecurrenceRule::EveryNHours { hours: 2 } };
+        let s = AutomationSchedule::Recurring {
+            rule: RecurrenceRule::EveryNHours { hours: 2 },
+        };
         assert_eq!(
             s.next_occurrence(tz(), utc("2026-07-16T10:15:00Z")),
             Some(utc("2026-07-16T12:15:00Z"))
@@ -277,7 +281,11 @@ mod tests {
     #[test]
     fn daily_at_local_time() {
         // 08:00 Bratislava summer = 06:00 UTC.
-        let s = AutomationSchedule::Recurring { rule: RecurrenceRule::Daily { time: t("08:00:00") } };
+        let s = AutomationSchedule::Recurring {
+            rule: RecurrenceRule::Daily {
+                time: t("08:00:00"),
+            },
+        };
         assert_eq!(
             s.next_occurrence(tz(), utc("2026-07-16T05:00:00Z")),
             Some(utc("2026-07-16T06:00:00Z"))
@@ -292,7 +300,11 @@ mod tests {
     #[test]
     fn weekdays_skip_weekend() {
         // 2026-07-17 is a Friday.
-        let s = AutomationSchedule::Recurring { rule: RecurrenceRule::Weekdays { time: t("08:00:00") } };
+        let s = AutomationSchedule::Recurring {
+            rule: RecurrenceRule::Weekdays {
+                time: t("08:00:00"),
+            },
+        };
         assert_eq!(
             s.next_occurrence(tz(), utc("2026-07-17T06:00:00Z")), // Fri 08:00 local exactly
             Some(utc("2026-07-20T06:00:00Z"))                     // Mon
@@ -318,7 +330,10 @@ mod tests {
     fn weekly_same_day_time_passed_goes_next_week() {
         // 2026-07-17 is a Friday; 07:45 local = 05:45 UTC.
         let s = AutomationSchedule::Recurring {
-            rule: RecurrenceRule::Weekly { day: Weekday::Fri, time: t("07:45:00") },
+            rule: RecurrenceRule::Weekly {
+                day: Weekday::Fri,
+                time: t("07:45:00"),
+            },
         };
         assert_eq!(
             s.next_occurrence(tz(), utc("2026-07-17T05:45:00Z")),
@@ -330,7 +345,11 @@ mod tests {
     fn spring_forward_nonexistent_time_advances_to_next_valid() {
         // Bratislava 2026-03-29: 02:00 → 03:00, so 02:30 local does not exist.
         // Policy: next valid local time = 03:00 CEST = 01:00 UTC.
-        let s = AutomationSchedule::Recurring { rule: RecurrenceRule::Daily { time: t("02:30:00") } };
+        let s = AutomationSchedule::Recurring {
+            rule: RecurrenceRule::Daily {
+                time: t("02:30:00"),
+            },
+        };
         assert_eq!(
             s.next_occurrence(tz(), utc("2026-03-28T23:00:00Z")),
             Some(utc("2026-03-29T01:00:00Z"))
@@ -341,7 +360,11 @@ mod tests {
     fn fall_back_ambiguous_time_picks_earlier_instant() {
         // Bratislava 2026-10-25: 03:00 → 02:00, so 02:30 local happens twice.
         // Policy: earlier instant = 02:30 CEST = 00:30 UTC.
-        let s = AutomationSchedule::Recurring { rule: RecurrenceRule::Daily { time: t("02:30:00") } };
+        let s = AutomationSchedule::Recurring {
+            rule: RecurrenceRule::Daily {
+                time: t("02:30:00"),
+            },
+        };
         assert_eq!(
             s.next_occurrence(tz(), utc("2026-10-24T23:00:00Z")),
             Some(utc("2026-10-25T00:30:00Z"))
@@ -352,8 +375,14 @@ mod tests {
     fn daily_recurrence_is_local_not_utc_plus_24h() {
         // Across the fall-back transition a daily 08:00 automation moves from
         // 06:00 UTC (CEST) to 07:00 UTC (CET) — not a fixed +24 h.
-        let s = AutomationSchedule::Recurring { rule: RecurrenceRule::Daily { time: t("08:00:00") } };
-        let sat = s.next_occurrence(tz(), utc("2026-10-24T00:00:00Z")).unwrap();
+        let s = AutomationSchedule::Recurring {
+            rule: RecurrenceRule::Daily {
+                time: t("08:00:00"),
+            },
+        };
+        let sat = s
+            .next_occurrence(tz(), utc("2026-10-24T00:00:00Z"))
+            .unwrap();
         let sun = s.next_occurrence(tz(), sat).unwrap();
         assert_eq!(sat, utc("2026-10-24T06:00:00Z"));
         assert_eq!(sun, utc("2026-10-25T07:00:00Z"));
@@ -366,7 +395,10 @@ mod tests {
             Err(ScheduleError::InvalidInterval)
         );
         assert_eq!(
-            RecurrenceRule::EveryNHours { hours: MAX_INTERVAL_HOURS + 1 }.validate(),
+            RecurrenceRule::EveryNHours {
+                hours: MAX_INTERVAL_HOURS + 1
+            }
+            .validate(),
             Err(ScheduleError::InvalidInterval)
         );
         assert!(RecurrenceRule::EveryNHours { hours: 1 }.validate().is_ok());
@@ -375,7 +407,11 @@ mod tests {
     #[test]
     fn empty_selected_weekdays_rejected() {
         assert_eq!(
-            RecurrenceRule::SelectedWeekdays { days: vec![], time: t("08:00:00") }.validate(),
+            RecurrenceRule::SelectedWeekdays {
+                days: vec![],
+                time: t("08:00:00")
+            }
+            .validate(),
             Err(ScheduleError::EmptyWeekdays)
         );
     }

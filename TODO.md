@@ -582,3 +582,18 @@ Daemon spawns `uvx mcp-server-odoo` as a child process and speaks MCP over stdio
 - [ ] Kill switch: menu bar item immediately revokes all active session-scoped permits
 - [ ] Forbidden list: `sudo`, `rm -rf`, password fields (`AXIsPasswordField`), Keychain paths, system files
 - [ ] Hard per-minute action budget (default 20 actions/min); configurable in Settings
+
+---
+
+## Scheduled Automations (2026-07) — DONE
+
+Implemented end to end (see `docs/AUTOMATIONS.md`; issues #1–#14):
+
+- [x] `bagent-automations` crate: typed schedules, IANA-zone recurrence, DST policies, validation, catch-up window
+- [x] launchd daemon residency — scheduling continues after the app exits
+- [x] shared agent execution service (`agent_exec.rs`): one loop for chat + automations, unattended write gating, fail-closed unknown tools
+- [x] persistence + typed CRUD API (`V13`), approval provenance (`V14`), 50-run retention with audited cleanup
+- [x] daemon scheduler: atomic claims, 24h single catch-up, overlap/stale skip records, restart recovery, 2-run concurrency
+- [x] daemon-wide `/events` SSE + background approval preemption in the notch
+- [x] `/automations` notch surface: list, detail (runs + full-output reuse), step editor for once/hourly/daily/weekday/weekly
+- [ ] follow-ups: live manual validation of sleep/wake + unattended write approval paths; per-automation model selection; fixed-phase every-N-hours anchoring

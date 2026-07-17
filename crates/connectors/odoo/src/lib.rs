@@ -5,7 +5,7 @@ pub use types::{
     HelpdeskTicket, Invoice, OdooConfig, OdooError, OdooMcpResult, OdooRecordRef, Partner, M2O,
 };
 
-use mcp::{McpClient, extract_first_id, extract_first_name, extract_text, find_uvx, spawn_mcp};
+use mcp::{extract_first_id, extract_first_name, extract_text, find_uvx, spawn_mcp, McpClient};
 use rmcp::model::CallToolRequestParams;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -77,28 +77,21 @@ impl OdooConnector {
         tracing::debug!(uvx = %uvx_path.display(), "spawning mcp-server-odoo");
 
         // 2. Spawn MCP subprocess + initialize handshake (generous timeout for cold start)
-        let client = tokio::time::timeout(
-            Duration::from_secs(90),
-            spawn_mcp(&cfg, &uvx_path),
-        )
-        .await
-        .map_err(|_| {
-            OdooError::McpUnavailable(
+        let client = tokio::time::timeout(Duration::from_secs(90), spawn_mcp(&cfg, &uvx_path))
+            .await
+            .map_err(|_| {
+                OdooError::McpUnavailable(
                 "timed out after 90 s — first run may need longer for uvx to download the package"
                     .into(),
             )
-        })??;
+            })??;
 
         // 3. Verify creds + resolve uid via /mcp/auth/validate REST endpoint
         //    (search_records on res.users requires explicit MCP model permission — use REST instead)
         let uid = resolve_uid_rest(&cfg).await?;
 
         // 4. Cache tool list
-        let tool_count = client
-            .list_all_tools()
-            .await
-            .map(|t| t.len())
-            .unwrap_or(0);
+        let tool_count = client.list_all_tools().await.map(|t| t.len()).unwrap_or(0);
 
         // 5. Best-effort server version from REST (non-fatal)
         let server_version = fetch_server_version(&cfg).await;
@@ -145,9 +138,7 @@ impl OdooConnector {
         open_only: bool,
         limit: u32,
     ) -> Result<OdooMcpResult, OdooError> {
-        let mut filters = vec![
-            json!(["move_type", "in", ["out_invoice", "in_invoice"]]),
-        ];
+        let mut filters = vec![json!(["move_type", "in", ["out_invoice", "in_invoice"]])];
         if open_only {
             filters.push(json!(["payment_state", "not in", ["paid", "reversed"]]));
             filters.push(json!(["state", "=", "posted"]));
@@ -157,9 +148,15 @@ impl OdooConnector {
             "account.move",
             domain,
             json!([
-                "id", "name", "partner_id", "amount_total",
-                "currency_id", "state", "payment_state",
-                "invoice_date", "invoice_date_due"
+                "id",
+                "name",
+                "partner_id",
+                "amount_total",
+                "currency_id",
+                "state",
+                "payment_state",
+                "invoice_date",
+                "invoice_date_due"
             ]),
             limit,
         )
@@ -181,8 +178,13 @@ impl OdooConnector {
             "helpdesk.ticket",
             domain,
             json!([
-                "id", "name", "stage_id", "partner_id", "user_id",
-                "priority", "create_date"
+                "id",
+                "name",
+                "stage_id",
+                "partner_id",
+                "user_id",
+                "priority",
+                "create_date"
             ]),
             limit,
         )
@@ -347,12 +349,10 @@ async fn resolve_uid_rest(cfg: &OdooConfig) -> Result<i64, OdooError> {
     }
 
     // Parse uid from the response JSON — try common field names defensively
-    let body: Value = resp
-        .json()
-        .await
-        .unwrap_or(Value::Null);
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
 
-    let uid = body.get("uid")
+    let uid = body
+        .get("uid")
         .or_else(|| body.get("user_id"))
         .or_else(|| body.get("id"))
         .and_then(|v| v.as_i64());
@@ -411,7 +411,7 @@ async fn fetch_server_version(cfg: &OdooConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{M2O, Partner};
+    use crate::types::{Partner, M2O};
 
     #[test]
     fn web_url_format() {
@@ -468,8 +468,7 @@ mod tests {
     #[test]
     fn domain_shapes_not_double_wrapped() {
         // search_partners domain: should be ["|", term, term], NOT [["|", ...]]
-        let domain_partners =
-            json!(["|", ["name", "ilike", "q"], ["email", "ilike", "q"]]);
+        let domain_partners = json!(["|", ["name", "ilike", "q"], ["email", "ilike", "q"]]);
         assert!(domain_partners.is_array(), "domain must be array");
         assert_eq!(
             domain_partners.as_array().unwrap()[0].as_str(),
@@ -518,7 +517,10 @@ mod tests {
             api_key: std::env::var("ODOO_KEY").unwrap(),
         };
         let conn = OdooConnector::connect(cfg).await.expect("connect");
-        println!("uid={} version={} tools={}", conn.uid, conn.server_version, conn.tool_count);
+        println!(
+            "uid={} version={} tools={}",
+            conn.uid, conn.server_version, conn.tool_count
+        );
     }
 
     #[tokio::test]
@@ -533,7 +535,10 @@ mod tests {
         let conn = OdooConnector::connect(cfg).await.unwrap();
         let result = conn.search_partners("Tenenet", 5).await.unwrap();
         println!("text:\n{}", result.text);
-        println!("first_id: {:?}, first_name: {:?}", result.first_id, result.first_name);
+        println!(
+            "first_id: {:?}, first_name: {:?}",
+            result.first_id, result.first_name
+        );
     }
 
     #[tokio::test]

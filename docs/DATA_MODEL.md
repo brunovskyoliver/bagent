@@ -236,6 +236,15 @@ Hash chain: `prev_hash = SHA256(JSON(previous_row))` where `JSON(row)` = canonic
 
 ---
 
+### `automations` / `automation_runs` (V13, V14)
+
+Scheduled automations and their bounded run history — see
+`crates/daemon/migrations/V13__automations.sql` and `docs/AUTOMATIONS.md`.
+Schedules are typed JSON (`bagent-automations::AutomationSchedule`), instants
+UTC RFC3339, the user's IANA zone alongside. `automation_runs` keeps the
+newest 50 rows per automation (each cleanup audited); `pending_approvals`
+gained `origin_json` (V14) so approvals identify the originating automation.
+
 ### `embeddings`
 
 Vector embeddings for semantic search over messages, notes, and memory items.

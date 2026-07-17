@@ -72,6 +72,7 @@ they were removed; do not reintroduce them.
 | `.thinking` | submit → `collapseInputForThinking()` | thinking indicator |
 | `.output` | first assistant token → `presentOutputChat()` | streamed response |
 | `.settings` | `/settings` → `openNotchSettings()` | settings pages |
+| `.automations` | `/automations` → `openAutomations()` | automation list / detail / step editor |
 
 Two surfaces preempt the mode switch entirely, in `InlineNotchContent.body`:
 
@@ -92,6 +93,7 @@ All points, in `NotchWrapMetrics`:
 | Input | 221 | 72 |
 | Output | 154 (min 72) | 96, grows to 280 |
 | Settings | 205 | 252 (setup page: 280) |
+| Automations | 205 | 214 |
 | cmux banner | 84 | 19 |
 | Paste wheel | 196 | 36 + 96 bulge dome |
 | **Ceiling** | **260** | **280** |
@@ -150,6 +152,21 @@ current page icon.
 
 `setup` is the only page that scrolls and the only one at full bridge height —
 credentials plus the rules editor do not fit otherwise.
+
+---
+
+## Automations
+
+`/automations` opens `.automations` mode. `AutomationsSurfaceState` (an enum on
+`ChatViewModel`, rendered by `AutomationsNotchContent`) selects what shows
+inside the mode: `.list` (≈3 upcoming rows + `+`), `.detail`,
+`.deleteConfirmation`, and the step editor
+(`.editorTask → .editorSchedule → .editorRecurrence → .editorReview →
+.editorSaving`). The editor is divided into steps instead of scrolling; every
+step fits the 214-pt bridge. Escape steps back one level before collapsing;
+↑/↓ + Return drive the list. Long run results are shown by reusing the normal
+`.output` presentation (tap the result box in detail). Approval and WhatsApp
+QR preemption order is unchanged. See `docs/AUTOMATIONS.md`.
 
 ---
 

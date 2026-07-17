@@ -263,11 +263,6 @@ struct MailRef {
     auto_open: bool,
 }
 
-
-
-
-
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WhatsappRef {
     chat_id: String,
@@ -654,7 +649,6 @@ async fn main() -> Result<()> {
         Arc::new(loaded)
     };
 
-
     let task_rater = Arc::new(TaskRater::new());
 
     let codex = {
@@ -747,10 +741,22 @@ async fn main() -> Result<()> {
                 .patch(automations_api::automation_patch)
                 .delete(automations_api::automation_delete),
         )
-        .route("/automations/:id/enable", post(automations_api::automation_enable))
-        .route("/automations/:id/disable", post(automations_api::automation_disable))
-        .route("/automations/:id/run-now", post(automations_api::automation_run_now))
-        .route("/automations/:id/runs", get(automations_api::automation_runs))
+        .route(
+            "/automations/:id/enable",
+            post(automations_api::automation_enable),
+        )
+        .route(
+            "/automations/:id/disable",
+            post(automations_api::automation_disable),
+        )
+        .route(
+            "/automations/:id/run-now",
+            post(automations_api::automation_run_now),
+        )
+        .route(
+            "/automations/:id/runs",
+            get(automations_api::automation_runs),
+        )
         // Phase 4B — Sessions
         .route("/sessions", post(session_create).get(sessions_list))
         .route("/sessions/:id/turns", get(session_turns))
@@ -1506,8 +1512,6 @@ async fn skills_get(State(state): State<AppState>, Path(name): Path<String>) -> 
 
 // ── Debug: context plan ───────────────────────────────────────────────────────
 
-
-
 async fn debug_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1654,10 +1658,6 @@ fn debug_trace_preview(trace: &PromptTrace) -> String {
     preview_text(&format!("{layers}; {recall}{mail}"), 180)
 }
 
-
-
-
-
 fn preview_text(s: &str, max: usize) -> String {
     let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.len() <= max {
@@ -1785,7 +1785,11 @@ async fn events_stream(
         loop {
             match sub.recv().await {
                 Ok(v) => {
-                    if tx.send(Ok(Event::default().data(v.to_string()))).await.is_err() {
+                    if tx
+                        .send(Ok(Event::default().data(v.to_string())))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1958,9 +1962,7 @@ async fn chat(
             .history
             .iter()
             .rev()
-            .filter(|m| {
-                (m.role == "user" || m.role == "assistant") && !m.content.trim().is_empty()
-            })
+            .filter(|m| (m.role == "user" || m.role == "assistant") && !m.content.trim().is_empty())
             .take(HISTORY_MAX_TURNS)
             .map(|m| Message {
                 role: m.role.clone(),
@@ -2025,7 +2027,6 @@ async fn chat(
             ))
         };
         let _ = source_mode; // source hints are obsolete — the model picks tools itself
-
 
         // Load attachment records from DB and build context + image data for Ollama.
         struct AttachmentData {
@@ -2205,8 +2206,7 @@ async fn chat(
 
         // Select skills
         let selected_skills: Vec<SelectedSkill> = {
-            let bagent_selected =
-                skill_selector::select(&[], &skills, &user_message);
+            let bagent_selected = skill_selector::select(&[], &skills, &user_message);
             bagent_selected
                 .into_iter()
                 .map(|s| SelectedSkill {
@@ -2260,7 +2260,10 @@ async fn chat(
                         included: true,
                         chars: hist_chars,
                         preview: preview_text(
-                            &history.last().map(|m| m.content.clone()).unwrap_or_default(),
+                            &history
+                                .last()
+                                .map(|m| m.content.clone())
+                                .unwrap_or_default(),
                             240,
                         ),
                     });
@@ -3074,8 +3077,14 @@ async fn request_tool_approval(
     tool_name: &str,
     description: &str,
 ) -> bool {
-    request_approval_core(state, tool_name, description, Some(sink), origin.provenance_json())
-        .await
+    request_approval_core(
+        state,
+        tool_name,
+        description,
+        Some(sink),
+        origin.provenance_json(),
+    )
+    .await
 }
 
 // ── Codex handlers (Phase 8) ─────────────────────────────────────────────────
@@ -3883,32 +3892,7 @@ async fn mail_sync(State(state): State<AppState>) -> impl IntoResponse {
 
 // ── Tool context injection ────────────────────────────────────────────────────
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ── WhatsApp DB helpers ───────────────────────────────────────────────────────
-
-
-
 
 // ── AeroSpace executor ────────────────────────────────────────────────────────
 
@@ -3954,9 +3938,6 @@ async fn run_aerospace(args: &[&str]) -> anyhow::Result<String> {
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
-
-
-
 
 // ── Context management ────────────────────────────────────────────────────────
 
@@ -4047,8 +4028,14 @@ mod tests {
         assert_eq!(
             links,
             vec![
-                ("Denné menu".to_string(), "https://www.example.sk/denne-menu".to_string()),
-                ("Kontakt".to_string(), "https://www.example.sk/kontakt.html".to_string()),
+                (
+                    "Denné menu".to_string(),
+                    "https://www.example.sk/denne-menu".to_string()
+                ),
+                (
+                    "Kontakt".to_string(),
+                    "https://www.example.sk/kontakt.html".to_string()
+                ),
             ]
         );
         assert_eq!(extract_links(html, &base, 1).len(), 1);
@@ -4071,7 +4058,16 @@ mod tests {
 
     #[test]
     fn private_hosts_are_rejected() {
-        for h in ["localhost", "127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1", "[::1]", "printer.local", ""] {
+        for h in [
+            "localhost",
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.1",
+            "[::1]",
+            "printer.local",
+            "",
+        ] {
             assert!(is_private_host(h), "{h} should be private");
         }
         for h in ["example.com", "8.8.8.8", "en.wikipedia.org"] {
@@ -4127,17 +4123,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
-
-
-
-
-
-
-
-
-
-
-
 }
 
 // ── Tool-loop dispatch helpers ────────────────────────────────────────────────
@@ -4299,8 +4284,7 @@ async fn tool_mail_read(
         Ok(Ok(Some(mut msg))) => {
             // emlx not cached → on-demand AppleScript fetch (same as mail_message handler)
             if msg.body.is_none() {
-                if let Some(body) = apple_mail_connector::body_via_applescript(&msg.subject).await
-                {
+                if let Some(body) = apple_mail_connector::body_via_applescript(&msg.subject).await {
                     msg.body = Some(body);
                 }
             }
@@ -4356,7 +4340,9 @@ async fn tool_mail_open(mail: &MailConnector, args: &serde_json::Value) -> Strin
 // private hosts/IPs are rejected (per hop via the redirect policy).
 
 fn is_private_host(host: &str) -> bool {
-    let h = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    let h = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
     if h.is_empty() || h == "localhost" || h.ends_with(".local") {
         return true;
     }
@@ -4386,9 +4372,7 @@ fn web_http_client() -> reqwest::Client {
                 attempt.follow()
             }
         }))
-        .user_agent(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/128.0",
-        )
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/128.0")
         .build()
         .unwrap_or_default()
 }
@@ -4399,10 +4383,9 @@ fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(b) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(b);
                 i += 3;
                 continue;
@@ -4480,9 +4463,13 @@ fn parse_ddg_lite(html: &str, max: usize) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     let mut rest = html;
     while out.len() < max {
-        let Some(a_pos) = rest.find(ANCHOR) else { break };
+        let Some(a_pos) = rest.find(ANCHOR) else {
+            break;
+        };
         let after = &rest[a_pos + ANCHOR.len()..];
-        let Some(href_end) = after.find('"') else { break };
+        let Some(href_end) = after.find('"') else {
+            break;
+        };
         let href = &after[..href_end];
         let (Some(gt), Some(a_close)) = (after.find('>'), after.find("</a>")) else {
             break;
@@ -4584,8 +4571,12 @@ fn extract_links(html: &str, base: &reqwest::Url, max: usize) -> Vec<(String, St
     while out.len() < max {
         let Some(a_pos) = rest.find("<a ") else { break };
         let tag_rest = &rest[a_pos..];
-        let Some(tag_end) = tag_rest.find('>') else { break };
-        let Some(close) = tag_rest.find("</a>") else { break };
+        let Some(tag_end) = tag_rest.find('>') else {
+            break;
+        };
+        let Some(close) = tag_rest.find("</a>") else {
+            break;
+        };
         let tag = &tag_rest[..tag_end];
         let inner = if tag_end < close {
             &tag_rest[tag_end + 1..close]
@@ -4600,8 +4591,7 @@ fn extract_links(html: &str, base: &reqwest::Url, max: usize) -> Vec<(String, St
             Some(&tag[start..start + end])
         });
         let Some(href) = href else { continue };
-        if href.starts_with('#') || href.starts_with("javascript:") || href.starts_with("mailto:")
-        {
+        if href.starts_with('#') || href.starts_with("javascript:") || href.starts_with("mailto:") {
             continue;
         }
         let Ok(mut abs) = base.join(href) else {

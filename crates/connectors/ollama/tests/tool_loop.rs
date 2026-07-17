@@ -91,7 +91,8 @@ async fn tool_result_round_trip_produces_grounded_answer() {
         Message::user("show me the most recent email from tomas.juricek@novem.sk"),
     ];
     // Simulate the loop: round 1 → tool call
-    let stream = client.chat_stream_with_tools(MODEL.into(), messages.clone(), vec![mail_search_tool()]);
+    let stream =
+        client.chat_stream_with_tools(MODEL.into(), messages.clone(), vec![mail_search_tool()]);
     tokio::pin!(stream);
     let mut calls = Vec::new();
     while let Some(ev) = stream.next().await {
@@ -151,7 +152,8 @@ async fn web_question_triggers_web_search_and_grounded_answer() {
         Message::system("You are a local assistant. Use tools for facts; never guess."),
         Message::user("Which company develops the tool called Claude Code? Search the web."),
     ];
-    let stream = client.chat_stream_with_tools(MODEL.into(), messages.clone(), vec![web_search_tool()]);
+    let stream =
+        client.chat_stream_with_tools(MODEL.into(), messages.clone(), vec![web_search_tool()]);
     tokio::pin!(stream);
     let mut calls = Vec::new();
     while let Some(ev) = stream.next().await {
@@ -205,7 +207,10 @@ async fn history_window_resolves_followup_reference() {
     }
     let a = answer.to_lowercase();
     assert!(
-        a.contains("claude") || a.contains("anthropic") || a.contains("subscription") || a.contains("plan"),
+        a.contains("claude")
+            || a.contains("anthropic")
+            || a.contains("subscription")
+            || a.contains("plan"),
         "follow-up not resolved from history: {answer}"
     );
 }

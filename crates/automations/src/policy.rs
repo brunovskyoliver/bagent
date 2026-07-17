@@ -63,7 +63,10 @@ mod tests {
 
     #[test]
     fn clamp_preserves_short_and_truncates_long() {
-        assert_eq!(clamp_result_summary("faktúra so splatnosťou"), "faktúra so splatnosťou");
+        assert_eq!(
+            clamp_result_summary("faktúra so splatnosťou"),
+            "faktúra so splatnosťou"
+        );
         let long = "á".repeat(MAX_RESULT_SUMMARY_CHARS + 10);
         let clamped = clamp_result_summary(&long);
         assert_eq!(clamped.chars().count(), MAX_RESULT_SUMMARY_CHARS);
