@@ -996,7 +996,16 @@ struct NotchWrapView: View {
                 bulgeSweep: bulgeSweep
             )
         )
-        .onTapGesture { handleTap() }
+        // The surface tap toggles the pill / focuses cmux. While an inline
+        // surface (input/output/settings/automations) is open, the mask hands
+        // clicks to the content instead — otherwise this ancestor gesture
+        // races SwiftUI Buttons inside the bridge (e.g. the automations
+        // editor's "Ďalej") and a button click collapses the notch.
+        // Esc and click-away still dismiss inline surfaces.
+        .gesture(
+            TapGesture().onEnded { handleTap() },
+            including: isInlineActive ? .subviews : .all
+        )
         .onDrop(of: [.fileURL], isTargeted: $isDragTargeted) { providers in
             // Expand the chat panel, then queue the dropped files
             onTap()
