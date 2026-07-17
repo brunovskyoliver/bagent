@@ -46,6 +46,7 @@ use whatsapp_connector::{
 
 mod agent_exec;
 mod automations_api;
+mod scheduler;
 
 mod embedded {
     refinery::embed_migrations!("migrations");
@@ -92,6 +93,8 @@ struct AppState {
     /// background approval notifications. Payloads are concise and redacted —
     /// clients refetch authoritative records.
     events_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// Bounded automation concurrency (scheduled + run-now share the slots).
+    run_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -714,7 +717,14 @@ async fn main() -> Result<()> {
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
         events_tx: tokio::sync::broadcast::channel(256).0,
+        run_slots: Arc::new(tokio::sync::Semaphore::new(
+            bagent_automations::policy::MAX_CONCURRENT_RUNS,
+        )),
     };
+
+    // Daemon-owned automation scheduler: recovery at startup, then sleeps
+    // until the next due instant (woken immediately by automations_changed).
+    tokio::spawn(scheduler::run_scheduler(state.clone()));
 
     let shutdown_state = state.clone();
     let app = Router::new()

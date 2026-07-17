@@ -293,8 +293,7 @@ pub(crate) fn repo_recent_runs(
     Ok(rows)
 }
 
-/// Insert a run row. Used by run-now and the scheduler (issues #6/#8).
-#[allow(dead_code)]
+/// Insert a run row (skip records; claims go through repo_claim_run).
 pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<(), RepoError> {
     conn.execute(
         &format!(
@@ -319,7 +318,6 @@ pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<
 
 /// Finish a run and mirror the outcome onto the automation row, then prune
 /// history past the retention cap. Audit entries are untouched (append-only).
-#[allow(dead_code)]
 pub(crate) fn repo_finish_run(
     conn: &Connection,
     run_id: &str,
@@ -692,6 +690,9 @@ pub(crate) fn outcome_to_status(
 /// Execute a claimed run through the shared agent loop and persist the
 /// outcome. Holds no DB lock during model/connector work.
 pub(crate) async fn execute_automation_run(state: AppState, automation: Automation, run: AutomationRun) {
+    // Bounded concurrency across scheduled and manual runs. The claim row
+    // already exists, so a queued run simply starts a little later.
+    let _permit = state.run_slots.clone().acquire_owned().await;
     let ctx = AutomationExecutionContext {
         automation_id: automation.id,
         automation_name: automation.name.clone(),
