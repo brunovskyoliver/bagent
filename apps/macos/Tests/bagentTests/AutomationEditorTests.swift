@@ -52,6 +52,58 @@ final class AutomationDraftBuilderTests: XCTestCase {
     }
 }
 
+final class AutomationRecurrenceDraftTests: XCTestCase {
+    private func draft(_ recurrence: AutomationDraftRecurrence) -> AutomationDraft {
+        var d = AutomationDraft()
+        d.name = "n"
+        d.prompt = "p"
+        d.hour = 8
+        d.minute = 0
+        d.recurrence = recurrence
+        return d
+    }
+
+    func testHourlyAndDailyWireEncoding() throws {
+        let hourly = try XCTUnwrap(AutomationDraftBuilder.schedule(draft(.everyNHours(2))))
+        XCTAssertEqual(hourly, .recurring(rule: RecurrenceRuleWire(
+            type: "every_n_hours", hours: 2, time: nil, day: nil, days: nil)))
+
+        let daily = try XCTUnwrap(AutomationDraftBuilder.schedule(draft(.daily)))
+        XCTAssertEqual(daily, .recurring(rule: RecurrenceRuleWire(
+            type: "daily", hours: nil, time: "08:00:00", day: nil, days: nil)))
+        // Wire JSON carries the structured rule, never cron.
+        let json = String(decoding: try JSONEncoder().encode(daily), as: UTF8.self)
+        XCTAssertTrue(json.contains("\"type\":\"daily\""))
+        XCTAssertFalse(json.contains("* *"))
+    }
+
+    func testWeekdayWireEncodingIsOrdered() throws {
+        let sched = try XCTUnwrap(AutomationDraftBuilder.schedule(
+            draft(.selectedWeekdays(["fri", "mon", "wed"]))))
+        guard case .recurring(let rule) = sched else { return XCTFail("expected recurring") }
+        XCTAssertEqual(rule.days, ["mon", "wed", "fri"])
+        XCTAssertNil(AutomationDraftBuilder.schedule(draft(.selectedWeekdays([]))))
+    }
+
+    @MainActor
+    func testRecurringSummaryAndPrefill() throws {
+        let vm = ChatViewModel()
+        vm.automationDraft = draft(.daily)
+        XCTAssertTrue(vm.automationDraftSummary.contains("denne o 08:00"))
+
+        let record = try JSONDecoder().decode(AutomationRecord.self, from: Data("""
+        {"id":"r1","name":"Hodinovka","prompt":"p","enabled":true,
+         "timezone":"Europe/Bratislava",
+         "schedule":{"kind":"recurring","rule":{"type":"every_n_hours","hours":3}},
+         "next_run_at":"2026-07-18T07:30:00Z","created_at":"2026-07-17T10:00:00Z",
+         "updated_at":"2026-07-17T10:00:00Z","last_run_at":null,
+         "last_run_status":null,"last_result_summary":null}
+        """.utf8))
+        vm.startAutomationEdit(record)
+        XCTAssertEqual(vm.automationDraft.recurrence, .everyNHours(3))
+    }
+}
+
 @MainActor
 final class AutomationEditorFlowTests: XCTestCase {
     func testEditorStepNavigationAndValidation() {
@@ -81,10 +133,22 @@ final class AutomationEditorFlowTests: XCTestCase {
 
         vm.automationDraft.day = .tomorrow
         vm.automationEditorNext()
+        XCTAssertEqual(vm.automationsSurface, .editorRecurrence)
+
+        // Selected-weekdays with nothing picked can't advance.
+        vm.automationDraft.recurrence = .selectedWeekdays([])
+        vm.automationEditorNext()
+        XCTAssertEqual(vm.automationsSurface, .editorRecurrence)
+        XCTAssertEqual(vm.automationsError, "Vyber aspoň jeden deň")
+
+        vm.automationDraft.recurrence = .once
+        vm.automationEditorNext()
         XCTAssertEqual(vm.automationsSurface, .editorReview)
         XCTAssertTrue(vm.automationDraftSummary.contains("Ranná pošta"))
 
         // Escape steps backwards through the flow, then discards to the list.
+        XCTAssertTrue(vm.automationsGoBack())
+        XCTAssertEqual(vm.automationsSurface, .editorRecurrence)
         XCTAssertTrue(vm.automationsGoBack())
         XCTAssertEqual(vm.automationsSurface, .editorSchedule)
         XCTAssertTrue(vm.automationsGoBack())

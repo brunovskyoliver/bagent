@@ -29,6 +29,8 @@ struct AutomationsNotchContent: View {
                 editorTaskView.transition(contentTransition)
             case .editorSchedule:
                 editorScheduleView.transition(contentTransition)
+            case .editorRecurrence:
+                editorRecurrenceView.transition(contentTransition)
             case .editorReview:
                 editorReviewView.transition(contentTransition)
             case .editorSaving:
@@ -76,6 +78,7 @@ struct AutomationsNotchContent: View {
         case .deleteConfirmation: return "Vymazať?"
         case .editorTask: return viewModel.automationDraft.editingID == nil ? "Nová · úloha" : "Úprava · úloha"
         case .editorSchedule: return "Kedy"
+        case .editorRecurrence: return "Opakovanie"
         case .editorReview: return "Zhrnutie"
         case .editorSaving: return "Ukladám…"
         }
@@ -372,6 +375,93 @@ struct AutomationsNotchContent: View {
               shifted > Calendar.current.startOfDay(for: Date())
         else { return }
         viewModel.automationDraft.day = .custom(shifted)
+    }
+
+    private var editorRecurrenceView: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 5) {
+                recurrenceChip("Raz", matches: { $0.isOnce }) { .once }
+                recurrenceChip("Každé N h", matches: {
+                    if case .everyNHours = $0 { return true } else { return false }
+                }) { .everyNHours(2) }
+                recurrenceChip("Denne", matches: { $0 == .daily }) { .daily }
+            }
+            HStack(spacing: 5) {
+                recurrenceChip("Po–Pia", matches: { $0 == .weekdays }) { .weekdays }
+                recurrenceChip("Vybrané dni", matches: {
+                    if case .selectedWeekdays = $0 { return true } else { return false }
+                }) { .selectedWeekdays(["mon"]) }
+                recurrenceChip("Týždenne", matches: {
+                    if case .weekly = $0 { return true } else { return false }
+                }) { .weekly("mon") }
+            }
+            recurrenceDetailControls
+            Spacer(minLength: 0)
+            editorNav(nextEnabled: true)
+        }
+    }
+
+    @ViewBuilder
+    private var recurrenceDetailControls: some View {
+        switch viewModel.automationDraft.recurrence {
+        case .everyNHours(let n):
+            stepperRow(
+                label: "\(n) h",
+                accessibility: "Interval v hodinách",
+                minus: { viewModel.automationDraft.recurrence = .everyNHours(max(1, n - 1)) },
+                plus: { viewModel.automationDraft.recurrence = .everyNHours(min(168, n + 1)) }
+            )
+        case .selectedWeekdays(let days):
+            weekdayPicker(selected: days) { day in
+                var next = days
+                if next.contains(day) { next.remove(day) } else { next.insert(day) }
+                viewModel.automationDraft.recurrence = .selectedWeekdays(next)
+            }
+        case .weekly(let day):
+            weekdayPicker(selected: [day]) { picked in
+                viewModel.automationDraft.recurrence = .weekly(picked)
+            }
+        case .once, .daily, .weekdays:
+            EmptyView()
+        }
+    }
+
+    private func weekdayPicker(selected: Set<String>, toggle: @escaping (String) -> Void) -> some View {
+        HStack(spacing: 3) {
+            ForEach(["mon", "tue", "wed", "thu", "fri", "sat", "sun"], id: \.self) { day in
+                let isOn = selected.contains(day)
+                Button(RecurrenceRuleWire.shortDay(day)) { toggle(day) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(
+                        isOn ? Color.black : NotchWrapMetrics.notchTextSecondary)
+                    .frame(width: 24, height: 20)
+                    .background(
+                        Color.white.opacity(isOn ? 0.85 : 0.06),
+                        in: RoundedRectangle(cornerRadius: 5))
+                    .accessibilityLabel("Deň \(RecurrenceRuleWire.shortDay(day))")
+                    .accessibilityAddTraits(isOn ? [.isButton, .isSelected] : .isButton)
+            }
+        }
+    }
+
+    private func recurrenceChip(
+        _ title: String,
+        matches: (AutomationDraftRecurrence) -> Bool,
+        make: @escaping () -> AutomationDraftRecurrence
+    ) -> some View {
+        let selected = matches(viewModel.automationDraft.recurrence)
+        return Button(title) {
+            viewModel.automationDraft.recurrence = make()
+        }
+        .buttonStyle(.plain)
+        .font(.system(size: 10, weight: .medium))
+        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(Color.white.opacity(selected ? 0.12 : 0.06), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityLabel("Opakovanie: \(title)")
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 
     private var editorReviewView: some View {

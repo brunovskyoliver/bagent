@@ -97,6 +97,7 @@ enum AutomationsSurfaceState: Equatable {
     // of scrolling — each fits the fixed notch bridge.
     case editorTask
     case editorSchedule
+    case editorRecurrence
     case editorReview
     case editorSaving
 }
@@ -109,6 +110,18 @@ enum AutomationDayChoice: Equatable {
     case custom(Date)
 }
 
+/// How the drafted automation repeats. Structured — no cron strings.
+enum AutomationDraftRecurrence: Equatable {
+    case once
+    case everyNHours(Int)
+    case daily
+    case weekdays
+    case selectedWeekdays(Set<String>)   // lowercase wire days: mon…sun
+    case weekly(String)
+
+    var isOnce: Bool { self == .once }
+}
+
 /// Editor draft — typed state, no scattered booleans.
 struct AutomationDraft: Equatable {
     var editingID: String? = nil
@@ -117,6 +130,7 @@ struct AutomationDraft: Equatable {
     var day: AutomationDayChoice = .today
     var hour: Int
     var minute: Int
+    var recurrence: AutomationDraftRecurrence = .once
     var enabled = true
 
     /// Default: the next full hour.
@@ -153,17 +167,48 @@ enum AutomationDraftBuilder {
         return f.string(from: date)
     }
 
-    /// Wire draft for POST /automations (run-once).
+    /// Structured schedule for the daemon; recurrence times are local
+    /// wall-clock in the automation's zone (backend calculates occurrences).
+    static func schedule(
+        _ draft: AutomationDraft, calendar: Calendar = .current, now: Date = Date()
+    ) -> AutomationSchedule? {
+        let localTime = String(format: "%02d:%02d:00", draft.hour, draft.minute)
+        switch draft.recurrence {
+        case .once:
+            guard let at = scheduledDate(draft, calendar: calendar, now: now) else { return nil }
+            return .once(at: isoUTC(at))
+        case .everyNHours(let n):
+            return .recurring(rule: RecurrenceRuleWire(
+                type: "every_n_hours", hours: n, time: nil, day: nil, days: nil))
+        case .daily:
+            return .recurring(rule: RecurrenceRuleWire(
+                type: "daily", hours: nil, time: localTime, day: nil, days: nil))
+        case .weekdays:
+            return .recurring(rule: RecurrenceRuleWire(
+                type: "weekdays", hours: nil, time: localTime, day: nil, days: nil))
+        case .selectedWeekdays(let days):
+            guard !days.isEmpty else { return nil }
+            let order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+            return .recurring(rule: RecurrenceRuleWire(
+                type: "selected_weekdays", hours: nil, time: localTime, day: nil,
+                days: order.filter { days.contains($0) }))
+        case .weekly(let day):
+            return .recurring(rule: RecurrenceRuleWire(
+                type: "weekly", hours: nil, time: localTime, day: day, days: nil))
+        }
+    }
+
+    /// Wire draft for POST /automations.
     static func wireDraft(
         _ draft: AutomationDraft, timezone: String = TimeZone.current.identifier,
         calendar: Calendar = .current, now: Date = Date()
     ) -> DaemonClient.AutomationDraft? {
-        guard let at = scheduledDate(draft, calendar: calendar, now: now) else { return nil }
+        guard let schedule = schedule(draft, calendar: calendar, now: now) else { return nil }
         return DaemonClient.AutomationDraft(
             name: draft.name.trimmingCharacters(in: .whitespacesAndNewlines),
             prompt: draft.prompt.trimmingCharacters(in: .whitespacesAndNewlines),
             timezone: timezone,
-            schedule: .once(at: isoUTC(at)),
+            schedule: schedule,
             enabled: draft.enabled
         )
     }
@@ -323,7 +368,8 @@ final class ChatViewModel: ObservableObject {
                 if !automations.contains(where: { $0.id == id }) {
                     automationsSurface = .list
                 }
-            case .list, .editorTask, .editorSchedule, .editorReview, .editorSaving:
+            case .list, .editorTask, .editorSchedule, .editorRecurrence, .editorReview,
+                 .editorSaving:
                 // Editor keeps its draft through concurrent SSE updates; an
                 // edited record deleted elsewhere fails at save with 404.
                 break
@@ -358,8 +404,11 @@ final class ChatViewModel: ObservableObject {
         case .editorSchedule:
             automationsSurface = .editorTask
             return true
-        case .editorReview:
+        case .editorRecurrence:
             automationsSurface = .editorSchedule
+            return true
+        case .editorReview:
+            automationsSurface = .editorRecurrence
             return true
         case .editorSaving:
             return true // saving is brief; swallow Escape
@@ -445,18 +494,40 @@ final class ChatViewModel: ObservableObject {
         draft.name = automation.name
         draft.prompt = automation.prompt
         draft.enabled = automation.enabled
-        if case .once = automation.schedule,
-           let date = AutomationTimeFormat.parse(automation.nextRunAt) {
-            let cal = Calendar.current
-            if cal.isDateInToday(date) {
-                draft.day = .today
-            } else if cal.isDateInTomorrow(date) {
-                draft.day = .tomorrow
-            } else {
-                draft.day = .custom(date)
+        switch automation.schedule {
+        case .once:
+            if let date = AutomationTimeFormat.parse(automation.nextRunAt) {
+                let cal = Calendar.current
+                if cal.isDateInToday(date) {
+                    draft.day = .today
+                } else if cal.isDateInTomorrow(date) {
+                    draft.day = .tomorrow
+                } else {
+                    draft.day = .custom(date)
+                }
+                draft.hour = cal.component(.hour, from: date)
+                draft.minute = cal.component(.minute, from: date)
             }
-            draft.hour = cal.component(.hour, from: date)
-            draft.minute = cal.component(.minute, from: date)
+        case .recurring(let rule):
+            switch rule.type {
+            case "every_n_hours":
+                draft.recurrence = .everyNHours(max(1, rule.hours ?? 1))
+            case "daily":
+                draft.recurrence = .daily
+            case "weekdays":
+                draft.recurrence = .weekdays
+            case "selected_weekdays":
+                draft.recurrence = .selectedWeekdays(Set(rule.days ?? []))
+            case "weekly":
+                draft.recurrence = .weekly(rule.day ?? "mon")
+            default:
+                break
+            }
+            if let time = rule.time, time.count >= 5,
+               let h = Int(time.prefix(2)), let m = Int(time.dropFirst(3).prefix(2)) {
+                draft.hour = h
+                draft.minute = m
+            }
         }
         automationDraft = draft
         automationsError = nil
@@ -479,8 +550,19 @@ final class ChatViewModel: ObservableObject {
             automationsError = nil
             automationsSurface = .editorSchedule
         case .editorSchedule:
-            guard let at = AutomationDraftBuilder.scheduledDate(automationDraft), at > Date() else {
-                automationsError = "Čas už uplynul"
+            // The first-run instant only constrains one-shot schedules;
+            // recurrence computes its own next occurrence server-side.
+            if automationDraft.recurrence.isOnce {
+                guard let at = AutomationDraftBuilder.scheduledDate(automationDraft), at > Date() else {
+                    automationsError = "Čas už uplynul"
+                    return
+                }
+            }
+            automationsError = nil
+            automationsSurface = .editorRecurrence
+        case .editorRecurrence:
+            if case .selectedWeekdays(let days) = automationDraft.recurrence, days.isEmpty {
+                automationsError = "Vyber aspoň jeden deň"
                 return
             }
             automationsError = nil
@@ -494,9 +576,18 @@ final class ChatViewModel: ObservableObject {
 
     /// Concise review line: task — schedule — zone.
     var automationDraftSummary: String {
-        let when = AutomationDraftBuilder.scheduledDate(automationDraft)
-            .flatMap { AutomationTimeFormat.shortLocal(AutomationDraftBuilder.isoUTC($0)) } ?? "—"
-        return "\(automationDraft.name) — jednorazovo \(when) (\(TimeZone.current.identifier))"
+        let when: String
+        switch AutomationDraftBuilder.schedule(automationDraft) {
+        case .once?:
+            let at = AutomationDraftBuilder.scheduledDate(automationDraft)
+                .flatMap { AutomationTimeFormat.shortLocal(AutomationDraftBuilder.isoUTC($0)) } ?? "—"
+            when = "jednorazovo \(at)"
+        case .recurring(let rule)?:
+            when = rule.displayLabel
+        case nil:
+            when = "—"
+        }
+        return "\(automationDraft.name) — \(when) (\(TimeZone.current.identifier))"
     }
 
     /// Persist via the daemon; success is claimed only after it confirms.

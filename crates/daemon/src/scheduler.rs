@@ -343,6 +343,95 @@ mod tests {
     }
 
     #[test]
+    fn daily_recurrence_advances_in_local_zone_across_dst() {
+        use bagent_automations::RecurrenceRule;
+        let conn = test_conn();
+        // Daily 08:00 Bratislava, created the day before the fall-back change.
+        let a = repo_create(
+            &conn,
+            "daily",
+            "p",
+            "Europe/Bratislava",
+            &AutomationSchedule::Recurring {
+                rule: RecurrenceRule::Daily { time: "08:00:00".parse().unwrap() },
+            },
+            true,
+            t(2026, 10, 23, 12, 0),
+        )
+        .unwrap();
+        // Sat 2026-10-24: 08:00 CEST = 06:00 UTC.
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 10, 24, 6, 0)));
+        let claimed = scheduler_step(&conn, t(2026, 10, 24, 6, 0));
+        assert_eq!(claimed.len(), 1);
+        // Advanced to Sun 2026-10-25: 08:00 CET = 07:00 UTC — local time, not +24h UTC.
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 10, 25, 7, 0)));
+        // No catch-up loop: an immediate second pass claims nothing.
+        assert!(scheduler_step(&conn, t(2026, 10, 24, 6, 1)).is_empty());
+    }
+
+    #[test]
+    fn every_n_hours_advances_and_failure_does_not_retry() {
+        use bagent_automations::RecurrenceRule;
+        let conn = test_conn();
+        let a = repo_create(
+            &conn,
+            "hourly",
+            "p",
+            "Europe/Bratislava",
+            &AutomationSchedule::Recurring { rule: RecurrenceRule::EveryNHours { hours: 2 } },
+            true,
+            t(2026, 7, 17, 10, 0),
+        )
+        .unwrap();
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 17, 12, 0)));
+        let claimed = scheduler_step(&conn, t(2026, 7, 17, 12, 0));
+        assert_eq!(claimed.len(), 1);
+        // Advanced two hours past the dispatch instant.
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 17, 14, 0)));
+        // The run fails — outcome persists, schedule is NOT pulled earlier.
+        crate::automations_api::repo_finish_run(
+            &conn,
+            &claimed[0].1.id.to_string(),
+            &a.id.to_string(),
+            AutomationRunStatus::Failed,
+            Some("Model error"),
+            t(2026, 7, 17, 12, 1),
+        )
+        .unwrap();
+        let after = repo_get(&conn, &a.id.to_string()).unwrap();
+        assert_eq!(after.last_run_status, Some(AutomationRunStatus::Failed));
+        assert_eq!(after.next_run_at, Some(t(2026, 7, 17, 14, 0)));
+        assert!(scheduler_step(&conn, t(2026, 7, 17, 12, 2)).is_empty());
+    }
+
+    #[test]
+    fn recurring_missed_beyond_window_skips_then_advances() {
+        use bagent_automations::RecurrenceRule;
+        let conn = test_conn();
+        let a = repo_create(
+            &conn,
+            "daily",
+            "p",
+            "Europe/Bratislava",
+            &AutomationSchedule::Recurring {
+                rule: RecurrenceRule::Daily { time: "08:00:00".parse().unwrap() },
+            },
+            true,
+            t(2026, 7, 17, 0, 0),
+        )
+        .unwrap();
+        // Laptop closed for a week: exactly one skip record, schedule jumps to
+        // the next future occurrence — no replay of the missed week.
+        let claimed = scheduler_step(&conn, t(2026, 7, 25, 12, 0));
+        assert!(claimed.is_empty());
+        let runs = repo_recent_runs(&conn, &a.id.to_string(), 20).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, AutomationRunStatus::SkippedStale);
+        // Next occurrence: tomorrow 08:00 local (06:00 UTC in July).
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 26, 6, 0)));
+    }
+
+    #[test]
     fn next_due_ordering_and_clock_jump_forward() {
         let conn = test_conn();
         once(&conn, "b", t(2026, 7, 18, 8, 0), t(2026, 7, 17, 0, 0));
