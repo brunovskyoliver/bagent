@@ -45,6 +45,7 @@ use whatsapp_connector::{
 };
 
 mod agent_exec;
+mod automations_api;
 
 mod embedded {
     refinery::embed_migrations!("migrations");
@@ -84,6 +85,9 @@ struct AppState {
     whatsapp: Arc<WhatsappConnector>,
     /// Ephemeral connector refs for current daemon run only. Never persisted.
     runtime_refs: Arc<Mutex<HashMap<String, RuntimeRefs>>>,
+    /// Pinged whenever an automation is created/edited/enabled/disabled/deleted
+    /// so the scheduler recomputes its next wake-up immediately.
+    automations_changed: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -697,6 +701,7 @@ async fn main() -> Result<()> {
         odoo,
         whatsapp,
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
+        automations_changed: Arc::new(tokio::sync::Notify::new()),
     };
 
     let shutdown_state = state.clone();
@@ -708,6 +713,20 @@ async fn main() -> Result<()> {
         .route("/approvals/pending", get(approvals_pending))
         .route("/approvals/:id/decide", post(approval_decide))
         .route("/rules", get(rules_get).post(rules_save))
+        // Automations — persisted scheduled agent tasks
+        .route(
+            "/automations",
+            get(automations_api::automations_list).post(automations_api::automations_create),
+        )
+        .route(
+            "/automations/:id",
+            get(automations_api::automation_get)
+                .patch(automations_api::automation_patch)
+                .delete(automations_api::automation_delete),
+        )
+        .route("/automations/:id/enable", post(automations_api::automation_enable))
+        .route("/automations/:id/disable", post(automations_api::automation_disable))
+        .route("/automations/:id/runs", get(automations_api::automation_runs))
         // Phase 4B — Sessions
         .route("/sessions", post(session_create).get(sessions_list))
         .route("/sessions/:id/turns", get(session_turns))

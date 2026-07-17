@@ -18,6 +18,7 @@ whatsapp-connector    = { path = "../connectors/whatsapp" }
 bagent-agent          = { path = "../agent" }
 bagent-memory         = { path = "../memory" }
 bagent-rules          = { path = "../rules" }
+bagent-automations    = { path = "../automations" }
 bagent-skills         = { path = "../skills" }
 bagent-attachments    = { path = "../attachments" }
 

@@ -1,0 +1,706 @@
+//! Automations persistence (repository over the daemon SQLite) and typed HTTP
+//! handlers. Transactions stay short — nothing holds the DB lock across an
+//! agent run. Audit rows are concise and redacted: ids, names, statuses —
+//! never full prompts or connector payloads.
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
+use serde_json::json;
+use uuid::Uuid;
+
+use bagent_automations::{
+    parse_timezone, policy, Automation, AutomationId, AutomationRun, AutomationRunId,
+    AutomationRunStatus, AutomationSchedule, ScheduleError,
+};
+
+use crate::{audit_fs, AppState};
+
+// ── Repository ────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub(crate) enum RepoError {
+    NotFound,
+    /// Deletion/patch attempted while a run of this automation is active.
+    ActiveRun,
+    Invalid(ScheduleError),
+    Db(String),
+}
+
+impl From<rusqlite::Error> for RepoError {
+    fn from(e: rusqlite::Error) -> Self {
+        RepoError::Db(e.to_string())
+    }
+}
+
+fn ts(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339()
+}
+
+fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
+
+fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation> {
+    let id: String = row.get(0)?;
+    let schedule_json: String = row.get(5)?;
+    let next_run_at: Option<String> = row.get(6)?;
+    let created_at: String = row.get(7)?;
+    let updated_at: String = row.get(8)?;
+    let last_run_at: Option<String> = row.get(9)?;
+    let last_run_status: Option<String> = row.get(10)?;
+    Ok(Automation {
+        id: AutomationId(Uuid::parse_str(&id).unwrap_or_default()),
+        name: row.get(1)?,
+        prompt: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        timezone: row.get(4)?,
+        schedule: serde_json::from_str(&schedule_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        next_run_at: next_run_at.as_deref().and_then(parse_ts),
+        created_at: parse_ts(&created_at).unwrap_or_default(),
+        updated_at: parse_ts(&updated_at).unwrap_or_default(),
+        last_run_at: last_run_at.as_deref().and_then(parse_ts),
+        last_run_status: last_run_status.and_then(|s| s.parse().ok()),
+        last_result_summary: row.get(11)?,
+    })
+}
+
+const AUTOMATION_COLS: &str = "id, name, prompt, enabled, timezone, schedule_json, next_run_at, \
+     created_at, updated_at, last_run_at, last_run_status, last_result_summary";
+
+/// Validate fields, compute the first occurrence, insert.
+pub(crate) fn repo_create(
+    conn: &Connection,
+    name: &str,
+    prompt: &str,
+    timezone: &str,
+    schedule: &AutomationSchedule,
+    enabled: bool,
+    now: DateTime<Utc>,
+) -> Result<Automation, RepoError> {
+    Automation::validate(name, prompt, schedule, timezone).map_err(RepoError::Invalid)?;
+    let tz = parse_timezone(timezone).map_err(RepoError::Invalid)?;
+    let next = schedule.next_occurrence(tz, now);
+    if next.is_none() {
+        return Err(RepoError::Invalid(ScheduleError::NoNextOccurrence));
+    }
+    let automation = Automation {
+        id: AutomationId::new(),
+        name: name.trim().to_string(),
+        prompt: prompt.trim().to_string(),
+        enabled,
+        timezone: timezone.to_string(),
+        schedule: schedule.clone(),
+        next_run_at: next,
+        created_at: now,
+        updated_at: now,
+        last_run_at: None,
+        last_run_status: None,
+        last_result_summary: None,
+    };
+    conn.execute(
+        "INSERT INTO automations (id, name, prompt, enabled, timezone, schedule_json, next_run_at, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            automation.id.to_string(),
+            automation.name,
+            automation.prompt,
+            automation.enabled as i64,
+            automation.timezone,
+            serde_json::to_string(&automation.schedule).map_err(|e| RepoError::Db(e.to_string()))?,
+            automation.next_run_at.map(ts),
+            ts(now),
+            ts(now),
+        ],
+    )?;
+    Ok(automation)
+}
+
+pub(crate) fn repo_get(conn: &Connection, id: &str) -> Result<Automation, RepoError> {
+    conn.query_row(
+        &format!("SELECT {AUTOMATION_COLS} FROM automations WHERE id = ?1"),
+        params![id],
+        row_to_automation,
+    )
+    .optional()?
+    .ok_or(RepoError::NotFound)
+}
+
+pub(crate) fn repo_list(conn: &Connection) -> Result<Vec<Automation>, RepoError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {AUTOMATION_COLS} FROM automations \
+         ORDER BY next_run_at IS NULL, next_run_at ASC, created_at ASC"
+    ))?;
+    let rows = stmt
+        .query_map([], row_to_automation)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Editable fields; `None` = unchanged. Schedule/zone/enable changes recompute
+/// the next occurrence.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct AutomationPatch {
+    pub name: Option<String>,
+    pub prompt: Option<String>,
+    pub timezone: Option<String>,
+    pub schedule: Option<AutomationSchedule>,
+    pub enabled: Option<bool>,
+}
+
+pub(crate) fn repo_update(
+    conn: &Connection,
+    id: &str,
+    patch: &AutomationPatch,
+    now: DateTime<Utc>,
+) -> Result<Automation, RepoError> {
+    let mut a = repo_get(conn, id)?;
+    if let Some(ref name) = patch.name {
+        a.name = name.trim().to_string();
+    }
+    if let Some(ref prompt) = patch.prompt {
+        a.prompt = prompt.trim().to_string();
+    }
+    if let Some(ref tzid) = patch.timezone {
+        a.timezone = tzid.clone();
+    }
+    if let Some(ref schedule) = patch.schedule {
+        a.schedule = schedule.clone();
+    }
+    if let Some(enabled) = patch.enabled {
+        a.enabled = enabled;
+    }
+    Automation::validate(&a.name, &a.prompt, &a.schedule, &a.timezone).map_err(RepoError::Invalid)?;
+    let tz = parse_timezone(&a.timezone).map_err(RepoError::Invalid)?;
+    // Recompute on any schedule-affecting change (cheap enough to always do).
+    a.next_run_at = a.schedule.next_occurrence(tz, now);
+    if a.next_run_at.is_none() && matches!(a.schedule, AutomationSchedule::Once { .. }) {
+        return Err(RepoError::Invalid(ScheduleError::NoNextOccurrence));
+    }
+    a.updated_at = now;
+    let changed = conn.execute(
+        "UPDATE automations SET name=?2, prompt=?3, enabled=?4, timezone=?5, schedule_json=?6, \
+         next_run_at=?7, updated_at=?8 WHERE id=?1",
+        params![
+            id,
+            a.name,
+            a.prompt,
+            a.enabled as i64,
+            a.timezone,
+            serde_json::to_string(&a.schedule).map_err(|e| RepoError::Db(e.to_string()))?,
+            a.next_run_at.map(ts),
+            ts(now),
+        ],
+    )?;
+    if changed == 0 {
+        return Err(RepoError::NotFound);
+    }
+    Ok(a)
+}
+
+pub(crate) fn repo_set_enabled(
+    conn: &Connection,
+    id: &str,
+    enabled: bool,
+    now: DateTime<Utc>,
+) -> Result<Automation, RepoError> {
+    let a = repo_get(conn, id)?;
+    // Re-enabling recomputes the next occurrence so a long-disabled automation
+    // doesn't fire immediately on a stale timestamp.
+    let next_run_at = if enabled {
+        let tz = parse_timezone(&a.timezone).map_err(RepoError::Invalid)?;
+        a.schedule.next_occurrence(tz, now)
+    } else {
+        a.next_run_at
+    };
+    conn.execute(
+        "UPDATE automations SET enabled=?2, next_run_at=?3, updated_at=?4 WHERE id=?1",
+        params![id, enabled as i64, next_run_at.map(ts), ts(now)],
+    )?;
+    repo_get(conn, id)
+}
+
+pub(crate) fn repo_has_active_run(conn: &Connection, id: &str) -> Result<bool, RepoError> {
+    let active: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automation_runs WHERE automation_id=?1 AND status='running')",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(active != 0)
+}
+
+pub(crate) fn repo_delete(conn: &Connection, id: &str) -> Result<(), RepoError> {
+    if repo_has_active_run(conn, id)? {
+        return Err(RepoError::ActiveRun);
+    }
+    let changed = conn.execute("DELETE FROM automations WHERE id=?1", params![id])?;
+    // ON DELETE CASCADE needs foreign_keys=ON; enforce manually so run rows
+    // never orphan regardless of connection pragmas.
+    conn.execute("DELETE FROM automation_runs WHERE automation_id=?1", params![id])?;
+    if changed == 0 {
+        return Err(RepoError::NotFound);
+    }
+    Ok(())
+}
+
+fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRun> {
+    let id: String = row.get(0)?;
+    let automation_id: String = row.get(1)?;
+    let scheduled_for: String = row.get(2)?;
+    let started_at: Option<String> = row.get(3)?;
+    let finished_at: Option<String> = row.get(4)?;
+    let status: String = row.get(5)?;
+    Ok(AutomationRun {
+        id: AutomationRunId(Uuid::parse_str(&id).unwrap_or_default()),
+        automation_id: AutomationId(Uuid::parse_str(&automation_id).unwrap_or_default()),
+        scheduled_for: parse_ts(&scheduled_for).unwrap_or_default(),
+        started_at: started_at.as_deref().and_then(parse_ts),
+        finished_at: finished_at.as_deref().and_then(parse_ts),
+        status: status
+            .parse()
+            .unwrap_or(bagent_automations::AutomationRunStatus::Failed),
+        result_summary: row.get(6)?,
+        is_catch_up: row.get::<_, i64>(7)? != 0,
+        is_manual: row.get::<_, i64>(8)? != 0,
+    })
+}
+
+const RUN_COLS: &str = "id, automation_id, scheduled_for, started_at, finished_at, status, \
+     result_summary, is_catch_up, is_manual";
+
+pub(crate) fn repo_recent_runs(
+    conn: &Connection,
+    automation_id: &str,
+    limit: usize,
+) -> Result<Vec<AutomationRun>, RepoError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RUN_COLS} FROM automation_runs WHERE automation_id=?1 \
+         ORDER BY created_at DESC LIMIT ?2"
+    ))?;
+    let rows = stmt
+        .query_map(params![automation_id, limit as i64], row_to_run)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Insert a run row. Used by run-now and the scheduler (issues #6/#8).
+#[allow(dead_code)]
+pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<(), RepoError> {
+    conn.execute(
+        &format!(
+            "INSERT INTO automation_runs ({RUN_COLS}, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+        ),
+        params![
+            run.id.to_string(),
+            run.automation_id.to_string(),
+            ts(run.scheduled_for),
+            run.started_at.map(ts),
+            run.finished_at.map(ts),
+            run.status.as_str(),
+            run.result_summary,
+            run.is_catch_up as i64,
+            run.is_manual as i64,
+            ts(Utc::now()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Finish a run and mirror the outcome onto the automation row, then prune
+/// history past the retention cap. Audit entries are untouched (append-only).
+#[allow(dead_code)]
+pub(crate) fn repo_finish_run(
+    conn: &Connection,
+    run_id: &str,
+    automation_id: &str,
+    status: AutomationRunStatus,
+    result_summary: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(), RepoError> {
+    let summary = result_summary.map(policy::clamp_result_summary);
+    conn.execute(
+        "UPDATE automation_runs SET status=?2, finished_at=?3, result_summary=?4 WHERE id=?1",
+        params![run_id, status.as_str(), ts(now), summary],
+    )?;
+    conn.execute(
+        "UPDATE automations SET last_run_at=?2, last_run_status=?3, last_result_summary=?4 WHERE id=?1",
+        params![automation_id, ts(now), status.as_str(), summary],
+    )?;
+    repo_prune_runs(conn, automation_id)?;
+    Ok(())
+}
+
+/// Keep only the newest `RUN_HISTORY_RETAINED` runs per automation.
+pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<(), RepoError> {
+    conn.execute(
+        "DELETE FROM automation_runs WHERE automation_id=?1 AND id NOT IN (\
+             SELECT id FROM automation_runs WHERE automation_id=?1 \
+             ORDER BY created_at DESC LIMIT ?2)",
+        params![automation_id, policy::RUN_HISTORY_RETAINED as i64],
+    )?;
+    Ok(())
+}
+
+// ── HTTP handlers ─────────────────────────────────────────────────────────────
+
+fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        RepoError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "automation not found"})),
+        ),
+        RepoError::ActiveRun => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "automation has an active run"})),
+        ),
+        RepoError::Invalid(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
+        RepoError::Db(e) => {
+            tracing::error!("automations db error: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "internal error"})),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CreateAutomationRequest {
+    name: String,
+    prompt: String,
+    timezone: String,
+    schedule: AutomationSchedule,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub(crate) async fn automations_list(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    match repo_list(&conn) {
+        Ok(items) => (StatusCode::OK, Json(json!({"automations": items}))),
+        Err(e) => {
+            let (code, body) = repo_error_response(e);
+            (code, body)
+        }
+    }
+}
+
+pub(crate) async fn automations_create(
+    State(state): State<AppState>,
+    Json(req): Json<CreateAutomationRequest>,
+) -> impl IntoResponse {
+    let result = {
+        let conn = state.db.lock().await;
+        repo_create(
+            &conn,
+            &req.name,
+            &req.prompt,
+            &req.timezone,
+            &req.schedule,
+            req.enabled,
+            Utc::now(),
+        )
+    };
+    match result {
+        Ok(a) => {
+            audit_fs(
+                &state.db,
+                "automation_create",
+                &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
+            );
+            state.automations_changed.notify_waiters();
+            (StatusCode::CREATED, Json(serde_json::to_value(&a).unwrap_or_default()))
+        }
+        Err(e) => repo_error_response(e),
+    }
+}
+
+pub(crate) async fn automation_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    match repo_get(&conn, &id) {
+        Ok(a) => (StatusCode::OK, Json(serde_json::to_value(&a).unwrap_or_default())),
+        Err(e) => repo_error_response(e),
+    }
+}
+
+pub(crate) async fn automation_patch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(patch): Json<AutomationPatch>,
+) -> impl IntoResponse {
+    let result = {
+        let conn = state.db.lock().await;
+        repo_update(&conn, &id, &patch, Utc::now())
+    };
+    match result {
+        Ok(a) => {
+            audit_fs(
+                &state.db,
+                "automation_update",
+                &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
+            );
+            state.automations_changed.notify_waiters();
+            (StatusCode::OK, Json(serde_json::to_value(&a).unwrap_or_default()))
+        }
+        Err(e) => repo_error_response(e),
+    }
+}
+
+pub(crate) async fn automation_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let result = {
+        let conn = state.db.lock().await;
+        repo_delete(&conn, &id)
+    };
+    match result {
+        Ok(()) => {
+            audit_fs(&state.db, "automation_delete", &json!({"id": id}));
+            state.automations_changed.notify_waiters();
+            (StatusCode::OK, Json(json!({"ok": true})))
+        }
+        Err(e) => repo_error_response(e),
+    }
+}
+
+pub(crate) async fn automation_enable(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    set_enabled(state, id, true).await
+}
+
+pub(crate) async fn automation_disable(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    set_enabled(state, id, false).await
+}
+
+async fn set_enabled(
+    state: AppState,
+    id: String,
+    enabled: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let result = {
+        let conn = state.db.lock().await;
+        repo_set_enabled(&conn, &id, enabled, Utc::now())
+    };
+    match result {
+        Ok(a) => {
+            audit_fs(
+                &state.db,
+                if enabled { "automation_enable" } else { "automation_disable" },
+                &json!({"id": id}),
+            );
+            state.automations_changed.notify_waiters();
+            (StatusCode::OK, Json(serde_json::to_value(&a).unwrap_or_default()))
+        }
+        Err(e) => repo_error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RunsQuery {
+    #[serde(default = "default_runs_limit")]
+    limit: usize,
+}
+
+fn default_runs_limit() -> usize {
+    10
+}
+
+pub(crate) async fn automation_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RunsQuery>,
+) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    if let Err(e) = repo_get(&conn, &id) {
+        return repo_error_response(e);
+    }
+    match repo_recent_runs(&conn, &id, q.limit.min(50)) {
+        Ok(runs) => (StatusCode::OK, Json(json!({"runs": runs}))),
+        Err(e) => repo_error_response(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bagent_automations::RecurrenceRule;
+    use chrono::TimeZone;
+
+    fn test_conn() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::embedded::migrations::runner().run(&mut conn).unwrap();
+        conn
+    }
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 17, 10, 0, 0).unwrap()
+    }
+
+    fn once_at(h: u32) -> AutomationSchedule {
+        AutomationSchedule::Once { at: Utc.with_ymd_and_hms(2026, 7, 18, h, 0, 0).unwrap() }
+    }
+
+    #[test]
+    fn create_get_list_roundtrip() {
+        let conn = test_conn();
+        let a = repo_create(&conn, "Ranná pošta", "skontroluj neprečítané maily", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        assert_eq!(a.next_run_at, Some(Utc.with_ymd_and_hms(2026, 7, 18, 6, 0, 0).unwrap()));
+        let got = repo_get(&conn, &a.id.to_string()).unwrap();
+        assert_eq!(got, a);
+        assert_eq!(repo_list(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_rejects_invalid_input() {
+        let conn = test_conn();
+        assert!(matches!(
+            repo_create(&conn, "", "p", "Europe/Bratislava", &once_at(6), true, now()),
+            Err(RepoError::Invalid(ScheduleError::EmptyName))
+        ));
+        assert!(matches!(
+            repo_create(&conn, "n", "p", "Nope/Zone", &once_at(6), true, now()),
+            Err(RepoError::Invalid(ScheduleError::InvalidTimeZone(_)))
+        ));
+        // One-shot in the past has no next occurrence.
+        let past = AutomationSchedule::Once { at: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap() };
+        assert!(matches!(
+            repo_create(&conn, "n", "p", "Europe/Bratislava", &past, true, now()),
+            Err(RepoError::Invalid(ScheduleError::NoNextOccurrence))
+        ));
+        // Sub-hour interval rejected.
+        let fast = AutomationSchedule::Recurring { rule: RecurrenceRule::EveryNHours { hours: 0 } };
+        assert!(matches!(
+            repo_create(&conn, "n", "p", "Europe/Bratislava", &fast, true, now()),
+            Err(RepoError::Invalid(ScheduleError::InvalidInterval))
+        ));
+    }
+
+    #[test]
+    fn patch_updates_and_recomputes_next_run() {
+        let conn = test_conn();
+        let a = repo_create(&conn, "n", "p", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        let patch = AutomationPatch {
+            name: Some("Nový názov".into()),
+            schedule: Some(once_at(9)),
+            ..Default::default()
+        };
+        let updated = repo_update(&conn, &a.id.to_string(), &patch, now()).unwrap();
+        assert_eq!(updated.name, "Nový názov");
+        assert_eq!(updated.next_run_at, Some(Utc.with_ymd_and_hms(2026, 7, 18, 9, 0, 0).unwrap()));
+        assert!(matches!(
+            repo_update(&conn, "missing", &AutomationPatch::default(), now()),
+            Err(RepoError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn enable_disable_and_delete() {
+        let conn = test_conn();
+        let a = repo_create(&conn, "n", "p", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        let id = a.id.to_string();
+        let off = repo_set_enabled(&conn, &id, false, now()).unwrap();
+        assert!(!off.enabled);
+        let on = repo_set_enabled(&conn, &id, true, now()).unwrap();
+        assert!(on.enabled);
+        repo_delete(&conn, &id).unwrap();
+        assert!(matches!(repo_get(&conn, &id), Err(RepoError::NotFound)));
+        assert!(matches!(repo_delete(&conn, &id), Err(RepoError::NotFound)));
+    }
+
+    #[test]
+    fn delete_conflicts_with_active_run_and_runs_are_bounded() {
+        let conn = test_conn();
+        let a = repo_create(&conn, "n", "p", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        let id = a.id.to_string();
+        let run = AutomationRun {
+            id: AutomationRunId::new(),
+            automation_id: a.id,
+            scheduled_for: now(),
+            started_at: Some(now()),
+            finished_at: None,
+            status: AutomationRunStatus::Running,
+            result_summary: None,
+            is_catch_up: false,
+            is_manual: false,
+        };
+        repo_insert_run(&conn, &run).unwrap();
+        assert!(matches!(repo_delete(&conn, &id), Err(RepoError::ActiveRun)));
+
+        repo_finish_run(&conn, &run.id.to_string(), &id, AutomationRunStatus::Completed, Some("hotovo"), now()).unwrap();
+        let a2 = repo_get(&conn, &id).unwrap();
+        assert_eq!(a2.last_run_status, Some(AutomationRunStatus::Completed));
+        assert_eq!(a2.last_result_summary.as_deref(), Some("hotovo"));
+
+        // History is bounded to the retention cap.
+        for _ in 0..(policy::RUN_HISTORY_RETAINED + 10) {
+            let r = AutomationRun { id: AutomationRunId::new(), started_at: None, ..run.clone() };
+            repo_insert_run(&conn, &r).unwrap();
+            conn.execute(
+                "UPDATE automation_runs SET status='completed' WHERE id=?1",
+                params![r.id.to_string()],
+            )
+            .unwrap();
+        }
+        repo_prune_runs(&conn, &id).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_runs WHERE automation_id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count as usize, policy::RUN_HISTORY_RETAINED);
+        // Deleting after the run finished works and clears history.
+        repo_delete(&conn, &id).unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM automation_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn recent_runs_ordering_and_limit() {
+        let conn = test_conn();
+        let a = repo_create(&conn, "n", "p", "Europe/Bratislava", &once_at(6), true, now()).unwrap();
+        for i in 0..5 {
+            let r = AutomationRun {
+                id: AutomationRunId::new(),
+                automation_id: a.id,
+                scheduled_for: now() + chrono::Duration::hours(i),
+                started_at: None,
+                finished_at: None,
+                status: AutomationRunStatus::Completed,
+                result_summary: None,
+                is_catch_up: false,
+                is_manual: false,
+            };
+            repo_insert_run(&conn, &r).unwrap();
+        }
+        let runs = repo_recent_runs(&conn, &a.id.to_string(), 3).unwrap();
+        assert_eq!(runs.len(), 3);
+    }
+}
