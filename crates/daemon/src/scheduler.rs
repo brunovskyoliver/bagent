@@ -432,6 +432,81 @@ mod tests {
     }
 
     #[test]
+    fn weekday_recurrence_skips_weekend_and_handles_spring_forward() {
+        use bagent_automations::RecurrenceRule;
+        let conn = test_conn();
+        // Weekdays 08:00 Bratislava; created Fri 2026-03-27 (spring-forward on
+        // Sun 2026-03-29, 02:00→03:00).
+        let a = repo_create(
+            &conn,
+            "weekdays",
+            "p",
+            "Europe/Bratislava",
+            &AutomationSchedule::Recurring {
+                rule: RecurrenceRule::Weekdays { time: "08:00:00".parse().unwrap() },
+            },
+            true,
+            t(2026, 3, 27, 6, 0),
+        )
+        .unwrap();
+        // Fri 08:00 CET = 07:00 UTC.
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 3, 27, 7, 0)));
+        let claimed = scheduler_step(&conn, t(2026, 3, 27, 7, 0));
+        assert_eq!(claimed.len(), 1);
+        // Weekend skipped, and Monday is CEST: 08:00 = 06:00 UTC.
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 3, 30, 6, 0)));
+    }
+
+    #[test]
+    fn weekly_recurrence_catch_up_and_overlap() {
+        use bagent_automations::{RecurrenceRule, Weekday};
+        let conn = test_conn();
+        // Weekly Friday 07:45 Bratislava (2026-07-17 is a Friday; 05:45 UTC).
+        let a = repo_create(
+            &conn,
+            "weekly",
+            "p",
+            "Europe/Bratislava",
+            &AutomationSchedule::Recurring {
+                rule: RecurrenceRule::Weekly { day: Weekday::Fri, time: "07:45:00".parse().unwrap() },
+            },
+            true,
+            t(2026, 7, 16, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 17, 5, 45)));
+
+        // Wakes 4 hours late (restart): one catch-up, advanced to next Friday.
+        let claimed = scheduler_step(&conn, t(2026, 7, 17, 9, 45));
+        assert_eq!(claimed.len(), 1);
+        assert!(claimed[0].1.is_catch_up);
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 24, 5, 45)));
+
+        // Next Friday arrives while the catch-up run is still active → overlap
+        // skip recorded, schedule advances again.
+        let claimed2 = scheduler_step(&conn, t(2026, 7, 24, 5, 45));
+        assert!(claimed2.is_empty());
+        let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
+        assert!(runs.iter().any(|r| r.status == AutomationRunStatus::SkippedOverlap));
+        assert_eq!(repo_get(&conn, &a.id.to_string()).unwrap().next_run_at, Some(t(2026, 7, 31, 5, 45)));
+    }
+
+    #[test]
+    fn malformed_weekday_and_empty_selection_rejected_at_api_boundary() {
+        // Wire-level rejection: unknown weekday fails deserialization, empty
+        // selected set fails validation before persistence.
+        assert!(serde_json::from_str::<bagent_automations::RecurrenceRule>(
+            r#"{"type":"weekly","day":"friday","time":"07:45:00"}"#
+        )
+        .is_err());
+        let empty: bagent_automations::RecurrenceRule = serde_json::from_str(
+            r#"{"type":"selected_weekdays","days":[],"time":"07:45:00"}"#,
+        )
+        .unwrap();
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
     fn next_due_ordering_and_clock_jump_forward() {
         let conn = test_conn();
         once(&conn, "b", t(2026, 7, 18, 8, 0), t(2026, 7, 17, 0, 0));
