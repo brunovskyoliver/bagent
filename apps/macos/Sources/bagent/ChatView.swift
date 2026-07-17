@@ -1237,7 +1237,10 @@ struct InlineNotchContent: View {
                     .transition(.opacity)
             }
         }
-        .animation(.easeOut(duration: 0.18), value: viewModel.slashSuggestions)
+        .animation(
+            reduceMotion ? nil : .easeOut(duration: 0.18),
+            value: viewModel.slashSuggestions
+        )
     }
 
     private var slashSuggestionRows: some View {

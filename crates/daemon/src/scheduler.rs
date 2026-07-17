@@ -20,7 +20,8 @@ use rusqlite::{params, Connection};
 use serde_json::json;
 
 use bagent_automations::{
-    missed_run_decision, parse_timezone, Automation, AutomationRun, MissedRunDecision,
+    missed_run_decision, parse_timezone, Automation, AutomationRun, AutomationSchedule,
+    MissedRunDecision,
 };
 
 use crate::automations_api::{repo_claim_run, repo_get, repo_insert_run, RepoError};
@@ -82,27 +83,32 @@ fn record_skip(
     let _ = repo_insert_run(conn, &run);
 }
 
+/// Outcome of one scheduling pass: work to execute plus prebuilt daemon
+/// events to broadcast (the pass itself holds only the DB connection).
+#[derive(Default)]
+pub(crate) struct SchedulerPass {
+    pub claimed: Vec<(Automation, AutomationRun)>,
+    pub events: Vec<serde_json::Value>,
+}
+
 /// One synchronous scheduling pass: claim every due automation, record
 /// stale/overlap skips, and advance schedules. Deterministic — `now` is
 /// injected. Returns the claimed work to execute (no DB locks held after).
-pub(crate) fn scheduler_step(
-    conn: &Connection,
-    now: DateTime<Utc>,
-) -> Vec<(Automation, AutomationRun)> {
+pub(crate) fn scheduler_step(conn: &Connection, now: DateTime<Utc>) -> SchedulerPass {
     let due_ids: Vec<String> = {
         let mut stmt = match conn.prepare(
             "SELECT id FROM automations WHERE enabled=1 AND next_run_at IS NOT NULL \
              AND next_run_at <= ?1 ORDER BY next_run_at ASC",
         ) {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(_) => return SchedulerPass::default(),
         };
         stmt.query_map(params![now.to_rfc3339()], |r| r.get(0))
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default()
     };
 
-    let mut claimed = Vec::new();
+    let mut pass = SchedulerPass::default();
     for id in due_ids {
         let Ok(a) = repo_get(conn, &id) else { continue };
         let Some(scheduled_for) = a.next_run_at else {
@@ -125,7 +131,13 @@ pub(crate) fn scheduler_step(
                         "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
                     }),
                 );
-                advance_next_run(conn, &a, now);
+                let next = advance_next_run(conn, &a, now);
+                pass.events.push(json!({
+                    "type": "automation_run_missed",
+                    "automation_id": id,
+                    "status": "skipped_stale",
+                }));
+                pass.events.push(next_run_changed_event(&id, next));
             }
             MissedRunDecision::CatchUp => {
                 let is_catch_up = now - scheduled_for > CATCH_UP_LATENCY;
@@ -139,11 +151,31 @@ pub(crate) fn scheduler_step(
                                     "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
                                 }),
                             );
+                            pass.events.push(json!({
+                                "type": "automation_run_caught_up",
+                                "automation_id": id,
+                            }));
                         }
-                        advance_next_run(conn, &a, now);
-                        claimed.push((a, run));
+                        let next = advance_next_run(conn, &a, now);
+                        pass.events.push(next_run_changed_event(&id, next));
+                        pass.claimed.push((a, run));
                     }
                     Err(RepoError::ActiveRun) => {
+                        // One-shots DEFER on overlap: keep next_run_at, retry
+                        // once the active run releases the claim (the run
+                        // finish notifies the scheduler). Advancing would
+                        // silently exhaust them forever. Recurring schedules
+                        // SKIP and advance per the documented overlap policy.
+                        if matches!(a.schedule, AutomationSchedule::Once { .. }) {
+                            audit(
+                                conn,
+                                "automation_run_overlap_deferred",
+                                json!({
+                                    "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
+                                }),
+                            );
+                            continue;
+                        }
                         record_skip(
                             conn,
                             &a,
@@ -158,7 +190,12 @@ pub(crate) fn scheduler_step(
                                 "automation_id": id, "scheduled_for": scheduled_for.to_rfc3339(),
                             }),
                         );
-                        advance_next_run(conn, &a, now);
+                        let next = advance_next_run(conn, &a, now);
+                        pass.events.push(json!({
+                            "type": "automation_run_skipped_overlap",
+                            "automation_id": id,
+                        }));
+                        pass.events.push(next_run_changed_event(&id, next));
                     }
                     Err(e) => {
                         tracing::error!("scheduler claim failed for {id}: {e:?}");
@@ -167,7 +204,15 @@ pub(crate) fn scheduler_step(
             }
         }
     }
-    claimed
+    pass
+}
+
+fn next_run_changed_event(id: &str, next: Option<DateTime<Utc>>) -> serde_json::Value {
+    json!({
+        "type": "automation_next_run_changed",
+        "automation_id": id,
+        "next_run_at": next.map(|t| t.to_rfc3339()),
+    })
 }
 
 /// Startup recovery: abandoned `running` rows become terminal `abandoned`
@@ -235,15 +280,14 @@ pub(crate) async fn run_scheduler(state: AppState) {
         }
     }
     loop {
-        let claimed = {
+        let pass = {
             let conn = state.db.lock().await;
             scheduler_step(&conn, Utc::now())
         };
-        for (automation, run) in claimed {
-            state.publish_event(json!({
-                "type": "automation_next_run_changed",
-                "automation_id": automation.id.to_string(),
-            }));
+        for event in pass.events {
+            state.publish_event(event);
+        }
+        for (automation, run) in pass.claimed {
             let st = state.clone();
             tokio::spawn(async move {
                 // Bounded concurrency: at most policy::MAX_CONCURRENT_RUNS
@@ -311,15 +355,19 @@ mod tests {
         let conn = test_conn();
         let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
         // Not due yet.
-        assert!(scheduler_step(&conn, t(2026, 7, 18, 5, 59)).is_empty());
+        assert!(scheduler_step(&conn, t(2026, 7, 18, 5, 59))
+            .claimed
+            .is_empty());
         // Due: claimed exactly once, next_run_at cleared.
-        let claimed = scheduler_step(&conn, t(2026, 7, 18, 6, 0));
+        let claimed = scheduler_step(&conn, t(2026, 7, 18, 6, 0)).claimed;
         assert_eq!(claimed.len(), 1);
         assert!(!claimed[0].1.is_catch_up); // on-time dispatch
         let after = repo_get(&conn, &a.id.to_string()).unwrap();
         assert_eq!(after.next_run_at, None);
         // Second pass claims nothing.
-        assert!(scheduler_step(&conn, t(2026, 7, 18, 6, 1)).is_empty());
+        assert!(scheduler_step(&conn, t(2026, 7, 18, 6, 1))
+            .claimed
+            .is_empty());
     }
 
     #[test]
@@ -327,7 +375,7 @@ mod tests {
         let conn = test_conn();
         let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
         // Daemon was down; wakes 3 hours later → one catch-up flagged run.
-        let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0));
+        let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0)).claimed;
         assert_eq!(claimed.len(), 1);
         assert!(claimed[0].1.is_catch_up);
         assert_eq!(
@@ -341,7 +389,7 @@ mod tests {
         let conn = test_conn();
         let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
         // Wakes 3 days later → intentionally skipped, recorded, exhausted.
-        let claimed = scheduler_step(&conn, t(2026, 7, 21, 6, 0));
+        let claimed = scheduler_step(&conn, t(2026, 7, 21, 6, 0)).claimed;
         assert!(claimed.is_empty());
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -353,11 +401,12 @@ mod tests {
     }
 
     #[test]
-    fn overlap_is_recorded_and_skipped() {
+    fn one_shot_overlap_defers_instead_of_exhausting() {
         let conn = test_conn();
         let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
-        // A manual run is still active when the scheduled instant arrives.
-        repo_claim_run(
+        // A manual run is still active when the scheduled instant arrives:
+        // the one-shot DEFERS — next_run_at survives, nothing is skipped.
+        let manual = repo_claim_run(
             &conn,
             &a,
             t(2026, 7, 18, 5, 0),
@@ -366,12 +415,62 @@ mod tests {
             t(2026, 7, 18, 5, 0),
         )
         .unwrap();
-        let claimed = scheduler_step(&conn, t(2026, 7, 18, 6, 0));
-        assert!(claimed.is_empty());
+        let pass = scheduler_step(&conn, t(2026, 7, 18, 6, 0));
+        assert!(pass.claimed.is_empty());
+        let after = repo_get(&conn, &a.id.to_string()).unwrap();
+        assert_eq!(after.next_run_at, Some(t(2026, 7, 18, 6, 0)));
+        // Once the manual run finishes, the deferred occurrence is claimed.
+        crate::automations_api::repo_finish_run(
+            &conn,
+            &manual.id.to_string(),
+            &a.id.to_string(),
+            AutomationRunStatus::Completed,
+            Some("ok"),
+            t(2026, 7, 18, 6, 1),
+        )
+        .unwrap();
+        assert_eq!(scheduler_step(&conn, t(2026, 7, 18, 6, 2)).claimed.len(), 1);
+    }
+
+    #[test]
+    fn recurring_overlap_skip_emits_events() {
+        use bagent_automations::RecurrenceRule;
+        let conn = test_conn();
+        let a = repo_create(
+            &conn,
+            "hourly",
+            "p",
+            "Europe/Bratislava",
+            &AutomationSchedule::Recurring {
+                rule: RecurrenceRule::EveryNHours { hours: 2 },
+            },
+            true,
+            t(2026, 7, 17, 10, 0),
+        )
+        .unwrap();
+        repo_claim_run(
+            &conn,
+            &a,
+            t(2026, 7, 17, 11, 0),
+            false,
+            true,
+            t(2026, 7, 17, 11, 0),
+        )
+        .unwrap();
+        let pass = scheduler_step(&conn, t(2026, 7, 17, 12, 0));
+        assert!(pass.claimed.is_empty());
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
         assert!(runs
             .iter()
             .any(|r| r.status == AutomationRunStatus::SkippedOverlap));
+        // Spec: skip + next-run-changed events reach subscribers.
+        let types: Vec<&str> = pass
+            .events
+            .iter()
+            .filter_map(|e| e["type"].as_str())
+            .collect();
+        assert!(types.contains(&"automation_run_skipped_overlap"));
+        assert!(types.contains(&"automation_next_run_changed"));
     }
 
     #[test]
@@ -379,7 +478,9 @@ mod tests {
         let conn = test_conn();
         let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
         repo_set_enabled(&conn, &a.id.to_string(), false, t(2026, 7, 17, 1, 0)).unwrap();
-        assert!(scheduler_step(&conn, t(2026, 7, 18, 6, 0)).is_empty());
+        assert!(scheduler_step(&conn, t(2026, 7, 18, 6, 0))
+            .claimed
+            .is_empty());
     }
 
     #[test]
@@ -451,7 +552,7 @@ mod tests {
             repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
             Some(t(2026, 10, 24, 6, 0))
         );
-        let claimed = scheduler_step(&conn, t(2026, 10, 24, 6, 0));
+        let claimed = scheduler_step(&conn, t(2026, 10, 24, 6, 0)).claimed;
         assert_eq!(claimed.len(), 1);
         // Advanced to Sun 2026-10-25: 08:00 CET = 07:00 UTC — local time, not +24h UTC.
         assert_eq!(
@@ -459,7 +560,9 @@ mod tests {
             Some(t(2026, 10, 25, 7, 0))
         );
         // No catch-up loop: an immediate second pass claims nothing.
-        assert!(scheduler_step(&conn, t(2026, 10, 24, 6, 1)).is_empty());
+        assert!(scheduler_step(&conn, t(2026, 10, 24, 6, 1))
+            .claimed
+            .is_empty());
     }
 
     #[test]
@@ -482,7 +585,7 @@ mod tests {
             repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
             Some(t(2026, 7, 17, 12, 0))
         );
-        let claimed = scheduler_step(&conn, t(2026, 7, 17, 12, 0));
+        let claimed = scheduler_step(&conn, t(2026, 7, 17, 12, 0)).claimed;
         assert_eq!(claimed.len(), 1);
         // Advanced two hours past the dispatch instant.
         assert_eq!(
@@ -502,7 +605,9 @@ mod tests {
         let after = repo_get(&conn, &a.id.to_string()).unwrap();
         assert_eq!(after.last_run_status, Some(AutomationRunStatus::Failed));
         assert_eq!(after.next_run_at, Some(t(2026, 7, 17, 14, 0)));
-        assert!(scheduler_step(&conn, t(2026, 7, 17, 12, 2)).is_empty());
+        assert!(scheduler_step(&conn, t(2026, 7, 17, 12, 2))
+            .claimed
+            .is_empty());
     }
 
     #[test]
@@ -525,7 +630,7 @@ mod tests {
         .unwrap();
         // Laptop closed for a week: exactly one skip record, schedule jumps to
         // the next future occurrence — no replay of the missed week.
-        let claimed = scheduler_step(&conn, t(2026, 7, 25, 12, 0));
+        let claimed = scheduler_step(&conn, t(2026, 7, 25, 12, 0)).claimed;
         assert!(claimed.is_empty());
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 20).unwrap();
         assert_eq!(runs.len(), 1);
@@ -562,7 +667,7 @@ mod tests {
             repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
             Some(t(2026, 3, 27, 7, 0))
         );
-        let claimed = scheduler_step(&conn, t(2026, 3, 27, 7, 0));
+        let claimed = scheduler_step(&conn, t(2026, 3, 27, 7, 0)).claimed;
         assert_eq!(claimed.len(), 1);
         // Weekend skipped, and Monday is CEST: 08:00 = 06:00 UTC.
         assert_eq!(
@@ -597,7 +702,7 @@ mod tests {
         );
 
         // Wakes 4 hours late (restart): one catch-up, advanced to next Friday.
-        let claimed = scheduler_step(&conn, t(2026, 7, 17, 9, 45));
+        let claimed = scheduler_step(&conn, t(2026, 7, 17, 9, 45)).claimed;
         assert_eq!(claimed.len(), 1);
         assert!(claimed[0].1.is_catch_up);
         assert_eq!(
@@ -607,7 +712,7 @@ mod tests {
 
         // Next Friday arrives while the catch-up run is still active → overlap
         // skip recorded, schedule advances again.
-        let claimed2 = scheduler_step(&conn, t(2026, 7, 24, 5, 45));
+        let claimed2 = scheduler_step(&conn, t(2026, 7, 24, 5, 45)).claimed;
         assert!(claimed2.is_empty());
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
         assert!(runs
@@ -639,7 +744,7 @@ mod tests {
         let conn = test_conn();
         let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
         let id = a.id.to_string();
-        let claimed = scheduler_step(&conn, t(2026, 7, 18, 6, 0));
+        let claimed = scheduler_step(&conn, t(2026, 7, 18, 6, 0)).claimed;
         assert_eq!(claimed.len(), 1);
 
         // Edit while running: allowed, applies from the next occurrence — the
@@ -652,7 +757,9 @@ mod tests {
 
         // Disable while running: the run finishes, but nothing new is claimed.
         crate::automations_api::repo_set_enabled(&conn, &id, false, t(2026, 7, 18, 6, 5)).unwrap();
-        assert!(scheduler_step(&conn, t(2026, 7, 19, 6, 0)).is_empty());
+        assert!(scheduler_step(&conn, t(2026, 7, 19, 6, 0))
+            .claimed
+            .is_empty());
 
         // Delete while running: deterministic 409 until the run finishes.
         assert!(matches!(repo_delete(&conn, &id), Err(RepoError::ActiveRun)));
@@ -685,7 +792,7 @@ mod tests {
         )
         .unwrap();
         // Catch-up claim (3 h late) so lifecycle audit rows exist to inspect.
-        let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0));
+        let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0)).claimed;
         assert_eq!(claimed.len(), 1);
         crate::automations_api::repo_finish_run(
             &conn,
@@ -724,7 +831,7 @@ mod tests {
         once(&conn, "a", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
         assert_eq!(next_due_at(&conn), Some(t(2026, 7, 18, 6, 0)));
         // Clock jumps past both → both fire in one pass (each within 24 h).
-        let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0));
+        let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0)).claimed;
         assert_eq!(claimed.len(), 2);
         assert_eq!(next_due_at(&conn), None);
     }

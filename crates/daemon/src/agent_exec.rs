@@ -99,16 +99,16 @@ impl EventSink {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // run metadata consumed by the automations scheduler
 pub(crate) struct ExecOutcome {
     pub final_text: String,
+    /// Emitted in outcome logs/tests; not otherwise consumed yet.
+    #[allow(dead_code)]
     pub tool_calls_used: usize,
     /// Gated actions the user denied (or that timed out) during this run.
     pub approvals_denied: usize,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // error detail consumed by the automations scheduler
 pub(crate) enum ExecError {
     /// The event receiver went away (chat client disconnected).
     SinkClosed,
@@ -177,20 +177,17 @@ impl<'a> Gate<'a> {
         args: &serde_json::Value,
         kind: ToolKind,
     ) -> ApprovalLevel {
-        let verdict = self.rules.check(rule, &args.to_string());
-        match (self.unattended, kind, verdict) {
-            (true, ToolKind::SideEffect, ApprovalLevel::Auto) => ApprovalLevel::Ask,
-            (_, _, v) => v,
-        }
+        escalate(
+            self.unattended,
+            kind,
+            self.rules.check(rule, &args.to_string()),
+        )
     }
 }
 
-#[cfg(test)]
-pub(crate) fn escalate_for_test(
-    unattended: bool,
-    kind: ToolKind,
-    verdict: ApprovalLevel,
-) -> ApprovalLevel {
+/// Unattended escalation: side-effecting tools never run on `auto` without a
+/// fresh approval when nobody is watching. Forbidden always wins.
+fn escalate(unattended: bool, kind: ToolKind, verdict: ApprovalLevel) -> ApprovalLevel {
     match (unattended, kind, verdict) {
         (true, ToolKind::SideEffect, ApprovalLevel::Auto) => ApprovalLevel::Ask,
         (_, _, v) => v,
@@ -1213,28 +1210,16 @@ mod tests {
     fn unattended_escalates_auto_side_effects_to_ask() {
         use ApprovalLevel::*;
         // Unattended + side effect + auto → ask (fresh approval required).
-        assert!(matches!(
-            escalate_for_test(true, ToolKind::SideEffect, Auto),
-            Ask
-        ));
+        assert!(matches!(escalate(true, ToolKind::SideEffect, Auto), Ask));
         // Forbidden always stays forbidden.
         assert!(matches!(
-            escalate_for_test(true, ToolKind::SideEffect, Forbidden),
+            escalate(true, ToolKind::SideEffect, Forbidden),
             Forbidden
         ));
         // Reads keep their rules verdict unattended.
-        assert!(matches!(
-            escalate_for_test(true, ToolKind::ReadOnly, Auto),
-            Auto
-        ));
+        assert!(matches!(escalate(true, ToolKind::ReadOnly, Auto), Auto));
         // Attended behavior unchanged.
-        assert!(matches!(
-            escalate_for_test(false, ToolKind::SideEffect, Auto),
-            Auto
-        ));
-        assert!(matches!(
-            escalate_for_test(false, ToolKind::ReadOnly, Ask),
-            Ask
-        ));
+        assert!(matches!(escalate(false, ToolKind::SideEffect, Auto), Auto));
+        assert!(matches!(escalate(false, ToolKind::ReadOnly, Ask), Ask));
     }
 }

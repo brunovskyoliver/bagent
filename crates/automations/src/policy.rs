@@ -3,15 +3,22 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A due occurrence while a run of the same automation is still active is
-/// skipped (recorded as `skipped_overlap`), never queued behind it.
+/// A due recurring occurrence while a run of the same automation is still
+/// active is skipped (recorded as `skipped_overlap`) and the schedule
+/// advances. One-shot occurrences defer instead: they keep their instant and
+/// are claimed once the active run releases the claim — advancing would
+/// silently exhaust them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlapPolicy {
+    /// Recurring schedules.
     Skip,
+    /// One-shot schedules.
+    Defer,
 }
 
-pub const OVERLAP_POLICY: OverlapPolicy = OverlapPolicy::Skip;
+pub const OVERLAP_POLICY_RECURRING: OverlapPolicy = OverlapPolicy::Skip;
+pub const OVERLAP_POLICY_ONCE: OverlapPolicy = OverlapPolicy::Defer;
 
 /// What happens to an active run when its automation is edited, disabled, or
 /// deleted: the run always finishes with its original prompt/context, and the

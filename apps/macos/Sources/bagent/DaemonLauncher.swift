@@ -96,7 +96,7 @@ final class DaemonLauncher {
 
     private func installAndStart(binary: URL) {
         let env = [
-            "BAGENT_DEFAULT_MODEL": UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen2.5:7b",
+            "BAGENT_DEFAULT_MODEL": UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen3:8b",
             "BAGENT_CLASSIFIER_MODEL": UserDefaults.standard.string(forKey: "bagent.classifier_model") ?? "qwen3:0.6b",
             "BAGENT_VISION_MODEL": "qwen2.5vl:7b",
         ]

@@ -75,8 +75,11 @@ Daemon-owned Tokio task (`crates/daemon/src/scheduler.rs`):
 
 ### Overlap
 
-A due occurrence while the same automation is running records a
-`skipped_overlap` run and advances. Run-now respects the same claim.
+A due **recurring** occurrence while the same automation is running records a
+`skipped_overlap` run and advances. A due **one-shot** defers instead — it
+keeps its `next_run_at` and is claimed as soon as the active run releases the
+claim (advancing would silently exhaust it forever). Run-now respects the
+same atomic claim.
 
 ### Restart / shutdown
 
@@ -142,8 +145,9 @@ GET    /automations/{id}/runs?limit=N   recent runs (≤ 50)
 
 `GET /events` streams concise typed envelopes (ids/status only — clients
 refetch authoritative records): `automation_created/updated/deleted/enabled/
-disabled`, `automation_run_started/finished`, `automation_next_run_changed`,
-and `approval_requested` (with origin). The Swift app keeps one reconnecting
+disabled`, `automation_run_started/finished`, `automation_run_skipped_overlap`,
+`automation_run_missed`, `automation_run_caught_up`,
+`automation_next_run_changed`, and `approval_requested` (with origin). The Swift app keeps one reconnecting
 subscription and refetches `/approvals/pending` at start and on reconnect.
 
 ## Audit events

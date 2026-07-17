@@ -742,14 +742,23 @@ pub(crate) async fn execute_automation_run(
     run: AutomationRun,
 ) {
     // Bounded concurrency across scheduled and manual runs. The claim row
-    // already exists, so a queued run simply starts a little later.
-    let _permit = state.run_slots.clone().acquire_owned().await;
+    // already exists, so a queued run simply starts a little later; once the
+    // slot is acquired, started_at is corrected to the actual start.
+    let _permit = state.run_slots.clone().acquire_owned().await.ok();
+    let started_at = Utc::now();
+    {
+        let conn = state.db.lock().await;
+        let _ = conn.execute(
+            "UPDATE automation_runs SET started_at=?2 WHERE id=?1",
+            rusqlite::params![run.id.to_string(), ts(started_at)],
+        );
+    }
     let ctx = AutomationExecutionContext {
         automation_id: automation.id,
         automation_name: automation.name.clone(),
         run_id: run.id,
         scheduled_for: run.scheduled_for,
-        started_at: run.started_at.unwrap_or_else(Utc::now),
+        started_at,
         is_catch_up: run.is_catch_up,
         unattended: true,
         timezone: automation.timezone.clone(),

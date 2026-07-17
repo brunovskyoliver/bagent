@@ -802,7 +802,7 @@ final class ChatViewModel: ObservableObject {
     private var approvalPollTask: Task<Void, Never>?
     private var healthMonitorTask: Task<Void, Never>?
 
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen2.5:7b" {
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen3:8b" {
         didSet { UserDefaults.standard.set(selectedModel, forKey: "bagent.model") }
     }
 
