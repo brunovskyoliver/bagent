@@ -491,7 +491,6 @@ pub(crate) async fn run_agent_loop(
     let mail = &state.mail;
     let notes = &state.notes;
     let fs_exec = &state.fs;
-    let pending_approvals = &state.pending_approvals;
     let runtime_refs = &state.runtime_refs;
     let ollama = &state.ollama;
 
@@ -605,8 +604,7 @@ pub(crate) async fn run_agent_loop(
                                 let approved = match level {
                                     ApprovalLevel::Ask => {
                                         request_tool_approval(
-                                            db,
-                                            pending_approvals,
+                                            state,
                                             sink,
                                             origin,
                                             "mail_inbox",
@@ -685,8 +683,7 @@ pub(crate) async fn run_agent_loop(
                             "chat_id and message are required.".to_string()
                         } else {
                             let approved = request_tool_approval(
-                                db,
-                                pending_approvals,
+                                state,
                                 sink,
                                 origin,
                                 "whatsapp.send_message",
@@ -746,8 +743,7 @@ pub(crate) async fn run_agent_loop(
                             }
                             ApprovalLevel::Ask => {
                                 let ok = request_tool_approval(
-                                    db,
-                                    pending_approvals,
+                                    state,
                                     sink,
                                     origin,
                                     "macos.switch_workspace",
@@ -896,8 +892,7 @@ pub(crate) async fn run_agent_loop(
                             ApprovalLevel::Auto => true,
                             ApprovalLevel::Ask => {
                                 let ok = request_tool_approval(
-                                    db,
-                                    pending_approvals,
+                                    state,
                                     sink,
                                     origin,
                                     rule_name,
@@ -1030,8 +1025,7 @@ pub(crate) async fn run_agent_loop(
                                 let approved = match level {
                                     ApprovalLevel::Ask => {
                                         let ok = request_tool_approval(
-                                            db,
-                                            pending_approvals,
+                                            state,
                                             sink,
                                             origin,
                                             rule_name,

@@ -88,6 +88,17 @@ struct AppState {
     /// Pinged whenever an automation is created/edited/enabled/disabled/deleted
     /// so the scheduler recomputes its next wake-up immediately.
     automations_changed: Arc<tokio::sync::Notify>,
+    /// Daemon-wide event broadcast (GET /events): automation lifecycle +
+    /// background approval notifications. Payloads are concise and redacted —
+    /// clients refetch authoritative records.
+    events_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+}
+
+impl AppState {
+    /// Fire-and-forget daemon-wide event. Lagging/absent subscribers are fine.
+    fn publish_event(&self, event: serde_json::Value) {
+        let _ = self.events_tx.send(event);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -702,11 +713,13 @@ async fn main() -> Result<()> {
         whatsapp,
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
+        events_tx: tokio::sync::broadcast::channel(256).0,
     };
 
     let shutdown_state = state.clone();
     let app = Router::new()
         .route("/health", get(health))
+        .route("/events", get(events_stream))
         .route("/models", get(models))
         .route("/chat", post(chat))
         .route("/embeddings", post(embeddings))
@@ -1749,6 +1762,29 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             },
         },
     })
+}
+
+/// Daemon-wide SSE stream: automation lifecycle + approval notifications.
+/// Typed envelopes only — clients refetch authoritative records on receipt.
+async fn events_stream(
+    State(state): State<AppState>,
+) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    let mut sub = state.events_tx.subscribe();
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+    tokio::spawn(async move {
+        loop {
+            match sub.recv().await {
+                Ok(v) => {
+                    if tx.send(Ok(Event::default().data(v.to_string()))).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
@@ -2941,13 +2977,14 @@ async fn notes_get(State(state): State<AppState>, Path(pk): Path<i64>) -> impl I
 /// `approval_requested` event; pass `None` for REST callers (the Swift app's
 /// 1 s poll of `GET /approvals/pending` will surface the row automatically).
 async fn request_approval_core(
-    db: &Arc<Mutex<Connection>>,
-    pending: &Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    state: &AppState,
     tool_name: &str,
     description: &str,
     sink: Option<&agent_exec::EventSink>,
     origin_json: Option<String>,
 ) -> bool {
+    let db = &state.db;
+    let pending = &state.pending_approvals;
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
@@ -2963,18 +3000,22 @@ async fn request_approval_core(
     let (send, recv) = oneshot::channel::<bool>();
     pending.lock().unwrap().insert(id.clone(), send);
 
-    // Emit the event only when an execution stream is active.
+    let approval_event = serde_json::json!({
+        "type":        "approval_requested",
+        "id":          id,
+        "tool":        tool_name,
+        "description": description,
+        "expires_in":  60,
+        "origin":      origin_json
+            .as_deref()
+            .and_then(|o| serde_json::from_str::<serde_json::Value>(o).ok()),
+    });
+    // Chat streams get it inline; the daemon-wide broadcast reaches the app
+    // even when no chat stream is open (background automation approvals).
     if let Some(s) = sink {
-        let _ = s
-            .emit(serde_json::json!({
-                "type":        "approval_requested",
-                "id":          id,
-                "tool":        tool_name,
-                "description": description,
-                "expires_in":  60
-            }))
-            .await;
+        let _ = s.emit(approval_event.clone()).await;
     }
+    state.publish_event(approval_event);
 
     match tokio::time::timeout(tokio::time::Duration::from_secs(60), recv).await {
         Ok(Ok(decision)) => {
@@ -3017,14 +3058,13 @@ async fn request_approval_core(
 
 /// Convenience wrapper for streaming execution paths (always emits the event).
 async fn request_tool_approval(
-    db: &Arc<Mutex<Connection>>,
-    pending: &Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    state: &AppState,
     sink: &agent_exec::EventSink,
     origin: &agent_exec::ExecOrigin,
     tool_name: &str,
     description: &str,
 ) -> bool {
-    request_approval_core(db, pending, tool_name, description, Some(sink), origin.provenance_json())
+    request_approval_core(state, tool_name, description, Some(sink), origin.provenance_json())
         .await
 }
 
@@ -3192,8 +3232,7 @@ async fn codex_run_task_handler(
 
     // 7. Request approval via the DB-backed poll path (no SSE channel needed).
     let approved = request_approval_core(
-        &state.db,
-        &state.pending_approvals,
+        &state,
         "codex.run_task",
         &approval_description,
         None, // REST path — Swift polls GET /approvals/pending
@@ -3695,8 +3734,7 @@ async fn whatsapp_send_handler(
     // Note: approval modal shows `approval_description` with full text;
     //       audit row stores `audit_description` (truncated preview, no full body).
     let approved = request_approval_core(
-        &state.db,
-        &state.pending_approvals,
+        &state,
         "whatsapp.send_message",
         &audit_description, // stored in audit_entries — redacted (trap #2)
         None,               // REST path; no SSE channel

@@ -654,6 +654,47 @@ struct DaemonClient: Sendable {
         return prettyJSONString(data)
     }
 
+    // MARK: - Daemon-wide events (GET /events)
+
+    /// One typed envelope per daemon broadcast event. Payloads are concise —
+    /// callers refetch authoritative records instead of trusting them.
+    struct GlobalEvent: Decodable, Sendable {
+        let type: String
+        let automation_id: String?
+        let run_id: String?
+        let status: String?
+        let id: String?          // approval id for approval_requested
+    }
+
+    /// Long-lived SSE subscription to the daemon broadcast. Throws on
+    /// disconnect — callers loop with a backoff to reconnect.
+    func globalEvents() -> AsyncThrowingStream<GlobalEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let c = try await loadCreds()
+                    let req = authedRequest("/events", creds: c)
+                    let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                        throw DaemonError.badStatus
+                    }
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix("data: ") else { continue }
+                        let json = String(line.dropFirst(6))
+                        if let data = json.data(using: .utf8),
+                           let event = try? JSONDecoder().decode(GlobalEvent.self, from: data) {
+                            continuation.yield(event)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     // MARK: - Approvals
 
     func pendingApprovals() async throws -> [ApprovalItem] {
@@ -1196,12 +1237,24 @@ struct ApprovalItem: Identifiable, Decodable, Sendable {
     let description: String?
     let expiresAt: String
     let createdAt: String
+    /// Provenance for approvals raised by unattended automations.
+    var origin: ApprovalOrigin?
 
     enum CodingKeys: String, CodingKey {
-        case id, description
+        case id, description, origin
         case toolName  = "tool_name"
         case expiresAt = "expires_at"
         case createdAt = "created_at"
+    }
+}
+
+struct ApprovalOrigin: Decodable, Sendable {
+    let kind: String
+    let automationName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case automationName = "automation_name"
     }
 }
 

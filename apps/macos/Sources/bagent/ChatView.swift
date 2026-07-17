@@ -2200,6 +2200,20 @@ struct ApprovalModalOverlay: View {
             }
             .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
 
+            // Identify the originating automation for unattended approvals.
+            if let origin = approval.origin, origin.kind == "automation",
+               let name = origin.automationName {
+                HStack(spacing: 5) {
+                    Image(systemName: "clock.arrow.2.circlepath")
+                        .font(.system(size: 10, weight: .medium))
+                    Text("Automatizácia · \(name)")
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                .accessibilityLabel("Požiadavka z automatizácie \(name)")
+            }
+
             VStack(alignment: .leading, spacing: 4) {
                 Text(approval.toolName)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))

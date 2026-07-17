@@ -1218,7 +1218,7 @@ final class ChatViewModel: ObservableObject {
                     case .approvalRequested(let id, let tool, let desc):
                         let item = ApprovalItem(
                             id: id, toolName: tool, description: desc,
-                            expiresAt: "", createdAt: ""
+                            expiresAt: "", createdAt: "", origin: nil
                         )
                         pendingApprovals.append(item)
                     case .toolBlocked:
@@ -1298,6 +1298,63 @@ final class ChatViewModel: ObservableObject {
                     notchInteractionMode = .output
                 }
             }
+        }
+    }
+
+    // MARK: - Daemon-wide events (automations + background approvals)
+
+    /// Set by AppDelegate — opens the notch when a background approval arrives.
+    var onApprovalArrived: (() -> Void)?
+    /// Bumped on any automation lifecycle event; the automations surface
+    /// refetches authoritative records when it changes.
+    @Published var automationsRefreshID = UUID()
+    private var eventsMonitorTask: Task<Void, Never>?
+
+    /// Subscribe to GET /events with reconnect. Pending approvals are fetched
+    /// at start and after every reconnect so durable approvals are not missed.
+    func startEventsMonitor() {
+        eventsMonitorTask?.cancel()
+        eventsMonitorTask = Task {
+            while !Task.isCancelled {
+                await refreshPendingApprovals()
+                do {
+                    for try await event in client.globalEvents() {
+                        guard !Task.isCancelled else { return }
+                        await handleGlobalEvent(event)
+                    }
+                } catch {
+                    // Daemon restarting or unreachable — retry shortly.
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    func stopEventsMonitor() {
+        eventsMonitorTask?.cancel()
+        eventsMonitorTask = nil
+    }
+
+    private func handleGlobalEvent(_ event: DaemonClient.GlobalEvent) async {
+        switch event.type {
+        case "approval_requested":
+            // Event payloads are notifications, not truth — refetch.
+            await refreshPendingApprovals()
+        case let t where t.hasPrefix("automation"):
+            automationsRefreshID = UUID()
+        default:
+            break
+        }
+    }
+
+    /// Refetch the authoritative pending-approval list; opens the notch when
+    /// approvals exist and nothing is being shown.
+    func refreshPendingApprovals() async {
+        guard let items = try? await client.pendingApprovals() else { return }
+        let hadNone = pendingApprovals.isEmpty
+        pendingApprovals = items
+        if hadNone && !items.isEmpty {
+            onApprovalArrived?()
         }
     }
 

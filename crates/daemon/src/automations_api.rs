@@ -354,6 +354,18 @@ pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
+/// Concise redacted lifecycle event: ids/status/next-run only, no prompts or
+/// summaries — clients refetch the authoritative record.
+fn publish_automation_event(state: &AppState, event_type: &str, a_id: &str, extra: serde_json::Value) {
+    let mut ev = json!({"type": event_type, "automation_id": a_id});
+    if let (Some(obj), Some(x)) = (ev.as_object_mut(), extra.as_object()) {
+        for (k, v) in x {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    state.publish_event(ev);
+}
+
 fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
     match e {
         RepoError::NotFound => (
@@ -424,6 +436,12 @@ pub(crate) async fn automations_create(
                 &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
             );
             state.automations_changed.notify_waiters();
+            publish_automation_event(
+                &state,
+                "automation_created",
+                &a.id.to_string(),
+                json!({"next_run_at": a.next_run_at.map(ts)}),
+            );
             (StatusCode::CREATED, Json(serde_json::to_value(&a).unwrap_or_default()))
         }
         Err(e) => repo_error_response(e),
@@ -458,6 +476,12 @@ pub(crate) async fn automation_patch(
                 &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
             );
             state.automations_changed.notify_waiters();
+            publish_automation_event(
+                &state,
+                "automation_updated",
+                &a.id.to_string(),
+                json!({"next_run_at": a.next_run_at.map(ts)}),
+            );
             (StatusCode::OK, Json(serde_json::to_value(&a).unwrap_or_default()))
         }
         Err(e) => repo_error_response(e),
@@ -476,6 +500,7 @@ pub(crate) async fn automation_delete(
         Ok(()) => {
             audit_fs(&state.db, "automation_delete", &json!({"id": id}));
             state.automations_changed.notify_waiters();
+            publish_automation_event(&state, "automation_deleted", &id, json!({}));
             (StatusCode::OK, Json(json!({"ok": true})))
         }
         Err(e) => repo_error_response(e),
@@ -513,6 +538,12 @@ async fn set_enabled(
                 &json!({"id": id}),
             );
             state.automations_changed.notify_waiters();
+            publish_automation_event(
+                &state,
+                if enabled { "automation_enabled" } else { "automation_disabled" },
+                &id,
+                json!({"next_run_at": a.next_run_at.map(ts)}),
+            );
             (StatusCode::OK, Json(serde_json::to_value(&a).unwrap_or_default()))
         }
         Err(e) => repo_error_response(e),
@@ -676,6 +707,12 @@ pub(crate) async fn execute_automation_run(state: AppState, automation: Automati
         automation_name: automation.name.clone(),
         run_id: run.id.to_string(),
     };
+    publish_automation_event(
+        &state,
+        "automation_run_started",
+        &automation.id.to_string(),
+        json!({"run_id": run.id.to_string(), "manual": run.is_manual}),
+    );
     audit_fs(
         &state.db,
         "automation_run_start",
@@ -768,6 +805,12 @@ pub(crate) async fn execute_automation_run(state: AppState, automation: Automati
             "run_id": run.id.to_string(),
             "status": status.as_str(),
         }),
+    );
+    publish_automation_event(
+        &state,
+        "automation_run_finished",
+        &automation.id.to_string(),
+        json!({"run_id": run.id.to_string(), "status": status.as_str()}),
     );
     state.automations_changed.notify_waiters();
 }
