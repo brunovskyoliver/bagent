@@ -532,28 +532,44 @@ struct AutomationsNotchContent: View {
         .accessibilityLabel("Ukladám automatizáciu")
     }
 
-    private func editorNav(nextEnabled: Bool, nextTitle: String = "Ďalej") -> some View {
-        HStack(spacing: 8) {
-            Button("Späť") { _ = viewModel.automationsGoBack() }
-                .buttonStyle(.plain)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 5)
-                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                .accessibilityLabel("Späť")
-            Button(nextTitle) { viewModel.automationEditorNext() }
-                .buttonStyle(.plain)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(nextEnabled ? .black : NotchWrapMetrics.notchTextFaint)
+    /// Full-width pill button. The entire pill lives INSIDE the button label
+    /// with an explicit contentShape — styling applied outside a `.plain`
+    /// button leaves only the bare text glyphs clickable, which made these
+    /// controls effectively dead inside the notch panel.
+    private func pillButton(
+        _ title: String,
+        prominent: Bool = false,
+        enabled: Bool = true,
+        accessibility: String? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12, weight: prominent ? .semibold : .medium))
+                .foregroundStyle(
+                    prominent
+                        ? (enabled ? Color.black : NotchWrapMetrics.notchTextFaint)
+                        : NotchWrapMetrics.notchTextSecondary
+                )
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 5)
                 .background(
-                    Color.white.opacity(nextEnabled ? 0.9 : 0.08),
-                    in: RoundedRectangle(cornerRadius: 6))
-                .disabled(!nextEnabled)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .accessibilityLabel(nextTitle)
+                    Color.white.opacity(prominent && enabled ? 0.9 : 0.08),
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .accessibilityLabel(accessibility ?? title)
+    }
+
+    private func editorNav(nextEnabled: Bool, nextTitle: String = "Ďalej") -> some View {
+        HStack(spacing: 8) {
+            pillButton("Späť") { _ = viewModel.automationsGoBack() }
+            pillButton(nextTitle, prominent: true, enabled: nextEnabled) {
+                viewModel.automationEditorNext()
+            }
         }
     }
 
@@ -565,28 +581,12 @@ struct AutomationsNotchContent: View {
                 .font(.system(size: 12))
                 .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
             HStack(spacing: 8) {
-                Button("Zrušiť") {
+                pillButton("Zrušiť", accessibility: "Zrušiť vymazanie") {
                     viewModel.automationsSurface = .detail(a.id)
                 }
-                .buttonStyle(.plain)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 5)
-                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                .accessibilityLabel("Zrušiť vymazanie")
-
-                Button("Vymazať") {
+                pillButton("Vymazať", prominent: true, accessibility: "Potvrdiť vymazanie") {
                     viewModel.deleteAutomation(a)
                 }
-                .buttonStyle(.plain)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.black)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 5)
-                .background(Color.white.opacity(0.9), in: RoundedRectangle(cornerRadius: 6))
-                .keyboardShortcut(.return, modifiers: [])
-                .accessibilityLabel("Potvrdiť vymazanie")
             }
         }
     }

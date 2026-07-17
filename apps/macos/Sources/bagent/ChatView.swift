@@ -2251,22 +2251,31 @@ struct ApprovalModalOverlay: View {
             .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
 
             HStack(spacing: 8) {
-                Button("Zamietnuť") { viewModel.decideApproval(approval, allow: false) }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 5)
-                    .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                    .keyboardShortcut(.escape, modifiers: [])
-                Button("Schváliť") { viewModel.decideApproval(approval, allow: true) }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.black)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 5)
-                    .background(Color.white.opacity(0.9), in: RoundedRectangle(cornerRadius: 6))
-                    .keyboardShortcut(.return, modifiers: [])
+                // Styling lives inside the label + contentShape: with a
+                // `.plain` button, outside styling leaves only the text
+                // glyphs clickable and the pill is effectively dead.
+                Button { viewModel.decideApproval(approval, allow: false) } label: {
+                    Text("Zamietnuť")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.escape, modifiers: [])
+                Button { viewModel.decideApproval(approval, allow: true) } label: {
+                    Text("Schváliť")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(0.9), in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.return, modifiers: [])
             }
         }
         .onReceive(timer) { _ in

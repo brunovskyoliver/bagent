@@ -395,12 +395,21 @@ final class NotchWindowController: NSObject {
                 self.collapse()
                 return nil
             }
-            // Automations list: ↑/↓ select a row, Return opens its detail.
+            // Automations: ↑/↓ select a list row, Return opens the detail or
+            // advances the editor one step (keyboard equivalent of "Ďalej").
             if self.chatViewModel.notchInteractionMode == .automations {
                 switch event.keyCode {
                 case 126: if self.chatViewModel.moveAutomationsSelection(by: -1) { return nil }
                 case 125: if self.chatViewModel.moveAutomationsSelection(by: 1) { return nil }
-                case 36: if self.chatViewModel.openSelectedAutomationDetail() { return nil }
+                case 36:
+                    if self.chatViewModel.openSelectedAutomationDetail() { return nil }
+                    switch self.chatViewModel.automationsSurface {
+                    case .editorTask, .editorSchedule, .editorRecurrence, .editorReview:
+                        self.chatViewModel.automationEditorNext()
+                        return nil
+                    default:
+                        break
+                    }
                 default: break
                 }
             }
