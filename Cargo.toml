@@ -6,6 +6,7 @@ members = [
     "crates/rules",
     "crates/skills",
     "crates/attachments",
+    "crates/automations",
     "crates/connectors/ollama",
     "crates/connectors/apple_mail",
     "crates/connectors/apple_notes",
