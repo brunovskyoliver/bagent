@@ -695,6 +695,93 @@ struct DaemonClient: Sendable {
         }
     }
 
+    // MARK: - Automations
+
+    func listAutomations() async throws -> [AutomationRecord] {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/automations", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
+        struct Resp: Decodable { let automations: [AutomationRecord] }
+        return try JSONDecoder().decode(Resp.self, from: data).automations
+    }
+
+    func getAutomation(id: String) async throws -> AutomationRecord {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/automations/\(id)", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
+        return try JSONDecoder().decode(AutomationRecord.self, from: data)
+    }
+
+    struct AutomationDraft: Encodable {
+        var name: String
+        var prompt: String
+        var timezone: String
+        var schedule: AutomationSchedule
+        var enabled: Bool = true
+    }
+
+    func createAutomation(_ draft: AutomationDraft) async throws -> AutomationRecord {
+        try await automationRequest(path: "/automations", method: "POST", body: draft)
+    }
+
+    struct AutomationPatch: Encodable {
+        var name: String?
+        var prompt: String?
+        var timezone: String?
+        var schedule: AutomationSchedule?
+        var enabled: Bool?
+    }
+
+    func patchAutomation(id: String, _ patch: AutomationPatch) async throws -> AutomationRecord {
+        try await automationRequest(path: "/automations/\(id)", method: "PATCH", body: patch)
+    }
+
+    private struct APIErrorBody: Decodable { let error: String }
+
+    private func automationRequest<B: Encodable>(
+        path: String, method: String, body: B
+    ) async throws -> AutomationRecord {
+        let c = try await loadCreds()
+        var req = authedRequest(path, creds: c)
+        req.httpMethod = method
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            let message = (try? JSONDecoder().decode(APIErrorBody.self, from: data))?.error
+            throw DaemonError.serverError(message ?? "HTTP \(status)")
+        }
+        return try JSONDecoder().decode(AutomationRecord.self, from: data)
+    }
+
+    /// POST helper for enable/disable/run-now/delete-style endpoints.
+    private func automationAction(path: String, method: String = "POST") async throws {
+        let c = try await loadCreds()
+        var req = authedRequest(path, creds: c)
+        req.httpMethod = method
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            let message = (try? JSONDecoder().decode(APIErrorBody.self, from: data))?.error
+            throw DaemonError.serverError(message ?? "HTTP \(status)")
+        }
+    }
+
+    func enableAutomation(id: String) async throws { try await automationAction(path: "/automations/\(id)/enable") }
+    func disableAutomation(id: String) async throws { try await automationAction(path: "/automations/\(id)/disable") }
+    func deleteAutomation(id: String) async throws { try await automationAction(path: "/automations/\(id)", method: "DELETE") }
+    func runNowAutomation(id: String) async throws { try await automationAction(path: "/automations/\(id)/run-now") }
+
+    func automationRuns(id: String, limit: Int = 10) async throws -> [AutomationRunRecord] {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/automations/\(id)/runs?limit=\(limit)", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
+        struct Resp: Decodable { let runs: [AutomationRunRecord] }
+        return try JSONDecoder().decode(Resp.self, from: data).runs
+    }
+
     // MARK: - Approvals
 
     func pendingApprovals() async throws -> [ApprovalItem] {

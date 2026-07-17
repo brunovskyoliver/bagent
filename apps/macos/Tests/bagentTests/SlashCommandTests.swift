@@ -11,7 +11,7 @@ final class SlashCommandRegistryTests: XCTestCase {
     }
 
     func testPrefixFilteringIsCaseInsensitive() {
-        XCTAssertEqual(SlashCommandRegistry.suggestions(for: "/").map(\.id), ["settings"])
+        XCTAssertEqual(SlashCommandRegistry.suggestions(for: "/").map(\.id), ["settings", "automations"])
         XCTAssertEqual(SlashCommandRegistry.suggestions(for: "/s").map(\.id), ["settings"])
         XCTAssertEqual(SlashCommandRegistry.suggestions(for: "/S").map(\.id), ["settings"])
         XCTAssertEqual(SlashCommandRegistry.suggestions(for: "/SETT").map(\.id), ["settings"])
@@ -43,9 +43,12 @@ final class SlashCommandRegistryTests: XCTestCase {
         }
     }
 
-    func testAutomationsNotRegisteredYet() {
-        // Registered only once the automations surface exists.
-        XCTAssertNil(SlashCommandRegistry.exactMatch("/automations"))
+    func testAutomationsRegisteredWithSurface() {
+        XCTAssertEqual(SlashCommandRegistry.exactMatch("/automations")?.id, "automations")
+        XCTAssertEqual(SlashCommandRegistry.exactMatch("/automatizácie")?.id, "automations")
+        XCTAssertEqual(SlashCommandRegistry.suggestions(for: "/a").map(\.id), ["automations"])
+        // "/s" still uniquely matches settings.
+        XCTAssertEqual(SlashCommandRegistry.suggestions(for: "/s").map(\.id), ["settings"])
     }
 }
 

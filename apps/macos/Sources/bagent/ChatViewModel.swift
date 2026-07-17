@@ -84,6 +84,15 @@ enum NotchInteractionMode: Equatable {
     case thinking
     case output
     case settings
+    case automations
+}
+
+/// Step-based state of the `/automations` surface (single source of truth
+/// stays NotchInteractionMode — this only selects what renders inside it).
+enum AutomationsSurfaceState: Equatable {
+    case list
+    case detail(String)
+    case deleteConfirmation(String)
 }
 
 /// Pages of the notch-style settings surface (`/settings`).
@@ -206,6 +215,136 @@ final class ChatViewModel: ObservableObject {
         notchInteractionMode = .settings
     }
 
+    // MARK: - Automations surface (/automations)
+
+    @Published var automationsSurface: AutomationsSurfaceState = .list
+    @Published var automations: [AutomationRecord] = []
+    @Published var automationsSelectionIndex: Int = 0
+    @Published var automationsError: String? = nil
+    /// True while a run-now/enable/delete request is in flight.
+    @Published var automationsBusy = false
+
+    /// Open the `/automations` surface on its list.
+    func openAutomations() {
+        inputText = ""
+        historyBrowseIndex = nil
+        automationsSurface = .list
+        automationsSelectionIndex = 0
+        automationsError = nil
+        notchInteractionMode = .automations
+        Task { await refreshAutomations() }
+    }
+
+    /// Refetch the authoritative list; handles records deleted elsewhere by
+    /// falling back to the list when an open detail disappears.
+    func refreshAutomations() async {
+        do {
+            automations = try await client.listAutomations()
+            automationsError = nil
+            if automationsSelectionIndex >= automations.count {
+                automationsSelectionIndex = max(0, automations.count - 1)
+            }
+            switch automationsSurface {
+            case .detail(let id), .deleteConfirmation(let id):
+                if !automations.contains(where: { $0.id == id }) {
+                    automationsSurface = .list
+                }
+            case .list:
+                break
+            }
+        } catch {
+            automationsError = "Daemon nedostupný"
+        }
+    }
+
+    var selectedAutomation: AutomationRecord? {
+        switch automationsSurface {
+        case .detail(let id), .deleteConfirmation(let id):
+            return automations.first { $0.id == id }
+        case .list:
+            return automations[safe: automationsSelectionIndex]
+        }
+    }
+
+    /// Escape steps back one level; returns false at the list (caller collapses).
+    func automationsGoBack() -> Bool {
+        switch automationsSurface {
+        case .deleteConfirmation(let id):
+            automationsSurface = .detail(id)
+            return true
+        case .detail:
+            automationsSurface = .list
+            return true
+        case .list:
+            return false
+        }
+    }
+
+    func moveAutomationsSelection(by delta: Int) -> Bool {
+        guard notchInteractionMode == .automations, automationsSurface == .list,
+              !automations.isEmpty else { return false }
+        let count = automations.count
+        automationsSelectionIndex = (automationsSelectionIndex + delta + count) % count
+        return true
+    }
+
+    func openSelectedAutomationDetail() -> Bool {
+        guard notchInteractionMode == .automations, automationsSurface == .list,
+              let a = automations[safe: automationsSelectionIndex] else { return false }
+        automationsSurface = .detail(a.id)
+        return true
+    }
+
+    func setAutomationEnabled(_ automation: AutomationRecord, enabled: Bool) {
+        automationsBusy = true
+        Task {
+            defer { automationsBusy = false }
+            do {
+                if enabled {
+                    try await client.enableAutomation(id: automation.id)
+                } else {
+                    try await client.disableAutomation(id: automation.id)
+                }
+                await refreshAutomations()
+            } catch {
+                automationsError = "Zmena zlyhala"
+            }
+        }
+    }
+
+    func runAutomationNow(_ automation: AutomationRecord) {
+        automationsBusy = true
+        Task {
+            defer { automationsBusy = false }
+            do {
+                try await client.runNowAutomation(id: automation.id)
+                await refreshAutomations()
+            } catch {
+                automationsError = (error as? DaemonError).flatMap { e in
+                    if case .serverError(let m) = e { return m } else { return nil }
+                } ?? "Spustenie zlyhalo"
+            }
+        }
+    }
+
+    func deleteAutomation(_ automation: AutomationRecord) {
+        automationsBusy = true
+        Task {
+            defer { automationsBusy = false }
+            do {
+                try await client.deleteAutomation(id: automation.id)
+                automationsSurface = .list
+                await refreshAutomations()
+            } catch {
+                automationsError = "Vymazanie zlyhalo (beží?)"
+            }
+        }
+    }
+
+    /// Editor entry points — implemented with the creation flow (issue #10).
+    func startAutomationCreation() {}
+    func startAutomationEdit(_ automation: AutomationRecord) {}
+
     // MARK: - Slash-command suggestions
 
     /// Matching commands for the current input (max 3, prefix, case-insensitive).
@@ -249,6 +388,8 @@ final class ChatViewModel: ObservableObject {
         switch command.action {
         case .openSettings:
             openNotchSettings()
+        case .openAutomations:
+            openAutomations()
         }
     }
 
@@ -1342,6 +1483,9 @@ final class ChatViewModel: ObservableObject {
             await refreshPendingApprovals()
         case let t where t.hasPrefix("automation"):
             automationsRefreshID = UUID()
+            if notchInteractionMode == .automations {
+                await refreshAutomations()
+            }
         default:
             break
         }

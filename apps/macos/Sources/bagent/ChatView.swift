@@ -24,6 +24,8 @@ enum NotchWrapMetrics {
     static let cmuxBridgeHeight: CGFloat  = 19   // single caption line, minimal growth
     static let settingsWingWidth: CGFloat   = 205  // /settings surface
     static let settingsBridgeHeight: CGFloat = 252
+    static let automationsWingWidth: CGFloat = 205   // /automations surface
+    static let automationsBridgeHeight: CGFloat = 190
     /// The setup page carries credentials + the rules editor — it needs the full bridge.
     static let setupBridgeHeight: CGFloat   = 280
     static let slashSuggestionRowHeight: CGFloat = 24  // one command suggestion row
@@ -249,6 +251,7 @@ struct NotchWrapView: View {
     private var isInlineActive: Bool {
         viewModel.notchInteractionMode == .input || viewModel.notchInteractionMode == .output
             || viewModel.notchInteractionMode == .settings
+            || viewModel.notchInteractionMode == .automations
     }
     private var isSettingsActive: Bool { viewModel.notchInteractionMode == .settings }
 
@@ -275,9 +278,10 @@ struct NotchWrapView: View {
 
     private func inlineWingWidth(for mode: NotchInteractionMode) -> CGFloat {
         switch mode {
-        case .output:   return outputWingWidth()
-        case .settings: return NotchWrapMetrics.settingsWingWidth
-        default:        return NotchWrapMetrics.inlineWingWidth
+        case .output:      return outputWingWidth()
+        case .settings:    return NotchWrapMetrics.settingsWingWidth
+        case .automations: return NotchWrapMetrics.automationsWingWidth
+        default:           return NotchWrapMetrics.inlineWingWidth
         }
     }
 
@@ -288,6 +292,8 @@ struct NotchWrapView: View {
             return viewModel.notchSettingsPage == .setup
                 ? NotchWrapMetrics.setupBridgeHeight
                 : NotchWrapMetrics.settingsBridgeHeight
+        case .automations:
+            return NotchWrapMetrics.automationsBridgeHeight
         default:
             // Slash-command suggestion rows sit under the input field.
             let suggestionsExtra = CGFloat(viewModel.slashSuggestions.count)
@@ -1162,6 +1168,8 @@ struct InlineNotchContent: View {
                     outputView
                 case .settings:
                     NotchSettingsContent(viewModel: viewModel)
+                case .automations:
+                    AutomationsNotchContent(viewModel: viewModel)
                 case .collapsed:
                     EmptyView()
                 }

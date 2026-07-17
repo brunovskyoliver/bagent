@@ -6,6 +6,7 @@ import Foundation
 struct SlashCommand: Identifiable, Equatable {
     enum Action: Equatable {
         case openSettings
+        case openAutomations
     }
 
     let id: String
@@ -29,8 +30,6 @@ extension Array {
 enum SlashCommandRegistry {
     static let maxSuggestions = 3
 
-    /// /automations is registered by the automations surface issue — do not
-    /// add it before that surface exists.
     static let all: [SlashCommand] = [
         SlashCommand(
             id: "settings",
@@ -39,6 +38,14 @@ enum SlashCommandRegistry {
             subtitle: "Open bagent settings",
             symbol: "gearshape",
             action: .openSettings
+        ),
+        SlashCommand(
+            id: "automations",
+            command: "/automations",
+            aliases: ["/automatizacie", "/automatizácie"],
+            subtitle: "Scheduled agent tasks",
+            symbol: "clock.arrow.2.circlepath",
+            action: .openAutomations
         ),
     ]
 

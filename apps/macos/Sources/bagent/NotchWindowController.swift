@@ -377,10 +377,15 @@ final class NotchWindowController: NSObject {
                 return event
             }
             if event.keyCode == 53 {
-                // Esc dismisses slash suggestions first, then exits
-                // response-history browsing, then collapses the notch.
+                // Esc dismisses slash suggestions first, then steps back in
+                // the automations surface, then exits response-history
+                // browsing, then collapses the notch.
                 if !self.chatViewModel.slashSuggestions.isEmpty {
                     self.chatViewModel.dismissSlashSuggestions()
+                    return nil
+                }
+                if self.chatViewModel.notchInteractionMode == .automations,
+                   self.chatViewModel.automationsGoBack() {
                     return nil
                 }
                 if self.chatViewModel.historyBrowseIndex != nil {
@@ -389,6 +394,15 @@ final class NotchWindowController: NSObject {
                 }
                 self.collapse()
                 return nil
+            }
+            // Automations list: ↑/↓ select a row, Return opens its detail.
+            if self.chatViewModel.notchInteractionMode == .automations {
+                switch event.keyCode {
+                case 126: if self.chatViewModel.moveAutomationsSelection(by: -1) { return nil }
+                case 125: if self.chatViewModel.moveAutomationsSelection(by: 1) { return nil }
+                case 36: if self.chatViewModel.openSelectedAutomationDetail() { return nil }
+                default: break
+                }
             }
             // Slash-command suggestions consume ↑/↓ (selection), Tab and
             // Return (accept) while visible.
@@ -505,7 +519,7 @@ final class NotchWindowController: NSObject {
 
     private var statusPanelAllowedOverFullscreen: Bool {
         switch chatViewModel.notchInteractionMode {
-        case .input, .output, .settings:
+        case .input, .output, .settings, .automations:
             return true
         case .collapsed, .thinking:
             return false
