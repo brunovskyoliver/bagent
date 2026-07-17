@@ -377,13 +377,29 @@ final class NotchWindowController: NSObject {
                 return event
             }
             if event.keyCode == 53 {
-                // Esc exits response-history browsing before collapsing the notch.
+                // Esc dismisses slash suggestions first, then exits
+                // response-history browsing, then collapses the notch.
+                if !self.chatViewModel.slashSuggestions.isEmpty {
+                    self.chatViewModel.dismissSlashSuggestions()
+                    return nil
+                }
                 if self.chatViewModel.historyBrowseIndex != nil {
                     self.chatViewModel.exitHistoryBrowse()
                     return nil
                 }
                 self.collapse()
                 return nil
+            }
+            // Slash-command suggestions consume ↑/↓ (selection), Tab and
+            // Return (accept) while visible.
+            if !self.chatViewModel.slashSuggestions.isEmpty {
+                switch event.keyCode {
+                case 126: if self.chatViewModel.moveSlashSelection(by: -1) { return nil }
+                case 125: if self.chatViewModel.moveSlashSelection(by: 1) { return nil }
+                case 48, 36:
+                    if self.chatViewModel.acceptSlashSuggestion() { return nil }
+                default: break
+                }
             }
             // ←/→ switch settings pages while the /settings surface is open.
             if self.chatViewModel.notchInteractionMode == .settings {

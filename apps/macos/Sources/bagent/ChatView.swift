@@ -26,6 +26,7 @@ enum NotchWrapMetrics {
     static let settingsBridgeHeight: CGFloat = 252
     /// The setup page carries credentials + the rules editor — it needs the full bridge.
     static let setupBridgeHeight: CGFloat   = 280
+    static let slashSuggestionRowHeight: CGFloat = 24  // one command suggestion row
     static let wheelWingWidth: CGFloat    = 196  // paste wheel — 5 chips along the arc
     static let wheelBridgeHeight: CGFloat = 36   // thin strip; the dome carries the height
     static let wheelBulgeDepth: CGFloat   = 96   // circular-arc dome below the strip
@@ -287,7 +288,14 @@ struct NotchWrapView: View {
             return viewModel.notchSettingsPage == .setup
                 ? NotchWrapMetrics.setupBridgeHeight
                 : NotchWrapMetrics.settingsBridgeHeight
-        default:        return NotchWrapMetrics.inlineBridgeHeight
+        default:
+            // Slash-command suggestion rows sit under the input field.
+            let suggestionsExtra = CGFloat(viewModel.slashSuggestions.count)
+                * NotchWrapMetrics.slashSuggestionRowHeight
+            return min(
+                NotchWrapMetrics.maxBridgeHeight,
+                NotchWrapMetrics.inlineBridgeHeight + suggestionsExtra
+            )
         }
     }
 
@@ -1024,6 +1032,10 @@ struct NotchWrapView: View {
         .onChange(of: viewModel.notchSettingsPage) {
             refreshSurface()
         }
+        // Slash-command suggestion rows grow the input bridge.
+        .onChange(of: viewModel.slashSuggestions) {
+            refreshSurface()
+        }
         .onChange(of: viewModel.cmuxBanner) {
             refreshSurface()
         }
@@ -1143,7 +1155,7 @@ struct InlineNotchContent: View {
             } else {
                 switch viewModel.notchInteractionMode {
                 case .input:
-                    inputRow
+                    inputWithSuggestions
                 case .thinking:
                     thinkingRow
                 case .output:
@@ -1207,6 +1219,54 @@ struct InlineNotchContent: View {
             .frame(height: 24)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var inputWithSuggestions: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            inputRow
+            if !viewModel.slashSuggestions.isEmpty {
+                slashSuggestionRows
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.18), value: viewModel.slashSuggestions)
+    }
+
+    private var slashSuggestionRows: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(viewModel.slashSuggestions.enumerated()), id: \.element.id) { index, cmd in
+                let selected = index == viewModel.slashSelectionIndex
+                HStack(spacing: 8) {
+                    if let symbol = cmd.symbol {
+                        Image(systemName: symbol)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                            .frame(width: 14)
+                    }
+                    Text(cmd.command)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                    Text(cmd.subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 8)
+                .frame(height: NotchWrapMetrics.slashSuggestionRowHeight - 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(selected ? 0.12 : 0.06))
+                )
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    _ = viewModel.acceptSlashSuggestion(cmd)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Command \(cmd.command), \(cmd.subtitle)")
+                .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+            }
+        }
     }
 
     private var thinkingRow: some View {

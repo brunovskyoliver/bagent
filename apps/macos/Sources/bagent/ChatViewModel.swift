@@ -161,7 +161,9 @@ enum SourceMode: String, CaseIterable, Equatable, Identifiable {
 @MainActor
 final class ChatViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
-    @Published var inputText: String = ""
+    @Published var inputText: String = "" {
+        didSet { updateSlashSuggestions() }
+    }
     @Published var isThinking = false
     /// Transient tool-loop status ("🔎 Searching mail…") shown next to the thinking indicator.
     @Published var toolStatus: String? = nil
@@ -202,6 +204,52 @@ final class ChatViewModel: ObservableObject {
         historyBrowseIndex = nil
         notchSettingsPage = .general
         notchInteractionMode = .settings
+    }
+
+    // MARK: - Slash-command suggestions
+
+    /// Matching commands for the current input (max 3, prefix, case-insensitive).
+    @Published var slashSuggestions: [SlashCommand] = []
+    /// Keyboard-selected suggestion row.
+    @Published var slashSelectionIndex: Int = 0
+    private func updateSlashSuggestions() {
+        // Called only from inputText.didSet — an Escape dismissal therefore
+        // holds until the text changes again.
+        let matches = notchInteractionMode == .settings
+            ? []
+            : SlashCommandRegistry.suggestions(for: inputText)
+        if matches != slashSuggestions { slashSuggestions = matches }
+        if slashSelectionIndex >= matches.count { slashSelectionIndex = 0 }
+    }
+
+    /// Escape while suggestions are showing: hide them, keep the text editable.
+    func dismissSlashSuggestions() {
+        slashSuggestions = []
+        slashSelectionIndex = 0
+    }
+
+    func moveSlashSelection(by delta: Int) -> Bool {
+        guard !slashSuggestions.isEmpty else { return false }
+        let count = slashSuggestions.count
+        slashSelectionIndex = (slashSelectionIndex + delta + count) % count
+        return true
+    }
+
+    /// Return/Tab/click on a suggestion: canonical spelling, then execute.
+    func acceptSlashSuggestion(_ command: SlashCommand? = nil) -> Bool {
+        guard let cmd = command ?? slashSuggestions[safe: slashSelectionIndex] else { return false }
+        slashSuggestions = []
+        slashSelectionIndex = 0
+        inputText = cmd.command
+        execute(cmd)
+        return true
+    }
+
+    func execute(_ command: SlashCommand) {
+        switch command.action {
+        case .openSettings:
+            openNotchSettings()
+        }
     }
 
     // MARK: - Clipboard paste wheel (hold right ⌘)
@@ -1042,8 +1090,13 @@ final class ChatViewModel: ObservableObject {
     func send() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !pendingAttachments.isEmpty else { return }
-        if text.lowercased() == "/settings" || text.lowercased() == "/nastavenia" {
-            openNotchSettings()
+        // A keyboard-selected suggestion wins over raw text; only complete
+        // recognized commands execute. Unknown slash text submits normally.
+        if !slashSuggestions.isEmpty, acceptSlashSuggestion() {
+            return
+        }
+        if let cmd = SlashCommandRegistry.exactMatch(text) {
+            execute(cmd)
             return
         }
         guard !isThinking else { return }
