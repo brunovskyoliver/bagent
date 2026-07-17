@@ -23,10 +23,8 @@ use codex_connector::{
     CodexConfig, CodexConnector, CodexContextPacket, CodexExpectedOutput, CodexTask, ContextItem,
 };
 use filesystem_connector::{
-    self, open as fs_open, search as fs_search, FileSearchRequest, FsConnector, OpenResponse,
-    ReadTextRequest,
+    self, open as fs_open, search as fs_search, FileSearchRequest, FsConnector, ReadTextRequest,
 };
-use futures_util::StreamExt;
 use odoo_connector::{OdooConfig, OdooConnector, OdooError, OdooRecordRef};
 use ollama_connector::{Message, OllamaClient, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL};
 use rusqlite::Connection;
@@ -45,6 +43,8 @@ use uuid::Uuid;
 use whatsapp_connector::{
     WhatsappConfig, WhatsappConnectionStatus, WhatsappConnector, WhatsappSendTarget,
 };
+
+mod agent_exec;
 
 mod embedded {
     refinery::embed_migrations!("migrations");
@@ -1846,14 +1846,9 @@ async fn chat(
     let (tx, rx) = mpsc::channel(64);
     let model = req.model.clone().unwrap_or(state.default_model.clone());
     let db = state.db.clone();
-    let ollama = state.ollama.clone();
     let user_message = req.message.clone();
-    let mail = state.mail.clone();
-    let notes = state.notes.clone();
     let prompt_builder = state.prompt_builder.clone();
-    let rules = state.rules.clone();
     let debug_dir = state.debug_dir.clone();
-    let pending_approvals = state.pending_approvals.clone();
     let vision_model = state.vision_model.clone();
     let attachment_ids = req.attachment_ids.clone();
     // Screen context (Phase 7) — never persisted to disk
@@ -1864,7 +1859,6 @@ async fn chat(
     let source_mode = req.source_mode.clone();
     let skills = state.skills.clone();
     let task_rater = state.task_rater.clone();
-    let fs_exec = state.fs.clone(); // kept for action execution in handler post-classify
     let runtime_refs = state.runtime_refs.clone();
 
     tokio::spawn(async move {
@@ -2167,7 +2161,7 @@ async fn chat(
         // ── Build layered prompt ──────────────────────────────────────────────
         let prompt_trace_id = Uuid::new_v4().to_string();
         let mut prompt_trace: Option<PromptTrace> = None;
-        let mut messages = match prompt_builder
+        let messages = match prompt_builder
             .build(
                 &user_message,
                 lang,
@@ -2265,932 +2259,47 @@ async fn chat(
         );
         let prompt_messages_for_log = messages.clone();
 
-        // ── Agentic tool loop ─────────────────────────────────────────────────
-        // The model drives all data access through tool calls and can only cite
-        // what tools returned. Guardrails live in the dispatcher: rules engine
-        // verdicts, PathPolicy (inside the fs connector), approval modal for
-        // writes, per-turn budgets, and an audit entry per call.
-        // Vision turns (image attachment / screen capture) skip tools — the
-        // vision model answers directly from the injected context.
-        use ollama_connector::{ChatStreamEvent, ToolCall as OllamaToolCall, ToolDef as OllamaToolDef};
+        // ── Agentic tool loop (shared execution service) ─────────────────────
+        // One loop for chat and automations lives in agent_exec. Guardrails
+        // live in its dispatcher: rules engine verdicts on the actual args,
+        // PathPolicy (inside the fs connector), approval modal for writes,
+        // per-turn budgets, and an audit entry per call. Vision turns skip
+        // tools — the vision model answers from injected context.
+        let tools = agent_exec::build_tools(&state, att_data.model_override.is_some()).await;
 
-        let mut tools: Vec<OllamaToolDef> = Vec::new();
-        if att_data.model_override.is_none() {
-            if mail.is_some() {
-                tools.push(OllamaToolDef::function(
-                    "mail_search",
-                    "Search the user's Apple Mail. Returns message headers (rowid, subject, sender, date). \
-                     Use mail_read with a rowid to get a message body. \
-                     When the user asks what a mail says or about its content, immediately follow up \
-                     with mail_read on the best-matching rowid — reading is safe, never ask permission first. \
-                     Put the sender's email address or name in `sender` when the user asks about mail from someone. \
-                     IMPORTANT: Never describe a message that this tool did not return.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "sender": {"type": "string", "description": "Sender email address or name."},
-                            "subject": {"type": "string", "description": "Subject substring."},
-                            "keywords": {"type": "array", "items": {"type": "string"}, "description": "Terms that must ALL match sender or subject."},
-                            "date_from": {"type": "string", "description": "ISO date YYYY-MM-DD."},
-                            "date_to": {"type": "string", "description": "ISO date YYYY-MM-DD."},
-                            "limit": {"type": "integer", "description": "Max results, default 10."}
-                        }
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "mail_list_inbox",
-                    "List the most recent inbox messages, optionally unread only.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "limit": {"type": "integer", "description": "Max results, default 10."},
-                            "unread_only": {"type": "boolean"}
-                        }
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "mail_read",
-                    "Read the full body of a mail message by rowid (from mail_search / mail_list_inbox). \
-                     Call this without asking whenever the user wants a message's content, summary, or details.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {"rowid": {"type": "integer"}},
-                        "required": ["rowid"]
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "mail_open",
-                    "Open a mail message in the Mail app by rowid.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {"rowid": {"type": "integer"}},
-                        "required": ["rowid"]
-                    }),
-                ));
-            }
-            if fs_exec.is_some() {
-                tools.push(OllamaToolDef::function(
-                    "filesystem_search_files",
-                    "Search the user's Mac for files by name or content using macOS Spotlight. \
-                     Use multiple Slovak/English synonym terms for best recall on Slovak documents. \
-                     IMPORTANT: Never name or describe a file that was not returned by this tool.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "terms": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Search terms (OR semantics). When the user's query is in English but the files are Slovak business documents, include Slovak synonyms and transliterations. E.g. 'customer statement' → ['zákazník','zakaznik','preplatk','saldokonto','výpis','prehľad']."
-                            },
-                            "roots": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Folders to search, e.g. ['~/Downloads']. Omit to search all allowed folders."
-                            },
-                            "extensions": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "File extensions without dot, e.g. ['pdf','xlsx']."
-                            },
-                            "search_contents": {
-                                "type": "boolean",
-                                "description": "Also search inside document contents (needed when the filename doesn't match but contents do)."
-                            },
-                            "max_results": {
-                                "type": "integer",
-                                "description": "Max results to return. Default 10."
-                            }
-                        },
-                        "required": ["terms"]
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "filesystem_read_text",
-                    "Read the text content of a local file (PDF, Word, Excel, or plain text). \
-                     Use this to inspect candidate files returned by filesystem_search_files.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Absolute path to the file."}
-                        },
-                        "required": ["path"]
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "filesystem_open_file",
-                    "Open a local file in its default application. Requires user approval.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Absolute path to the file."}
-                        },
-                        "required": ["path"]
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "filesystem_open_file_with",
-                    "Open a local file in a specific application. Requires user approval.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"},
-                            "app": {"type": "string", "description": "App name, e.g. 'Microsoft Excel', 'Preview'."}
-                        },
-                        "required": ["path", "app"]
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "filesystem_reveal_in_finder",
-                    "Reveal a local file in the macOS Finder.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"}
-                        },
-                        "required": ["path"]
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "macos_open_app",
-                    "Launch or focus a macOS application by name.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "app": {"type": "string", "description": "App name, e.g. 'Mail', 'Finder', 'Preview'."}
-                        },
-                        "required": ["app"]
-                    }),
-                ));
-            }
-            if notes.is_some() {
-                tools.push(OllamaToolDef::function(
-                    "notes_search",
-                    "Search Apple Notes by title/snippet. Returns note metadata; use notes_read for the body.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                            "limit": {"type": "integer", "description": "Max results, default 10."}
-                        },
-                        "required": ["query"]
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "notes_read",
-                    "Read the body of an Apple Note by its coredata_id (from notes_search).",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {"coredata_id": {"type": "string"}},
-                        "required": ["coredata_id"]
-                    }),
-                ));
-            }
-            tools.push(OllamaToolDef::function(
-                "web_search",
-                "Search the public web (DuckDuckGo + Wikipedia). Returns result lines: title | url | snippet. \
-                 Use for facts, current events, prices, or to identify an entity (e.g. what company makes a product) \
-                 before searching mail or files. Follow up with web_fetch on the best URL when snippets are not enough. \
-                 IMPORTANT: Answer factual questions ONLY from these results, cite the source URL, \
-                 and say the answer was not found rather than guessing.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query, in the language most likely to have results (usually English)."},
-                        "lang": {"type": "string", "description": "Wikipedia language code, 'en' or 'sk'. Default 'en'."}
-                    },
-                    "required": ["query"]
-                }),
-            ));
-            tools.push(OllamaToolDef::function(
-                "web_fetch",
-                "Download a web page by URL and return its readable text (capped), \
-                 plus a Links section of same-site links. Use on a URL from web_search \
-                 or one the user provided. When the answer lives on a subpage (daily menu, \
-                 news article), call web_fetch again on the most promising listed link. \
-                 IMPORTANT: Never describe page content this tool did not return.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "url": {"type": "string", "description": "Full http(s) URL to fetch."}
-                    },
-                    "required": ["url"]
-                }),
-            ));
-            tools.push(OllamaToolDef::function(
-                "macos_switch_workspace",
-                "Switch to an AeroSpace window-manager workspace by name/number.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"workspace": {"type": "string"}},
-                    "required": ["workspace"]
-                }),
-            ));
-            // WhatsApp connector always exists; calls report politely when the bridge is down.
-            tools.push(OllamaToolDef::function(
-                "whatsapp_list_chats",
-                "List the user's recent WhatsApp chats (chat_id, contact name, last message).",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"limit": {"type": "integer", "description": "Max chats, default 20."}}
-                }),
-            ));
-            tools.push(OllamaToolDef::function(
-                "whatsapp_chat_messages",
-                "Read recent messages of one WhatsApp chat by chat_id (from whatsapp_list_chats).",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "chat_id": {"type": "string"},
-                        "limit": {"type": "integer", "description": "Max messages, default 20."}
-                    },
-                    "required": ["chat_id"]
-                }),
-            ));
-            tools.push(OllamaToolDef::function(
-                "whatsapp_send_message",
-                "Send ONE WhatsApp text message to a chat. Always requires explicit user approval.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "chat_id": {"type": "string"},
-                        "message": {"type": "string"}
-                    },
-                    "required": ["chat_id", "message"]
-                }),
-            ));
-            if state.odoo.read().await.is_some() {
-                tools.push(OllamaToolDef::function(
-                    "odoo_search_partners",
-                    "Search Odoo partners (customers/suppliers) by name or email.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string"},
-                            "limit": {"type": "integer", "description": "Max results, default 10."}
-                        },
-                        "required": ["query"]
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "odoo_my_invoices",
-                    "List Odoo invoices. open_only=true returns only unpaid/partially-paid ones.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "open_only": {"type": "boolean"},
-                            "limit": {"type": "integer", "description": "Max results, default 10."}
-                        }
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "odoo_my_helpdesk_tickets",
-                    "List the user's Odoo helpdesk tickets. open_only=true excludes closed stages.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "open_only": {"type": "boolean"},
-                            "limit": {"type": "integer", "description": "Max results, default 10."}
-                        }
-                    }),
-                ));
-                tools.push(OllamaToolDef::function(
-                    "odoo_get_record",
-                    "Read a single Odoo record by model and id, e.g. model='res.partner', id=42.",
-                    serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "model": {"type": "string"},
-                            "id": {"type": "integer"}
-                        },
-                        "required": ["model", "id"]
-                    }),
-                ));
-            }
-        }
-
-        let mut full_response = String::new();
-
-        if tools.is_empty() {
-            // Vision turns / no connectors: single streamed answer, no tools.
-            let token_stream = ollama.chat_stream(effective_model.clone(), messages.clone());
-            tokio::pin!(token_stream);
-            while let Some(result) = token_stream.next().await {
-                match result {
-                    Ok(token) => {
-                        full_response.push_str(&token);
-                        let ev = Event::default()
-                            .data(serde_json::json!({"type":"token","content":token}).to_string());
-                        if tx.send(Ok(ev)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Ok(err_event(&e.to_string()))).await;
-                        return;
-                    }
+        // Forward execution events onto this request's SSE stream.
+        let (ev_tx, mut ev_rx) = mpsc::channel::<serde_json::Value>(64);
+        let sink = agent_exec::EventSink::new(ev_tx);
+        let sse_tx = tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(v) = ev_rx.recv().await {
+                if sse_tx
+                    .send(Ok(Event::default().data(v.to_string())))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
-        } else {
-            let mut found_file_ref: Option<FileRef> = None;
-            let mut tool_calls_used: usize = 0;
-            // ponytail: flat budgets — raise if real sessions hit them
-            const MAX_ROUNDS: usize = 5;
-            const MAX_TOOL_CALLS: usize = 8;
+        });
 
-            'agent: for round in 0..=MAX_ROUNDS {
-                // Final round or exhausted budget: no tools → model must answer.
-                let round_tools = if round == MAX_ROUNDS || tool_calls_used >= MAX_TOOL_CALLS {
-                    Vec::new()
-                } else {
-                    tools.clone()
-                };
-                let stream = ollama.chat_stream_with_tools(
-                    effective_model.clone(),
-                    messages.clone(),
-                    round_tools,
-                );
-                tokio::pin!(stream);
-
-                let mut round_text = String::new();
-                let mut round_calls: Vec<OllamaToolCall> = Vec::new();
-                while let Some(ev) = stream.next().await {
-                    match ev {
-                        Ok(ChatStreamEvent::Delta(token)) => {
-                            round_text.push_str(&token);
-                            let ev = Event::default().data(
-                                serde_json::json!({"type":"token","content":token}).to_string(),
-                            );
-                            if tx.send(Ok(ev)).await.is_err() {
-                                return;
-                            }
-                        }
-                        Ok(ChatStreamEvent::ToolCalls(calls)) => round_calls.extend(calls),
-                        Err(e) => {
-                            let _ = tx.send(Ok(err_event(&e.to_string()))).await;
-                            return;
-                        }
-                    }
-                }
-
-                if round_calls.is_empty() {
-                    full_response = round_text;
-                    break 'agent;
-                }
-
-                // Assistant turn carrying this round's calls (plus any preamble text).
-                let mut assistant = Message::assistant(round_text);
-                assistant.tool_calls = round_calls.clone();
-                messages.push(assistant);
-
-                for call in &round_calls {
-                    tool_calls_used += 1;
-                    let fn_name = &call.function.name;
-                    let args = &call.function.arguments;
-                    tracing::info!("tool loop call {}: {} {:?}", tool_calls_used, fn_name, args);
-                    let _ = tx
-                        .send(Ok(Event::default().data(
-                            serde_json::json!({"type":"tool_call","tool": fn_name}).to_string(),
-                        )))
-                        .await;
-                    audit_fs(&db, "tool_call", &serde_json::json!({"tool": fn_name}));
-
-                    let tool_result: String = if tool_calls_used > MAX_TOOL_CALLS {
-                        "Tool budget exhausted — answer now using what you have.".to_string()
-                    } else {
-                        match fn_name.as_str() {
-                            // ── Mail ──────────────────────────────────────────
-                            tool @ ("mail_search" | "mail_list_inbox" | "mail_read"
-                            | "mail_open") => match (&mail, rules.check("mail_inbox", "{}")) {
-                                (None, _) => {
-                                    "Apple Mail connector unavailable (Full Disk Access not granted)."
-                                        .to_string()
-                                }
-                                (_, ApprovalLevel::Forbidden) => {
-                                    let _ = tx
-                                        .send(Ok(Event::default().data(
-                                            serde_json::json!({"type":"tool_blocked","tool":"mail_inbox"})
-                                                .to_string(),
-                                        )))
-                                        .await;
-                                    "Mail access blocked by rules.".to_string()
-                                }
-                                (Some(m), level) => {
-                                    let approved = match level {
-                                        ApprovalLevel::Ask => {
-                                            request_tool_approval(
-                                                &db,
-                                                &pending_approvals,
-                                                &tx,
-                                                "mail_inbox",
-                                                "Čítanie poštovej schránky (Apple Mail)",
-                                            )
-                                            .await
-                                        }
-                                        _ => true,
-                                    };
-                                    if !approved {
-                                        "Mail access not approved by the user.".to_string()
-                                    } else {
-                                        match tool {
-                                            "mail_search" => {
-                                                let (result, mail_ref) =
-                                                    tool_mail_search(m, args).await;
-                                                if let Some(ref r) = mail_ref {
-                                                    let _ = tx
-                                                        .send(Ok(Event::default().data(
-                                                            serde_json::json!({
-                                                                "type": "mail_found",
-                                                                "rowid": r.rowid,
-                                                                "message_id": r.message_id,
-                                                                "subject": r.subject,
-                                                                "sender": r.sender,
-                                                                "auto_open": false,
-                                                            })
-                                                            .to_string(),
-                                                        )))
-                                                        .await;
-                                                    save_last_mail_ref(
-                                                        &runtime_refs,
-                                                        &session_id,
-                                                        r,
-                                                    )
-                                                    .await;
-                                                }
-                                                result
-                                            }
-                                            "mail_list_inbox" => tool_mail_list_inbox(m, args).await,
-                                            "mail_read" => {
-                                                let (result, mail_ref) =
-                                                    tool_mail_read(m, args).await;
-                                                if let Some(ref r) = mail_ref {
-                                                    save_last_mail_ref(
-                                                        &runtime_refs,
-                                                        &session_id,
-                                                        r,
-                                                    )
-                                                    .await;
-                                                }
-                                                result
-                                            }
-                                            _ => tool_mail_open(m, args).await,
-                                        }
-                                    }
-                                }
-                            },
-
-                            // ── Notes ─────────────────────────────────────────
-                            tool @ ("notes_search" | "notes_read") => match &notes {
-                                None => "Apple Notes connector unavailable.".to_string(),
-                                Some(n) => match rules.check("notes_search", "{}") {
-                                    ApprovalLevel::Forbidden => {
-                                        "Notes access blocked by rules.".to_string()
-                                    }
-                                    _ => {
-                                        if tool == "notes_search" {
-                                            tool_notes_search(n, args).await
-                                        } else {
-                                            tool_notes_read(n, args).await
-                                        }
-                                    }
-                                },
-                            },
-
-                            // ── WhatsApp ──────────────────────────────────────
-                            "whatsapp_list_chats" => {
-                                tool_whatsapp_list_chats(&state.whatsapp, args).await
-                            }
-                            "whatsapp_chat_messages" => {
-                                let (result, wa_ref) =
-                                    tool_whatsapp_chat_messages(&state.whatsapp, args).await;
-                                if let Some(ref r) = wa_ref {
-                                    save_last_whatsapp_ref(&runtime_refs, &session_id, r).await;
-                                }
-                                result
-                            }
-                            "whatsapp_send_message" => {
-                                let chat_id =
-                                    args["chat_id"].as_str().unwrap_or_default().to_string();
-                                let text =
-                                    args["message"].as_str().unwrap_or_default().to_string();
-                                if chat_id.is_empty() || text.is_empty() {
-                                    "chat_id and message are required.".to_string()
-                                } else {
-                                    let approved = request_tool_approval(
-                                        &db,
-                                        &pending_approvals,
-                                        &tx,
-                                        "whatsapp.send_message",
-                                        &format!("WhatsApp → {chat_id}: {text}"),
-                                    )
-                                    .await;
-                                    if !approved {
-                                        "User did not approve sending the message.".to_string()
-                                    } else {
-                                        match state
-                                            .whatsapp
-                                            .send_message(
-                                                WhatsappSendTarget::ChatId(chat_id),
-                                                &text,
-                                            )
-                                            .await
-                                        {
-                                            Ok(_) => "Message sent.".to_string(),
-                                            Err(e) => format!("WhatsApp send failed: {e}"),
-                                        }
-                                    }
-                                }
-                            }
-
-                            // ── Odoo (read-only; writes are forbidden by rules) ─
-                            tool @ ("odoo_search_partners" | "odoo_my_invoices"
-                            | "odoo_my_helpdesk_tickets" | "odoo_get_record") => {
-                                let guard = state.odoo.read().await;
-                                match guard.as_ref() {
-                                    None => "Odoo not connected — connect it in Settings first."
-                                        .to_string(),
-                                    Some(o) => {
-                                        let (result, odoo_ref) = tool_odoo(o, tool, args).await;
-                                        if let Some(ref r) = odoo_ref {
-                                            let _ = tx
-                                                .send(Ok(Event::default().data(
-                                                    serde_json::json!({
-                                                        "type": "odoo_found",
-                                                        "model": r.model,
-                                                        "record_id": r.id,
-                                                        "name": r.name,
-                                                        "url": r.url,
-                                                    })
-                                                    .to_string(),
-                                                )))
-                                                .await;
-                                            save_last_odoo_ref(&runtime_refs, &session_id, r)
-                                                .await;
-                                        }
-                                        result
-                                    }
-                                }
-                            }
-
-                            // ── Window management (AeroSpace) ─────────────────
-                            "macos_switch_workspace" => {
-                                match json_str_arg(args, "workspace") {
-                                    None => "workspace is required.".to_string(),
-                                    Some(ws) => match run_aerospace(&["workspace", &ws]).await {
-                                        Ok(_) => format!("Switched to workspace {ws}."),
-                                        Err(e) => format!("AeroSpace error: {e}"),
-                                    },
-                                }
-                            }
-
-                            // ── Filesystem ────────────────────────────────────
-                            "filesystem_search_files" => match fs_exec.as_ref() {
-                                None => "Filesystem connector unavailable.".to_string(),
-                                Some(fs_c) => {
-                                    let terms: Vec<String> = args["terms"]
-                                        .as_array()
-                                        .map(|a| {
-                                            a.iter()
-                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    let query = terms.first().cloned().unwrap_or_default();
-                                    let roots: Option<Vec<String>> =
-                                        args["roots"].as_array().map(|a| {
-                                            a.iter()
-                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                                .collect()
-                                        });
-                                    let extensions: Option<Vec<String>> =
-                                        args["extensions"].as_array().map(|a| {
-                                            a.iter()
-                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                                .collect()
-                                        });
-                                    let search_contents =
-                                        args["search_contents"].as_bool().unwrap_or(false);
-                                    let max_results = args["max_results"]
-                                        .as_u64()
-                                        .map(|n| n as usize)
-                                        .unwrap_or(10);
-
-                                    let req = FileSearchRequest {
-                                        query,
-                                        terms,
-                                        roots,
-                                        search_names: true,
-                                        search_contents,
-                                        extensions,
-                                        include_hidden: false,
-                                        max_results,
-                                        max_depth: Some(8),
-                                    };
-                                    let policy = fs_c.policy.clone();
-                                    match tokio::task::spawn_blocking(move || {
-                                        fs_search::search_files_sync(&policy, req)
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok(resp)) => {
-                                            audit_fs(
-                                                &db,
-                                                "filesystem_search",
-                                                &serde_json::json!({
-                                                    "result_count": resp.results.len(),
-                                                    "ok": true
-                                                }),
-                                            );
-                                            // Track top result for coreference
-                                            if found_file_ref.is_none() {
-                                                if let Some(top) = resp.results.first() {
-                                                    found_file_ref = Some(FileRef {
-                                                        path: top.path.clone(),
-                                                        display_name: top.display_name.clone(),
-                                                        kind: format!("{:?}", top.kind)
-                                                            .to_lowercase(),
-                                                    });
-                                                }
-                                            }
-                                            serde_json::to_string(&resp)
-                                                .unwrap_or_else(|_| "[]".to_string())
-                                        }
-                                        Ok(Err(e)) => {
-                                            format!("{{\"error\":\"{}\"}}", e)
-                                        }
-                                        Err(e) => {
-                                            format!("{{\"error\":\"{}\"}}", e)
-                                        }
-                                    }
-                                }
-                            },
-
-                            "filesystem_read_text" => match fs_exec.as_ref() {
-                                None => "Filesystem connector unavailable.".to_string(),
-                                Some(fs_c) => {
-                                    let path = args["path"].as_str().unwrap_or("").to_string();
-                                    let req = ReadTextRequest {
-                                        path,
-                                        max_bytes: None,
-                                        around_line: None,
-                                    };
-                                    let policy = fs_c.policy.clone();
-                                    match tokio::task::spawn_blocking(move || {
-                                        fs_search::read_text_sync(&policy, req)
-                                    })
-                                    .await
-                                    {
-                                        Ok(Ok(resp)) => {
-                                            // Cap content to avoid huge context
-                                            let content: String =
-                                                resp.content.chars().take(4000).collect();
-                                            let truncated_note = if resp.truncated {
-                                                " [truncated]"
-                                            } else {
-                                                ""
-                                            };
-                                            format!(
-                                                "[File: {}]\n{}{}",
-                                                resp.path, content, truncated_note
-                                            )
-                                        }
-                                        Ok(Err(e)) => format!("Error reading file: {e}"),
-                                        Err(e) => format!("Error: {e}"),
-                                    }
-                                }
-                            },
-
-                            tool @ ("filesystem_open_file"
-                            | "filesystem_open_file_with"
-                            | "filesystem_reveal_in_finder"
-                            | "filesystem_open_folder"
-                            | "macos_open_app"
-                            | "macos_focus_app") => {
-                                // Derive the dotted rule name from the underscore tool name
-                                let rule_name = match tool {
-                                    "filesystem_open_file" => "filesystem.open_file",
-                                    "filesystem_open_file_with" => "filesystem.open_file_with",
-                                    "filesystem_reveal_in_finder" => "filesystem.reveal_in_finder",
-                                    "filesystem_open_folder" => "filesystem.open_folder",
-                                    "macos_open_app" => "macos.open_app",
-                                    "macos_focus_app" => "macos.focus_app",
-                                    _ => tool,
-                                };
-                                let path = args["path"].as_str().map(|s| s.to_string());
-                                let app = args["app"].as_str().map(|s| s.to_string());
-                                let approval_level = rules.check(rule_name, "{}");
-                                let approved = match approval_level {
-                                    ApprovalLevel::Auto => true,
-                                    ApprovalLevel::Ask => {
-                                        request_tool_approval(
-                                            &db,
-                                            &pending_approvals,
-                                            &tx,
-                                            rule_name,
-                                            &format!(
-                                                "Open: {}",
-                                                path.as_deref().or(app.as_deref()).unwrap_or("?")
-                                            ),
-                                        )
-                                        .await
-                                    }
-                                    ApprovalLevel::Forbidden => {
-                                        let _ = tx
-                                            .send(Ok(Event::default().data(
-                                                serde_json::json!({
-                                                    "type": "tool_blocked",
-                                                    "tool": rule_name
-                                                })
-                                                .to_string(),
-                                            )))
-                                            .await;
-                                        false
-                                    }
-                                };
-                                if !approved {
-                                    format!("Tool {rule_name} blocked — user did not approve.")
-                                } else if rule_name.starts_with("macos.") {
-                                    match app {
-                                        Some(ref a) => match fs_open::open_app(a).await {
-                                            Ok(_) => {
-                                                audit_fs(
-                                                    &db,
-                                                    &rule_name.replace('.', "_"),
-                                                    &serde_json::json!({"app": a, "ok": true}),
-                                                );
-                                                format!("Opened: {a}")
-                                            }
-                                            Err(e) => format!("Error: {e}"),
-                                        },
-                                        None => "Error: no app".to_string(),
-                                    }
-                                } else {
-                                    match fs_exec.as_ref() {
-                                        None => "Filesystem connector unavailable.".to_string(),
-                                        Some(fs_c) => {
-                                            let result: anyhow::Result<OpenResponse> =
-                                                match rule_name {
-                                                    "filesystem.open_file" => {
-                                                        if let Some(ref p) = path {
-                                                            fs_open::open_file(&fs_c.policy, p)
-                                                                .await
-                                                        } else {
-                                                            Err(anyhow::anyhow!("no path"))
-                                                        }
-                                                    }
-                                                    "filesystem.open_file_with" => {
-                                                        if let (Some(ref p), Some(ref a)) =
-                                                            (&path, &app)
-                                                        {
-                                                            fs_open::open_file_with(
-                                                                &fs_c.policy,
-                                                                p,
-                                                                a,
-                                                            )
-                                                            .await
-                                                        } else {
-                                                            Err(anyhow::anyhow!("no path or app"))
-                                                        }
-                                                    }
-                                                    "filesystem.reveal_in_finder" => {
-                                                        if let Some(ref p) = path {
-                                                            fs_open::reveal_in_finder(
-                                                                &fs_c.policy,
-                                                                p,
-                                                            )
-                                                            .await
-                                                        } else {
-                                                            Err(anyhow::anyhow!("no path"))
-                                                        }
-                                                    }
-                                                    "filesystem.open_folder" => {
-                                                        if let Some(ref p) = path {
-                                                            fs_open::open_folder(&fs_c.policy, p)
-                                                                .await
-                                                        } else {
-                                                            Err(anyhow::anyhow!("no path"))
-                                                        }
-                                                    }
-                                                    _ => Err(anyhow::anyhow!("unknown")),
-                                                };
-                                            match result {
-                                                Ok(ref resp) => {
-                                                    let path_hash =
-                                                        path.as_deref().map(sha256_str);
-                                                    audit_fs(
-                                                        &db,
-                                                        &rule_name.replace('.', "_"),
-                                                        &serde_json::json!({
-                                                            "path_hash": path_hash,
-                                                            "app": app,
-                                                            "ok": true
-                                                        }),
-                                                    );
-                                                    let _ = tx
-                                                        .send(Ok(Event::default().data(
-                                                            serde_json::json!({
-                                                                "type": "file_opened",
-                                                                "path": resp.path,
-                                                                "app": resp.app,
-                                                                "action": resp.action,
-                                                            })
-                                                            .to_string(),
-                                                        )))
-                                                        .await;
-                                                    format!(
-                                                        "Opened: {}",
-                                                        path.as_deref()
-                                                            .or(app.as_deref())
-                                                            .unwrap_or("ok")
-                                                    )
-                                                }
-                                                Err(ref e) => {
-                                                    audit_fs(
-                                                        &db,
-                                                        &rule_name.replace('.', "_"),
-                                                        &serde_json::json!({
-                                                            "ok": false,
-                                                            "error": e.to_string()
-                                                        }),
-                                                    );
-                                                    format!("Error: {e}")
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // ── Web (read-only; queries leave the device) ─────
-                            tool @ ("web_search" | "web_fetch") => {
-                                let rule_name = if tool == "web_search" {
-                                    "web.search"
-                                } else {
-                                    "web.fetch"
-                                };
-                                match rules.check(rule_name, "{}") {
-                                    ApprovalLevel::Forbidden => {
-                                        let _ = tx
-                                            .send(Ok(Event::default().data(
-                                                serde_json::json!({"type":"tool_blocked","tool": rule_name})
-                                                    .to_string(),
-                                            )))
-                                            .await;
-                                        "Web access blocked by rules.".to_string()
-                                    }
-                                    level => {
-                                        let approved = match level {
-                                            ApprovalLevel::Ask => {
-                                                request_tool_approval(
-                                                    &db,
-                                                    &pending_approvals,
-                                                    &tx,
-                                                    rule_name,
-                                                    &format!(
-                                                        "Web: {}",
-                                                        args["query"]
-                                                            .as_str()
-                                                            .or(args["url"].as_str())
-                                                            .unwrap_or("?")
-                                                    ),
-                                                )
-                                                .await
-                                            }
-                                            _ => true,
-                                        };
-                                        if !approved {
-                                            "Web access not approved by the user.".to_string()
-                                        } else {
-                                            let result = if tool == "web_search" {
-                                                tool_web_search(args).await
-                                            } else {
-                                                tool_web_fetch(args).await
-                                            };
-                                            audit_fs(
-                                                &db,
-                                                &rule_name.replace('.', "_"),
-                                                &serde_json::json!({"ok": true}),
-                                            );
-                                            result
-                                        }
-                                    }
-                                }
-                            }
-
-                            other => {
-                                tracing::warn!("unknown tool: {}", other);
-                                format!("Unknown tool: {other}. Answer with what you have or use a listed tool.")
-                            }
-                        }
-                    };
-
-                    messages.push(Message::tool_result(fn_name, tool_result));
-                }
-            } // end 'agent loop
-
-            if let Some(ref fref) = found_file_ref {
-                save_last_file_ref(&runtime_refs, &session_id, fref).await;
-            }
-        }
+        let loop_result = agent_exec::run_agent_loop(
+            &state,
+            &sink,
+            &agent_exec::ExecOrigin::Chat,
+            &session_id,
+            &effective_model,
+            messages,
+            tools,
+        )
+        .await;
+        drop(sink);
+        let _ = forwarder.await;
+        let full_response = match loop_result {
+            Ok(outcome) => outcome.final_text,
+            // Error already emitted to the stream / client gone.
+            Err(_) => return,
+        };
 
         let response_for_audit = full_response.clone();
         if let Ok(db) = db.try_lock() {
@@ -3813,7 +2922,7 @@ async fn request_approval_core(
     pending: &Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     tool_name: &str,
     description: &str,
-    sse_tx: Option<&mpsc::Sender<Result<Event, Infallible>>>,
+    sink: Option<&agent_exec::EventSink>,
 ) -> bool {
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
@@ -3830,19 +2939,16 @@ async fn request_approval_core(
     let (send, recv) = oneshot::channel::<bool>();
     pending.lock().unwrap().insert(id.clone(), send);
 
-    // Emit SSE event only when a chat stream is active.
-    if let Some(tx) = sse_tx {
-        let _ = tx
-            .send(Ok(Event::default().data(
-                serde_json::json!({
-                    "type":        "approval_requested",
-                    "id":          id,
-                    "tool":        tool_name,
-                    "description": description,
-                    "expires_in":  60
-                })
-                .to_string(),
-            )))
+    // Emit the event only when an execution stream is active.
+    if let Some(s) = sink {
+        let _ = s
+            .emit(serde_json::json!({
+                "type":        "approval_requested",
+                "id":          id,
+                "tool":        tool_name,
+                "description": description,
+                "expires_in":  60
+            }))
             .await;
     }
 
@@ -3885,15 +2991,15 @@ async fn request_approval_core(
     }
 }
 
-/// Convenience wrapper for the chat SSE path (always emits the SSE event).
+/// Convenience wrapper for streaming execution paths (always emits the event).
 async fn request_tool_approval(
     db: &Arc<Mutex<Connection>>,
     pending: &Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
-    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    sink: &agent_exec::EventSink,
     tool_name: &str,
     description: &str,
 ) -> bool {
-    request_approval_core(db, pending, tool_name, description, Some(tx)).await
+    request_approval_core(db, pending, tool_name, description, Some(sink)).await
 }
 
 // ── Codex handlers (Phase 8) ─────────────────────────────────────────────────
@@ -4835,10 +3941,6 @@ async fn save_last_whatsapp_ref(
         .entry(session_id.to_string())
         .or_default()
         .whatsapp = Some(whatsapp_ref.clone());
-}
-
-fn err_event(msg: &str) -> Event {
-    Event::default().data(serde_json::json!({"type":"error","message":msg}).to_string())
 }
 
 #[cfg(test)]
