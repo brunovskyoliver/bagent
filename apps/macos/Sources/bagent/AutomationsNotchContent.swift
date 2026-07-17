@@ -176,13 +176,41 @@ struct AutomationsNotchContent: View {
                         Text(summary)
                             .font(.system(size: 11))
                             .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                            .lineLimit(3)
+                            .lineLimit(2)
                             .accessibilityLabel("Posledný výsledok: \(summary)")
                     }
                 }
                 .padding(6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
+                // Long results don't belong in the notch — tap reuses the
+                // existing output presentation.
+                .onTapGesture { viewModel.showAutomationResult(a) }
+                .accessibilityAddTraits(.isButton)
+                .accessibilityHint("Zobrazí celý výsledok")
+            }
+
+            if !viewModel.automationDetailRuns.isEmpty {
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(viewModel.automationDetailRuns) { run in
+                        HStack(spacing: 5) {
+                            if let glyph = AutomationTimeFormat.statusGlyph(run.status) {
+                                Image(systemName: glyph).font(.system(size: 8))
+                            }
+                            Text(AutomationTimeFormat.shortLocal(run.finishedAt ?? run.scheduledFor) ?? "—")
+                                .font(.system(size: 9))
+                            if run.isManual {
+                                Text("manuálne").font(.system(size: 8))
+                                    .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Beh \(run.status), \(AutomationTimeFormat.shortLocal(run.finishedAt ?? run.scheduledFor) ?? "")")
+                    }
+                }
             }
 
             Spacer(minLength: 0)

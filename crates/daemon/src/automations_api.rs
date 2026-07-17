@@ -181,11 +181,14 @@ pub(crate) fn repo_update(
         a.enabled = enabled;
     }
     Automation::validate(&a.name, &a.prompt, &a.schedule, &a.timezone).map_err(RepoError::Invalid)?;
-    let tz = parse_timezone(&a.timezone).map_err(RepoError::Invalid)?;
-    // Recompute on any schedule-affecting change (cheap enough to always do).
-    a.next_run_at = a.schedule.next_occurrence(tz, now);
-    if a.next_run_at.is_none() && matches!(a.schedule, AutomationSchedule::Once { .. }) {
-        return Err(RepoError::Invalid(ScheduleError::NoNextOccurrence));
+    // Recompute only when the schedule/zone changed — a prompt/name edit on an
+    // already-exhausted one-shot must not fail or resurrect it.
+    if patch.schedule.is_some() || patch.timezone.is_some() {
+        let tz = parse_timezone(&a.timezone).map_err(RepoError::Invalid)?;
+        a.next_run_at = a.schedule.next_occurrence(tz, now);
+        if a.next_run_at.is_none() && matches!(a.schedule, AutomationSchedule::Once { .. }) {
+            return Err(RepoError::Invalid(ScheduleError::NoNextOccurrence));
+        }
     }
     a.updated_at = now;
     let changed = conn.execute(
@@ -339,14 +342,22 @@ pub(crate) fn repo_finish_run(
     Ok(())
 }
 
-/// Keep only the newest `RUN_HISTORY_RETAINED` runs per automation.
+/// Keep only the newest `RUN_HISTORY_RETAINED` runs per automation. Each
+/// cleanup is audited; audit_entries themselves are append-only and never
+/// pruned here.
 pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<(), RepoError> {
-    conn.execute(
+    let deleted = conn.execute(
         "DELETE FROM automation_runs WHERE automation_id=?1 AND id NOT IN (\
              SELECT id FROM automation_runs WHERE automation_id=?1 \
              ORDER BY created_at DESC LIMIT ?2)",
         params![automation_id, policy::RUN_HISTORY_RETAINED as i64],
     )?;
+    if deleted > 0 {
+        let _ = conn.execute(
+            "INSERT INTO audit_entries (action, payload, model) VALUES ('automation_retention_cleanup', ?1, '')",
+            params![json!({"automation_id": automation_id, "deleted": deleted}).to_string()],
+        );
+    }
     Ok(())
 }
 

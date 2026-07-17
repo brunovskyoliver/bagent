@@ -507,6 +507,71 @@ mod tests {
     }
 
     #[test]
+    fn edit_disable_delete_during_active_run_is_finish_then_apply() {
+        use crate::automations_api::{repo_delete, repo_update, AutomationPatch, RepoError};
+        let conn = test_conn();
+        let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
+        let id = a.id.to_string();
+        let claimed = scheduler_step(&conn, t(2026, 7, 18, 6, 0));
+        assert_eq!(claimed.len(), 1);
+
+        // Edit while running: allowed, applies from the next occurrence — the
+        // in-flight run keeps its captured prompt/context.
+        let patch = AutomationPatch { prompt: Some("nový prompt".into()), ..Default::default() };
+        assert!(repo_update(&conn, &id, &patch, t(2026, 7, 18, 6, 5)).is_ok());
+
+        // Disable while running: the run finishes, but nothing new is claimed.
+        crate::automations_api::repo_set_enabled(&conn, &id, false, t(2026, 7, 18, 6, 5)).unwrap();
+        assert!(scheduler_step(&conn, t(2026, 7, 19, 6, 0)).is_empty());
+
+        // Delete while running: deterministic 409 until the run finishes.
+        assert!(matches!(repo_delete(&conn, &id), Err(RepoError::ActiveRun)));
+        crate::automations_api::repo_finish_run(
+            &conn, &claimed[0].1.id.to_string(), &id,
+            AutomationRunStatus::Completed, Some("ok"), t(2026, 7, 18, 6, 10),
+        )
+        .unwrap();
+        assert!(repo_delete(&conn, &id).is_ok());
+    }
+
+    #[test]
+    fn audit_and_run_payloads_never_contain_the_prompt() {
+        let conn = test_conn();
+        let secret_prompt = "SECRET-PROMPT-najdi vsetky faktury od ACME";
+        let a = repo_create(
+            &conn, "Faktúry", secret_prompt, "Europe/Bratislava",
+            &AutomationSchedule::Once { at: t(2026, 7, 18, 6, 0) },
+            true, t(2026, 7, 17, 0, 0),
+        )
+        .unwrap();
+        // Catch-up claim (3 h late) so lifecycle audit rows exist to inspect.
+        let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0));
+        assert_eq!(claimed.len(), 1);
+        crate::automations_api::repo_finish_run(
+            &conn, &claimed[0].1.id.to_string(), &a.id.to_string(),
+            AutomationRunStatus::Failed, Some("Model error: connection refused"),
+            t(2026, 7, 18, 9, 1),
+        )
+        .unwrap();
+
+        // No audit payload may carry the stored prompt.
+        let mut stmt = conn.prepare("SELECT payload FROM audit_entries").unwrap();
+        let payloads: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, Option<String>>(0))
+            .unwrap()
+            .flatten()
+            .flatten()
+            .collect();
+        assert!(!payloads.is_empty());
+        for p in &payloads {
+            assert!(!p.contains(secret_prompt), "prompt leaked into audit: {p}");
+        }
+        // Run rows keep only the concise redacted summary.
+        let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
+        assert_eq!(runs[0].result_summary.as_deref(), Some("Model error: connection refused"));
+    }
+
+    #[test]
     fn next_due_ordering_and_clock_jump_forward() {
         let conn = test_conn();
         once(&conn, "b", t(2026, 7, 18, 8, 0), t(2026, 7, 17, 0, 0));

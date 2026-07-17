@@ -367,6 +367,8 @@ final class ChatViewModel: ObservableObject {
             case .detail(let id), .deleteConfirmation(let id):
                 if !automations.contains(where: { $0.id == id }) {
                     automationsSurface = .list
+                } else if case .detail = automationsSurface {
+                    loadAutomationDetailRuns(id)
                 }
             case .list, .editorTask, .editorSchedule, .editorRecurrence, .editorReview,
                  .editorSaving:
@@ -377,6 +379,23 @@ final class ChatViewModel: ObservableObject {
         } catch {
             automationsError = "Daemon nedostupný"
         }
+    }
+
+    /// Recent runs shown on the detail page (fetched on entry + on events).
+    @Published var automationDetailRuns: [AutomationRunRecord] = []
+
+    func loadAutomationDetailRuns(_ id: String) {
+        Task {
+            automationDetailRuns = (try? await client.automationRuns(id: id, limit: 3)) ?? []
+        }
+    }
+
+    /// Show the full latest result through the existing output presentation.
+    func showAutomationResult(_ automation: AutomationRecord) {
+        guard let summary = automation.lastResultSummary, !summary.isEmpty else { return }
+        messages.append(ChatMessage(role: .assistant, content: "**\(automation.name)**\n\(summary)"))
+        historyBrowseIndex = nil
+        notchInteractionMode = .output
     }
 
     var selectedAutomation: AutomationRecord? {
@@ -429,6 +448,7 @@ final class ChatViewModel: ObservableObject {
         guard notchInteractionMode == .automations, automationsSurface == .list,
               let a = automations[safe: automationsSelectionIndex] else { return false }
         automationsSurface = .detail(a.id)
+        loadAutomationDetailRuns(a.id)
         return true
     }
 

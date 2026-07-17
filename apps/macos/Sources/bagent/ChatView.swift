@@ -25,7 +25,7 @@ enum NotchWrapMetrics {
     static let settingsWingWidth: CGFloat   = 205  // /settings surface
     static let settingsBridgeHeight: CGFloat = 252
     static let automationsWingWidth: CGFloat = 205   // /automations surface
-    static let automationsBridgeHeight: CGFloat = 190
+    static let automationsBridgeHeight: CGFloat = 214
     /// The setup page carries credentials + the rules editor — it needs the full bridge.
     static let setupBridgeHeight: CGFloat   = 280
     static let slashSuggestionRowHeight: CGFloat = 24  // one command suggestion row
