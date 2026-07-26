@@ -1,6 +1,7 @@
 import Combine
 import ScreenCaptureKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Attachment types
 
@@ -303,11 +304,7 @@ final class ChatViewModel: ObservableObject {
     @Published var hoveredSourceMode: SourceMode? = nil
     @Published var isSourcePickerForced = false
     @Published var hasNotch = false
-    @Published var availableModels: [String] = ["qwen2.5:7b"]
-    @Published var visionModelAvailable: Bool = false
-    /// Set true when an image is attached and the vision model isn't available —
-    /// triggers the one-time pull prompt in the UI.
-    @Published var showVisionModelAlert: Bool = false
+    @Published var availableModels: [String] = [BaseRTLaunchAgent.model]
     @Published var daemonHealth: DaemonHealth?
     @Published var isSyncing = false
     @Published var lastSyncResult: String? = nil
@@ -711,7 +708,7 @@ final class ChatViewModel: ObservableObject {
     var agentStatus: AgentStatus {
         if !pendingApprovals.isEmpty { return .awaitingApproval }
         if isThinking { return .thinking }
-        if let h = daemonHealth, (!h.daemonUp || !h.ollamaUp) { return .error }
+        if let h = daemonHealth, (!h.daemonUp || !h.baseRTUp) { return .error }
         return .ready
     }
 
@@ -802,11 +799,11 @@ final class ChatViewModel: ObservableObject {
     private var approvalPollTask: Task<Void, Never>?
     private var healthMonitorTask: Task<Void, Never>?
 
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen3:8b" {
+    @Published var selectedModel: String = BaseRTLaunchAgent.model {
         didSet { UserDefaults.standard.set(selectedModel, forKey: "bagent.model") }
     }
 
-    @Published var selectedClassifierModel: String = UserDefaults.standard.string(forKey: "bagent.classifier_model") ?? "qwen3:0.6b" {
+    @Published var selectedClassifierModel: String = BaseRTLaunchAgent.model {
         didSet { UserDefaults.standard.set(selectedClassifierModel, forKey: "bagent.classifier_model") }
     }
 
@@ -1395,15 +1392,11 @@ final class ChatViewModel: ObservableObject {
             if !fetched.isEmpty {
                 availableModels = fetched
                 if !fetched.contains(selectedModel) {
-                    selectedModel = fetched.first ?? "qwen2.5:7b"
+                    selectedModel = fetched.first ?? BaseRTLaunchAgent.model
                 }
                 if !fetched.contains(selectedClassifierModel) {
-                    selectedClassifierModel = fetched.contains("qwen3:0.6b") ? "qwen3:0.6b" : (fetched.first ?? "qwen2.5:0.5b")
+                    selectedClassifierModel = fetched.first ?? BaseRTLaunchAgent.model
                 }
-                // Check whether the vision model is installed
-                visionModelAvailable = fetched.contains(where: {
-                    $0.hasPrefix("qwen2.5vl") || $0.hasPrefix("qwen2.5-vl")
-                })
             }
         } catch {}
     }
@@ -1425,7 +1418,7 @@ final class ChatViewModel: ObservableObject {
         for attempt in 0..<24 {
             let health = await client.healthStatus()
             daemonHealth = health
-            if health.daemonUp && health.ollamaUp { break }
+            if health.daemonUp && health.baseRTUp { break }
             if attempt < 23 {
                 try? await Task.sleep(for: .milliseconds(500))
             }
@@ -1587,11 +1580,9 @@ final class ChatViewModel: ObservableObject {
                     if intent.wants_screen || intent.wants_selection {
                         let raw = await ScreenContextProvider.shared.capture(
                             wantsScreen: intent.wants_screen,
-                            wantsOCR: intent.wants_ocr,
                             wantsSelection: intent.wants_selection
                         )
                         screenCtx = ScreenContextFields(
-                            imagePNGBase64: raw.imagePNGBase64,
                             ocrText: raw.ocrText,
                             activeApp: raw.activeApp,
                             selectedText: raw.selectedText
@@ -1829,7 +1820,15 @@ final class ChatViewModel: ObservableObject {
         guard !urls.isEmpty else { return }
         // Cap at 5 total
         let remaining = max(0, 5 - pendingAttachments.count)
-        let toAdd = Array(urls.prefix(remaining))
+        let candidates = Array(urls.prefix(remaining))
+        let imageURLs = candidates.filter { url in
+            guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
+            return type.conforms(to: .image)
+        }
+        if !imageURLs.isEmpty {
+            showUnsupportedImageAlert()
+        }
+        let toAdd = candidates.filter { !imageURLs.contains($0) }
         guard !toAdd.isEmpty else { return }
         isUploadingAttachment = true
         Task {
@@ -1838,10 +1837,6 @@ final class ChatViewModel: ObservableObject {
                 do {
                     let att = try await client.uploadAttachment(url: url)
                     added.append(att)
-                    // One-time vision model alert
-                    if att.kind == .image && !visionModelAvailable {
-                        showVisionModelAlert = true
-                    }
                 } catch {
                     // silently skip failed uploads
                 }
@@ -1862,27 +1857,19 @@ final class ChatViewModel: ObservableObject {
     @discardableResult
     func pasteImageFromClipboard() -> Bool {
         let pb = NSPasteboard.general
-        guard let image = NSImage(pasteboard: pb) else { return false }
-
-        // Count how many images have been pasted this compose session
-        let n = pendingAttachments.filter { $0.kind == .image }.count + 1
-
-        // Write to a temp PNG file — uploadAttachment requires a file URL
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              let pngData = NSBitmapImageRep(cgImage: cgImage)
-                                .representation(using: .png, properties: [:]) else { return false }
-
-        let tmpURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("paste_\(UUID().uuidString).png")
-        do {
-            try pngData.write(to: tmpURL)
-        } catch {
-            return false
-        }
-
-        addAttachments(urls: [tmpURL])
-        inputText += inputText.isEmpty ? "[image #\(n)]" : " [image #\(n)]"
+        guard NSImage(pasteboard: pb) != nil else { return false }
+        showUnsupportedImageAlert()
         return true
+    }
+
+    private func showUnsupportedImageAlert() {
+        let alert = NSAlert()
+        alert.messageText = "Obrázky nie sú podporované"
+        alert.informativeText =
+            "Model BaseRT Qwen3-4B je textový. Otázky o obrazovke používajú lokálne OCR."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     // MARK: - Mail open (Phase 5E)
@@ -1941,13 +1928,6 @@ final class ChatViewModel: ObservableObject {
             "objednávk",
         ]
         return keywords.contains { low.contains($0) }
-    }
-
-    // MARK: - Vision model check
-
-    func isVisionModelAvailable() async -> Bool {
-        let models = (try? await client.models()) ?? []
-        return models.contains(where: { $0.hasPrefix("qwen2.5vl") || $0.hasPrefix("qwen2.5-vl") })
     }
 
     // MARK: - Private

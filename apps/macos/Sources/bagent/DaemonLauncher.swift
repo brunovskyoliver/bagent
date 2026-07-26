@@ -55,6 +55,70 @@ enum DaemonLaunchAgent {
     }
 }
 
+/// Dedicated BaseRT runtime for bagent. Port 8080 remains reserved for the
+/// user's independent BaseRT/Claude-local service.
+enum BaseRTLaunchAgent {
+    static let label = "com.bagent.basert"
+    static let model = "basecompute/Qwen3-4B-Instruct-2507"
+    static let apiKey = "basert-local"
+    static let port = 8082
+
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    static var logURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/bagent/basert.log")
+    }
+
+    static func plistContent(binaryPath: String) -> String {
+        let arguments = [
+            binaryPath,
+            "serve",
+            model,
+            "--host", "127.0.0.1",
+            "--port", String(port),
+            "--api-key", apiKey,
+            "--max-context", "40960",
+            "--kv-bits", "4",
+            "--max-tokens", "2048",
+            "--max-batch-size", "1",
+            "--request-timeout", "300000",
+            "--verbose",
+        ]
+        let argumentXML = arguments
+            .map { "            <string>\($0)</string>" }
+            .joined(separator: "\n")
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>\(label)</string>
+            <key>ProgramArguments</key>
+            <array>
+        \(argumentXML)
+            </array>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <dict>
+                <key>SuccessfulExit</key>
+                <false/>
+            </dict>
+            <key>StandardOutPath</key>
+            <string>\(logURL.path)</string>
+            <key>StandardErrorPath</key>
+            <string>\(logURL.path)</string>
+        </dict>
+        </plist>
+        """
+    }
+}
+
 /// Manages daemon residency via a per-user launchd agent.
 ///
 /// Lifecycle contract:
@@ -67,13 +131,8 @@ enum DaemonLaunchAgent {
 ///   `daemon.port` / `daemon.token` / `daemon.pid` in Application Support.
 @MainActor
 final class DaemonLauncher {
-    /// Handle to the Ollama process we may have spawned. Kept alive so we don't
-    /// spawn a second instance if `launch()` is called more than once.
-    private var ollamaProcess: Process?
-
     func launch() {
-        // Ensure Ollama is running before the daemon tries to call it.
-        Task { await ensureOllamaRunning() }
+        Task { await ensureBaseRTRunning() }
 
         guard let url = findBinary() else {
             print("[bagentd] binary not found — run `cargo build` first")
@@ -90,15 +149,17 @@ final class DaemonLauncher {
     /// Explicit shutdown — unloads the agent; launchd will not restart it.
     func shutdownDaemon() {
         _ = runLaunchctl(["bootout", "gui/\(getuid())/\(DaemonLaunchAgent.label)"])
+        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(BaseRTLaunchAgent.label)"])
     }
 
     // MARK: - launchd
 
     private func installAndStart(binary: URL) {
         let env = [
-            "BAGENT_DEFAULT_MODEL": UserDefaults.standard.string(forKey: "bagent.model") ?? "qwen3:8b",
-            "BAGENT_CLASSIFIER_MODEL": UserDefaults.standard.string(forKey: "bagent.classifier_model") ?? "qwen3:0.6b",
-            "BAGENT_VISION_MODEL": "qwen2.5vl:7b",
+            "BAGENT_BASERT_BASE_URL": "http://127.0.0.1:8082/v1",
+            "BAGENT_BASERT_API_KEY": BaseRTLaunchAgent.apiKey,
+            "BAGENT_DEFAULT_MODEL": BaseRTLaunchAgent.model,
+            "BAGENT_CLASSIFIER_MODEL": BaseRTLaunchAgent.model,
         ]
         let plist = DaemonLaunchAgent.plistContent(binaryPath: binary.path, environment: env)
         let plistURL = DaemonLaunchAgent.plistURL
@@ -182,61 +243,90 @@ final class DaemonLauncher {
         return nil
     }
 
-    // MARK: - Ollama autostart
+    // MARK: - BaseRT autostart
 
-    /// Checks whether Ollama is reachable; spawns `ollama serve` if not,
-    /// then polls until it answers or the timeout elapses.
-    private func ensureOllamaRunning() async {
-        guard await !isOllamaUp() else {
-            print("[ollama] already running")
+    private func ensureBaseRTRunning() async {
+        if await isBaseRTReady() {
+            print("[BaseRT] bagent runtime already ready on port \(BaseRTLaunchAgent.port)")
             return
         }
-        guard let ollamaBin = findOllamaBinary() else {
-            print("[ollama] binary not found — install from https://ollama.com")
+        guard let binary = findBaseRTBinary() else {
+            print("[BaseRT] binary not found — install from https://basecompute.co")
             return
         }
 
-        // Spawn `ollama serve` in the background; discard stdout/stderr.
-        let p = Process()
-        p.executableURL = ollamaBin
-        p.arguments = ["serve"]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError  = FileHandle.nullDevice
+        let plist = BaseRTLaunchAgent.plistContent(binaryPath: binary.path)
         do {
-            try p.run()
-            ollamaProcess = p
-            print("[ollama] started pid \(p.processIdentifier)")
+            try FileManager.default.createDirectory(
+                at: BaseRTLaunchAgent.plistURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.createDirectory(
+                at: BaseRTLaunchAgent.logURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try plist.write(
+                to: BaseRTLaunchAgent.plistURL,
+                atomically: true,
+                encoding: .utf8
+            )
         } catch {
-            print("[ollama] failed to start: \(error)")
+            print("[BaseRT] failed to write LaunchAgent: \(error)")
             return
         }
 
-        // Poll up to 6 s (12 × 0.5 s) for the HTTP API to answer.
-        for attempt in 1...12 {
+        _ = runLaunchctl(["bootout", "gui/\(getuid())/\(BaseRTLaunchAgent.label)"])
+        let status = runLaunchctl([
+            "bootstrap", "gui/\(getuid())", BaseRTLaunchAgent.plistURL.path,
+        ])
+        guard status == 0 else {
+            print("[BaseRT] launchctl bootstrap failed (\(status))")
+            return
+        }
+
+        // First serve may download the model, so keep polling without blocking UI.
+        for attempt in 1...600 {
             try? await Task.sleep(for: .milliseconds(500))
-            if await isOllamaUp() {
-                print("[ollama] ready after \(attempt) poll(s)")
+            if await isBaseRTReady() {
+                print("[BaseRT] ready after \(attempt) poll(s)")
                 return
             }
         }
-        print("[ollama] did not become ready in time — continuing anyway")
+        print("[BaseRT] did not become ready within 5 minutes; see \(BaseRTLaunchAgent.logURL.path)")
     }
 
-    /// Async HTTP probe — returns true if Ollama's `/api/tags` responds 200.
-    private func isOllamaUp() async -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:11434/api/tags") else { return false }
+    private func isBaseRTReady() async -> Bool {
+        guard let healthURL = URL(string: "http://127.0.0.1:8082/health"),
+              let modelsURL = URL(string: "http://127.0.0.1:8082/v1/models") else {
+            return false
+        }
+        guard await authenticatedGet(healthURL) != nil,
+              let modelData = await authenticatedGet(modelsURL),
+              let value = try? JSONSerialization.jsonObject(with: modelData) as? [String: Any],
+              let models = value["data"] as? [[String: Any]] else {
+            return false
+        }
+        return models.contains { $0["id"] as? String == BaseRTLaunchAgent.model }
+    }
+
+    private func authenticatedGet(_ url: URL) async -> Data? {
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 1)
         req.httpMethod = "GET"
-        guard let (_, response) = try? await URLSession.shared.data(for: req) else { return false }
-        return (response as? HTTPURLResponse)?.statusCode == 200
+        req.setValue("Bearer \(BaseRTLaunchAgent.apiKey)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              (response as? HTTPURLResponse)?.statusCode == 200 else {
+            return nil
+        }
+        return data
     }
 
-    /// Finds the `ollama` binary in well-known locations.
-    private func findOllamaBinary() -> URL? {
+    private func findBaseRTBinary() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
         let candidates = [
-            "/usr/local/bin/ollama",
-            "/opt/homebrew/bin/ollama",
-            "/usr/bin/ollama",
+            "\(home)/.basert/basert",
+            "\(home)/.local/bin/basert",
+            "/opt/homebrew/bin/basert",
+            "/usr/local/bin/basert",
         ]
         for path in candidates {
             let url = URL(fileURLWithPath: path)

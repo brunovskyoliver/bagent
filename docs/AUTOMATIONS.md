@@ -169,7 +169,8 @@ rows.
 - `apps/macos: swift test` — wire models, editor flow, slash commands,
   selection/back navigation, geometry ceilings.
 
-Live end-to-end runs require Ollama and are exercised manually (see
+Live end-to-end runs require the app-managed BaseRT service on port 8082 and
+are exercised manually (see
 Limitations).
 
 ## Known limitations

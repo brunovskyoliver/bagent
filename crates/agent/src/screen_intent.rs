@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ollama_connector::OllamaClient;
+use basert_connector::BaseRtClient;
 use serde::{Deserialize, Serialize};
 
 /// LLM-classified intent for a screen-context user turn.
@@ -50,13 +50,13 @@ pub enum ScreenAction {
 }
 
 pub struct ScreenIntentClassifier {
-    ollama: OllamaClient,
+    inference: BaseRtClient,
     model: String,
 }
 
 impl ScreenIntentClassifier {
-    pub fn new(ollama: OllamaClient, model: String) -> Self {
-        Self { ollama, model }
+    pub fn new(inference: BaseRtClient, model: String) -> Self {
+        Self { inference, model }
     }
 
     /// Classify whether the user wants the agent to access the current screen.
@@ -116,7 +116,10 @@ Príklady:
 - "write a business email" → {{"action":"none","wants_screen":false,"wants_ocr":false,"wants_selection":false}}"#
         );
 
-        let raw = self.ollama.generate_json(&self.model, &prompt, 0.0).await?;
+        let raw = self
+            .inference
+            .generate_json(&self.model, &prompt, 0.0)
+            .await?;
         let intent: ScreenIntent = serde_json::from_str(clean_json(&raw)).unwrap_or_default();
         Ok(intent)
     }

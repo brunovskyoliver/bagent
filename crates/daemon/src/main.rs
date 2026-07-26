@@ -19,6 +19,9 @@ use bagent_memory::MemoryStore;
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
 use bagent_skills::{selector as skill_selector, LoadedSkill};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use basert_connector::{
+    BaseRtClient, Message, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL,
+};
 use codex_connector::{
     CodexConfig, CodexConnector, CodexContextPacket, CodexExpectedOutput, CodexTask, ContextItem,
 };
@@ -26,7 +29,6 @@ use filesystem_connector::{
     self, open as fs_open, search as fs_search, FileSearchRequest, FsConnector, ReadTextRequest,
 };
 use odoo_connector::{OdooConfig, OdooConnector, OdooError, OdooRecordRef};
-use ollama_connector::{Message, OllamaClient, DEFAULT_BASE_URL, DEFAULT_EMBED_MODEL};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,9 +63,8 @@ struct AppState {
     debug_dir: PathBuf,
     /// Small fast model for intent/correction classifiers — never blocks chat TTFT.
     classifier_model: String,
-    vision_model: String,
     attachments_dir: PathBuf,
-    ollama: OllamaClient,
+    inference: BaseRtClient,
     mail: Option<MailConnector>,
     notes: Option<NotesConnector>,
     fs: Option<FsConnector>,
@@ -124,12 +125,8 @@ struct ChatRequest {
     /// IDs returned by POST /attachments — empty when no files attached.
     #[serde(default)]
     attachment_ids: Vec<String>,
-    // ── Screen context (Phase 7) ─────────────────────────────────────────────
-    /// Base64-encoded PNG of the user's screen captured in Swift.
-    /// Never persisted to disk — injected into the model turn in-memory only.
-    #[serde(default)]
-    screen_image_b64: Option<String>,
-    /// On-device OCR text extracted from the captured frame (Vision framework).
+    // ── OCR/selection context ────────────────────────────────────────────────
+    /// On-device OCR text extracted from a temporary frame.
     #[serde(default)]
     screen_ocr_text: Option<String>,
     /// Frontmost application name + bundle id at capture time.
@@ -217,12 +214,6 @@ struct MemorySearchQuery {
 }
 
 #[derive(Deserialize)]
-struct EmbedRequest {
-    input: String,
-    model: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct ListQuery {
     #[serde(default = "default_limit")]
     limit: usize,
@@ -285,7 +276,7 @@ struct MailOpenReq {
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
-    ollama: bool,
+    basert: bool,
     model: String,
     classifier_model: String,
     connectors: ConnectorStatus,
@@ -332,58 +323,40 @@ async fn wait_for_shutdown_signal() {
 }
 
 async fn cleanup_runtime_resources(state: &AppState) {
-    cleanup_ollama_models(state).await;
+    cleanup_basert_models(state).await;
 
     if let Err(e) = state.whatsapp.stop().await {
         tracing::debug!("shutdown: WhatsApp stop skipped: {e}");
     }
 }
 
-async fn cleanup_ollama_models(state: &AppState) {
-    let loaded_models = match state.ollama.loaded_models().await {
+async fn cleanup_basert_models(state: &AppState) {
+    let loaded_models = match state.inference.models().await {
         Ok(models) => models,
         Err(e) => {
-            tracing::debug!("shutdown: Ollama loaded-model check skipped: {e}");
+            tracing::debug!("shutdown: BaseRT model check skipped: {e}");
             return;
         }
     };
 
     let mut seen = HashSet::new();
-    let mut generate_models = Vec::new();
+    let mut models_to_unload = Vec::new();
     for model in [
         state.default_model.as_str(),
         state.classifier_model.as_str(),
-        state.vision_model.as_str(),
     ] {
         let trimmed = model.trim();
         if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
             if let Some(loaded_name) = matching_loaded_model(&loaded_models, trimmed) {
-                generate_models.push(loaded_name);
+                models_to_unload.push(loaded_name);
             }
         }
     }
 
-    for model in generate_models {
-        match state.ollama.unload_generate_model(&model).await {
-            Ok(()) => tracing::info!(model = %model, "shutdown: Ollama model unloaded"),
-            Err(e) => tracing::debug!(model = %model, "shutdown: Ollama model unload skipped: {e}"),
-        }
-    }
-
-    if let Some(loaded_embed_model) = matching_loaded_model(&loaded_models, DEFAULT_EMBED_MODEL) {
-        match state
-            .ollama
-            .unload_embedding_model(&loaded_embed_model)
-            .await
-        {
-            Ok(()) => tracing::info!(
-                model = %loaded_embed_model,
-                "shutdown: Ollama embedding model unloaded"
-            ),
-            Err(e) => tracing::debug!(
-                model = %loaded_embed_model,
-                "shutdown: Ollama embedding unload skipped: {e}"
-            ),
+    for model in models_to_unload {
+        match state.inference.unload_model(&model).await {
+            Ok(()) => tracing::info!(model = %model, "shutdown: BaseRT model unloaded"),
+            Err(e) => tracing::debug!(model = %model, "shutdown: BaseRT unload skipped: {e}"),
         }
     }
 }
@@ -461,42 +434,36 @@ async fn main() -> Result<()> {
         tracing::warn!("Filesystem connector: could not build default policy");
     }
 
-    let ollama = OllamaClient::new(DEFAULT_BASE_URL);
+    let basert_base_url =
+        std::env::var("BAGENT_BASERT_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+    let basert_api_key =
+        std::env::var("BAGENT_BASERT_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
+    let inference = BaseRtClient::new(basert_base_url, basert_api_key);
 
     // MemoryStore uses a separate connection with std::sync::Mutex (blocking SQLite ops)
     let mem_conn = rusqlite::Connection::open(data_dir.join("bagent.db"))?;
     let mem_db = Arc::new(std::sync::Mutex::new(mem_conn));
-    let memory = Arc::new(MemoryStore::new(mem_db, ollama.clone()).with_data_dir(data_dir.clone()));
+    let memory = Arc::new(MemoryStore::new(mem_db).with_data_dir(data_dir.clone()));
     let prompt_builder = Arc::new(PromptBuilder::new());
 
     let default_model =
-        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string());
+        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
     let classifier_model =
-        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| "qwen3:0.6b".to_string());
-    let vision_model =
-        std::env::var("BAGENT_VISION_MODEL").unwrap_or_else(|_| "qwen2.5vl:7b".to_string());
+        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
 
-    // Startup: warm the selected chat model and embed model into memory so first
-    // user query doesn't pay cold-load cost. Vision stays lazy and only loads
-    // when an image attachment or screen capture routes to the vision model.
+    // Warm the configured BaseRT model without blocking daemon startup.
     {
-        let warmup_ollama = ollama.clone();
+        let warmup_inference = inference.clone();
         let warmup_chat_model = default_model.clone();
-        let warmup_embed_model = ollama_connector::DEFAULT_EMBED_MODEL.to_string();
         tokio::spawn(async move {
-            // Both models load in parallel: sequential warmup leaves a cold-embed
-            // window after the chat model finishes loading.
-            let ollama_chat = warmup_ollama.clone();
-            let ollama_embed = warmup_ollama.clone();
-            let (r_chat, r_embed) = tokio::join!(
-                ollama_chat.generate_raw(&warmup_chat_model, ".", 0.0),
-                ollama_embed.embed(&warmup_embed_model, "warmup"),
-            );
-            if r_chat.is_ok() {
-                tracing::info!(model = %warmup_chat_model, "warmup: chat model loaded");
-            }
-            if r_embed.is_ok() {
-                tracing::info!(model = %warmup_embed_model, "warmup: embed model loaded");
+            match warmup_inference
+                .generate_raw(&warmup_chat_model, "Reply with one period.", 0.0)
+                .await
+            {
+                Ok(_) => tracing::info!(model = %warmup_chat_model, "warmup: BaseRT model loaded"),
+                Err(e) => {
+                    tracing::debug!(model = %warmup_chat_model, "warmup: BaseRT unavailable: {e}")
+                }
             }
         });
     }
@@ -693,9 +660,8 @@ async fn main() -> Result<()> {
         default_model,
         debug_dir,
         classifier_model,
-        vision_model,
         attachments_dir,
-        ollama,
+        inference,
         mail,
         notes,
         fs,
@@ -1333,7 +1299,7 @@ async fn screen_intent_handler(
     Json(req): Json<ScreenIntentRequest>,
 ) -> impl IntoResponse {
     let classifier =
-        ScreenIntentClassifier::new(state.ollama.clone(), state.classifier_model.clone());
+        ScreenIntentClassifier::new(state.inference.clone(), state.classifier_model.clone());
     match classifier.classify(&req.message, "").await {
         Ok(intent) => (
             StatusCode::OK,
@@ -1757,7 +1723,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         });
     Json(HealthResponse {
         status: "ok",
-        ollama: state.ollama.is_up().await,
+        basert: state.inference.is_up().await,
         model: state.default_model,
         classifier_model: state.classifier_model,
         connectors: ConnectorStatus {
@@ -1802,8 +1768,17 @@ async fn events_stream(
 }
 
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
-    match state.ollama.models().await {
-        Ok(names) => (StatusCode::OK, Json(serde_json::json!({ "models": names }))),
+    match state.inference.models().await {
+        Ok(names) => {
+            let chat_models = names
+                .into_iter()
+                .filter(|name| name == &state.default_model)
+                .collect::<Vec<_>>();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "models": chat_models })),
+            )
+        }
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -1896,20 +1871,18 @@ async fn rules_save(
 }
 
 async fn embeddings(
-    State(state): State<AppState>,
-    Json(req): Json<EmbedRequest>,
+    State(_state): State<AppState>,
+    Json(_req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let model = req.model.as_deref().unwrap_or(DEFAULT_EMBED_MODEL);
-    match state.ollama.embed(model, &req.input).await {
-        Ok(vec) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "embedding": vec, "model": model })),
-        ),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": {
+                "code": "embeddings_disabled",
+                "message": "Semantic embeddings are disabled; bagent uses full-text retrieval."
+            }
+        })),
+    )
 }
 
 async fn chat(
@@ -1922,10 +1895,8 @@ async fn chat(
     let user_message = req.message.clone();
     let prompt_builder = state.prompt_builder.clone();
     let debug_dir = state.debug_dir.clone();
-    let vision_model = state.vision_model.clone();
     let attachment_ids = req.attachment_ids.clone();
-    // Screen context (Phase 7) — never persisted to disk
-    let screen_image_b64 = req.screen_image_b64.clone();
+    // Screen context is text-only: screenshot bytes are intentionally ignored.
     let screen_ocr_text = req.screen_ocr_text.clone();
     let active_app = req.active_app.clone();
     let selected_text = req.selected_text.clone();
@@ -2028,18 +1999,16 @@ async fn chat(
         };
         let _ = source_mode; // source hints are obsolete — the model picks tools itself
 
-        // Load attachment records from DB and build context + image data for Ollama.
+        // Load text attachment context. Image inference is intentionally unsupported.
         struct AttachmentData {
-            images_b64: Vec<String>,
             ctx: Option<String>,
-            model_override: Option<String>,
             turn_ids: Vec<String>,
+            has_unsupported_image: bool,
         }
         let att_data = {
-            let mut images_b64: Vec<String> = Vec::new();
             let mut ctx_parts: Vec<String> = Vec::new();
-            let mut has_image = false;
             let mut turn_ids: Vec<String> = Vec::new();
+            let mut has_unsupported_image = false;
 
             if !attachment_ids.is_empty() {
                 if let Ok(db_guard) = db.try_lock() {
@@ -2055,17 +2024,10 @@ async fn chat(
                                 r.get::<_,Option<String>>(4)?,
                             )),
                         );
-                        if let Ok((filename, kind, bytes_path, _mime, extracted_text)) = row {
+                        if let Ok((filename, kind, _bytes_path, _mime, extracted_text)) = row {
                             turn_ids.push(att_id.clone());
                             if kind == "image" {
-                                has_image = true;
-                                if let Ok(bytes) = std::fs::read(&bytes_path) {
-                                    images_b64.push(B64.encode(&bytes));
-                                }
-                                ctx_parts.push(format!(
-                                    "### {} (obrázok — spracované modelom pre videnie)",
-                                    filename
-                                ));
+                                has_unsupported_image = true;
                             } else {
                                 let text = extracted_text
                                     .unwrap_or_else(|| "[obsah nedostupný]".to_string());
@@ -2082,52 +2044,36 @@ async fn chat(
                 Some(format!("Pripojené súbory:\n\n{}", ctx_parts.join("\n\n")))
             };
 
-            let model_override = if has_image {
-                // Auto-route image turns to the vision model even when the client
-                // sends the selected chat model from Settings.
-                if let Ok(db_guard) = db.try_lock() {
-                    let _ = db_guard.execute(
-                        "INSERT INTO audit_entries (action, payload, model) VALUES ('model_swap', ?1, ?2)",
-                        rusqlite::params![
-                            serde_json::json!({"from": model, "to": vision_model, "reason": "image_attachment"}).to_string(),
-                            vision_model.clone()
-                        ],
-                    );
-                }
-                Some(vision_model.clone())
-            } else {
-                None
-            };
-
             AttachmentData {
-                images_b64,
                 ctx,
-                model_override,
                 turn_ids,
+                has_unsupported_image,
             }
         };
 
-        // ── Screen context injection (Phase 7) ────────────────────────────────
-        // In-memory only — never written to the attachments table or disk.
-        // Merges into the same att_data fields so existing vision-routing logic fires.
+        if att_data.has_unsupported_image {
+            let _ = tx
+                .send(Ok(Event::default().data(
+                    serde_json::json!({
+                        "type": "error",
+                        "code": "image_unsupported",
+                        "message": "Image attachments are not supported by the configured text-only BaseRT model."
+                    })
+                    .to_string(),
+                )))
+                .await;
+            return;
+        }
+
+        // Screen OCR/selection is in-memory only and screenshot bytes are discarded.
         let att_data = {
             let AttachmentData {
-                mut images_b64,
                 ctx,
-                model_override,
                 turn_ids,
+                has_unsupported_image,
             } = att_data;
 
             let mut screen_ctx_parts: Vec<String> = Vec::new();
-            let mut has_screen_image = false;
-
-            if let Some(b64) = &screen_image_b64 {
-                images_b64.push(b64.clone());
-                has_screen_image = true;
-                screen_ctx_parts.push(
-                    "### Snímka obrazovky (pii: true — zhrň obsah, necituj doslovne)".to_string(),
-                );
-            }
             if let Some(app) = &active_app {
                 screen_ctx_parts.push(format!("### Aktívna aplikácia\n{app}"));
             }
@@ -2150,32 +2096,14 @@ async fn chat(
                 (existing, true) => existing,
             };
 
-            // Upgrade model_override to vision when a screen image was added but no
-            // file-attachment already triggered the vision swap.
-            let merged_override = if has_screen_image && model_override.is_none() {
-                if let Ok(db_guard) = db.try_lock() {
-                    let _ = db_guard.execute(
-                        "INSERT INTO audit_entries (action, payload, model) VALUES ('model_swap', ?1, ?2)",
-                        rusqlite::params![
-                            serde_json::json!({"from": model, "to": vision_model, "reason": "screen_context"}).to_string(),
-                            vision_model
-                        ],
-                    );
-                }
-                Some(vision_model.to_string())
-            } else {
-                model_override
-            };
-
             AttachmentData {
-                images_b64,
                 ctx: merged_ctx,
-                model_override: merged_override,
                 turn_ids,
+                has_unsupported_image,
             }
         };
 
-        let effective_model = att_data.model_override.clone().unwrap_or(model.clone());
+        let effective_model = model.clone();
 
         tracing::info!(
             "chat timing: tool_ctx fetched {}ms",
@@ -2269,14 +2197,7 @@ async fn chat(
                     });
                     built.messages.extend(history.clone());
                 }
-                if att_data.images_b64.is_empty() {
-                    built.messages.push(Message::user(&user_message));
-                } else {
-                    built.messages.push(Message::user_with_images(
-                        &user_message,
-                        att_data.images_b64.clone(),
-                    ));
-                }
+                built.messages.push(Message::user(&user_message));
                 built.trace.layers.push(bagent_agent::PromptLayerTrace {
                     name: "current_user_turn".to_string(),
                     role: "user".to_string(),
@@ -2307,14 +2228,7 @@ async fn chat(
             }
             Err(_) => {
                 let mut msgs = history.clone();
-                if att_data.images_b64.is_empty() {
-                    msgs.push(Message::user(&user_message));
-                } else {
-                    msgs.push(Message::user_with_images(
-                        &user_message,
-                        att_data.images_b64.clone(),
-                    ));
-                }
+                msgs.push(Message::user(&user_message));
                 msgs
             }
         };
@@ -2335,9 +2249,8 @@ async fn chat(
         // One loop for chat and automations lives in agent_exec. Guardrails
         // live in its dispatcher: rules engine verdicts on the actual args,
         // PathPolicy (inside the fs connector), approval modal for writes,
-        // per-turn budgets, and an audit entry per call. Vision turns skip
-        // tools — the vision model answers from injected context.
-        let tools = agent_exec::build_tools(&state, att_data.model_override.is_some()).await;
+        // per-turn budgets, and an audit entry per call.
+        let tools = agent_exec::build_tools(&state, false).await;
 
         // Forward execution events onto this request's SSE stream.
         let (ev_tx, mut ev_rx) = mpsc::channel::<serde_json::Value>(64);
@@ -2397,7 +2310,7 @@ async fn chat(
                     .map(|m| PromptDebugMessage {
                         role: m.role.clone(),
                         content: redact_debug_text(&m.content),
-                        images_count: m.images.len(),
+                        images_count: 0,
                     })
                     .collect(),
                 trace,
@@ -2691,6 +2604,10 @@ async fn mail_message_attachment_bytes(
 
 const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024; // 20 MB
 
+fn attachment_mime_is_supported(mime: &str) -> bool {
+    !mime.starts_with("image/")
+}
+
 async fn upload_attachment(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -2737,6 +2654,18 @@ async fn upload_attachment(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "no file field in multipart" })),
+        );
+    }
+
+    if !attachment_mime_is_supported(&mime) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(serde_json::json!({
+                "error": {
+                    "code": "image_unsupported",
+                    "message": "Image attachments are not supported by the configured text-only BaseRT model."
+                }
+            })),
         );
     }
 
@@ -4003,6 +3932,14 @@ async fn save_last_whatsapp_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_upload_policy_rejects_images_for_text_only_basert() {
+        assert!(!attachment_mime_is_supported("image/png"));
+        assert!(!attachment_mime_is_supported("image/jpeg"));
+        assert!(attachment_mime_is_supported("application/pdf"));
+        assert!(attachment_mime_is_supported("text/plain"));
+    }
 
     #[test]
     fn html_to_text_strips_tags_and_script_bodies() {

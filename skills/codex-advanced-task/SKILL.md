@@ -22,7 +22,7 @@ tags:
 
 Codex is an **external advanced reasoning harness**, not a replacement for the local model.
 Only invoke it when a task genuinely requires cross-source correlation or deep multi-step
-reasoning that Ollama cannot reliably complete locally.
+reasoning that BaseRT cannot reliably complete locally.
 
 **Use Codex for:**
 - Reconciling information across 3+ sources (Mail + Odoo + Notes + Files + WhatsApp)
@@ -38,7 +38,7 @@ reasoning that Ollama cannot reliably complete locally.
 - Short drafts or translations ("prepi toto po anglicky")
 - Single-file reads or searches
 - Opening apps, files, or URLs
-- Anything the local Ollama model can answer in one step
+- Anything the local BaseRT model can answer in one step
 - Tasks that do not require external reasoning (score < 60)
 
 ## Privacy guarantees
@@ -90,4 +90,4 @@ context packet approval.
 If the `codex` binary is not found or returns an error:
 - Report gracefully with the error from the daemon
 - Suggest verifying the binary path in Settings → Codex
-- Offer to attempt the task with the local Ollama model instead (with caveats about quality)
+- Offer to attempt the task with the local BaseRT model instead (with caveats about quality)

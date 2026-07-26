@@ -3,15 +3,12 @@ pub mod selector;
 
 use anyhow::Result;
 use chrono::Utc;
-use ollama_connector::OllamaClient;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-pub const DEFAULT_EMBED_MODEL: &str = "bge-m3";
-pub const DEDUP_COSINE_THRESHOLD: f32 = 0.92;
 pub const PRUNE_UNUSED_DAYS: i64 = 60;
 
 /// Minimum score for a memory hit to be considered relevant.
@@ -114,24 +111,12 @@ pub struct RetrieveQuery<'a> {
 
 pub struct MemoryStore {
     db: Arc<Mutex<Connection>>,
-    ollama: OllamaClient,
-    embed_model: String,
     data_dir: Option<PathBuf>,
 }
 
 impl MemoryStore {
-    pub fn new(db: Arc<Mutex<Connection>>, ollama: OllamaClient) -> Self {
-        Self {
-            db,
-            ollama,
-            embed_model: DEFAULT_EMBED_MODEL.to_string(),
-            data_dir: None,
-        }
-    }
-
-    pub fn with_embed_model(mut self, model: &str) -> Self {
-        self.embed_model = model.to_string();
-        self
+    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+        Self { db, data_dir: None }
     }
 
     pub fn with_data_dir(mut self, dir: PathBuf) -> Self {
@@ -165,8 +150,6 @@ impl MemoryStore {
         tracing::info!("memory mirror: importing {} changed file(s)", changed.len());
 
         for (fm, text) in changed {
-            // Best-effort embed
-            let embedding = self.ollama.embed(&self.embed_model, &text).await.ok();
             let db = self.db.lock().unwrap();
             let r = db.execute(
                 "INSERT INTO memory_items \
@@ -189,9 +172,6 @@ impl MemoryStore {
             if let Err(e) = r {
                 tracing::warn!("memory mirror: upsert failed for {}: {e}", fm.id);
                 continue;
-            }
-            if let Some(emb) = embedding {
-                let _ = self.store_embedding(&db, &fm.id, &fm.namespace, &emb);
             }
             tracing::debug!("memory mirror: imported {}", fm.id);
         }
@@ -238,31 +218,38 @@ impl MemoryStore {
             return Ok(None);
         }
 
-        let embedding = self.ollama.embed(&self.embed_model, params.text).await.ok();
-
-        // Dedup check
-        if let Some(ref emb) = embedding {
-            let db = self.db.lock().unwrap();
-            if self.is_duplicate_active(&db, params.namespace, emb, DEDUP_COSINE_THRESHOLD)? {
-                tracing::debug!("memory insert deduplicated ns={}", params.namespace);
-                return Ok(None);
-            }
+        let normalized = normalize_text(params.text);
+        let db = self.db.lock().unwrap();
+        let mut stmt =
+            db.prepare("SELECT text FROM memory_items WHERE namespace = ?1 AND status = 'active'")?;
+        let duplicate = stmt
+            .query_map(rusqlite::params![params.namespace], |row| {
+                row.get::<_, String>(0)
+            })?
+            .filter_map(std::result::Result::ok)
+            .any(|text| normalize_text(&text) == normalized);
+        drop(stmt);
+        drop(db);
+        if duplicate {
+            tracing::debug!("memory insert deduplicated ns={}", params.namespace);
+            return Ok(None);
         }
 
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
         {
-            let db = self.db.lock().unwrap();
+            let mut db = self.db.lock().unwrap();
+            let tx = db.transaction()?;
 
-            // On explicit/user_edit: supersede conflicting passive items in same namespace+kind
+            // Explicit corrections replace a related passive fact without
+            // requiring an embedding model. Prefer stable identity fields,
+            // then fall back to conservative lexical similarity.
             if params.source == "explicit" || params.source == "user_edit" {
-                if let Some(ref emb) = embedding {
-                    self.supersede_conflicting(&db, params.namespace, params.kind, emb, &id)?;
-                }
+                supersede_conflicting_lexical(&tx, &params, &id, &now)?;
             }
 
-            db.execute(
+            tx.execute(
                 "INSERT INTO memory_items \
                  (id, namespace, kind, language, text, source_ref, metadata_json, \
                   created_at, updated_at, expires_at, \
@@ -286,15 +273,7 @@ impl MemoryStore {
                     params.subject,
                 ],
             )?;
-        }
-
-        // Embed (best-effort)
-        if let Some(emb) = embedding {
-            let db = self.db.lock().unwrap();
-            let _ = self.store_embedding(&db, &id, params.namespace, &emb);
-        } else if let Ok(emb) = self.ollama.embed(&self.embed_model, params.text).await {
-            let db = self.db.lock().unwrap();
-            let _ = self.store_embedding(&db, &id, params.namespace, &emb);
+            tx.commit()?;
         }
 
         // Mirror export (best-effort — skip sensitive passive items already blocked above)
@@ -352,9 +331,9 @@ impl MemoryStore {
 
     // ── Retrieval ─────────────────────────────────────────────────────────────
 
-    /// Hybrid BM25 + cosine retrieval.
+    /// FTS-only retrieval.
     /// Hard filters: `status = 'active'`, `sensitivity = 'normal'` (unless allowed).
-    /// Score = 0.45 * semantic + 0.35 * bm25 + 0.10 * importance + 0.10 * recency.
+    /// Score = 0.70 * BM25 + 0.15 * importance + 0.15 * recency.
     pub async fn retrieve_filtered(&self, q: RetrieveQuery<'_>) -> Result<Vec<MemoryHit>> {
         let max_per_ns = if q.max_per_namespace == 0 {
             3
@@ -365,12 +344,6 @@ impl MemoryStore {
             RETRIEVAL_SCORE_THRESHOLD
         } else {
             q.score_threshold
-        };
-
-        let query_embedding = if q.query.trim().is_empty() {
-            None
-        } else {
-            self.ollama.embed(&self.embed_model, q.query).await.ok()
         };
 
         let sensitivity_filter = if q.allow_sensitive {
@@ -422,16 +395,24 @@ impl MemoryStore {
                 params.push(Box::new(limit));
                 let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
                 if let Ok(mut rows) = stmt.query(refs.as_slice()) {
+                    let mut ranked_items = Vec::new();
                     while let Ok(Some(row)) = rows.next() {
                         if let Ok(item) = row_to_item(row) {
-                            let bm25: f64 = row.get(19).unwrap_or(0.0);
-                            let bm25_norm = (bm25.abs() as f32).min(10.0) / 10.0;
-                            let base_score = bm25_norm * 0.35 + item.importance * 0.10;
-                            hits.push(MemoryHit {
-                                item,
-                                score: base_score,
-                            });
+                            ranked_items.push(item);
                         }
+                    }
+                    for (rank, item) in ranked_items.into_iter().enumerate() {
+                        // FTS5 BM25 magnitudes depend on corpus size and are
+                        // often tiny. Reciprocal rank keeps lexical relevance
+                        // dominant and stable across databases.
+                        let lexical_score = 1.0 / (rank as f32 + 1.0);
+                        let base_score = lexical_score * 0.70
+                            + item.importance * 0.15
+                            + recency_score(&item.created_at) * 0.15;
+                        hits.push(MemoryHit {
+                            item,
+                            score: base_score,
+                        });
                     }
                     true
                 } else {
@@ -480,56 +461,12 @@ impl MemoryStore {
                 if let Ok(mut rows) = stmt.query(refs.as_slice()) {
                     while let Ok(Some(row)) = rows.next() {
                         if let Ok(item) = row_to_item(row) {
-                            let importance_score = item.importance * 0.10;
+                            let importance_score =
+                                item.importance * 0.15 + recency_score(&item.created_at) * 0.15;
                             hits.push(MemoryHit {
                                 item,
                                 score: importance_score,
                             });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Cosine component (additive)
-        if let Some(ref qe) = query_embedding {
-            let cos_ns_ph: String = q
-                .namespaces
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", i + 1))
-                .collect::<Vec<_>>()
-                .join(",");
-            let cos_sql = format!(
-                "SELECT e.item_id, e.vector FROM embeddings e \
-                 JOIN memory_items mi ON e.item_id = mi.id \
-                 WHERE e.namespace IN ({cos_ns_ph}) AND mi.status = 'active'",
-                cos_ns_ph = cos_ns_ph
-            );
-            if let Ok(mut stmt) = db.prepare(&cos_sql) {
-                let ns_refs: Vec<&dyn rusqlite::ToSql> = q
-                    .namespaces
-                    .iter()
-                    .map(|ns| ns as &dyn rusqlite::ToSql)
-                    .collect();
-                if let Ok(mut rows) = stmt.query(ns_refs.as_slice()) {
-                    while let Ok(Some(row)) = rows.next() {
-                        let item_id: String = row.get(0)?;
-                        let blob: Vec<u8> = row.get(1)?;
-                        let stored = blob_to_f32(&blob);
-                        let cos = cosine_similarity(qe, &stored);
-                        let decay = self.recency_decay(&db, &item_id);
-                        let cos_contrib = cos * 0.45 * decay;
-                        if let Some(hit) = hits.iter_mut().find(|h| h.item.id == item_id) {
-                            hit.score += cos_contrib;
-                        } else if cos_contrib > threshold {
-                            if let Ok(Some(item)) = self.get_active(&db, &item_id) {
-                                let base = item.importance * 0.10;
-                                hits.push(MemoryHit {
-                                    item,
-                                    score: cos_contrib + base,
-                                });
-                            }
                         }
                     }
                 }
@@ -637,7 +574,6 @@ impl MemoryStore {
             return Ok(vec![]);
         }
 
-        let query_embedding = self.ollama.embed(&self.embed_model, query).await.ok();
         let db = self.db.lock().unwrap();
         let exclude = exclude_session_id.unwrap_or("");
 
@@ -668,39 +604,8 @@ impl MemoryStore {
                         role,
                         content,
                         created_at,
-                        (score.abs() as f32).min(10.0) / 10.0 * 0.4,
+                        (score.abs() as f32).min(10.0) / 10.0,
                     ));
-                }
-            }
-        }
-
-        if let Some(ref qe) = query_embedding {
-            let cos_sql = "SELECT item_id, vector FROM embeddings WHERE source = 'chat_turn'";
-            if let Ok(mut stmt) = db.prepare(cos_sql) {
-                if let Ok(mut rows) = stmt.query([]) {
-                    while let Ok(Some(row)) = rows.next() {
-                        let item_id: String = row.get(0).unwrap_or_default();
-                        let blob: Vec<u8> = row.get(1).unwrap_or_default();
-                        let stored = blob_to_f32(&blob);
-                        let cos = cosine_similarity(qe, &stored) * 0.6;
-                        if let Some(r) = results.iter_mut().find(|r| r.0 == item_id) {
-                            r.4 += cos;
-                        } else if cos > 0.15 {
-                            if let Ok(mut s) = db.prepare(
-                                "SELECT id, role, content, created_at FROM chat_turns WHERE id = ?1",
-                            ) {
-                                if let Ok(mut rows2) = s.query(rusqlite::params![item_id]) {
-                                    if let Ok(Some(r2)) = rows2.next() {
-                                        let id2: String = r2.get(0).unwrap_or_default();
-                                        let role2: String = r2.get(1).unwrap_or_default();
-                                        let content2: String = r2.get(2).unwrap_or_default();
-                                        let at2: String = r2.get(3).unwrap_or_default();
-                                        results.push((id2, role2, content2, at2, cos));
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -725,22 +630,6 @@ impl MemoryStore {
                 }
             })
             .collect())
-    }
-
-    // ── Embedding helpers ─────────────────────────────────────────────────────
-
-    pub async fn embed_chat_turn(&self, turn_id: &str, content: &str) -> Result<()> {
-        let embedding = self.ollama.embed(&self.embed_model, content).await?;
-        let db = self.db.lock().unwrap();
-        let blob = f32_to_blob(&embedding);
-        let now = Utc::now().to_rfc3339();
-        db.execute(
-            "INSERT OR REPLACE INTO embeddings \
-             (item_id, namespace, model, dim, vector, created_at, source) \
-             VALUES (?1, 'chat_turn', ?2, ?3, ?4, ?5, 'chat_turn')",
-            rusqlite::params![turn_id, self.embed_model, embedding.len() as i64, blob, now],
-        )?;
-        Ok(())
     }
 
     // ── Delete / prune ────────────────────────────────────────────────────────
@@ -792,117 +681,6 @@ impl MemoryStore {
         }
         Ok(n + n2)
     }
-
-    // ── Private helpers ───────────────────────────────────────────────────────
-
-    fn store_embedding(
-        &self,
-        db: &Connection,
-        item_id: &str,
-        namespace: &str,
-        vec: &[f32],
-    ) -> Result<()> {
-        let blob = f32_to_blob(vec);
-        let now = Utc::now().to_rfc3339();
-        db.execute(
-            "INSERT OR REPLACE INTO embeddings (item_id, namespace, model, dim, vector, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![item_id, namespace, self.embed_model, vec.len() as i64, blob, now],
-        )?;
-        Ok(())
-    }
-
-    /// Dedup check against active items only.
-    fn is_duplicate_active(
-        &self,
-        db: &Connection,
-        namespace: &str,
-        query_vec: &[f32],
-        threshold: f32,
-    ) -> Result<bool> {
-        let mut stmt = db.prepare(
-            "SELECT e.vector FROM embeddings e \
-             JOIN memory_items mi ON e.item_id = mi.id \
-             WHERE e.namespace = ?1 AND mi.status = 'active'",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![namespace])?;
-        while let Some(row) = rows.next()? {
-            let blob: Vec<u8> = row.get(0)?;
-            let stored = blob_to_f32(&blob);
-            if cosine_similarity(query_vec, &stored) >= threshold {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Supersede passive items in same namespace+kind that are semantically close
-    /// to the new explicit/user_edit item. Marks them 'superseded', not deleted.
-    fn supersede_conflicting(
-        &self,
-        db: &Connection,
-        namespace: &str,
-        kind: &str,
-        new_vec: &[f32],
-        new_id: &str,
-    ) -> Result<()> {
-        let mut stmt = db.prepare(
-            "SELECT mi.id, e.vector FROM embeddings e \
-             JOIN memory_items mi ON e.item_id = mi.id \
-             WHERE e.namespace = ?1 AND mi.status = 'active' AND mi.source = 'passive' \
-               AND mi.kind = ?2",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![namespace, kind])?;
-        let now = Utc::now().to_rfc3339();
-        while let Some(row) = rows.next()? {
-            let old_id: String = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            let stored = blob_to_f32(&blob);
-            // Only supersede items that are semantically close (> 0.75 similarity)
-            if cosine_similarity(new_vec, &stored) > 0.75 {
-                let _ = db.execute(
-                    "UPDATE memory_items SET status='superseded', supersedes_id=?1, updated_at=?2 WHERE id=?3",
-                    rusqlite::params![new_id, now, old_id],
-                );
-                tracing::debug!(
-                    "memory: superseded passive item {old_id} with new explicit {new_id}"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn recency_decay(&self, db: &Connection, item_id: &str) -> f32 {
-        let created_at: Option<String> = db
-            .query_row(
-                "SELECT created_at FROM memory_items WHERE id = ?1",
-                rusqlite::params![item_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(ts) = created_at {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&ts) {
-                let age_days = (Utc::now() - dt.with_timezone(&Utc)).num_days() as f32;
-                return (-age_days / 30.0).exp();
-            }
-        }
-        1.0
-    }
-
-    fn get_active(&self, db: &Connection, id: &str) -> Result<Option<MemoryItem>> {
-        let mut stmt = db.prepare(
-            "SELECT id, namespace, kind, language, text, source_ref, metadata_json, \
-                    last_used_at, use_count, created_at, updated_at, expires_at, \
-                    confidence, importance, status, source, sensitivity, subject, supersedes_id \
-             FROM memory_items WHERE id = ?1 AND status = 'active'",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![id])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row_to_item(row)?))
-        } else {
-            Ok(None)
-        }
-    }
 }
 
 // ── Text similarity helper (Jaccard over trigrams) ────────────────────────────
@@ -929,30 +707,59 @@ fn text_similarity(a: &str, b: &str) -> f32 {
     }
 }
 
-// ── Vec math ─────────────────────────────────────────────────────────────────
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 {
-        0.0
-    } else {
-        dot / (norm_a * norm_b)
-    }
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
-fn f32_to_blob(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+fn supersede_conflicting_lexical(
+    db: &Connection,
+    params: &InsertParams<'_>,
+    new_id: &str,
+    now: &str,
+) -> Result<()> {
+    let mut stmt = db.prepare(
+        "SELECT id, text, source_ref, subject FROM memory_items \
+         WHERE namespace = ?1 AND kind = ?2 AND status = 'active' AND source = 'passive'",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![params.namespace, params.kind])?;
+    let new_text = normalize_text(params.text);
+    while let Some(row) = rows.next()? {
+        let old_id: String = row.get(0)?;
+        let old_text: String = row.get(1)?;
+        let old_source_ref: Option<String> = row.get(2)?;
+        let old_subject: Option<String> = row.get(3)?;
+        let same_source = params
+            .source_ref
+            .zip(old_source_ref.as_deref())
+            .is_some_and(|(new, old)| !new.is_empty() && new == old);
+        let same_subject = params
+            .subject
+            .zip(old_subject.as_deref())
+            .is_some_and(|(new, old)| {
+                !new.is_empty() && normalize_text(new) == normalize_text(old)
+            });
+        let lexically_related = text_similarity(&new_text, &normalize_text(&old_text)) >= 0.55;
+        if same_source || same_subject || lexically_related {
+            db.execute(
+                "UPDATE memory_items SET status='superseded', supersedes_id=?1, updated_at=?2 \
+                 WHERE id=?3",
+                rusqlite::params![new_id, now, old_id],
+            )?;
+        }
+    }
+    Ok(())
 }
 
-fn blob_to_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
+fn recency_score(created_at: &str) -> f32 {
+    chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|created| {
+            let age_days = (Utc::now() - created.with_timezone(&Utc)).num_days().max(0) as f32;
+            (-age_days / 30.0).exp()
+        })
+        .unwrap_or(1.0)
 }
 
 fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryItem> {
@@ -1059,10 +866,7 @@ mod tests {
     fn test_store() -> Arc<MemoryStore> {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(TEST_SCHEMA).unwrap();
-        Arc::new(MemoryStore::new(
-            Arc::new(Mutex::new(conn)),
-            ollama_connector::OllamaClient::new("http://127.0.0.1:9"), // unreachable
-        ))
+        Arc::new(MemoryStore::new(Arc::new(Mutex::new(conn))))
     }
 
     static ITEM_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1117,6 +921,38 @@ mod tests {
             hits.iter().all(|h| h.item.status == "active"),
             "deleted items must not be returned"
         );
+    }
+
+    #[tokio::test]
+    async fn insert_deduplicates_normalized_text_without_embeddings() {
+        let store = test_store();
+        let first = store
+            .insert(
+                "global",
+                "fact",
+                "sk",
+                "  Faktúra   je splatná  ",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let duplicate = store
+            .insert(
+                "global",
+                "fact",
+                "sk",
+                "faktúra je SPLATNÁ",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(first.is_some());
+        assert!(duplicate.is_none());
     }
 
     #[tokio::test]
@@ -1295,6 +1131,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_correction_supersedes_related_passive_memory_without_embeddings() {
+        let store = test_store();
+        let old_id = store
+            .insert_full(InsertParams {
+                namespace: "user_pref",
+                kind: "preference",
+                language: "en",
+                text: "User prefers concise replies",
+                source_ref: Some("preference:reply-style"),
+                source: "passive",
+                confidence: 0.8,
+                importance: 0.5,
+                sensitivity: "normal",
+                subject: Some("reply style"),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let new_id = store
+            .insert_full(InsertParams {
+                namespace: "user_pref",
+                kind: "preference",
+                language: "en",
+                text: "User now prefers detailed replies",
+                source_ref: Some("preference:reply-style"),
+                source: "explicit",
+                confidence: 1.0,
+                importance: 0.9,
+                sensitivity: "normal",
+                subject: Some("reply style"),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let db = store.db.lock().unwrap();
+        let old_state: (String, Option<String>) = db
+            .query_row(
+                "SELECT status, supersedes_id FROM memory_items WHERE id = ?1",
+                rusqlite::params![old_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(old_state, ("superseded".to_string(), Some(new_id)));
+    }
+
+    #[tokio::test]
+    async fn fts_rank_dominates_recency_and_importance() {
+        let store = test_store();
+        let db = store.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO memory_items \
+             (id, namespace, kind, language, text, created_at, updated_at, importance) \
+             VALUES ('strong', 'facts', 'fact', 'en', ?1, '2020-01-01T00:00:00Z', \
+                     '2020-01-01T00:00:00Z', 0.0)",
+            ["alpha beta alpha beta alpha beta"],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO memory_items \
+             (id, namespace, kind, language, text, created_at, updated_at, importance) \
+             VALUES ('weak', 'facts', 'fact', 'en', ?1, ?2, ?2, 1.0)",
+            rusqlite::params![
+                "alpha beta filler filler filler filler filler filler filler filler",
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+        drop(db);
+
+        let hits = store
+            .retrieve_filtered(RetrieveQuery {
+                query: "alpha beta",
+                namespaces: &["facts"],
+                kinds: &[],
+                k: 2,
+                max_per_namespace: 2,
+                score_threshold: 0.01,
+                allow_sensitive: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.first().map(|hit| hit.item.id.as_str()), Some("strong"));
+    }
+
+    #[tokio::test]
     async fn supersede_marks_old_item() {
         let store = test_store();
         insert_item(
@@ -1345,18 +1270,5 @@ mod tests {
     fn text_similarity_different_strings() {
         let s = text_similarity("completely different text", "nothing in common here");
         assert!(s < 0.3, "should be low similarity: {s}");
-    }
-
-    #[test]
-    fn cosine_similarity_identical() {
-        let v = vec![1.0f32, 0.0, 0.0];
-        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_similarity_orthogonal() {
-        let a = vec![1.0f32, 0.0];
-        let b = vec![0.0f32, 1.0];
-        assert!((cosine_similarity(&a, &b)).abs() < 1e-6);
     }
 }

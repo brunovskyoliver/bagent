@@ -8,7 +8,7 @@ name = "bagentd"
 path = "src/main.rs"
 
 [dependencies]
-ollama-connector      = { path = "../connectors/ollama" }
+basert-connector      = { path = "../connectors/basert" }
 apple-mail-connector  = { path = "../connectors/apple_mail" }
 apple-notes-connector  = { path = "../connectors/apple_notes" }
 filesystem-connector  = { path = "../connectors/filesystem" }

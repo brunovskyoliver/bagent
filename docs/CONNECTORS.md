@@ -136,40 +136,38 @@ Each connector is described with: **Purpose · Permissions · Read Actions · Wr
 
 ---
 
-## Ollama
+## BaseRT
 
-**Purpose:** Local LLM inference for all private tasks — summarization, classification, embeddings, Slovak text generation, coding fallback.
+**Purpose:** Local text inference for private tasks — summarization, classification, Slovak text generation, and tool calling.
 
 **Permissions Required:**
-- Network (loopback only: `localhost:11434`). No external network needed.
+- Network (loopback only: `127.0.0.1:8082`). Model download requires internet on first use.
 
 **Read Actions:**
-- `ollama_chat(model, messages, stream?)` — streaming or blocking chat completion.
-- `ollama_embed(model, text)` — compute embedding vector.
-- `ollama_list_models()` — list installed models.
-- `ollama_model_info(model)` — model metadata (context length, quantization).
+- `POST /v1/chat/completions` — OpenAI-compatible streaming or blocking chat.
+- `GET /v1/models` — list loaded models.
+- `GET /health` — runtime liveness.
 
 **Write Actions:**
-- None exposed to the agent tool layer. Model installation is user-initiated via Ollama CLI or the Ollama app.
+- None exposed to the agent tool layer. The app manages a dedicated LaunchAgent and BaseRT downloads the model on first serve.
 
 **Approval Level:**
-- All Ollama calls: `Auto` (stays local; no PII leaves device).
+- All BaseRT calls: `Auto` (stays local; no PII leaves device).
 
 **Failure Modes:**
-- Ollama not running: `/health` shows `ollama_up: false`; show "Start Ollama" button with `open ollama://` deep link.
-- Model not installed: surface model name + `ollama pull <model>` instruction.
+- BaseRT not running: `/health` shows `basert: false`; inspect `~/Library/Logs/bagent/basert.log`.
+- Model unavailable: surface `basert pull basecompute/Qwen3-4B-Instruct-2507`.
 - Context window exceeded: truncate with sliding window strategy; log truncation in audit.
 - Slow response (> 5 s TTFT): show animated indicator; allow user to cancel.
-- Out of memory (OOM): Ollama returns 500; surface "Model too large" with suggested smaller model.
+- Out of memory (OOM): surface the BaseRT error without falling back to a cloud model.
 
 **MVP Scope (Phase 3):**
 - Chat with streaming.
 - Model picker.
-- Basic embedding for memory indexing.
+- FTS5 retrieval; semantic embeddings are intentionally disabled.
 - Slovak diacritics verified.
 
 **Future Scope:**
-- Vision model support (`llava`, `minicpm-v`) for screen context.
 - Multi-model routing (small model for classification, large for generation).
 - Local fine-tuned Slovak business model.
 - Automatic model download prompts.
@@ -290,7 +288,7 @@ Each connector is described with: **Purpose · Permissions · Read Actions · Wr
 
 **Future Scope:**
 - Continuous low-fps ambient awareness (opt-in, local only).
-- Vision model inference (Ollama `llava`) for complex UI understanding.
+- Optional future local multimodal runtime for complex UI understanding.
 - Cursor/selection tracking for proactive suggestions.
 - Multi-display support.
 

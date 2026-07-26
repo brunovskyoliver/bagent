@@ -515,7 +515,7 @@ impl MailConnector {
         ))
     }
 
-    /// Fetch attachment bytes as a base64-encoded string (for Ollama vision / JSON APIs).
+    /// Fetch attachment bytes as a base64-encoded string for connector APIs.
     pub fn get_message_attachment_base64(
         &self,
         rowid: i64,
@@ -1442,12 +1442,14 @@ mod tests {
     }
 
     #[test]
-    fn eml_image_receipt_triggers_vision_route() {
-        // Simulate the daemon logic: if any attachment is image/* → vision model needed
+    fn eml_image_receipt_is_classified_as_image() {
         let eml = include_bytes!("../../../../fixtures/sk/mail_with_image_receipt.eml");
         let parsed = mailparse::parse_mail(eml).expect("parse mail_with_image_receipt.eml");
         let attachments = extract_attachments_from_parsed(&parsed);
         let has_image = attachments.iter().any(|a| a.mimetype.starts_with("image/"));
-        assert!(has_image, "vision route should trigger for image receipt");
+        assert!(
+            has_image,
+            "image receipt should be classified as an image attachment"
+        );
     }
 }

@@ -384,7 +384,7 @@ struct NotchSettingsContent: View {
             connectorRow("WhatsApp", up: viewModel.daemonHealth?.whatsappConnector)
             connectorRow("Odoo", up: viewModel.daemonHealth?.odooConnector)
             connectorRow("Codex", up: viewModel.daemonHealth?.codexConnector)
-            connectorRow("Ollama", up: viewModel.daemonHealth?.ollamaUp)
+            connectorRow("BaseRT", up: viewModel.daemonHealth?.baseRTUp)
         }
     }
 

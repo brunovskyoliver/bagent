@@ -6,7 +6,7 @@
 //! are intentionally ignored so every LLM interaction starts clean.
 
 use bagent_memory::MemoryHit;
-use ollama_connector::Message;
+use basert_connector::Message;
 use serde::{Deserialize, Serialize};
 
 /// What kind of response language should the assistant target?
@@ -130,7 +130,7 @@ impl PromptBuilder {
     }
 
     /// Build the full message list up through layer 7 (session summary + history).
-    /// Caller appends the user turn and submits to Ollama.
+    /// Caller appends the user turn and submits to BaseRT.
     ///
     /// All context (skills, memory, recall candidates) is pre-selected by the caller.
     pub async fn build(

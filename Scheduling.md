@@ -1,6 +1,6 @@
 You are working in the bagent repository.
 
-bagent is a private, local-first macOS assistant that lives around the MacBook notch. Its frontend is SwiftUI/AppKit, its daemon and agent runtime are written in Rust, and all default inference runs locally through Ollama.
+bagent is a private, local-first macOS assistant that lives around the MacBook notch. Its frontend is SwiftUI/AppKit, its daemon and agent runtime are written in Rust, and all default inference runs locally through BaseRT.
 
 Your task is to design and implement persisted, cron-like agentic automations, including the Rust scheduling backend, HTTP/SSE integration, agent safety context, and a notch-native SwiftUI interface.
 
@@ -81,7 +81,7 @@ Local-first operation
 * The scheduler runs locally inside the Rust daemon.
 * Do not introduce a cloud scheduler.
 * The UI process must not need to remain open for scheduling to work.
-* Use local Ollama by default.
+* Use local BaseRT by default.
 * Cloud models remain opt-in only.
 * Existing PII redaction and privacy routing must apply unchanged.
 * Tool results must not be silently uploaded to cloud models.
@@ -799,7 +799,7 @@ Define explicit behavior for:
 
 * Agent failure
 * Model unavailable
-* Ollama unavailable
+* BaseRT unavailable
 * Connector unavailable
 * Temporary network failure for web search
 * Approval denial

@@ -11,7 +11,7 @@ bagent is a smart assistant you invoke with `⌥Space`. It runs entirely on your
 - **Summarizes email** — reads Apple Mail, produces concise summaries in Slovak or English.
 - **Drafts replies** — formal Slovak business tone; legal terms never auto-translated.
 - **Answers questions** about your mail, notes, and Odoo data (read-only).
-- **Routes privately** — all inference runs via local Ollama; cloud models are opt-in only.
+- **Routes privately** — all inference runs via local BaseRT; cloud models are opt-in only.
 - **Asks before acting** — no email is sent, no Odoo record modified, no shell command run without your explicit approval.
 
 ---
@@ -35,7 +35,7 @@ SwiftUI/AppKit (notch panel, modals, settings)
         ↕ HTTP / SSE (127.0.0.1)
 Rust daemon (agent runtime, model router, rules, SQLite)
         ↕
-Ollama (local LLM)  ·  Codex CLI  ·  Connectors (Mail, Notes, Odoo, Shell)
+BaseRT (local LLM)  ·  Codex CLI  ·  Connectors (Mail, Notes, Odoo, Shell)
 ```
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for full design.
@@ -71,7 +71,7 @@ bagent/
 |---|---|---|
 | Xcode | 16+ | Swift / macOS app build |
 | Rust | 1.80+ | Daemon binary |
-| Ollama | latest | Local LLM inference |
+| BaseRT | 0.1.7+ | Local OpenAI-compatible LLM inference |
 | Codex CLI | optional | Coding tasks |
 | macOS | 14.0+ | ScreenCaptureKit, modern SwiftUI |
 
@@ -98,7 +98,7 @@ Build: `cargo build --workspace`, then `make bundle && open bagent.app` from `ap
 | [`ROADMAP.md`](docs/ROADMAP.md) | Phased plan (historical; phases 0–10) |
 | [`MVP_SPEC.md`](docs/MVP_SPEC.md) | First release scope (historical) |
 | [`RULES.md`](docs/RULES.md) | What the agent may do auto, ask, or is forbidden |
-| [`CONNECTORS.md`](docs/CONNECTORS.md) | Per-connector specs (Mail, Notes, Odoo, Ollama, …) |
+| [`CONNECTORS.md`](docs/CONNECTORS.md) | Per-connector specs (Mail, Notes, Odoo, BaseRT, …) |
 | [`DATA_MODEL.md`](docs/DATA_MODEL.md) | SQLite schema (DDL), FTS5, embeddings, audit |
 | [`SECURITY.md`](docs/SECURITY.md) | Threat model, mitigations, OWASP LLM Top 10 |
 | [`TODO.md`](TODO.md) | Prioritized task list |

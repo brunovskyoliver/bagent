@@ -7,17 +7,13 @@ import Vision
 /// On-demand screen context capture (Phase 7).
 ///
 /// Produces an ephemeral `ScreenContext` struct from:
-///   - A PNG screenshot (ScreenCaptureKit, fallback CGWindowListCreateImage)
-///   - On-device OCR of the captured frame (Vision VNRecognizeTextRequest)
+///   - On-device OCR of a temporary screen frame (Vision VNRecognizeTextRequest)
 ///   - Frontmost application name via NSWorkspace (no extra permission needed)
 ///   - Accessibility selected-text (password-field safe-guarded)
 ///
-/// **No image bytes are ever written to disk.** The base64 PNG lives only in
-/// memory for the lifetime of the `/chat` request.
+/// **No image bytes are written to disk or sent to the daemon.**
 
 struct ScreenContext {
-    /// Base64-encoded PNG of the main display (nil if capture failed / not authorized).
-    var imagePNGBase64: String?
     /// Joined text recognised by Vision OCR (empty when no image or no text found).
     var ocrText: String
     /// Frontmost app as "AppName (bundle.id)" or just "AppName".
@@ -42,28 +38,21 @@ final class ScreenContextProvider {
     ///
     /// - Parameters:
     ///   - wantsScreen:    Capture a screenshot and run OCR.
-    ///   - wantsOCR:       Run on-device OCR (only meaningful when `wantsScreen` is true).
     ///   - wantsSelection: Read the Accessibility selected-text instead of / in addition
     ///                     to the screenshot.
-    func capture(wantsScreen: Bool, wantsOCR: Bool, wantsSelection: Bool) async -> ScreenContext {
+    func capture(wantsScreen: Bool, wantsSelection: Bool) async -> ScreenContext {
         async let appName     = frontmostApp()
         async let selection   = wantsSelection ? selectedText() : nil
 
-        var imagePNGBase64: String?
         var ocrText = ""
 
         if wantsScreen {
             if let cgImage = await captureFrame() {
-                // PNG encode in-memory only — never write to disk
-                imagePNGBase64 = pngBase64(cgImage)
-                if wantsOCR {
-                    ocrText = await recognizeText(in: cgImage)
-                }
+                ocrText = await recognizeText(in: cgImage)
             }
         }
 
         return ScreenContext(
-            imagePNGBase64: imagePNGBase64,
             ocrText: ocrText,
             activeApp: await appName,
             selectedText: await selection
@@ -116,18 +105,6 @@ final class ScreenContextProvider {
         )
         ctx?.draw(source, in: CGRect(x: 0, y: 0, width: newW, height: newH))
         return ctx?.makeImage() ?? source
-    }
-
-    // MARK: - PNG encode in-memory → base64
-
-    private func pngBase64(_ image: CGImage) -> String? {
-        let data = NSMutableData()
-        guard let dest = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
-            return nil
-        }
-        CGImageDestinationAddImage(dest, image, nil)
-        guard CGImageDestinationFinalize(dest) else { return nil }
-        return (data as Data).base64EncodedString()
     }
 
     // MARK: - On-device OCR (Vision)

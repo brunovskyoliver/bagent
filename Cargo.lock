@@ -192,8 +192,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bagent-memory",
+ "basert-connector",
  "chrono",
- "ollama-connector",
  "rusqlite",
  "serde",
  "serde_json",
@@ -229,7 +229,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "ollama-connector",
  "rusqlite",
  "serde",
  "serde_json",
@@ -278,6 +277,7 @@ dependencies = [
  "bagent-rules",
  "bagent-skills",
  "base64",
+ "basert-connector",
  "chrono",
  "codex-connector",
  "dirs",
@@ -285,7 +285,6 @@ dependencies = [
  "futures-util",
  "notify",
  "odoo-connector",
- "ollama-connector",
  "refinery",
  "reqwest",
  "rusqlite",
@@ -306,6 +305,21 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "basert-connector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "futures-core",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "bitflags"
@@ -1499,21 +1513,6 @@ dependencies = [
  "anyhow",
  "reqwest",
  "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ollama-connector"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "futures-core",
- "futures-util",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",

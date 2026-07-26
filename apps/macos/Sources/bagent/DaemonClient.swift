@@ -5,7 +5,7 @@ import AppKit
 
 struct DaemonHealth: Sendable {
     let daemonUp: Bool
-    let ollamaUp: Bool
+    let baseRTUp: Bool
     let model: String
     let classifierModel: String
     let mailConnector: Bool
@@ -61,7 +61,6 @@ struct SkillItem: Identifiable, Decodable, Sendable {
 /// Ephemeral screen context collected by ScreenContextProvider and forwarded to
 /// the daemon in the `/chat` request body. Never persisted to disk on either side.
 struct ScreenContextFields: Sendable {
-    var imagePNGBase64: String?
     var ocrText: String
     var activeApp: String?
     var selectedText: String?
@@ -135,7 +134,7 @@ struct DaemonClient: Sendable {
             req.timeoutInterval = 3
             let (data, response) = try await URLSession.shared.data(for: req)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—",
+                return DaemonHealth(daemonUp: false, baseRTUp: false, model: "—",
                                     classifierModel: "—", mailConnector: false, notesConnector: false,
                                     codexConnector: false, odooConnector: false, whatsappConnector: false)
             }
@@ -169,16 +168,16 @@ struct DaemonClient: Sendable {
                 let whatsapp: WhatsappConnectorResp?
             }
             struct HealthResp: Decodable {
-                let status: String; let ollama: Bool; let model: String
+                let status: String; let basert: Bool; let model: String
                 let classifier_model: String?
                 let connectors: ConnectorResp?
             }
             let h = try JSONDecoder().decode(HealthResp.self, from: data)
             return DaemonHealth(
                 daemonUp: h.status == "ok",
-                ollamaUp: h.ollama,
+                baseRTUp: h.basert,
                 model: h.model,
-                classifierModel: h.classifier_model ?? "qwen2.5:0.5b",
+                classifierModel: h.classifier_model ?? BaseRTLaunchAgent.model,
                 mailConnector:      h.connectors?.mail      ?? false,
                 notesConnector:     h.connectors?.notes     ?? false,
                 codexConnector:     h.connectors?.codex     ?? false,
@@ -186,7 +185,7 @@ struct DaemonClient: Sendable {
                 whatsappConnector:  h.connectors?.whatsapp?.isConnected  ?? false
             )
         } catch {
-            return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—",
+            return DaemonHealth(daemonUp: false, baseRTUp: false, model: "—",
                                 classifierModel: "—", mailConnector: false, notesConnector: false,
                                 codexConnector: false, odooConnector: false, whatsappConnector: false)
         }
@@ -430,8 +429,7 @@ struct DaemonClient: Sendable {
                         let attachment_ids: [String]
                         // Sliding-window conversation history (oldest first)
                         let history: [HistoryTurn]
-                        // Screen context (Phase 7) — ephemeral, never persisted
-                        let screen_image_b64: String?
+                        // OCR/selection context — ephemeral, never persisted
                         let screen_ocr_text: String?
                         let active_app: String?
                         let selected_text: String?
@@ -443,7 +441,6 @@ struct DaemonClient: Sendable {
                         session_id: sessionId,
                         attachment_ids: attachmentIds,
                         history: history,
-                        screen_image_b64: screenContext?.imagePNGBase64,
                         screen_ocr_text: screenContext?.ocrText.isEmpty == false ? screenContext?.ocrText : nil,
                         active_app: screenContext?.activeApp,
                         selected_text: screenContext?.selectedText,

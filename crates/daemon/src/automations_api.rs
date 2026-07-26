@@ -620,7 +620,7 @@ pub(crate) async fn automation_runs(
 
 use crate::agent_exec::{self, EventSink, ExecError, ExecOrigin, ExecOutcome};
 use bagent_automations::AutomationExecutionContext;
-use ollama_connector::Message;
+use basert_connector::Message;
 
 /// Atomically claim execution: exactly one `running` row per automation.
 /// Returns the claimed run or `ActiveRun` when one is already in flight.

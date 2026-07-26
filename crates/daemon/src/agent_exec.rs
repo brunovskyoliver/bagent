@@ -10,8 +10,8 @@
 //! - Unknown or unclassified tools fail closed in unattended runs.
 //! - Approval descriptions identify the originating automation.
 
+use basert_connector::{ChatStreamEvent, Message, ToolCall, ToolDef};
 use futures_util::StreamExt;
-use ollama_connector::{ChatStreamEvent, Message, ToolCall as OllamaToolCall, ToolDef};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -195,7 +195,7 @@ fn escalate(unattended: bool, kind: ToolKind, verdict: ApprovalLevel) -> Approva
 }
 
 /// Build the per-turn tool registry from available connectors. `vision` turns
-/// get no tools — the vision model answers directly from injected context.
+/// get no tools.
 pub(crate) async fn build_tools(state: &AppState, vision: bool) -> Vec<ToolDef> {
     let mut tools: Vec<ToolDef> = Vec::new();
     if vision {
@@ -513,7 +513,7 @@ pub(crate) async fn run_agent_loop(
     let notes = &state.notes;
     let fs_exec = &state.fs;
     let runtime_refs = &state.runtime_refs;
-    let ollama = &state.ollama;
+    let inference = &state.inference;
 
     let mut full_response = String::new();
     let mut approvals_denied: usize = 0;
@@ -521,7 +521,7 @@ pub(crate) async fn run_agent_loop(
 
     if tools.is_empty() {
         // Vision turns / no connectors: single streamed answer, no tools.
-        let token_stream = ollama.chat_stream(model.to_string(), messages.clone());
+        let token_stream = inference.chat_stream(model.to_string(), messages.clone());
         tokio::pin!(token_stream);
         while let Some(result) = token_stream.next().await {
             match result {
@@ -559,11 +559,11 @@ pub(crate) async fn run_agent_loop(
             tools.clone()
         };
         let stream =
-            ollama.chat_stream_with_tools(model.to_string(), messages.clone(), round_tools);
+            inference.chat_stream_with_tools(model.to_string(), messages.clone(), round_tools);
         tokio::pin!(stream);
 
         let mut round_text = String::new();
-        let mut round_calls: Vec<OllamaToolCall> = Vec::new();
+        let mut round_calls: Vec<ToolCall> = Vec::new();
         while let Some(ev) = stream.next().await {
             match ev {
                 Ok(ChatStreamEvent::Delta(token)) => {
@@ -1124,7 +1124,7 @@ pub(crate) async fn run_agent_loop(
                 }
             };
 
-            messages.push(Message::tool_result(fn_name, tool_result));
+            messages.push(Message::tool_result(&call.id, fn_name, tool_result));
         }
     } // end 'agent loop
 

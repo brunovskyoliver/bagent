@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Deterministic task-rating module.
 ///
 /// Classifies user task descriptions into five levels that govern whether the
-/// local Ollama model is sufficient, or whether the Codex external-reasoning
+/// local BaseRT model is sufficient, or whether the Codex external-reasoning
 /// harness should be offered (always with explicit user approval).
 ///
 /// The rating is **purely deterministic** — keyword gates, no LLM calls.
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskLevel {
-    /// Use local Ollama only. One-source, simple operation.
+    /// Use local BaseRT only. One-source, simple operation.
     #[default]
     LocalOnly,
     /// Local model should handle this. Codex unnecessary unless user asks.

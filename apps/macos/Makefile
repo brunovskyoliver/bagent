@@ -27,25 +27,7 @@ run: daemon-dev
 	    pid=$$(cat "$$pid_file" 2>/dev/null || true); \
 	    if [ -n "$$pid" ]; then kill -TERM "$$pid" 2>/dev/null || true; fi; \
 	  fi; \
-	  unload_generate() { \
-	    [ -n "$$1" ] || return 0; \
-	    curl -sS --max-time 10 http://127.0.0.1:11434/api/generate \
-	      -H 'Content-Type: application/json' \
-	      -d "$$(printf '{"model":"%s","prompt":"","stream":false,"keep_alive":0}' "$$1")" \
-	      >/dev/null 2>&1 || true; \
-	  }; \
-	  unload_embed() { \
-	    curl -sS --max-time 10 http://127.0.0.1:11434/api/embeddings \
-	      -H 'Content-Type: application/json' \
-	      -d "$$(printf '{"model":"%s","prompt":"","keep_alive":0}' "$$1")" \
-	      >/dev/null 2>&1 || true; \
-	  }; \
-	  model=$$(defaults read sk.bagent.app bagent.model 2>/dev/null || defaults read bagent bagent.model 2>/dev/null || echo qwen2.5:7b); \
-	  classifier=$$(defaults read sk.bagent.app bagent.classifier_model 2>/dev/null || defaults read bagent bagent.classifier_model 2>/dev/null || echo qwen3:0.6b); \
-	  unload_generate "$$model"; \
-	  unload_generate "$$classifier"; \
-	  unload_generate qwen2.5vl:7b; \
-	  unload_embed bge-m3:latest; \
+	  launchctl bootout "gui/$$(id -u)/com.bagent.basert" >/dev/null 2>&1 || true; \
 	  true; \
 	}; \
 	trap cleanup EXIT INT TERM; \

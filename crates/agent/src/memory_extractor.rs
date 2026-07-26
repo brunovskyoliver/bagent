@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bagent_memory::{InsertParams, MemoryStore};
-use ollama_connector::OllamaClient;
+use basert_connector::BaseRtClient;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -81,13 +81,13 @@ impl ExtractionResult {
 }
 
 pub struct MemoryExtractor {
-    ollama: OllamaClient,
+    inference: BaseRtClient,
     model: String,
 }
 
 impl MemoryExtractor {
-    pub fn new(ollama: OllamaClient, model: String) -> Self {
-        Self { ollama, model }
+    pub fn new(inference: BaseRtClient, model: String) -> Self {
+        Self { inference, model }
     }
 
     /// Extract and store memorable items from a completed turn. Fire-and-forget.
@@ -218,7 +218,10 @@ STRICT EXTRACTION RULES:
 - Return ONLY valid JSON."#
         );
 
-        let raw = self.ollama.generate_json(&self.model, &prompt, 0.0).await?;
+        let raw = self
+            .inference
+            .generate_json(&self.model, &prompt, 0.0)
+            .await?;
         let result: ExtractionResult = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("memory extraction parse error: {e}\nraw: {raw}"))?;
         Ok(result.all_items())
@@ -298,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Ollama + classifier model"]
+    #[ignore = "requires BaseRT + classifier model"]
     fn passive_extraction_returns_empty_for_one_off() {
         // Run with: cargo test -p bagent-agent -- --include-ignored
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -307,14 +310,11 @@ mod tests {
                 use rusqlite::Connection;
                 use std::sync::{Arc, Mutex};
                 let conn = Connection::open_in_memory().unwrap();
-                Arc::new(MemoryStore::new(
-                    Arc::new(Mutex::new(conn)),
-                    OllamaClient::new("http://127.0.0.1:11434"),
-                ))
+                Arc::new(MemoryStore::new(Arc::new(Mutex::new(conn))))
             };
             let extractor = MemoryExtractor::new(
-                OllamaClient::new("http://127.0.0.1:11434"),
-                "qwen2.5:0.5b".to_string(),
+                BaseRtClient::new("http://127.0.0.1:8082/v1", "basert-local"),
+                "basecompute/Qwen3-4B-Instruct-2507".to_string(),
             );
             extractor
                 .run(

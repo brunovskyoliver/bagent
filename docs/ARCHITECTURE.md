@@ -17,9 +17,9 @@
 │  │  Rules Engine · Memory · Audit Log · SQLite          │   │
 │  └──┬──────────┬──────────┬──────────────┬─────────────┘   │
 │     │          │          │              │                   │
-│  Ollama     Codex      Connectors    SQLite DB              │
-│  :11434      CLI      (Mail/Notes    (bagent.db +            │
-│  (local)  subprocess   Odoo/Shell    embeddings)            │
+│  BaseRT     Codex      Connectors    SQLite DB              │
+│  :8082       CLI      (Mail/Notes    (bagent.db + FTS5)      │
+│  (local)  subprocess   Odoo/Shell                            │
 │                        Screen)                               │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -60,7 +60,7 @@
 | Automation (Mail, Notes) | AppleScript/JXA bridge | Phase 4 |
 | Screen Recording | ScreenCaptureKit frames | Phase 7 |
 | Full Disk Access | Mail `.emlx` + `Envelope Index`, Notes SQLite | Phase 4 |
-| Network | Odoo API, Ollama, optional cloud | Phase 3 |
+| Network | Odoo API, BaseRT, optional cloud | Phase 3 |
 | Keychain | API keys, daemon bearer token | Phase 2 |
 
 > Request permissions lazily at first use; explain reason in native `NSAlert` before system prompt appears.
@@ -103,6 +103,9 @@ scheduled automations keep running after the app exits.
   started it. Daemon logs go to `~/Library/Logs/bagent/daemon.log`.
 - Migration: a pre-launchd daemon recorded in `daemon.pid` that launchd does
   not own is SIGTERMed once at app launch.
+- The app also owns `com.bagent.basert`, serving Qwen3-4B on loopback port
+  8082. It survives normal UI exit and is stopped by explicit shutdown. The
+  independent BaseRT service on port 8080 is never touched.
 
 ### Core Crates
 
@@ -111,11 +114,11 @@ crates/
   daemon/        — axum server, startup, port/token mgmt, route handlers
   agent/         — PromptBuilder, ContextPlanner, MemoryExtractor, MailIntent, WindowIntent
   rules/         — rules engine (YAML loader + matcher, hot-reload)
-  memory/        — SQLite read/write, FTS5, embeddings, MemorySelector
+  memory/        — SQLite read/write, FTS5, MemorySelector
   skills/        — SKILL.md loader + selector (repo skills/ dir + app data override)
   attachments/   — file extraction pipeline (text/PDF/image)
   connectors/
-    ollama/      — chat stream, embeddings, generate_json (format:json mode)
+    basert/      — OpenAI-compatible chat SSE, tools, JSON generation
     apple_mail/  — Envelope Index SQLite + emlx parser + AppleScript fallback
     apple_notes/ — NoteStore SQLite + JXA body retrieval
 ```
@@ -138,7 +141,7 @@ GET  /approvals/pending   → 200 [ApprovalRequest]
 GET  /audit          { since?, limit? } → 200 [AuditEntry]
 GET  /connectors     → 200 [ConnectorStatus]
 POST /connectors/{id}/sync  → 200 { queued: true }
-GET  /health         → 200 { status:"ok", version, ollama_up }
+GET  /health         → 200 { status:"ok", model, basert }
 ```
 
 Auth: `Authorization: Bearer <token>` on all requests.
@@ -159,8 +162,9 @@ There is no routing pipeline — it was replaced by an agentic tool-calling loop
 (the model sees native tool definitions and decides what to call). `MODEL_ROUTER.md`
 described the old design and has been removed.
 
-- Local Ollama (`qwen3:8b`) → chat + tool calls; `qwen3:0.6b` → classifiers; `bge-m3` → embeddings.
-- Vision (`qwen2.5vl:7b`) → image/screen turns; these skip tools.
+- Local BaseRT (`basecompute/Qwen3-4B-Instruct-2507`) → chat, tool calls, and classifiers.
+- Retrieval uses SQLite FTS5 only. Screen frames are processed by Apple Vision
+  OCR locally and only extracted text reaches the model; image attachments are rejected.
 - Codex CLI → advanced cross-source tasks, approval-gated.
 - Cloud LLM → opt-in only.
 
@@ -168,14 +172,17 @@ See the "Agentic tool loop" section of `CLAUDE.md` for the loop itself.
 
 ---
 
-## Ollama Integration
+## BaseRT Integration
 
-- Base URL: `http://localhost:11434` (configurable).
-- Endpoints used: `POST /api/chat` (streaming), `POST /api/embeddings`, `GET /api/tags`.
-- Preflight on daemon start: `GET /api/tags` with 2 s timeout; set `ollama_up` flag; expose via `/health`.
-- Streaming: parse `ndjson` lines, emit as SSE tokens upstream.
-- Model selection: stored in `connectors` table config; default `qwen2.5:7b`.
-- Context window management: sliding window of last N tokens; summarize older turns with local model.
+- Base URL: `http://127.0.0.1:8082/v1`; API key: `basert-local`.
+- Endpoints used: `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`,
+  and `POST /v1/models/unload`.
+- Streaming follows OpenAI SSE (`data: {...}` ending in `data: [DONE]`);
+  fragmented tool-call names and arguments are reassembled by index and call ID.
+- The configured model and classifier are both
+  `basecompute/Qwen3-4B-Instruct-2507`.
+- `/embeddings` remains as a compatibility route returning
+  `501 embeddings_disabled`.
 
 ---
 
@@ -191,8 +198,8 @@ not a coding tool. It is invoked only when the deterministic `TaskRater` returns
 
 | Level | Score | Meaning | Example |
 |---|---|---|---|
-| `LocalOnly` | 0–9 | Ollama handles it | "zhrň mi tento email" |
-| `LocalPreferred` | 10–29 | Ollama preferred | "navrhni krátky email" |
+| `LocalOnly` | 0–9 | BaseRT handles it | "zhrň mi tento email" |
+| `LocalPreferred` | 10–29 | BaseRT preferred | "navrhni krátky email" |
 | `CodexCandidate` | 30–59 | May benefit from Codex | "porovnaj dve zmluvy" |
 | `CodexRecommended` | 60–84 | Codex recommended | "priprav brief pre klienta z mailov a Odoo" |
 | `CodexRequired` | 85+ | Codex required | "hromadné odpovede na faktúry po splatnosti" |
@@ -300,11 +307,6 @@ rules:
       connector: mail
     action: ask
 
-  - id: allow-ollama-read
-    match:
-      connector: ollama
-    action: allow
-
   - id: block-root-shell
     match:
       tool: shell_exec
@@ -325,7 +327,7 @@ Before prompt assembly, every chat turn runs through three sequential stages:
 user_turn
   │
   ▼
-ContextPlanner::plan()          — deterministic rules + Ollama JSON-mode fallback
+ContextPlanner::plan()          — deterministic rules + BaseRT JSON-mode fallback
   │  produces ContextPlan { task_type, response_language_hint, needs_memory,
   │                         memory_namespaces, memory_kinds, needs_conversation_recall,
   │                         candidate_skill_names, confidence }
@@ -349,13 +351,12 @@ PromptBuilder::build()          — injects selected skills + memory into prompt
 ## Memory and Indexing
 
 - SQLite with FTS5 virtual tables for full-text search over `messages`, `notes`, `memory_items`.
-- `sqlite-vec` extension for cosine similarity search on embeddings.
-- Embedding model: `bge-m3` via Ollama (multilingual SK/EN).
+- Historical embedding rows remain in SQLite but are not consulted.
 - Per-source namespaces prevent cross-connector bleed.
 - `language` column on every text-storing table (`sk`, `en`, `und`).
-- Retrieval: hybrid BM25×0.35 + cosine×0.45 + importance×0.10 + recency×0.10; per-namespace cap 3; MMR near-dup filter.
+- Retrieval: BM25×0.70 + importance×0.15 + recency×0.15; per-namespace cap 3; near-duplicate text filter.
 - **Memory ledger fields** (V11): `confidence`, `importance`, `status` (`active`/`superseded`/`deleted`), `source` (`passive`/`explicit`/`user_edit`/`import`), `sensitivity` (`normal`/`sensitive`), `subject`, `supersedes_id`.
-- Hard retrieval filter: `status='active'` + `sensitivity='normal'`; explicit/user_edit insertion supersedes conflicting passive items.
+- Hard retrieval filter: `status='active'` + `sensitivity='normal'`; insertion uses normalized exact-text deduplication.
 - Passive extraction gates: `confidence ≥ 0.75`, `importance ≥ 0.60`, no sensitive-text indicators, no one-off content patterns.
 
 ## Skills

@@ -11,7 +11,6 @@ allowed_tools:
 tags:
   - screen
   - ocr
-  - vision
   - accessibility
   - analyze
 ---
@@ -24,18 +23,16 @@ Use this skill when the user asks to see, read, analyze, or find something on th
 
 When screen context is available, the following sections appear in the prompt:
 
-- **Snímka obrazovky** — PNG base64 sent to the vision model (`qwen2.5vl:7b`). Never saved to disk.
 - **Aktívna aplikácia** — Frontmost app name and bundle ID at capture time.
 - **Vybraný text** — Text selected in the focused element (if Accessibility is granted). Absent for password fields.
-- **OCR text z obrazovky** — On-device Vision OCR output (Slovak + English). Less reliable than vision for complex layouts.
+- **OCR text z obrazovky** — On-device Vision OCR output (Slovak + English). Screenshot bytes are discarded locally.
 
 ## Rules
 
 - Never invent UI elements, button labels, or text that are not in the provided context.
-- If the screen image is absent (permission not granted or capture failed), say so honestly — do not guess.
+- If OCR/selection context is absent (permission not granted or capture failed), say so honestly — do not guess.
 - Treat all screen content as `pii: true` — summarize, do not quote raw text verbatim unless the user explicitly asks.
 - Password fields are always excluded from selected-text capture; never comment on password field contents.
-- When the OCR text conflicts with the vision model's interpretation, prefer the vision model's reading.
 
 ## Slovak UI
 

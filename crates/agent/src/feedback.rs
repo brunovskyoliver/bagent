@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ollama_connector::OllamaClient;
+use basert_connector::BaseRtClient;
 use serde::{Deserialize, Serialize};
 
 /// Explicit trigger phrases that cause immediate memory capture.
@@ -49,13 +49,13 @@ pub struct StyleProfile {
 }
 
 pub struct DirectiveExtractor {
-    ollama: OllamaClient,
+    inference: BaseRtClient,
     model: String,
 }
 
 impl DirectiveExtractor {
-    pub fn new(ollama: OllamaClient, model: String) -> Self {
-        Self { ollama, model }
+    pub fn new(inference: BaseRtClient, model: String) -> Self {
+        Self { inference, model }
     }
 
     /// Returns Some(result) if the turn contains an explicit memory trigger.
@@ -73,20 +73,23 @@ impl DirectiveExtractor {
                \"language\": \"sk|en|und\"\n\
              }}"
         );
-        let response = self.ollama.generate_raw(&self.model, &prompt, 0.0).await?;
+        let response = self
+            .inference
+            .generate_raw(&self.model, &prompt, 0.0)
+            .await?;
         let result: DirectiveResult = serde_json::from_str(clean_json(&response))?;
         Ok(Some(result))
     }
 }
 
 pub struct CorrectionClassifier {
-    ollama: OllamaClient,
+    inference: BaseRtClient,
     model: String,
 }
 
 impl CorrectionClassifier {
-    pub fn new(ollama: OllamaClient, model: String) -> Self {
-        Self { ollama, model }
+    pub fn new(inference: BaseRtClient, model: String) -> Self {
+        Self { inference, model }
     }
 
     /// Classifies whether the user turn is correcting the previous assistant turn.
@@ -108,7 +111,10 @@ impl CorrectionClassifier {
                \"confidence\": 0.0\n\
              }}"
         );
-        let response = self.ollama.generate_raw(&self.model, &prompt, 0.0).await?;
+        let response = self
+            .inference
+            .generate_raw(&self.model, &prompt, 0.0)
+            .await?;
         let result: CorrectionResult = serde_json::from_str(clean_json(&response))?;
         Ok(result)
     }

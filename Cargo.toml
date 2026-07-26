@@ -7,7 +7,7 @@ members = [
     "crates/skills",
     "crates/attachments",
     "crates/automations",
-    "crates/connectors/ollama",
+    "crates/connectors/basert",
     "crates/connectors/apple_mail",
     "crates/connectors/apple_notes",
     "crates/connectors/filesystem",
