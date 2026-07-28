@@ -296,6 +296,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "whatsapp-connector",
 ]
@@ -2716,6 +2717,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

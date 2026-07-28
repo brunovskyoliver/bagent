@@ -48,6 +48,7 @@ use whatsapp_connector::{
 
 mod agent_exec;
 mod automations_api;
+mod evidence;
 mod scheduler;
 
 mod embedded {

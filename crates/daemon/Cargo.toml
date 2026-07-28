@@ -30,6 +30,7 @@ serde_json  = "1"
 rusqlite    = { version = "0.31", features = ["bundled"] }
 refinery    = { version = "0.8", features = ["rusqlite"] }
 reqwest     = { version = "0.12", features = ["json", "stream"] }
+url         = { version = "2", features = ["serde"] }
 uuid        = { version = "1", features = ["v4"] }
 anyhow      = "1"
 tracing     = "0.1"
