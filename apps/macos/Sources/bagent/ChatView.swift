@@ -60,6 +60,20 @@ enum NotchStatusDotGeometry {
     }
 }
 
+enum NotchActivityLayout {
+    static let headerHeight: CGFloat = 18
+    static let rowHeight: CGFloat = 22
+    static let maxRowsHeight: CGFloat = 84
+
+    static func extraHeight(activityCount: Int, expanded: Bool) -> CGFloat {
+        guard activityCount > 0 else { return 0 }
+        let rows = expanded
+            ? min(maxRowsHeight, CGFloat(activityCount) * rowHeight)
+            : 0
+        return headerHeight + rows
+    }
+}
+
 private enum NotchOutputLayout {
     static let lineSpacing: CGFloat = 1.5
     static let bottomSlack: CGFloat = 12
@@ -362,7 +376,14 @@ struct NotchWrapView: View {
         let browseExtra: CGFloat = viewModel.historyBrowseIndex == nil ? 0 : 20
         // Tool-status chip also sits above the response text during streaming.
         let toolChipExtra: CGFloat = viewModel.toolStatus == nil ? 0 : 20
-        return min(NotchWrapMetrics.outputMaxBridgeHeight, base + browseExtra + toolChipExtra)
+        let activityExtra = NotchActivityLayout.extraHeight(
+            activityCount: viewModel.latestAssistantMessage?.activities.count ?? 0,
+            expanded: viewModel.isActivityTranscriptExpanded
+        )
+        return min(
+            NotchWrapMetrics.outputMaxBridgeHeight,
+            base + browseExtra + toolChipExtra + activityExtra
+        )
     }
 
     private func estimatedNotchTextHeight(_ text: String, width: CGFloat) -> CGFloat {
@@ -1076,6 +1097,9 @@ struct NotchWrapView: View {
         .onChange(of: viewModel.traceCopiedFlash) {
             refreshSurface()
         }
+        .onChange(of: viewModel.isActivityTranscriptExpanded) {
+            refreshOutputSurfaceIfNeeded(force: true)
+        }
     }
 
     var body: some View {
@@ -1162,7 +1186,6 @@ struct InlineNotchContent: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var placeholderRevealID = UUID()
     @State private var inlineFocusRetryID = UUID()
-    @State private var activityExpanded = false
 
     init(viewModel: ChatViewModel, showsInputLeadingIcon: Bool = true, outputGrowthPhase: Bool = false) {
         self.viewModel = viewModel
@@ -1382,10 +1405,10 @@ struct InlineNotchContent: View {
             ? "\(activities.count) steps completed"
             : "\(activities.count) steps · \(failureCount) failed"
         Button {
-            activityExpanded.toggle()
+            viewModel.isActivityTranscriptExpanded.toggle()
         } label: {
             HStack(spacing: 5) {
-                Image(systemName: activityExpanded ? "chevron.down" : "chevron.right")
+                Image(systemName: viewModel.isActivityTranscriptExpanded ? "chevron.down" : "chevron.right")
                     .font(.system(size: 8, weight: .semibold))
                 Text(streaming && current.status == "running" ? current.title : completedSummary)
                     .lineLimit(1)
@@ -1397,9 +1420,9 @@ struct InlineNotchContent: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(activityExpanded ? "Collapse assistant activity" : "Expand assistant activity")
+        .accessibilityLabel(viewModel.isActivityTranscriptExpanded ? "Collapse assistant activity" : "Expand assistant activity")
 
-        if activityExpanded {
+        if viewModel.isActivityTranscriptExpanded {
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(activities) { activity in

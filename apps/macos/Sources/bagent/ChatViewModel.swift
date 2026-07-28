@@ -329,6 +329,7 @@ final class ChatViewModel: ObservableObject {
     /// True while uploading a file to the daemon.
     @Published var isUploadingAttachment = false
     @Published var streamingAssistantMessageId: UUID? = nil
+    @Published var isActivityTranscriptExpanded = false
 
     /// Set to true by NotchWindowController before expanding so the pill
     /// animates to its hover state before the chat panel appears.
@@ -1579,6 +1580,7 @@ final class ChatViewModel: ObservableObject {
         Task {
             let assistantMsg = ChatMessage(role: .assistant, content: "")
             messages.append(assistantMsg)
+            isActivityTranscriptExpanded = false
             streamingAssistantMessageId = assistantMsg.id
             let idx = messages.count - 1
 

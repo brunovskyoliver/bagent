@@ -63,4 +63,23 @@ final class StreamingPresentationTests: XCTestCase {
         XCTAssertGreaterThan(point.x, 260 + 221)
         XCTAssertLessThan(point.y, 39 + 96 / 2)
     }
+
+    func testExpandedActivityTranscriptContributesToBridgeHeight() {
+        XCTAssertEqual(
+            NotchActivityLayout.extraHeight(activityCount: 0, expanded: true),
+            0
+        )
+        XCTAssertEqual(
+            NotchActivityLayout.extraHeight(activityCount: 2, expanded: false),
+            NotchActivityLayout.headerHeight
+        )
+        XCTAssertEqual(
+            NotchActivityLayout.extraHeight(activityCount: 2, expanded: true),
+            NotchActivityLayout.headerHeight + 2 * NotchActivityLayout.rowHeight
+        )
+        XCTAssertEqual(
+            NotchActivityLayout.extraHeight(activityCount: 20, expanded: true),
+            NotchActivityLayout.headerHeight + NotchActivityLayout.maxRowsHeight
+        )
+    }
 }
