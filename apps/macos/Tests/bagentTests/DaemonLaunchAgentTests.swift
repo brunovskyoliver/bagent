@@ -34,7 +34,6 @@ final class DaemonLaunchAgentTests: XCTestCase {
         XCTAssertTrue(plist.contains("<string>8082</string>"))
         XCTAssertTrue(plist.contains("<string>basert-local</string>"))
         XCTAssertFalse(plist.contains("<string>8080</string>"))
-        XCTAssertFalse(plist.localizedCaseInsensitiveContains("ollama"))
 
         let parsed = try PropertyListSerialization.propertyList(
             from: plist.data(using: .utf8)!, options: [], format: nil

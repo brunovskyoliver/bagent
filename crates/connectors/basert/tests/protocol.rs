@@ -1,5 +1,5 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
     http::{HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
@@ -153,4 +153,30 @@ async fn surfaces_openai_error_payloads() {
 
     let error = stream.next().await.unwrap().unwrap_err().to_string();
     assert!(error.contains("context is too long"), "{error}");
+}
+
+#[tokio::test]
+async fn preserves_utf8_split_across_transport_chunks() {
+    let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"Dobrý deň 👋\"}}]}\n\n\
+                   data: [DONE]\n\n";
+    let bytes = payload.as_bytes();
+    let split = payload.find('ý').unwrap() + 1;
+    let chunks = vec![
+        Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(&bytes[..split])),
+        Ok(Bytes::copy_from_slice(&bytes[split..])),
+    ];
+    let response = Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap();
+    let (base_url, _) = spawn_server(response).await;
+    let client = BaseRtClient::new(base_url, "test-key");
+    let stream = client.chat_stream("model".into(), vec![Message::user("hello")]);
+    tokio::pin!(stream);
+    let mut content = String::new();
+    while let Some(delta) = stream.next().await {
+        content.push_str(&delta.unwrap());
+    }
+    assert_eq!(content, "Dobrý deň 👋");
 }

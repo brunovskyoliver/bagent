@@ -4,11 +4,15 @@ import PackageDescription
 let package = Package(
     name: "bagent",
     platforms: [.macOS(.v14)],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/swiftlang/swift-markdown.git", from: "0.8.0"),
+    ],
     targets: [
         .executableTarget(
             name: "bagent",
-            dependencies: [],
+            dependencies: [
+                .product(name: "Markdown", package: "swift-markdown"),
+            ],
             path: "Sources/bagent",
             linkerSettings: [
                 .linkedFramework("Carbon"),

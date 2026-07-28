@@ -13,6 +13,7 @@
 use basert_connector::{ChatStreamEvent, Message, ToolCall, ToolCallFunction, ToolDef};
 use futures_util::StreamExt;
 use serde_json::json;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 use bagent_rules::{ApprovalLevel, RuleEngine};
@@ -678,6 +679,7 @@ pub(crate) async fn run_agent_loop(
     let mut full_response = String::new();
     let mut approvals_denied: usize = 0;
     let mut tool_calls_used: usize = 0;
+    let mut transcript_sources: Vec<TranscriptSource> = Vec::new();
 
     let user_message = messages
         .iter()
@@ -946,7 +948,19 @@ pub(crate) async fn run_agent_loop(
             let fn_name = &call.function.name;
             let args = &call.function.arguments;
             tracing::info!("tool loop call {}: {} {:?}", tool_calls_used, fn_name, args);
+            let activity_id = format!("tool:{}", call.id);
+            let _ = sink
+                .emit(json!({
+                    "type": "activity_started",
+                    "id": activity_id,
+                    "kind": activity_kind(fn_name),
+                    "tool": fn_name,
+                    "title": activity_title(fn_name),
+                    "detail": args["query"].as_str().or(args["url"].as_str()),
+                }))
+                .await;
             let _ = sink.emit(json!({"type":"tool_call","tool": fn_name})).await;
+            let activity_started = Instant::now();
             audit_fs(
                 db,
                 "tool_call",
@@ -955,7 +969,7 @@ pub(crate) async fn run_agent_loop(
 
             let tool_kind = classify_tool(fn_name);
 
-            let tool_result: String = if tool_calls_used > MAX_TOOL_CALLS {
+            let mut tool_result: String = if tool_calls_used > MAX_TOOL_CALLS {
                 "Tool budget exhausted — answer now using what you have.".to_string()
             } else if origin.unattended() && tool_kind.is_none() {
                 // Fail closed: unattended runs never execute unmapped operations.
@@ -1474,6 +1488,15 @@ pub(crate) async fn run_agent_loop(
             };
 
             let tool_succeeded = mail_tool_succeeded(fn_name, &tool_result);
+            let activity_succeeded = ![
+                "error:",
+                "blocked by rules",
+                "not approved",
+                "unavailable",
+                "unknown tool",
+            ]
+            .iter()
+            .any(|marker| tool_result.to_lowercase().contains(marker));
             if fn_name == "mail_read" && tool_succeeded {
                 if let Some(rowid) = args["rowid"].as_i64() {
                     if mail_read_rowids.insert(rowid) {
@@ -1487,6 +1510,45 @@ pub(crate) async fn run_agent_loop(
                 mail_reads_completed,
                 desired_mail_reads,
             );
+            // Search queries remain in the activity transcript. Only pages the
+            // agent actually opened become trusted/clickable sources.
+            if fn_name == "web_fetch" {
+                for source in extract_web_sources(&tool_result) {
+                    let position = if let Some(index) = transcript_sources
+                        .iter()
+                        .position(|known| known.url == source.url)
+                    {
+                        index + 1
+                    } else {
+                        transcript_sources.push(source.clone());
+                        transcript_sources.len()
+                    };
+                    let _ = sink
+                        .emit(json!({
+                            "type": "source_discovered",
+                            "id": source.id,
+                            "title": source.title,
+                            "url": source.url,
+                            "domain": source.domain,
+                        }))
+                        .await;
+                    tool_result.push_str(&format!(
+                        "\nCitation [{position}] maps to {} ({})",
+                        source.title, source.url
+                    ));
+                }
+            }
+            let _ = sink
+                .emit(json!({
+                    "type": "activity_completed",
+                    "id": activity_id,
+                    "kind": activity_kind(fn_name),
+                    "tool": fn_name,
+                    "title": activity_title(fn_name),
+                    "status": if activity_succeeded { "completed" } else { "failed" },
+                    "duration_ms": activity_started.elapsed().as_millis() as u64,
+                }))
+                .await;
             messages.push(Message::tool_result(&call.id, fn_name, tool_result));
         }
         if let Some(guidance) = batch_followup_guidance {
@@ -1503,6 +1565,85 @@ pub(crate) async fn run_agent_loop(
         tool_calls_used,
         approvals_denied,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptSource {
+    id: String,
+    title: String,
+    url: String,
+    domain: String,
+}
+
+fn activity_kind(tool: &str) -> &'static str {
+    match tool {
+        "web_search" | "web_fetch" => "web",
+        t if t.starts_with("mail_") => "mail",
+        t if t.starts_with("filesystem_") => "files",
+        t if t.starts_with("odoo_") => "odoo",
+        t if t.starts_with("whatsapp_") => "whatsapp",
+        t if t.starts_with("notes_") => "notes",
+        _ => "tool",
+    }
+}
+
+fn activity_title(tool: &str) -> &'static str {
+    match tool {
+        "web_search" => "Searching the web",
+        "web_fetch" => "Reading a web page",
+        "mail_search" => "Searching Mail",
+        "mail_list_inbox" => "Reading the inbox",
+        "mail_read" => "Reading a message",
+        "mail_open" => "Opening a message",
+        "filesystem_search_files" => "Searching files",
+        "filesystem_read_text" => "Reading a file",
+        "odoo_search_partners"
+        | "odoo_my_invoices"
+        | "odoo_my_helpdesk_tickets"
+        | "odoo_get_record" => "Reading Odoo",
+        "whatsapp_list_chats" | "whatsapp_chat_messages" => "Reading WhatsApp",
+        _ => "Using a tool",
+    }
+}
+
+fn extract_web_sources(result: &str) -> Vec<TranscriptSource> {
+    let mut out = Vec::new();
+    for line in result.lines() {
+        let candidate = if let Some(url) = line.strip_prefix("Source: ") {
+            Some((url.trim(), url.trim()))
+        } else {
+            let parts = line.split(" | ").map(str::trim).collect::<Vec<_>>();
+            (parts.len() >= 2 && parts[1].starts_with("http")).then_some((parts[0], parts[1]))
+        };
+        let Some((title, raw_url)) = candidate else {
+            continue;
+        };
+        let Ok(url) = reqwest::Url::parse(raw_url) else {
+            continue;
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            continue;
+        }
+        let canonical = url.as_str().to_string();
+        if out
+            .iter()
+            .any(|source: &TranscriptSource| source.url == canonical)
+        {
+            continue;
+        }
+        let domain = url.host_str().unwrap_or_default().to_string();
+        out.push(TranscriptSource {
+            id: format!("src-{}", &sha256_str(&canonical)[..12]),
+            title: if title == raw_url {
+                domain.clone()
+            } else {
+                title.to_string()
+            },
+            url: canonical,
+            domain,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1719,5 +1860,19 @@ mod tests {
         // Attended behavior unchanged.
         assert!(matches!(escalate(false, ToolKind::SideEffect, Auto), Auto));
         assert!(matches!(escalate(false, ToolKind::ReadOnly, Ask), Ask));
+    }
+
+    #[test]
+    fn web_sources_are_validated_and_deduplicated() {
+        let result = "Example | https://example.com/a | Snippet\n\
+                      Duplicate | https://example.com/a | Again\n\
+                      Source: https://docs.example.org/page\n\
+                      Bad | javascript:alert(1) | no";
+        let sources = extract_web_sources(result);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].title, "Example");
+        assert_eq!(sources[0].domain, "example.com");
+        assert_eq!(sources[1].domain, "docs.example.org");
+        assert!(sources.iter().all(|source| source.id.starts_with("src-")));
     }
 }

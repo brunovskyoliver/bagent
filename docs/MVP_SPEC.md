@@ -1,6 +1,6 @@
 # MVP Specification
 
-The MVP delivers a functional, local-first assistant for one primary use case: **summarize and draft replies to Slovak and English emails, running entirely on-device with Ollama**.
+The MVP delivers a functional, local-first assistant for one primary use case: **summarize and draft replies to Slovak and English emails, running entirely on-device with BaseRT**.
 
 ---
 
@@ -9,7 +9,7 @@ The MVP delivers a functional, local-first assistant for one primary use case: *
 **In MVP:**
 - Notch / menu-bar UI with chat panel.
 - Rust backend daemon with local HTTP/SSE IPC.
-- Ollama chat (streaming, model picker).
+- BaseRT chat (streaming, model picker).
 - Read-only Apple Mail summaries.
 - Slovak email summarization with formal tone.
 - Approval framework scaffold (modal + audit — for cloud LLM opt-in decision in MVP).
@@ -68,7 +68,7 @@ The MVP delivers a functional, local-first assistant for one primary use case: *
 ```
 
 - Panel slides down from notch (150 ms ease-out).
-- Model picker (bottom right) lists installed Ollama models.
+- Model picker (bottom right) lists installed BaseRT models.
 - `⌘↩` sends; `Escape` collapses.
 - Typing indicator: animated dots when daemon is processing.
 - Stop button replaces send during streaming.
@@ -102,7 +102,7 @@ The MVP delivers a functional, local-first assistant for one primary use case: *
 
 Tabs:
 1. **General**: language preference (Slovak / English / Auto), hotkey config.
-2. **Models**: Ollama model picker, cloud LLM toggle + API key (SecureField → Keychain).
+2. **Models**: BaseRT model picker, cloud LLM toggle + API key (SecureField → Keychain).
 3. **Mail**: Full Disk Access status, inbox selection, sync now button.
 4. **Rules**: YAML text editor (read-only in MVP; editable in Phase 5), reset to defaults.
 5. **Audit**: scrollable list of recent audit entries, filter by action type.
@@ -114,7 +114,7 @@ Tabs:
 
 ```
 GET  /health
-     → { "status": "ok", "version": "0.1.0", "ollama_up": true, "db_ok": true }
+     → { "status": "ok", "version": "0.1.0", "basert_up": true, "db_ok": true }
 
 POST /chat
      body: { "messages": [{"role":"user","content":"..."}], "session_id": "uuid" }
@@ -151,9 +151,9 @@ POST /connectors/apple_mail/sync
 3. `mail_list_inbox(unread_only: true, limit: 10)` called (auto — read-only).
 4. For each message: `mail_get_message(id)` called (auto).
 5. Prompt assembled with Slovak summarization template.
-6. Ollama `qwen2.5:7b` generates streaming summary.
+6. BaseRT `basecompute/Qwen3-4B-Instruct-2507` generates the streaming summary.
 7. Response streamed to UI.
-8. Audit entry: action=`model_invoke`, model=`qwen2.5:7b`, language=`sk`, connector=`apple_mail`.
+8. Audit entry records the configured BaseRT model, language, and connector.
 
 **Expected output format:**
 ```
@@ -268,7 +268,7 @@ Miroslav Horváth
 ## Acceptance Criteria for MVP
 
 - [ ] App launches; notch panel appears; `⌥Space` toggles it.
-- [ ] Ollama `qwen2.5:7b` responds in < 1 s TTFT on M-series Mac.
+- [ ] The configured BaseRT model responds in < 1 s TTFT on an M-series Mac.
 - [ ] Slovak diacritics intact in all 3 fixtures (zero corrupted characters).
 - [ ] `faktúra` not replaced with `invoice` in Slovak summaries.
 - [ ] Approval modal appears for cloud LLM call; auto-denies after 60 s timeout.

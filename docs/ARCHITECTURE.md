@@ -42,8 +42,12 @@
 
 ### Chat View
 
-- `SwiftUI.TextEditor` for multi-line input, `ScrollView` with streaming token append for output.
-- SSE stream from daemon: each `data:` chunk appended to `@Published var tokens: [String]`.
+- The daemon emits semantic SSE events for answer deltas, activity lifecycle,
+  retained sources, approvals, errors, and completion.
+- `AdaptiveStreamPresenter` separates BaseRT transport chunks from the displayed
+  prefix, revealing complete words at an adaptive cadence with bounded catch-up.
+- Each assistant message owns its canonical text, displayed prefix, activity
+  transcript, and validated HTTP(S) sources for the current in-memory session.
 
 ### Approval Modals
 
@@ -130,9 +134,9 @@ crates/
 ### MVP — Local HTTP + SSE
 
 ```
-POST /chat           { messages, context, rules_override? }
-                     → 200 SSE stream: data: {"token":"…"}\n\n
-                     → 200 SSE stream: data: {"done":true,"tool_calls":[…]}\n\n
+POST /chat           { message, model, history, context }
+                     → 200 SSE: token/activity_started/activity_completed
+                     → 200 SSE: source_discovered/approval_requested/error/done
 
 POST /approve        { approval_id, decision: "allow"|"deny", reason? }
                      → 200 { ok: true }
@@ -178,7 +182,8 @@ See the "Agentic tool loop" section of `CLAUDE.md` for the loop itself.
 - Endpoints used: `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`,
   and `POST /v1/models/unload`.
 - Streaming follows OpenAI SSE (`data: {...}` ending in `data: [DONE]`);
-  fragmented tool-call names and arguments are reassembled by index and call ID.
+  fragmented UTF-8 and tool-call names/arguments are reassembled before semantic
+  transcript events cross the daemon-to-app seam.
 - The configured model and classifier are both
   `basecompute/Qwen3-4B-Instruct-2507`.
 - `/embeddings` remains as a compatibility route returning

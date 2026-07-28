@@ -1146,6 +1146,7 @@ struct InlineNotchContent: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var placeholderRevealID = UUID()
     @State private var inlineFocusRetryID = UUID()
+    @State private var activityExpanded = false
 
     init(viewModel: ChatViewModel, showsInputLeadingIcon: Bool = true, outputGrowthPhase: Bool = false) {
         self.viewModel = viewModel
@@ -1335,26 +1336,98 @@ struct InlineNotchContent: View {
                 }
                 .transition(.opacity)
             }
-            // Action chip: which tool the model is using, visible through streaming.
-            if let status = viewModel.toolStatus {
-                Text(status)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                    .lineLimit(1)
-                    .transition(.opacity)
-                    .animation(.easeOut(duration: 0.18), value: viewModel.toolStatus)
+            if let message = viewModel.latestAssistantMessage,
+               !message.activities.isEmpty {
+                activityTranscript(message.activities, streaming: viewModel.isLatestAssistantStreaming)
             }
             LatestAssistantOutputScrollView(
                 text: text,
                 messageId: viewModel.latestAssistantMessageId,
                 isStreaming: viewModel.isLatestAssistantStreaming,
                 growthPhase: outputGrowthPhase,
-                reduceMotion: reduceMotion
+                reduceMotion: reduceMotion,
+                sources: viewModel.latestAssistantMessage?.sources ?? []
             )
             .frame(maxWidth: .infinity)
             .frame(maxHeight: .infinity)
             .accessibilityLabel("Latest assistant response")
             .accessibilityValue(text)
+            if let sources = viewModel.latestAssistantMessage?.sources, !sources.isEmpty {
+                sourceLinks(sources)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func activityTranscript(_ activities: [TurnActivity], streaming: Bool) -> some View {
+        let current = activities.last(where: { $0.status == "running" }) ?? activities.last!
+        let failureCount = activities.filter { $0.status == "failed" }.count
+        let completedSummary = failureCount == 0
+            ? "\(activities.count) steps completed"
+            : "\(activities.count) steps · \(failureCount) failed"
+        Button {
+            activityExpanded.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: activityExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(streaming && current.status == "running" ? current.title : completedSummary)
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+                if streaming && current.status == "running" { ProgressView().controlSize(.mini) }
+            }
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(activityExpanded ? "Collapse assistant activity" : "Expand assistant activity")
+
+        if activityExpanded {
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(activities) { activity in
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            Image(systemName: activity.status == "failed"
+                                ? "exclamationmark.circle"
+                                : (activity.status == "running" ? "circle.dotted" : "checkmark.circle"))
+                                .foregroundStyle(activity.status == "failed" ? Color.orange : NotchWrapMetrics.notchTextSecondary)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(activity.title)
+                                if let detail = activity.detail, !detail.isEmpty {
+                                    Text(detail).foregroundStyle(NotchWrapMetrics.notchTextSecondary).lineLimit(1)
+                                }
+                            }
+                            Spacer(minLength: 2)
+                            if let ms = activity.durationMs {
+                                Text(String(format: "%.1fs", Double(ms) / 1000))
+                                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .font(.system(size: 9.5))
+            .padding(.leading, 2)
+            .frame(maxHeight: 84)
+        }
+    }
+
+    private func sourceLinks(_ sources: [DaemonClient.TranscriptSource]) -> some View {
+        HStack(spacing: 5) {
+            Text("Sources")
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            ForEach(Array(sources.prefix(6).enumerated()), id: \.element.id) { index, source in
+                Button("[\(index + 1)]") {
+                    NSWorkspace.shared.open(source.url)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .help("\(source.title) — \(source.domain)")
+                .accessibilityLabel("Open source \(index + 1), \(source.title)")
+            }
         }
     }
 
@@ -1389,6 +1462,7 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
     let isStreaming: Bool
     let growthPhase: Bool
     let reduceMotion: Bool
+    let sources: [DaemonClient.TranscriptSource]
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = UserTrackingScrollView()
@@ -1419,6 +1493,7 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
         textView.autoresizingMask = [.width]
         textView.backgroundColor = .clear
         textView.insertionPointColor = .white
+        textView.delegate = context.coordinator
 
         scrollView.documentView = textView
         context.coordinator.scrollView = scrollView
@@ -1444,6 +1519,14 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
         }
 
         coordinator.growthPhase = growthPhase
+        let sourceIDs = sources.map(\.id)
+        if coordinator.sourceIDs != sourceIDs {
+            coordinator.sourceIDs = sourceIDs
+            coordinator.sources = sources
+            coordinator.lastText = nil
+            coordinator.finalizedSource = ""
+            coordinator.finalizedRendered = 0
+        }
         if coordinator.lastText != text {
             coordinator.lastText = text
             coordinator.applyText(text)
@@ -1466,18 +1549,20 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, NSTextViewDelegate {
         weak var scrollView: NSScrollView?
         weak var textView: NSTextView?
         var messageId: UUID?
         var lastText: String?
         var userScrolledAway = false
         var growthPhase = false
+        var sources: [DaemonClient.TranscriptSource] = []
+        var sourceIDs: [String] = []
         private var lastClipSize: NSSize = .zero
         // Source text up to (and incl.) the last rendered "\n", and the UTF-16
         // length its render occupies in the text storage.
-        private var finalizedSource = ""
-        private var finalizedRendered = 0
+        fileprivate var finalizedSource = ""
+        fileprivate var finalizedRendered = 0
 
         /// Incremental streaming render. `NotchMarkdown` styles are strictly
         /// line-scoped, so lines before the last newline never restyle as new
@@ -1491,14 +1576,40 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
                 finalizedRendered = 0
             }
             let tail = String(text.dropFirst(finalizedSource.count))
+            let renderedTail = NSMutableAttributedString(
+                attributedString: NotchMarkdown.attributedString(tail)
+            )
+            decorateCitations(renderedTail)
             storage.replaceCharacters(
                 in: NSRange(location: finalizedRendered, length: storage.length - finalizedRendered),
-                with: NotchMarkdown.attributedString(tail)
+                with: renderedTail
             )
             if let nl = tail.lastIndex(of: "\n") {
                 let completed = String(tail[...nl])
                 finalizedSource += completed
                 finalizedRendered += NotchMarkdown.attributedString(completed).length
+            }
+        }
+
+        private func decorateCitations(_ output: NSMutableAttributedString) {
+            guard !sources.isEmpty else { return }
+            let nsText = output.string as NSString
+            let regex = try? NSRegularExpression(pattern: #"\[(\d+)\]"#)
+            regex?.enumerateMatches(
+                in: output.string,
+                range: NSRange(location: 0, length: nsText.length)
+            ) { match, _, _ in
+                guard let match, match.numberOfRanges == 2 else { return }
+                let number = Int(nsText.substring(with: match.range(at: 1))) ?? 0
+                guard sources.indices.contains(number - 1) else { return }
+                output.addAttributes(
+                    [
+                        .link: sources[number - 1].url,
+                        .foregroundColor: NSColor.controlAccentColor,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    ],
+                    range: match.range
+                )
             }
         }
 
@@ -1580,6 +1691,26 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
             guard abs(clipView.bounds.origin.y - targetY) > 0.5 else { return }
             clipView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
             scrollView.reflectScrolledClipView(clipView)
+        }
+
+        func textView(
+            _ textView: NSTextView,
+            clickedOnLink link: Any,
+            at charIndex: Int
+        ) -> Bool {
+            let url: URL?
+            if let value = link as? URL {
+                url = value
+            } else if let value = link as? String {
+                url = URL(string: value)
+            } else {
+                url = nil
+            }
+            guard let url,
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? "")
+            else { return true }
+            NSWorkspace.shared.open(url)
+            return true
         }
     }
 }

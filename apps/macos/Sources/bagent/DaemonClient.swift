@@ -272,8 +272,28 @@ struct DaemonClient: Sendable {
         let truncated: Bool
     }
 
+    struct ActivityEvent: Sendable {
+        let id: String
+        let kind: String
+        let tool: String?
+        let title: String
+        let detail: String?
+        let status: String?
+        let durationMs: Int?
+    }
+
+    struct TranscriptSource: Identifiable, Sendable, Equatable {
+        let id: String
+        let title: String
+        let url: URL
+        let domain: String
+    }
+
     enum ChatEvent: Sendable {
         case token(String)
+        case activityStarted(ActivityEvent)
+        case activityCompleted(ActivityEvent)
+        case sourceDiscovered(TranscriptSource)
         case debugTrace(DebugTraceSummary)
         case memorySaved(id: String)
         case approvalRequested(id: String, tool: String, description: String?)
@@ -477,6 +497,33 @@ struct DaemonClient: Sendable {
                         case "token":
                             if let content = event.content {
                                 continuation.yield(.token(content))
+                            }
+                        case "activity_started", "activity_completed":
+                            if let id = event.id, let kind = event.kind,
+                               let title = event.title {
+                                let activity = ActivityEvent(
+                                    id: id,
+                                    kind: kind,
+                                    tool: event.tool,
+                                    title: title,
+                                    detail: event.detail,
+                                    status: event.status,
+                                    durationMs: event.duration_ms
+                                )
+                                continuation.yield(event.type == "activity_started"
+                                    ? .activityStarted(activity)
+                                    : .activityCompleted(activity))
+                            }
+                        case "source_discovered":
+                            if let id = event.id, let title = event.title,
+                               let rawURL = event.url, let url = URL(string: rawURL),
+                               ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                                continuation.yield(.sourceDiscovered(TranscriptSource(
+                                    id: id,
+                                    title: title,
+                                    url: url,
+                                    domain: event.domain ?? url.host() ?? ""
+                                )))
                             }
                         case "memory_saved":
                             if let id = event.id {
@@ -1364,6 +1411,11 @@ private struct SSEEvent: Decodable {
     let session_id: String?
     let tool: String?
     let description: String?
+    let title: String?
+    let detail: String?
+    let status: String?
+    let duration_ms: Int?
+    let domain: String?
     let attachments: [DaemonClient.MailAttachmentRef]?
     // mail_found event fields
     let rowid: Int?

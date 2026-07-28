@@ -1,4 +1,5 @@
 import AppKit
+import Markdown
 
 /// Lightweight markdown → NSAttributedString renderer for the notch output view.
 ///
@@ -8,9 +9,8 @@ import AppKit
 /// render path (`attributedText`) and the measurement path
 /// (`NotchOutputLayout.textHeight`) so the panel keeps auto-fitting.
 ///
-/// Supported: bold, italic, strikethrough, inline code, links, ATX headers,
-/// and unordered/ordered lists. Fenced code blocks are intentionally not
-/// handled. Unclosed inline markers render verbatim (live-stream friendly).
+/// Chat-focused CommonMark rendering backed by swift-markdown parsing, with
+/// TextKit attributes kept local so notch measurement and rendering agree.
 enum NotchMarkdown {
     // Base body style — must mirror the plain-text notch style exactly.
     private static let bodySize: CGFloat = 13
@@ -37,14 +37,37 @@ enum NotchMarkdown {
 
     static func attributedString(_ text: String) -> NSAttributedString {
         if text == lastInput, let lastOutput { return lastOutput }
+        // swift-markdown owns syntax and nesting. Its formatter gives the
+        // notch renderer one canonical CommonMark shape, including partial
+        // streaming input; the TextKit pass below only assigns visual styles.
+        let document = Document(parsing: text)
+        var formatter = MarkupFormatter()
+        formatter.visit(document)
+        var normalized = formatter.result
+        while normalized.hasSuffix("\n") { normalized.removeLast() }
+        if text.hasSuffix("\n") { normalized.append("\n") }
         let out = NSMutableAttributedString()
-        let lines = text.components(separatedBy: "\n")
+        let lines = normalized.components(separatedBy: "\n")
+        var fenced = false
         for (idx, line) in lines.enumerated() {
-            out.append(renderLine(line))
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                fenced.toggle()
+            } else if fenced {
+                out.append(NSAttributedString(
+                    string: line,
+                    attributes: codeAttributes(
+                        Inline(size: bodySize, headerBold: false),
+                        paragraph: baseParagraph()
+                    )
+                ))
+            } else {
+                out.append(renderLine(line))
+            }
             if idx != lines.count - 1 {
                 out.append(NSAttributedString(string: "\n"))
             }
         }
+        decorateBareLinks(out)
         lastInput = text
         lastOutput = out
         return out
@@ -53,6 +76,18 @@ enum NotchMarkdown {
     // MARK: - Block pass
 
     private static func renderLine(_ line: String) -> NSAttributedString {
+        if line.hasPrefix("> ") {
+            let para = baseParagraph()
+            para.headIndent = listIndentStep
+            para.firstLineHeadIndent = listIndentStep
+            var style = Inline(size: bodySize, headerBold: false)
+            let result = NSMutableAttributedString(
+                string: "▎ ",
+                attributes: attributes(style, paragraph: para)
+            )
+            result.append(parseInline(String(line.dropFirst(2)), style: &style, paragraph: para))
+            return result
+        }
         // Header: #{1,6} followed by space.
         if let (level, rest) = headerMatch(line) {
             let size: CGFloat = level <= 1 ? 17 : (level == 2 ? 15 : 13.5)
@@ -285,7 +320,29 @@ enum NotchMarkdown {
         guard let urlEnd = findClose(chars, from: labelEnd + 2, char: ")") else { return nil }
         let label = String(chars[(from + 1)..<labelEnd])
         let url = String(chars[(labelEnd + 2)..<urlEnd])
-        guard !url.isEmpty else { return nil }
+        guard let parsed = URL(string: url),
+              ["http", "https"].contains(parsed.scheme?.lowercased() ?? "")
+        else { return nil }
         return (label, url, urlEnd + 1)
+    }
+
+    private static func decorateBareLinks(_ output: NSMutableAttributedString) {
+        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        else { return }
+        let range = NSRange(location: 0, length: output.length)
+        detector.enumerateMatches(in: output.string, options: [], range: range) { match, _, _ in
+            guard let match, let url = match.url,
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+                  output.attribute(.link, at: match.range.location, effectiveRange: nil) == nil
+            else { return }
+            output.addAttributes(
+                [
+                    .foregroundColor: linkColor,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    .link: url,
+                ],
+                range: match.range
+            )
+        }
     }
 }

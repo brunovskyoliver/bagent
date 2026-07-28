@@ -101,6 +101,15 @@ All points, in `NotchWrapMetrics`:
 Never exceed `maxWingWidth` / `maxBridgeHeight` — they define the fixed panel
 frame, and anything larger is clipped rather than shown.
 
+### Assistant transcript
+
+- While work is running, the output surface shows one gray current-action row.
+- Completed activity collapses to a one-line step count and expands on click
+  into chronological tool/search rows; it never exposes hidden chain-of-thought.
+- The answer streams independently at an adaptive word cadence.
+- Retained web sources appear as numbered links. Inline `[N]` citations are
+  clickable only when `N` maps to a daemon-validated HTTP(S) source.
+
 ---
 
 ## Animation

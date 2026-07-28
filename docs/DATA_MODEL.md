@@ -188,7 +188,7 @@ Configuration and sync state for each connector instance.
 
 ```sql
 CREATE TABLE connectors (
-    id           TEXT PRIMARY KEY,            -- e.g. 'apple_mail', 'odoo_prod', 'ollama'
+    id           TEXT PRIMARY KEY,            -- e.g. 'apple_mail', 'odoo_prod', 'basert'
     kind         TEXT NOT NULL,               -- connector type enum
     display_name TEXT NOT NULL,
     enabled      INTEGER NOT NULL DEFAULT 1,

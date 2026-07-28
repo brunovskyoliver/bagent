@@ -18,13 +18,6 @@ Check off items as they are completed.
   - [ ] CPU/memory at 1 fps frame capture
   - [ ] CPU/memory at 5 fps
   - [ ] Confirm black-frame handling for DRM content
-- [x] Benchmark Ollama (Slovak) — see `docs/spikes/ollama.md`:
-  - [x] Latency on M5: TTFT ~269ms warm, ~26 tok/s (llama3.1:8b)
-  - [x] Roundtrip test: **llama3.1 FAILS** (62% diacritics, mixes Czech); **qwen2.5:7b PASSES** (16/16)
-  - [x] Invoice fixture: all 3 SK fixtures pass with qwen2.5:7b — DPH/faktúra/splatnosť preserved, zero Czech
-  - [x] `ollama pull qwen2.5:7b` — done; confirmed default model
-  - [ ] `ollama pull bge-m3` — needed for Phase 3 embeddings
-  - [ ] Benchmark qwen2.5:7b cold start time
 - [x] Snapshot Apple Mail SQLite schema — see `docs/spikes/apple_mail.md`:
   - [x] `Envelope Index` confirmed at `~/Library/Mail/V10/MailData/Envelope Index`
   - [x] Unread messages query confirmed (joins messages + subjects + addresses)
@@ -115,42 +108,39 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
 - [x] `crates/daemon/` (`bagentd`): axum 0.7 server on `127.0.0.1:0`
   - [x] Write port to `~/Library/Application Support/bagent/daemon.port`
   - [x] Generate bearer token on first run; written to `daemon.token` (Keychain: Phase 10)
-  - [x] `GET /health` endpoint (checks Ollama up/down, returns model)
-  - [x] `POST /chat` — SSE streaming to Ollama with ndjson → `data:` translation
+  - [x] `GET /health` endpoint (checks BaseRT up/down, returns model)
+  - [x] `POST /chat` — typed SSE events backed by BaseRT OpenAI-compatible streaming
   - [x] Bearer token auth middleware
 - [x] SQLite with refinery migrations (`migrations/V1__initial.sql`, `V2__full_schema.sql`)
   - [x] Schema: `audit_entries`, `approvals`, `messages`, `sessions`, `connectors`
 - [x] Swift `DaemonClient` — `DaemonClient.swift`
   - [x] Read port + token from files on app launch (40 × 100 ms retry)
   - [x] SSE streaming client via `URLSession.bytes(for:)`
-  - [x] `healthStatus()` → `DaemonHealth` (daemon up, Ollama up, model)
+  - [x] `healthStatus()` → `DaemonHealth` (daemon up, BaseRT up, model)
 - [x] `DaemonLauncher.swift` — auto-restarts on crash, max 3/min rolling window
 - [x] Audit entry on every chat request (SQLite `audit_entries`)
-- [x] Settings tab: daemon + Ollama status indicator with live indicator dots
+- [x] Settings tab: daemon + BaseRT status indicator with live indicator dots
 
 ---
 
-## Phase 3 — Ollama Integration ✅ COMPLETE
+## Phase 3 — BaseRT Integration ✅ COMPLETE
 
-- [x] `crates/connectors/ollama/` — standalone library crate (`OllamaClient`)
-  - [x] `models()` → sorted list from `/api/tags`
-  - [x] `chat_stream()` → `impl Stream<Item = Result<String>>` via async-stream
-  - [x] `embed()` → `Vec<f32>` from `/api/embeddings`
-  - [x] `summarize()` → single-shot summarisation call
-  - [x] `is_up()` → 2 s health ping
-- [x] Daemon uses `OllamaClient` for all Ollama I/O
-- [x] `POST /embeddings` endpoint in daemon (proxies to Ollama, uses `bge-m3` by default)
+- [x] `crates/connectors/basert/` — standalone library crate (`BaseRTClient`)
+  - [x] OpenAI-compatible `/v1/models` and `/v1/chat/completions`
+  - [x] Bearer-authenticated SSE content and fragmented tool-call parsing
+  - [x] 2 s health check and explicit model unload
+- [x] Daemon uses `BaseRTClient` for all BaseRT I/O
+- [x] Embeddings disabled until a dedicated BaseRT embedding model is configured
 - [x] System prompt — Slovak business assistant: formal tone, diacritics enforced, legal terms never translated
 - [x] Context window management:
   - [x] Sliding hard truncation (last 40 messages) for moderate histories
   - [x] Automatic summarisation when history > 60 messages (old turns → single summary system message)
-- [x] Model router: all requests → Ollama; client-supplied `model` field overrides default
+- [x] Model router: all requests → BaseRT; client-supplied `model` field overrides default
 - [x] Model picker in `SettingsView.swift` — fetches live from `/models`, persists to UserDefaults
-- [x] Default model: `qwen2.5:7b`
-- [x] Ollama up/down in `GET /health`
-- [x] Slovak diacritics regression tests — `crates/connectors/ollama/tests/diacritics.rs` (`#[ignore]`, run with `cargo test -p ollama-connector -- --include-ignored`)
-- [x] Streaming tokens appear in UI (TTFT < 1 s on warm Ollama)
-- [ ] `ollama pull bge-m3` — user must run once before embeddings work
+- [x] Default model: `basecompute/Qwen3-4B-Instruct-2507`
+- [x] BaseRT up/down in `GET /health`
+- [x] BaseRT protocol and ignored live regressions in `crates/connectors/basert/tests/`
+- [x] Streaming tokens appear in UI (TTFT < 1 s on warm BaseRT)
 
 ---
 
@@ -177,9 +167,9 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
 - [x] Settings → Konektory section: Mail + Notes status dots from `/health`
 - [x] Privacy gate: `pii: true` field on body responses; system prompt instructs LLM to summarize, not quote raw email
 - [x] Daemon `/health` now includes `connectors: { mail, notes }` status
-- [x] `ollama pull bge-m3` — pulled by user
+- [x] `basert pull bge-m3` — pulled by user
 - [x] Background sync with progress indicator — "Sync" button in Settings → Konektory; shows spinner + result count
-- [x] Slovak email summarization regression test — `sk_email_body_summarization` in `crates/connectors/ollama/tests/diacritics.rs`
+- [x] Slovak email summarization regression test — `sk_email_body_summarization` in `crates/connectors/basert/tests/diacritics.rs`
 - [x] emlx path resolution unit tests — `emlx_shard_calc_*` in `crates/connectors/apple_mail/src/lib.rs` (6 tests, all pass)
 
 ---
@@ -207,20 +197,20 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
 - [ ] Load `sqlite-vec` extension at daemon startup (rusqlite `load_extension`; bundle `.dylib` in app resources)
 - [x] Migration `crates/daemon/migrations/V5__embeddings.sql`: `embeddings` table
 - [x] `crates/memory/` new crate:
-  - [x] `embed_and_store(item_id, namespace, text)` — calls `OllamaClient::embed` with `bge-m3`, writes float32 blob
+  - [x] `embed_and_store(item_id, namespace, text)` — calls `BaseRTClient::embed` with `bge-m3`, writes float32 blob
   - [x] `retrieve(query, namespace, k)` → `Vec<MemoryHit>` — BM25 + cosine merged with `0.4*bm25 + 0.6*cos`, recency-decayed
   - [ ] Backfill job: embed existing `memory_items` + `messages` + `notes` on startup if embedding missing
 - [x] `PromptBuilder` layer 5: calls `memory::retrieve(user_turn, ["global","user_pref","sk_glossary"], 8)` → `Message::system`
 - [x] Per-namespace cap: max 3 retrieved items per namespace to bound prompt size
 - [x] `GET /memory/search?q=&namespace=` endpoint for Settings debug view
-- [ ] `ollama pull bge-m3` — user must run once before embeddings work
+- [ ] `basert pull bge-m3` — user must run once before embeddings work
 
 ---
 
 ## Phase 4D — Self-Improvement / Feedback Loop ✅ COMPLETE
 
-- [x] Explicit capture: scan user turn for trigger phrases (SK: "pamätaj si", "od teraz", "už nikdy", "vždy"; EN: "remember", "from now on", "never", "always") → extract directive via Ollama call → insert `memory_items` kind=`preference` namespace=`user_pref`; ACK in stream: `{"type":"memory_saved","id":...}`
-- [x] Implicit capture (background post-turn): spawn task after `done` event; Ollama call classifies `{prev_assistant, user_turn}` → `{is_correction, what_was_wrong, correct_behavior, confidence}`. If `confidence > 0.7`: insert `kind='correction'`
+- [x] Explicit capture: scan user turn for trigger phrases (SK: "pamätaj si", "od teraz", "už nikdy", "vždy"; EN: "remember", "from now on", "never", "always") → extract directive via BaseRT call → insert `memory_items` kind=`preference` namespace=`user_pref`; ACK in stream: `{"type":"memory_saved","id":...}`
+- [x] Implicit capture (background post-turn): spawn task after `done` event; BaseRT call classifies `{prev_assistant, user_turn}` → `{is_correction, what_was_wrong, correct_behavior, confidence}`. If `confidence > 0.7`: insert `kind='correction'`
 - [x] Slovak glossary corrections: `kind='sk_glossary'` namespace — injected as layer 4 prompt
 - [x] Style profile: `kind='style_profile'` row — injected as layer 3 prompt
 - [x] `DELETE /memory/{id}` forget endpoint; audit logs `action='memory_forget'`
@@ -278,14 +268,14 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
   - [x] `application/pdf` → `pdftotext` / `textutil` fallback
   - [x] `image/*` → store path, flag `requires_vision: true`
 - [x] `PromptBuilder::build` gains `attachments_ctx: Option<String>` — Layer 6.5 between tool data and session summary
-- [x] Ollama `Message` extended with `images: Vec<String>` (base64, skip_serializing_if empty)
+- [x] BaseRT `Message` extended with `images: Vec<String>` (base64, skip_serializing_if empty)
 - [x] Auto-route to `qwen2.5vl:7b` when any attachment `kind=image` and no explicit model override; audit `model_swap`
 - [x] Migration V8: `attachments` + `chat_turn_attachments` link table
-- [x] Settings → Ollama: vision model status indicator + pull hint
+- [x] Settings → BaseRT: vision model status indicator + pull hint
 - [x] Privacy: `pii: true` on attachment-derived context; max 20 MB per file
 - [x] Onboarding: first image attachment triggers one-time alert if vision model not installed
 - [x] Resize glitch fixed: removed `Task { @MainActor }` hop in `NotchWindowController.swift`; `.regularMaterial` swapped for solid color during active drag; `layerContentsRedrawPolicy = .onSetNeedsDisplay` on chat hosting view
-- [ ] `ollama pull qwen2.5vl:7b` — in progress (large model ~6GB)
+- [ ] `basert pull qwen2.5vl:7b` — in progress (large model ~6GB)
 
 ---
 
@@ -333,7 +323,7 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
   - [ ] `parse_date_to_range("2026-06-10")` → correct `[start, end)` bounds
   - [ ] `MailIntent` deserializes documented JSON shapes incl. `action:"none"` and `action:"open"`
   - [ ] `search_messages` filter combos (sender-only, subject+date, empty)
-  - [ ] Classifier round-trip (`#[ignore]`, needs live Ollama)
+  - [ ] Classifier round-trip (`#[ignore]`, needs live BaseRT)
   - [ ] `MailMessage.message_id` extracted from fixture emlx file
 
 ---
@@ -463,8 +453,8 @@ Daemon spawns `uvx mcp-server-odoo` as a child process and speaks MCP over stdio
 - [ ] Manual QA: `make bundle && open bagent.app` — grant Screen Recording + Accessibility in Settings; ask "čo je na obrazovke?" → vision model answers; "prečítaj výber" → AX selection used; verify no file written under `~/Library/Application Support/bagent/attachments` for screen frames
 - [ ] Image paste QA: ⌘V with image in clipboard → `[image #1]` token + chip; send → thumbnail in bubble
 - [ ] Unit tests: `is_screen_context` keyword combos; `ScreenIntent` JSON deserialisation incl. `action:"none"` (4 already in screen_intent.rs)
-- [ ] Live Ollama classifier round-trip test (`#[ignore]`)
-- [ ] `ollama pull qwen2.5vl:7b` — required for vision analysis (user must run once)
+- [ ] Live BaseRT classifier round-trip test (`#[ignore]`)
+- [ ] `basert pull qwen2.5vl:7b` — required for vision analysis (user must run once)
 
 ---
 
@@ -508,7 +498,7 @@ Daemon spawns `uvx mcp-server-odoo` as a child process and speaks MCP over stdio
 - [ ] SQLCipher encryption on `bagent.db`
 - [ ] Audit log hash-chain verification (`bagentd --verify-audit`)
 - [ ] Crash reporter (opt-in)
-- [ ] Onboarding flow (permissions, Ollama guide, language pref)
+- [ ] Onboarding flow (permissions, BaseRT guide, language pref)
 - [ ] Staged rollout config (10% → 50% → 100%)
 - [ ] OWASP LLM Top 10 checklist completed (see `SECURITY.md`)
 - [ ] Beta `.dmg` distributed to initial test users
@@ -551,7 +541,7 @@ Daemon spawns `uvx mcp-server-odoo` as a child process and speaks MCP over stdio
 - [x] `DANGEROUS_EXTENSIONS` list — blocks .app/.sh/.py/.scpt/.pkg/.dmg etc. from open
 - [x] `open.rs`: pure `build_*_argv` functions (test-safe) + async exec via `/usr/bin/open` only, never `sh -c`
 - [x] `search.rs`: WalkDir walk, filename/content/path scoring, Slovak diacritics, binary skip, 500-char line truncation
-- [x] `crates/agent/src/file_intent.rs`: `FileIntent`/`FileAction` + `FileIntentClassifier` (Ollama JSON, SK/EN few-shots)
+- [x] `crates/agent/src/file_intent.rs`: `FileIntent`/`FileAction` + `FileIntentClassifier` (BaseRT JSON, SK/EN few-shots)
 - [x] `crates/rules/src/lib.rs`: filesystem/macos rules (auto/ask/forbidden)
 - [x] `crates/agent/src/context_planner.rs`: `is_file_search()` (placed after `is_mail_search`), file skill names
 - [x] `crates/agent/src/prompt.rs`: `PromptTrace` file_* fields

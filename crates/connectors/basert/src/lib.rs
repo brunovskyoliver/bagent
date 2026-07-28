@@ -248,16 +248,21 @@ impl BaseRtClient {
             };
 
             let mut bytes = response.bytes_stream();
-            let mut buffer = String::new();
+            let mut buffer = Vec::<u8>::new();
             let mut calls: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
             let mut done = false;
 
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.context("BaseRT stream read")?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                buffer.extend_from_slice(&chunk);
 
-                while let Some(newline) = buffer.find('\n') {
-                    let line = buffer[..newline].trim_end_matches('\r').to_string();
+                while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                    let line_bytes = buffer[..newline]
+                        .strip_suffix(b"\r")
+                        .unwrap_or(&buffer[..newline]);
+                    let line = std::str::from_utf8(line_bytes)
+                        .context("BaseRT SSE line is not valid UTF-8")?
+                        .to_string();
                     buffer.drain(..=newline);
                     let Some(data) = line.strip_prefix("data:") else {
                         continue;

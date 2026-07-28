@@ -12,7 +12,7 @@ Each phase follows the structure: **Goal · Deliverables · Risks · Acceptance 
 - [ ] Notch geometry measurements per device class (14", 16" MBP, non-notch fallback).
 - [ ] Prototype `NSPanel` anchored to notch region; verify z-ordering and Mission Control behaviour.
 - [ ] ScreenCaptureKit cost benchmark: frame capture CPU/memory at 1 fps vs 5 fps.
-- [ ] Ollama latency benchmark: `qwen2.5:7b` first-token latency on M1/M2/M3; Slovak diacritics roundtrip test.
+- [ ] BaseRT latency benchmark: `qwen2.5:7b` first-token latency on M1/M2/M3; Slovak diacritics roundtrip test.
 - [ ] Apple Mail SQLite schema snapshot (`Envelope Index`); identify message body path pattern for `.emlx`.
 - [ ] Apple Notes SQLite schema snapshot (`NoteStore.sqlite`); AppleScript read test.
 - [ ] Odoo XML-RPC handshake test against a sandbox instance.
@@ -20,12 +20,12 @@ Each phase follows the structure: **Goal · Deliverables · Risks · Acceptance 
 
 **Risks:**
 - Notch geometry changes across OS updates — hardcode insets per device model string with fallback.
-- Ollama may be too slow for interactive use on older hardware — define minimum acceptable latency (< 800 ms TTFT).
+- BaseRT may be too slow for interactive use on older hardware — define minimum acceptable latency (< 800 ms TTFT).
 - Apple Mail DB schema undocumented and may change — build adapter layer with version detection.
 
 **Acceptance Criteria:**
 - [ ] NSPanel appears correctly anchored to notch on at least one physical device.
-- [ ] Ollama produces correct `Dobrý deň` and `č š ž ľ ť ď` in output without corruption.
+- [ ] BaseRT produces correct `Dobrý deň` and `č š ž ľ ť ď` in output without corruption.
 - [ ] At least one Mail message body successfully extracted from `.emlx`.
 - [ ] Written spike notes committed under `docs/spikes/`.
 
@@ -85,30 +85,30 @@ Each phase follows the structure: **Goal · Deliverables · Risks · Acceptance 
 
 ---
 
-## Phase 3 — Ollama Integration
+## Phase 3 — BaseRT Integration
 
-**Goal:** Real LLM responses via local Ollama; Slovak diacritics verified.
+**Goal:** Real LLM responses via local BaseRT; Slovak diacritics verified.
 
 **Deliverables:**
-- [ ] `crates/connectors/ollama` HTTP client; streaming ndjson parser.
-- [ ] Model router stub: all requests → Ollama.
-- [ ] Model picker in Settings (fetches from `/api/tags`).
-- [ ] Default model: `qwen2.5:7b`.
+- [x] `crates/connectors/basert` OpenAI-compatible HTTP/SSE adapter.
+- [x] Agentic tool loop backed by BaseRT.
+- [x] Model picker in Settings (fetches from `/v1/models`).
+- [x] Default model: `basecompute/Qwen3-4B-Instruct-2507`.
 - [ ] Slovak diacritics preserved end-to-end: `á č ď é í ľ ĺ ň ó ô ŕ š ť ú ý ž`.
-- [ ] Ollama up/down status in `/health` and Settings.
-- [ ] Context window management: sliding window, summarize older turns.
-- [ ] Embedding endpoint wired (`nomic-embed-text` or `bge-m3`).
+- [ ] BaseRT up/down status in `/health` and Settings.
+- [x] Bounded conversation-history window.
+- [ ] Dedicated BaseRT embedding model.
 
 **Risks:**
-- `qwen2.5:7b` may hallucinate Slovak diacritics — test with fixture corpus before releasing.
-- Users without Ollama installed get a broken experience — show clear install instructions in onboarding.
+- Local models may hallucinate Slovak diacritics — retain fixture coverage.
+- Users without BaseRT installed get a broken experience — show clear install instructions in onboarding.
 - Streaming + SSE → Swift concurrent access bugs — use actor-isolated stream state.
 
 **Acceptance Criteria:**
 - [ ] Slovak test fixture: input `"Ahoj, ako sa máš?"` → response contains valid Slovak text with diacritics intact.
-- [ ] Streaming: first token visible in UI < 1 s on M-series Mac with `qwen2.5:7b` loaded.
-- [ ] Model picker correctly lists installed Ollama models.
-- [ ] If Ollama is down, UI shows clear error (not a crash or silent hang).
+- [ ] Streaming: first word visible in UI < 1 s on an M-series Mac with the configured model loaded.
+- [ ] Model picker correctly lists installed BaseRT models.
+- [ ] If BaseRT is down, UI shows clear error (not a crash or silent hang).
 
 ---
 
@@ -136,7 +136,7 @@ Each phase follows the structure: **Goal · Deliverables · Risks · Acceptance 
 - [ ] `mail_list_inbox` returns last 20 unread messages.
 - [ ] Slovak email body extracted and summarized in Slovak with formal tone.
 - [ ] Notes search returns results for a Slovak query.
-- [ ] No mail body appears in Ollama prompt without user confirming (audit shows the gate).
+- [ ] No mail body appears in BaseRT prompt without user confirming (audit shows the gate).
 - [ ] Incremental sync completes in < 5 s for 100 new messages.
 
 ---
@@ -198,7 +198,7 @@ the voice overlay and the inline mic are gone; `⌥Space` opens the notch input.
 - [ ] Test connection succeeds against a real Odoo instance.
 - [ ] `odoo_get_invoice` returns invoice number, partner name, amount, due date, `splatnosť`, `DPH`.
 - [ ] Slovak field values preserved verbatim (no translation).
-- [ ] PII fields (partner email, phone) trigger privacy filter gate before any Ollama call.
+- [ ] PII fields (partner email, phone) trigger privacy filter gate before any BaseRT call.
 - [ ] No Odoo write attempted; all write tool registrations marked `Forbidden`.
 
 ---
@@ -211,7 +211,7 @@ the voice overlay and the inline mic are gone; `⌥Space` opens the notch input.
 - [ ] `ScreenCaptureKit` integration: on-demand frame capture (1 fps when panel open).
 - [ ] Active app + window title via `NSWorkspace.shared.frontmostApplication`.
 - [ ] Selected text via Accessibility API (`AXSelectedText`).
-- [ ] Vision model fallback: frame sent to local vision-capable Ollama model (e.g. `llava` or `minicpm-v`) when OCR insufficient.
+- [ ] Vision model fallback: frame sent to local vision-capable BaseRT model (e.g. `llava` or `minicpm-v`) when OCR insufficient.
 - [ ] Screen context attached to chat turn as `screen_context: { app, title, selected_text, ocr_text? }`.
 - [ ] Permission prompt: Screen Recording requested on first screen-context use.
 - [ ] Privacy: frames ephemeral by default; never stored; never cloud-uploaded without per-session opt-in.
@@ -274,7 +274,7 @@ the voice overlay and the inline mic are gone; `⌥Space` opens the notch input.
 - [ ] Formal greeting/closing enforced: `Dobrý deň, …` / `S pozdravom` in email drafts.
 
 **Risks:**
-- Ollama models may occasionally drop diacritics under load — add post-processing check with warning to user.
+- BaseRT models may occasionally drop diacritics under load — add post-processing check with warning to user.
 - Machine translation of legal terms could cause compliance issues — `deny` rule hardcoded against translation tool for Slovak legal terms.
 - `sk_SK` locale not available on all macOS installations — fallback to `sk`.
 
@@ -299,7 +299,7 @@ the voice overlay and the inline mic are gone; `⌥Space` opens the notch input.
 - [ ] SQLite encrypted via SQLCipher (key derived from Keychain secret).
 - [ ] Audit log hash-chain verification tool (CLI: `bagentd --verify-audit`).
 - [ ] Crash reporter (opt-in): Sentry or in-house with zero PII.
-- [ ] Onboarding flow: permission explanations, Ollama install guide, language preference.
+- [ ] Onboarding flow: permission explanations, BaseRT install guide, language preference.
 - [ ] Beta `.dmg` distributed to 5–10 test users.
 - [ ] Threat model reviewed against OWASP LLM Top 10.
 
@@ -307,7 +307,7 @@ the voice overlay and the inline mic are gone; `⌥Space` opens the notch input.
 - Notarization may reject entitlements — test on clean Apple ID with fresh provisioning profile.
 - SQLCipher migration from plain SQLite requires careful key management — document recovery path.
 - Auto-update delivering a broken daemon could brick the app — staged rollout (10% → 50% → 100%).
-- Beta users may have non-standard Ollama setups — add diagnostics command `⌘D` in Settings.
+- Beta users may have non-standard BaseRT setups — add diagnostics command `⌘D` in Settings.
 
 **Acceptance Criteria:**
 - [ ] App passes `spctl --assess --verbose bagent.app` (Gatekeeper check).

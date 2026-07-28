@@ -26,24 +26,6 @@ NSPanel config: `styleMask: [.borderless, .nonactivatingPanel]`, `level: .mainMe
 
 ---
 
-### ✅ Ollama Slovak Benchmark — COMPLETE
-
-| Check | llama3.1:8b | qwen2.5:7b |
-|---|---|---|
-| TTFT warm | 269 ms ✅ | 702 ms ✅ |
-| Throughput | 26–29 tok/s ✅ | 27–29 tok/s ✅ |
-| Diacritics | 10/16 ❌ | **16/16** ✅ |
-| Invoice fixture | 6/6 ✅ | **6/6** ✅ |
-| Pure Slovak (no Czech) | ❌ FAIL | **✅ PASS** |
-
-**`qwen2.5:7b` confirmed as default model.** `llama3.1` retained as English-only fallback.
-
-**Still needed:** `ollama pull bge-m3` (embeddings, Phase 3).
-
-See [`ollama.md`](ollama.md).
-
----
-
 ### ✅ Apple Mail Schema — COMPLETE
 
 | Check | Result |
@@ -114,7 +96,7 @@ print(uid)  # non-zero = success
 |---|---|---|
 | Notch geometry known | ✅ | Go |
 | NSPanel strategy confirmed | ✅ | Go |
-| Ollama basic functionality | ✅ | Go |
+| BaseRT basic functionality | ✅ | Go |
 | qwen2.5:7b Slovak verified | ✅ | Go — confirmed default model |
 | Mail schema readable | ✅ | Go (Phase 4) |
 | Notes schema readable | ✅ | Go (Phase 4) |

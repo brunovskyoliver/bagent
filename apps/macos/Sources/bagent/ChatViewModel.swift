@@ -25,6 +25,10 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     let id = UUID()
     let role: Role
     var content: String
+    /// Presentation prefix paced independently from BaseRT transport chunks.
+    var displayedContent: String = ""
+    var activities: [TurnActivity] = []
+    var sources: [DaemonClient.TranscriptSource] = []
     var attachments: [ChatAttachment] = []
     /// Set when the assistant's response found a specific mail message.
     /// Drives the "Otvoriť mail" animated button.
@@ -48,6 +52,16 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     var taskRating: (level: String, score: Int, reasons: [String], privacyRisk: String)? = nil
 
     enum Role { case user, assistant }
+}
+
+struct TurnActivity: Identifiable, Equatable {
+    let id: String
+    var kind: String
+    var tool: String?
+    var title: String
+    var detail: String?
+    var status: String
+    var durationMs: Int?
 }
 
 enum AgentStatus {
@@ -713,7 +727,8 @@ final class ChatViewModel: ObservableObject {
     }
 
     var latestAssistantText: String {
-        latestAssistantMessage?.content ?? ""
+        guard let message = latestAssistantMessage else { return "" }
+        return isLatestAssistantStreaming ? message.displayedContent : message.content
     }
 
     /// The message the notch output surface shows: the browsed past response
@@ -1593,20 +1608,12 @@ final class ChatViewModel: ObservableObject {
                 let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds, screenContext: screenCtx, sourceMode: sourceMode, history: history)
                 var first = true
                 var didAutoOpen = false
-                // Tokens are coalesced to ~30 Hz: per-token @Published writes
-                // re-evaluate the whole notch view graph, which turns long
-                // streams O(n²) and makes rendering lag behind generation.
-                var pendingTokens = ""
-                var lastFlush = Date.distantPast
-                @MainActor func flushTokens() {
-                    guard !pendingTokens.isEmpty else { return }
-                    messages[idx].content += pendingTokens
-                    pendingTokens = ""
+                let presenter = AdaptiveStreamPresenter { [weak self] edit in
+                    guard let self, messages.indices.contains(idx) else { return }
+                    messages[idx].displayedContent += edit
                     streamingChunk += 1
-                    lastFlush = Date()
                 }
                 for try await event in stream {
-                    if case .token = event {} else { flushTokens() }
                     switch event {
                     case .debugTrace(let trace):
                         messages[idx].debugTraceId = trace.prompt_trace_id
@@ -1619,7 +1626,6 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].debugConversationRecallInjected = trace.conversation_recall_injected
                         if let sid = trace.session_id { sessionId = sid }
                     case .token(let t):
-                        let isFirst = first
                         if first {
                             onFirstAssistantToken?()
                             isThinking = false
@@ -1627,10 +1633,8 @@ final class ChatViewModel: ObservableObject {
                         }
                         // toolStatus intentionally NOT cleared here — the action chip
                         // stays visible while the answer streams; cleared on .done.
-                        pendingTokens += t
-                        if isFirst || Date().timeIntervalSince(lastFlush) >= 0.033 {
-                            flushTokens()
-                        }
+                        messages[idx].content += t
+                        presenter.enqueue(t)
                         // Auto-open Mail after the first sentence has appeared in the response.
                         if !didAutoOpen,
                            let ref = messages[idx].mailRef,
@@ -1643,14 +1647,53 @@ final class ChatViewModel: ObservableObject {
                         }
                     case .memorySaved:
                         break
+                    case .activityStarted(let event):
+                        let activity = TurnActivity(
+                            id: event.id,
+                            kind: event.kind,
+                            tool: event.tool,
+                            title: event.title,
+                            detail: event.detail,
+                            status: "running",
+                            durationMs: nil
+                        )
+                        messages[idx].activities.removeAll { $0.id == event.id }
+                        messages[idx].activities.append(activity)
+                        toolStatus = event.title
+                    case .activityCompleted(let event):
+                        if let activityIndex = messages[idx].activities.firstIndex(where: { $0.id == event.id }) {
+                            messages[idx].activities[activityIndex].status = event.status ?? "completed"
+                            messages[idx].activities[activityIndex].durationMs = event.durationMs
+                        }
+                    case .sourceDiscovered(let source):
+                        if !messages[idx].sources.contains(where: { $0.id == source.id }) {
+                            messages[idx].sources.append(source)
+                        }
                     case .approvalRequested(let id, let tool, let desc):
                         let item = ApprovalItem(
                             id: id, toolName: tool, description: desc,
                             expiresAt: "", createdAt: "", origin: nil
                         )
                         pendingApprovals.append(item)
-                    case .toolBlocked:
-                        break
+                        messages[idx].activities.append(TurnActivity(
+                            id: "approval:\(id)",
+                            kind: "approval",
+                            tool: tool,
+                            title: "Waiting for approval",
+                            detail: desc,
+                            status: "running",
+                            durationMs: nil
+                        ))
+                    case .toolBlocked(let tool):
+                        messages[idx].activities.append(TurnActivity(
+                            id: "blocked:\(tool):\(messages[idx].activities.count)",
+                            kind: "blocked",
+                            tool: tool,
+                            title: "Action blocked",
+                            detail: tool,
+                            status: "failed",
+                            durationMs: nil
+                        ))
                     case .toolCall(let tool):
                         isThinking = true
                         toolStatus = Self.toolStatusLabel(for: tool)
@@ -1690,6 +1733,11 @@ final class ChatViewModel: ObservableObject {
                     case .taskRating(let level, let score, let reasons, let privacyRisk):
                         messages[idx].taskRating = (level: level, score: score, reasons: reasons, privacyRisk: privacyRisk)
                     case .done(let returnedSessionId):
+                        await presenter.finish()
+                        for activityIndex in messages[idx].activities.indices
+                            where messages[idx].activities[activityIndex].status == "running" {
+                            messages[idx].activities[activityIndex].status = "completed"
+                        }
                         if let sid = returnedSessionId { sessionId = sid }
                         toolStatus = nil
                         if first { isThinking = false }
@@ -1703,7 +1751,7 @@ final class ChatViewModel: ObservableObject {
                         Task { await loadDebugTrace(for: messages[idx].id) }
                     }
                 }
-                flushTokens()
+                await presenter.finish()
                 if first {
                     isThinking = false
                     streamingAssistantMessageId = nil
