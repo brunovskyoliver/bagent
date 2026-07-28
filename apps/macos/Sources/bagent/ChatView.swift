@@ -44,6 +44,22 @@ enum NotchWrapMetrics {
     static let notchTextPrimaryNS = NSColor(white: 0.80, alpha: 1)  // AppKit output
 }
 
+enum NotchStatusDotGeometry {
+    static func outputTopRight(
+        notchOffset: CGFloat,
+        notchWidth: CGFloat,
+        targetWingWidth: CGFloat,
+        notchHeight: CGFloat
+    ) -> CGPoint {
+        let visibleWidth = notchWidth + 2 * targetWingWidth
+        let contentWidth = visibleWidth * NotchWrapMetrics.inlineContentScale
+        return CGPoint(
+            x: notchOffset + notchWidth / 2 + contentWidth / 2 - 10,
+            y: notchHeight + 12
+        )
+    }
+}
+
 private enum NotchOutputLayout {
     static let lineSpacing: CGFloat = 1.5
     static let bottomSlack: CGFloat = 12
@@ -546,11 +562,11 @@ struct NotchWrapView: View {
         )
     }
     private var outputStatusTargetPos: CGPoint {
-        let visibleW = notchWidth + 2 * targetWingWidth
-        let contentW = visibleW * NotchWrapMetrics.inlineContentScale
-        return CGPoint(
-            x: notchOffset + notchWidth / 2 + contentW / 2 - 10,
-            y: notchHeight + targetBridgeHeight / 2
+        NotchStatusDotGeometry.outputTopRight(
+            notchOffset: notchOffset,
+            notchWidth: notchWidth,
+            targetWingWidth: targetWingWidth,
+            notchHeight: notchHeight
         )
     }
     private var outputStatusTravelProgress: CGFloat {

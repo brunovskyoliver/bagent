@@ -1740,7 +1740,7 @@ final class ChatViewModel: ObservableObject {
                         }
                         if let sid = returnedSessionId { sessionId = sid }
                         toolStatus = nil
-                        if first { isThinking = false }
+                        isThinking = false
                         streamingAssistantMessageId = nil
                         if first && notchInteractionMode == .thinking {
                             notchInteractionMode = .output

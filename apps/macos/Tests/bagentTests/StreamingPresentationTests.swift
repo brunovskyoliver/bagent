@@ -51,4 +51,16 @@ final class StreamingPresentationTests: XCTestCase {
         XCTAssertTrue(rendered.string.contains("let value = 1"))
         XCTAssertFalse(rendered.string.contains("```"))
     }
+
+    func testOutputStatusDotStaysAtTopRightInsteadOfBridgeCenter() {
+        let point = NotchStatusDotGeometry.outputTopRight(
+            notchOffset: 260,
+            notchWidth: 221,
+            targetWingWidth: 154,
+            notchHeight: 39
+        )
+        XCTAssertEqual(point.y, 51)
+        XCTAssertGreaterThan(point.x, 260 + 221)
+        XCTAssertLessThan(point.y, 39 + 96 / 2)
+    }
 }

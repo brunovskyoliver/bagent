@@ -897,6 +897,8 @@ pub(crate) async fn run_agent_loop(
         let stream =
             inference.chat_stream_with_tools(model.to_string(), messages.clone(), round_tools);
         tokio::pin!(stream);
+        let publish_live =
+            should_publish_model_delta_live(round, MAX_ROUNDS, tool_calls_used, MAX_TOOL_CALLS);
 
         let mut round_text = String::new();
         let mut round_calls: Vec<ToolCall> = Vec::new();
@@ -904,7 +906,7 @@ pub(crate) async fn run_agent_loop(
             match ev {
                 Ok(ChatStreamEvent::Delta(token)) => {
                     round_text.push_str(&token);
-                    if !sink.emit(json!({"type":"token","content":token})).await {
+                    if publish_live && !sink.emit(json!({"type":"token","content":token})).await {
                         return Err(ExecError::SinkClosed);
                     }
                 }
@@ -933,6 +935,13 @@ pub(crate) async fn run_agent_loop(
         }
 
         if round_calls.is_empty() {
+            if !publish_live
+                && !sink
+                    .emit(json!({"type":"token","content":round_text}))
+                    .await
+            {
+                return Err(ExecError::SinkClosed);
+            }
             full_response = round_text;
             break 'agent;
         }
@@ -1646,6 +1655,18 @@ fn extract_web_sources(result: &str) -> Vec<TranscriptSource> {
     out
 }
 
+fn should_publish_model_delta_live(
+    round: usize,
+    max_rounds: usize,
+    tool_calls_used: usize,
+    max_tool_calls: usize,
+) -> bool {
+    // A tool-capable round may turn out to be an intermediate preamble or
+    // refusal. Buffer it until its tool-call outcome is known so it cannot
+    // leak into the final visible answer.
+    round == max_rounds || tool_calls_used >= max_tool_calls
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1874,5 +1895,13 @@ mod tests {
         assert_eq!(sources[0].domain, "example.com");
         assert_eq!(sources[1].domain, "docs.example.org");
         assert!(sources.iter().all(|source| source.id.starts_with("src-")));
+    }
+
+    #[test]
+    fn intermediate_tool_capable_rounds_are_not_streamed_into_visible_answer() {
+        assert!(!should_publish_model_delta_live(0, 5, 0, 8));
+        assert!(!should_publish_model_delta_live(3, 5, 2, 8));
+        assert!(should_publish_model_delta_live(5, 5, 2, 8));
+        assert!(should_publish_model_delta_live(2, 5, 8, 8));
     }
 }
