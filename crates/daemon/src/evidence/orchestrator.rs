@@ -131,7 +131,7 @@ fn is_mail_intent(intent: &EvidenceIntent) -> bool {
     }
 }
 
-async fn execute_unavailable_mail_plan<G: EvidenceOperationGate + Send>(
+pub(crate) async fn execute_unavailable_mail_plan<G: EvidenceOperationGate + Send>(
     gate: &mut G,
     turn_id: &str,
     plan: &super::EvidencePlan,

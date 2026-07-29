@@ -23,8 +23,9 @@ use filesystem_connector::{
 use whatsapp_connector::WhatsappSendTarget;
 
 use crate::evidence::{
-    execute_evidence_turn, EvidenceContext, EvidenceIntent, EvidenceOrigin, EvidenceRequest,
-    ValidationOutcome, EVIDENCE_SCHEMA_VERSION,
+    execute_evidence_turn, Classification, Completeness, EvidenceBundle, EvidenceContext,
+    EvidenceIntent, EvidenceIntentClassifier, EvidenceOrigin, EvidenceRequest, ValidationOutcome,
+    EVIDENCE_SCHEMA_VERSION,
 };
 use crate::{
     audit_fs, json_str_arg, request_tool_approval, run_aerospace, save_last_file_ref,
@@ -627,16 +628,6 @@ fn requested_mail_summary_count(user_message: &str) -> Option<usize> {
     Some(explicit.unwrap_or(if plural_or_recent { 3 } else { 1 }))
 }
 
-fn legacy_summary_evidence_intent(user_message: &str) -> Option<EvidenceIntent> {
-    let requested_count =
-        requested_mail_summary_count(user_message)?.min(usize::from(u8::MAX)) as u8;
-    Some(EvidenceIntent::MailLatestContent {
-        count: requested_count.min(10),
-        requested_count,
-        unread_only: false,
-    })
-}
-
 pub(crate) const EVIDENCE_ORCHESTRATOR_FLAG_ENV: &str = "BAGENT_EVIDENCE_ORCHESTRATOR";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,20 +650,75 @@ impl EvidenceOrchestratorFlag {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MailAcquisitionPath {
-    Legacy,
-    EvidenceOrchestrator,
+fn routed_latest_mail_intent(
+    flag: EvidenceOrchestratorFlag,
+    user_message: &str,
+) -> Option<EvidenceIntent> {
+    if flag != EvidenceOrchestratorFlag::Enabled {
+        return None;
+    }
+    match EvidenceIntentClassifier.classify(user_message) {
+        Classification::Recognized(
+            intent @ (EvidenceIntent::MailLatestHeaders { .. }
+            | EvidenceIntent::MailLatestContent { .. }),
+        ) => Some(intent),
+        Classification::Recognized(_)
+        | Classification::NeedsClarification { .. }
+        | Classification::NotEvidenceIntent => None,
+    }
 }
 
-fn mail_acquisition_path(
+struct RoutedEvidenceTurn {
+    request: EvidenceRequest,
+    intent: EvidenceIntent,
+}
+
+fn routed_latest_mail_turn(
     flag: EvidenceOrchestratorFlag,
-    legacy_summary_target: Option<usize>,
-) -> MailAcquisitionPath {
-    match (flag, legacy_summary_target) {
-        (EvidenceOrchestratorFlag::Enabled, Some(_)) => MailAcquisitionPath::EvidenceOrchestrator,
-        _ => MailAcquisitionPath::Legacy,
+    origin: &ExecOrigin,
+    session_id: &str,
+    user_message: &str,
+) -> Option<RoutedEvidenceTurn> {
+    let intent = routed_latest_mail_intent(flag, user_message)?;
+    Some(RoutedEvidenceTurn {
+        request: EvidenceRequest {
+            version: EVIDENCE_SCHEMA_VERSION,
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            original_text: user_message.to_string(),
+            origin: origin.evidence_origin(),
+        },
+        intent,
+    })
+}
+
+fn latest_mail_evidence_kind(intent: &EvidenceIntent) -> &'static str {
+    match intent {
+        EvidenceIntent::MailLatestHeaders { .. } => "mail_latest_headers",
+        EvidenceIntent::MailLatestContent { .. } => "mail_latest_content",
+        _ => unreachable!("only latest-Mail intents enter Stage 3 routing"),
     }
+}
+
+fn render_mail_header_listing(bundle: &EvidenceBundle) -> String {
+    let acquired = bundle.acquired.mail_headers;
+    let requested = bundle.requested.mail_headers;
+    let suffix = if bundle.completeness == Completeness::Partial {
+        "; partial"
+    } else {
+        ""
+    };
+    let mut rendered = format!("Latest emails ({acquired} of {requested}{suffix}):");
+    for (index, item) in bundle.mail.iter().enumerate() {
+        rendered.push_str(&format!(
+            "\n{}. {} — {} — {}",
+            index + 1,
+            item.sender,
+            item.subject,
+            item.received_at.format("%Y-%m-%d %H:%M UTC"),
+        ));
+    }
+    rendered
 }
 
 fn mail_tool_followup_guidance(
@@ -751,6 +797,13 @@ pub(crate) async fn run_agent_loop(
     let summary_read_target = focused_mail_turn
         .then(|| desired_mail_read_count(user_message))
         .flatten();
+    let routed_evidence_turn = routed_latest_mail_turn(
+        state.evidence_orchestrator,
+        origin,
+        session_id,
+        user_message,
+    );
+    let typed_evidence_routed = routed_evidence_turn.is_some();
     let mut desired_mail_reads = summary_read_target.unwrap_or(1);
     // ponytail: flat budgets — raise if real sessions hit them
     const MAX_ROUNDS: usize = 5;
@@ -760,18 +813,8 @@ pub(crate) async fn run_agent_loop(
     let mut mail_read_rowids = std::collections::HashSet::new();
     let mut mail_access_denied = false;
 
-    if mail_acquisition_path(state.evidence_orchestrator, summary_read_target)
-        == MailAcquisitionPath::EvidenceOrchestrator
-    {
-        let intent = legacy_summary_evidence_intent(user_message)
-            .expect("evidence path requires a legacy summary request");
-        let request = EvidenceRequest {
-            version: EVIDENCE_SCHEMA_VERSION,
-            turn_id: uuid::Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            original_text: user_message.to_string(),
-            origin: origin.evidence_origin(),
-        };
+    if let Some(RoutedEvidenceTurn { request, intent }) = routed_evidence_turn {
+        let evidence_kind = latest_mail_evidence_kind(&intent);
         let evidence = execute_evidence_turn(
             EvidenceContext {
                 state,
@@ -782,14 +825,14 @@ pub(crate) async fn run_agent_loop(
             intent,
         )
         .await
-        .expect("Stage 2 feature path supplies a supported Mail intent");
+        .expect("Stage 3 routing supplies a supported latest-Mail intent");
         tool_calls_used += evidence.operations_executed;
         approvals_denied += evidence.approvals_denied;
         audit_fs(
             db,
             "evidence_turn",
             &json!({
-                "kind": "mail_latest_content",
+                "kind": evidence_kind,
                 "operations_executed": evidence.operations_executed,
                 "approvals_denied": evidence.approvals_denied,
                 "unattended": origin.unattended(),
@@ -797,6 +840,20 @@ pub(crate) async fn run_agent_loop(
         );
         match evidence.validation {
             ValidationOutcome::Bundle(bundle) => {
+                if matches!(bundle.intent, EvidenceIntent::MailLatestHeaders { .. }) {
+                    let final_text = render_mail_header_listing(&bundle);
+                    if !sink
+                        .emit(json!({"type":"token","content":&final_text}))
+                        .await
+                    {
+                        return Err(ExecError::SinkClosed);
+                    }
+                    return Ok(ExecOutcome {
+                        final_text,
+                        tool_calls_used,
+                        approvals_denied,
+                    });
+                }
                 mail_reads_completed = usize::from(bundle.acquired.mail_bodies);
                 desired_mail_reads = mail_reads_completed;
                 tools.clear();
@@ -856,11 +913,9 @@ pub(crate) async fn run_agent_loop(
     // A focused recent-mail summary is deterministic: perform the safe reads
     // before the first inference call and represent them as a valid tool
     // exchange. The 4B model therefore cannot refuse before accessing Mail.app.
-    if let (MailAcquisitionPath::Legacy, Some(target), Some(mail_connector)) = (
-        mail_acquisition_path(state.evidence_orchestrator, summary_read_target),
-        summary_read_target,
-        mail.as_ref(),
-    ) {
+    if let (false, Some(target), Some(mail_connector)) =
+        (typed_evidence_routed, summary_read_target, mail.as_ref())
+    {
         let list_args = json!({"limit": target, "unread_only": false});
         let level = gate.level("mail_inbox", &list_args, ToolKind::ReadOnly);
         let approved = match level {
@@ -1826,9 +1881,162 @@ fn should_publish_model_delta_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::{
+        execute_mail_plan, execute_unavailable_mail_plan, Admission, EvidenceOperation,
+        EvidenceOperationGate, EvidencePlanner, EvidenceResults, EvidenceTurnOutcome,
+        ExecutionStatus, FailureCode, MailBodyEvidence, MailEvidenceAdapter, MailHeaderEvidence,
+        OperationResult, RecoveryKind, ShortfallReason, ValidatedMailId,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
 
     fn test_tool(name: &str) -> ToolDef {
         ToolDef::function(name, name, json!({"type": "object", "properties": {}}))
+    }
+
+    struct ScriptedMailAdapter {
+        list_result: OperationResult<Vec<MailHeaderEvidence>>,
+        body_results: HashMap<ValidatedMailId, OperationResult<MailBodyEvidence>>,
+        operations: Vec<EvidenceOperation>,
+    }
+
+    impl ScriptedMailAdapter {
+        fn from_results(mut results: EvidenceResults) -> Self {
+            let list_result = results.mail_list.remove(0);
+            let headers = list_result.value.clone().unwrap_or_default();
+            let body_results = headers
+                .into_iter()
+                .zip(results.mail_bodies)
+                .map(|(header, result)| (header.connector_id, result))
+                .collect();
+            Self {
+                list_result,
+                body_results,
+                operations: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MailEvidenceAdapter for ScriptedMailAdapter {
+        async fn list(
+            &mut self,
+            limit: u8,
+            unread_only: bool,
+        ) -> OperationResult<Vec<MailHeaderEvidence>> {
+            self.operations
+                .push(EvidenceOperation::MailList { limit, unread_only });
+            self.list_result.clone()
+        }
+
+        async fn search(
+            &mut self,
+            normalized_query: &str,
+            limit: u8,
+        ) -> OperationResult<Vec<MailHeaderEvidence>> {
+            self.operations.push(EvidenceOperation::MailSearch {
+                normalized_query: normalized_query.to_string(),
+                limit,
+            });
+            OperationResult::without_value(
+                EvidenceOperation::MailSearch {
+                    normalized_query: normalized_query.to_string(),
+                    limit,
+                }
+                .key(),
+                ExecutionStatus::Failed(FailureCode::InvalidInput),
+                crate::evidence::EvidenceContribution::Empty,
+            )
+        }
+
+        async fn read(
+            &mut self,
+            message_id: &ValidatedMailId,
+        ) -> OperationResult<MailBodyEvidence> {
+            let operation = EvidenceOperation::MailRead {
+                message_id: message_id.clone(),
+            };
+            self.operations.push(operation.clone());
+            self.body_results
+                .get(message_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    OperationResult::without_value(
+                        operation.key(),
+                        ExecutionStatus::Failed(FailureCode::InvalidInput),
+                        crate::evidence::EvidenceContribution::Empty,
+                    )
+                })
+        }
+    }
+
+    #[derive(Default)]
+    struct ScriptedGate {
+        deny_list: bool,
+        deny_read_number: Option<usize>,
+        reads_seen: usize,
+        admitted: Vec<EvidenceOperation>,
+    }
+
+    #[async_trait]
+    impl EvidenceOperationGate for ScriptedGate {
+        async fn admit(&mut self, operation: &EvidenceOperation) -> Admission {
+            self.admitted.push(operation.clone());
+            if matches!(operation, EvidenceOperation::MailList { .. }) && self.deny_list {
+                return Admission::Denied;
+            }
+            if matches!(operation, EvidenceOperation::MailRead { .. }) {
+                self.reads_seen += 1;
+                if self.deny_read_number == Some(self.reads_seen) {
+                    return Admission::Denied;
+                }
+            }
+            Admission::Allowed
+        }
+    }
+
+    struct RoutingAcceptance {
+        request: Option<EvidenceRequest>,
+        outcome: Option<EvidenceTurnOutcome>,
+        executed: Vec<EvidenceOperation>,
+        gated: Vec<EvidenceOperation>,
+    }
+
+    async fn run_routing_acceptance(
+        prompt: &str,
+        flag: EvidenceOrchestratorFlag,
+        origin: &ExecOrigin,
+        results: EvidenceResults,
+        mut gate: ScriptedGate,
+        connector_available: bool,
+    ) -> RoutingAcceptance {
+        let Some(RoutedEvidenceTurn { request, intent }) =
+            routed_latest_mail_turn(flag, origin, "routing-acceptance-session", prompt)
+        else {
+            return RoutingAcceptance {
+                request: None,
+                outcome: None,
+                executed: Vec::new(),
+                gated: Vec::new(),
+            };
+        };
+        let plan = EvidencePlanner::plan(intent);
+        let (outcome, executed) = if connector_available {
+            let mut adapter = ScriptedMailAdapter::from_results(results);
+            let outcome = execute_mail_plan(&mut adapter, &mut gate, &request.turn_id, &plan).await;
+            (outcome, adapter.operations)
+        } else {
+            (
+                execute_unavailable_mail_plan(&mut gate, &request.turn_id, &plan).await,
+                Vec::new(),
+            )
+        };
+        RoutingAcceptance {
+            request: Some(request),
+            outcome: Some(outcome),
+            executed,
+            gated: gate.admitted,
+        }
     }
 
     #[test]
@@ -1974,22 +2182,29 @@ mod tests {
             EvidenceOrchestratorFlag::Enabled
         );
         assert_eq!(
-            mail_acquisition_path(EvidenceOrchestratorFlag::Disabled, Some(3)),
-            MailAcquisitionPath::Legacy
+            routed_latest_mail_intent(
+                EvidenceOrchestratorFlag::Disabled,
+                "can you read me the 3 latest emails?"
+            ),
+            None
         );
         assert_eq!(
-            mail_acquisition_path(EvidenceOrchestratorFlag::Enabled, Some(3)),
-            MailAcquisitionPath::EvidenceOrchestrator
+            routed_latest_mail_intent(
+                EvidenceOrchestratorFlag::Enabled,
+                "can you read me the 3 latest emails?"
+            ),
+            Some(EvidenceIntent::MailLatestContent {
+                count: 3,
+                requested_count: 3,
+                unread_only: false,
+            })
         );
         assert_eq!(
-            mail_acquisition_path(EvidenceOrchestratorFlag::Enabled, None),
-            MailAcquisitionPath::Legacy
-        );
-        let stage_three_header_intent = desired_mail_read_count("show my latest 3 emails");
-        assert_eq!(stage_three_header_intent, None);
-        assert_eq!(
-            mail_acquisition_path(EvidenceOrchestratorFlag::Enabled, stage_three_header_intent),
-            MailAcquisitionPath::Legacy
+            routed_latest_mail_intent(EvidenceOrchestratorFlag::Enabled, "show my latest 3 emails"),
+            Some(EvidenceIntent::MailLatestHeaders {
+                count: 3,
+                unread_only: false,
+            })
         );
         assert_eq!(
             requested_mail_summary_count("summarize my latest 11 emails"),
@@ -1999,14 +2214,23 @@ mod tests {
             desired_mail_read_count("summarize my latest 11 emails"),
             Some(3)
         );
-        assert_eq!(
-            legacy_summary_evidence_intent("summarize my latest 11 emails"),
-            Some(EvidenceIntent::MailLatestContent {
-                count: 10,
-                requested_count: 11,
-                unread_only: false,
-            })
-        );
+    }
+
+    #[test]
+    fn flagged_routing_keeps_targeted_ambiguous_mixed_web_and_unrelated_turns_legacy() {
+        for prompt in [
+            "read the latest email from Alice",
+            "read my latest email or the latest one from Alice",
+            "read my latest email and check the current price online",
+            "what is the latest weather?",
+            "what is in my project notes?",
+        ] {
+            assert_eq!(
+                routed_latest_mail_intent(EvidenceOrchestratorFlag::Enabled, prompt),
+                None,
+                "must remain on legacy routing: {prompt}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2026,19 +2250,16 @@ mod tests {
         }
 
         let message = "summarize my latest 3 emails";
-        let legacy_target = desired_mail_read_count(message);
         let mut disabled_adapter = FakeMailAdapter::with_three_readable_messages();
         assert_eq!(
-            mail_acquisition_path(EvidenceOrchestratorFlag::Disabled, legacy_target),
-            MailAcquisitionPath::Legacy
+            routed_latest_mail_intent(EvidenceOrchestratorFlag::Disabled, message),
+            None
         );
         assert!(disabled_adapter.operations().is_empty());
 
-        assert_eq!(
-            mail_acquisition_path(EvidenceOrchestratorFlag::Enabled, legacy_target),
-            MailAcquisitionPath::EvidenceOrchestrator
-        );
-        let plan = EvidencePlanner::plan(legacy_summary_evidence_intent(message).unwrap());
+        let intent = routed_latest_mail_intent(EvidenceOrchestratorFlag::Enabled, message)
+            .expect("flagged latest Mail content should use typed routing");
+        let plan = EvidencePlanner::plan(intent);
         let outcome =
             execute_mail_plan(&mut disabled_adapter, &mut AllowAll, "turn-flagged", &plan).await;
         assert!(matches!(
@@ -2048,6 +2269,286 @@ mod tests {
                     && bundle.acquired.mail_bodies == 3
         ));
         assert_eq!(disabled_adapter.operations().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn flagged_header_listing_is_model_free_and_contains_no_body_or_connector_id() {
+        use crate::evidence::{
+            execute_mail_plan, fixtures, Admission, EvidenceOperation, EvidenceOperationGate,
+            EvidencePlanner, FakeMailAdapter, ValidationOutcome,
+        };
+        use async_trait::async_trait;
+
+        struct AllowAll;
+        #[async_trait]
+        impl EvidenceOperationGate for AllowAll {
+            async fn admit(&mut self, _operation: &EvidenceOperation) -> Admission {
+                Admission::Allowed
+            }
+        }
+
+        let intent =
+            routed_latest_mail_intent(EvidenceOrchestratorFlag::Enabled, "show my latest 3 emails")
+                .unwrap();
+        let plan = EvidencePlanner::plan(intent);
+        let mut adapter = FakeMailAdapter::with_three_readable_messages();
+        let outcome = execute_mail_plan(&mut adapter, &mut AllowAll, "turn-headers", &plan).await;
+        let ValidationOutcome::Bundle(bundle) = outcome.validation else {
+            panic!("headers should produce an evidence bundle");
+        };
+
+        let rendered = render_mail_header_listing(&bundle);
+
+        assert_eq!(adapter.operations().len(), 1);
+        assert!(matches!(
+            adapter.operations()[0],
+            EvidenceOperation::MailList { limit: 3, .. }
+        ));
+        assert!(rendered.contains("Latest emails (3 of 3)"));
+        assert!(rendered.contains("Sender 1"));
+        assert!(rendered.contains("Subject 1"));
+        assert!(!rendered.contains("Body for"));
+        for raw_id in fixtures::three_readable_messages().mail_list[0]
+            .value
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|header| header.connector_id.as_str())
+        {
+            assert!(!rendered.contains(raw_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_acceptance_original_prompt_lists_once_then_reads_three_distinct_messages() {
+        use crate::evidence::{fixtures, Completeness, EvidenceOrigin, ValidationOutcome};
+        use std::collections::HashSet;
+
+        let origins = [
+            (ExecOrigin::Chat, EvidenceOrigin::Chat),
+            (
+                ExecOrigin::Automation {
+                    automation_id: "automation-1".into(),
+                    automation_name: "Mail digest".into(),
+                    run_id: "run-1".into(),
+                },
+                EvidenceOrigin::Automation,
+            ),
+        ];
+        for (origin, expected_origin) in origins {
+            let run = run_routing_acceptance(
+                "can you read me the 3 latest emails?",
+                EvidenceOrchestratorFlag::Enabled,
+                &origin,
+                fixtures::three_readable_messages(),
+                ScriptedGate::default(),
+                true,
+            )
+            .await;
+
+            let request = run.request.as_ref().unwrap();
+            assert_eq!(request.origin, expected_origin);
+            assert_eq!(request.session_id, "routing-acceptance-session");
+            assert_eq!(
+                request.original_text,
+                "can you read me the 3 latest emails?"
+            );
+            assert_eq!(run.executed.len(), 4);
+            assert!(matches!(
+                run.executed[0],
+                EvidenceOperation::MailList {
+                    limit: 3,
+                    unread_only: false
+                }
+            ));
+            let read_ids = run.executed[1..]
+                .iter()
+                .map(|operation| match operation {
+                    EvidenceOperation::MailRead { message_id } => message_id.as_str(),
+                    _ => panic!("only sequential reads may follow the list"),
+                })
+                .collect::<HashSet<_>>();
+            assert_eq!(read_ids.len(), 3);
+            assert_eq!(run.gated, run.executed);
+            let ValidationOutcome::Bundle(bundle) = &run.outcome.as_ref().unwrap().validation
+            else {
+                panic!("three readable messages should produce a bundle");
+            };
+            assert_eq!(bundle.completeness, Completeness::Complete);
+            assert_eq!(bundle.acquired.mail_bodies, 3);
+            let serialized = serde_json::to_string(bundle).unwrap();
+            assert!(!serialized.contains("connector_id"));
+            for operation in &run.executed[1..] {
+                if let EvidenceOperation::MailRead { message_id } = operation {
+                    assert!(!serialized.contains(message_id.as_str()));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_acceptance_one_unavailable_body_is_partial_after_all_three_reads() {
+        use crate::evidence::{fixtures, Completeness, ValidationOutcome};
+
+        let run = run_routing_acceptance(
+            "can you read me the 3 latest emails?",
+            EvidenceOrchestratorFlag::Enabled,
+            &ExecOrigin::Chat,
+            fixtures::one_unavailable_of_three(),
+            ScriptedGate::default(),
+            true,
+        )
+        .await;
+
+        assert_eq!(run.executed.len(), 4);
+        let ValidationOutcome::Bundle(bundle) = &run.outcome.unwrap().validation else {
+            panic!("some readable content should remain synthesis-eligible");
+        };
+        assert_eq!(bundle.completeness, Completeness::Partial);
+        assert_eq!(bundle.acquired.mail_bodies, 2);
+        assert!(bundle.missing.iter().any(|missing| {
+            missing.reason == ShortfallReason::BodyUnavailable && missing.missing_count == 1
+        }));
+    }
+
+    #[tokio::test]
+    async fn routing_acceptance_empty_inbox_is_distinct_and_reads_no_bodies() {
+        use crate::evidence::{fixtures, ValidationOutcome};
+
+        let run = run_routing_acceptance(
+            "show my latest 3 emails",
+            EvidenceOrchestratorFlag::Enabled,
+            &ExecOrigin::Chat,
+            fixtures::empty_mailbox(),
+            ScriptedGate::default(),
+            true,
+        )
+        .await;
+
+        assert_eq!(run.executed.len(), 1);
+        assert!(matches!(
+            run.outcome.unwrap().validation,
+            ValidationOutcome::Recovery(recovery) if recovery.kind == RecoveryKind::Empty
+        ));
+    }
+
+    #[tokio::test]
+    async fn routing_acceptance_unavailable_mail_connector_is_not_empty_or_denied() {
+        use crate::evidence::{fixtures, ValidationOutcome};
+
+        let run = run_routing_acceptance(
+            "can you read me the 3 latest emails?",
+            EvidenceOrchestratorFlag::Enabled,
+            &ExecOrigin::Chat,
+            fixtures::mail_connector_unavailable(),
+            ScriptedGate::default(),
+            false,
+        )
+        .await;
+
+        assert!(run.executed.is_empty());
+        assert_eq!(run.gated.len(), 1);
+        assert!(matches!(
+            run.outcome.unwrap().validation,
+            ValidationOutcome::Recovery(recovery) if recovery.kind == RecoveryKind::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn routing_acceptance_list_denial_is_terminal_and_executes_nothing() {
+        use crate::evidence::{fixtures, ValidationOutcome};
+
+        let run = run_routing_acceptance(
+            "can you read me the 3 latest emails?",
+            EvidenceOrchestratorFlag::Enabled,
+            &ExecOrigin::Chat,
+            fixtures::three_readable_messages(),
+            ScriptedGate {
+                deny_list: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+
+        assert!(run.executed.is_empty());
+        assert_eq!(run.gated.len(), 1);
+        assert!(matches!(
+            run.outcome.unwrap().validation,
+            ValidationOutcome::Recovery(recovery) if recovery.kind == RecoveryKind::Denied
+        ));
+    }
+
+    #[tokio::test]
+    async fn routing_acceptance_individual_read_denial_is_partial_and_other_reads_continue() {
+        use crate::evidence::{fixtures, Completeness, ValidationOutcome};
+
+        let run = run_routing_acceptance(
+            "can you read me the 3 latest emails?",
+            EvidenceOrchestratorFlag::Enabled,
+            &ExecOrigin::Chat,
+            fixtures::three_readable_messages(),
+            ScriptedGate {
+                deny_read_number: Some(2),
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+
+        assert_eq!(run.gated.len(), 4);
+        assert_eq!(run.executed.len(), 3);
+        let ValidationOutcome::Bundle(bundle) = &run.outcome.unwrap().validation else {
+            panic!("two readable messages should produce partial evidence");
+        };
+        assert_eq!(bundle.completeness, Completeness::Partial);
+        assert_eq!(bundle.acquired.mail_bodies, 2);
+        assert!(bundle.missing.iter().any(|missing| {
+            missing.reason == ShortfallReason::Denied && missing.missing_count == 1
+        }));
+    }
+
+    #[tokio::test]
+    async fn routing_acceptance_disabled_flag_executes_no_typed_operations() {
+        use crate::evidence::fixtures;
+
+        let run = run_routing_acceptance(
+            "can you read me the 3 latest emails?",
+            EvidenceOrchestratorFlag::Disabled,
+            &ExecOrigin::Chat,
+            fixtures::three_readable_messages(),
+            ScriptedGate::default(),
+            true,
+        )
+        .await;
+
+        assert!(run.request.is_none());
+        assert!(run.outcome.is_none());
+        assert!(run.executed.is_empty());
+        assert!(run.gated.is_empty());
+    }
+
+    #[tokio::test]
+    async fn routing_acceptance_ambiguous_and_mixed_requests_execute_no_typed_operations() {
+        use crate::evidence::fixtures;
+
+        for prompt in [
+            "read my latest email or the latest one from Alice",
+            "read my latest email and check the current price online",
+        ] {
+            let run = run_routing_acceptance(
+                prompt,
+                EvidenceOrchestratorFlag::Enabled,
+                &ExecOrigin::Chat,
+                fixtures::three_readable_messages(),
+                ScriptedGate::default(),
+                true,
+            )
+            .await;
+            assert!(run.outcome.is_none(), "typed route admitted: {prompt}");
+            assert!(run.executed.is_empty());
+            assert!(run.gated.is_empty());
+        }
     }
 
     #[test]

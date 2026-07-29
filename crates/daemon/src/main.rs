@@ -64,7 +64,7 @@ struct AppState {
     debug_dir: PathBuf,
     /// Small fast model for intent/correction classifiers — never blocks chat TTFT.
     classifier_model: String,
-    /// Local opt-in rollback flag for the Stage 2 typed Mail evidence path.
+    /// Local opt-in rollback flag for typed latest-Mail evidence routing.
     evidence_orchestrator: agent_exec::EvidenceOrchestratorFlag,
     attachments_dir: PathBuf,
     inference: BaseRtClient,
