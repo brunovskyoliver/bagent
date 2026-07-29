@@ -25,15 +25,24 @@ final class DaemonLaunchAgentTests: XCTestCase {
         XCTAssertEqual(parsed?["Label"] as? String, "com.bagent.daemon")
     }
 
-    func testBaseRTPlistUsesDedicatedPortAndRequiredModel() throws {
+    func testBaseRTPlistKeepsServiceResidentWithLazyRegisteredModels() throws {
         let plist = BaseRTLaunchAgent.plistContent(
-            binaryPath: "/Users/oliver/.basert/basert"
+            binaryPath: "/Users/oliver/.basert/basert",
+            modelDirectory: "/Users/oliver/Library/Application Support/bagent/basert-models"
         )
         XCTAssertTrue(plist.contains("<string>com.bagent.basert</string>"))
-        XCTAssertTrue(plist.contains("<string>basecompute/Qwen3-4B-Instruct-2507</string>"))
+        XCTAssertTrue(plist.contains("<string>--model-dir</string>"))
+        XCTAssertTrue(plist.contains(
+            "<string>/Users/oliver/Library/Application Support/bagent/basert-models</string>"))
+        XCTAssertTrue(plist.contains("<string>--idle-timeout</string>"))
+        XCTAssertTrue(plist.contains("<string>1200</string>"))
+        XCTAssertTrue(plist.contains("<string>--max-context</string>"))
+        XCTAssertTrue(plist.contains("<string>16384</string>"))
         XCTAssertTrue(plist.contains("<string>8082</string>"))
         XCTAssertTrue(plist.contains("<string>basert-local</string>"))
         XCTAssertFalse(plist.contains("<string>8080</string>"))
+        XCTAssertFalse(plist.contains("<string>basecompute/Qwen3-4B-Instruct-2507</string>"))
+        XCTAssertFalse(plist.contains("<string>basecompute/Qwen3.6-35B-A3B</string>"))
 
         let parsed = try PropertyListSerialization.propertyList(
             from: plist.data(using: .utf8)!, options: [], format: nil
@@ -41,5 +50,6 @@ final class DaemonLaunchAgentTests: XCTestCase {
         let args = parsed?["ProgramArguments"] as? [String]
         XCTAssertEqual(args?.first, "/Users/oliver/.basert/basert")
         XCTAssertEqual(args?.dropFirst().first, "serve")
+        XCTAssertEqual(args?.filter { $0 == "--model-dir" }.count, 1)
     }
 }

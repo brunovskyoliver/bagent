@@ -6,7 +6,9 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use basert_connector::{BaseRtClient, ChatStreamEvent, Message, ToolDef};
+use basert_connector::{
+    BaseRtClient, ChatStreamEvent, Message, ModelLoadRequest, ModelReadiness, ToolDef,
+};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -70,6 +72,88 @@ async fn authenticates_health_and_lists_models() {
 }
 
 #[tokio::test]
+async fn typed_model_lifecycle_loads_checks_readiness_and_unloads() {
+    #[derive(Clone, Default)]
+    struct LifecycleCapture(Arc<Mutex<Vec<(String, serde_json::Value)>>>);
+
+    async fn capture_request(
+        State(capture): State<LifecycleCapture>,
+        headers: HeaderMap,
+        request: Request<Body>,
+    ) -> impl IntoResponse {
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer test-key");
+        let path = request.uri().path().to_string();
+        let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        capture.0.lock().unwrap().push((path, body));
+        StatusCode::OK
+    }
+
+    let capture = LifecycleCapture::default();
+    let app = Router::new()
+        .route("/v1/models/load", post(capture_request))
+        .route("/v1/models/unload", post(capture_request))
+        .route(
+            "/v1/models",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(headers.get("authorization").unwrap(), "Bearer test-key");
+                axum::Json(json!({
+                    "data": [{
+                        "id": "basecompute/Qwen3.6-35B-A3B",
+                        "loaded": true
+                    }]
+                }))
+            }),
+        )
+        .with_state(capture.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = BaseRtClient::new(format!("http://{address}/v1"), "test-key");
+    let readiness = client
+        .load_model(&ModelLoadRequest {
+            id: "basecompute/Qwen3.6-35B-A3B".into(),
+            path: "/models/qwen35.base".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        readiness,
+        ModelReadiness {
+            id: "basecompute/Qwen3.6-35B-A3B".into(),
+            known: true,
+            loaded: true,
+        }
+    );
+    client
+        .unload_model("basecompute/Qwen3.6-35B-A3B")
+        .await
+        .unwrap();
+
+    let requests = capture.0.lock().unwrap();
+    assert_eq!(
+        requests.as_slice(),
+        [
+            (
+                "/v1/models/load".into(),
+                json!({"path": "/models/qwen35.base"})
+            ),
+            (
+                "/v1/models/unload".into(),
+                json!({"model": "basecompute/Qwen3.6-35B-A3B"})
+            )
+        ]
+    );
+}
+
+#[tokio::test]
 async fn bounded_chat_completion_is_non_streamed_and_uses_requested_limit() {
     let response = (
         StatusCode::OK,
@@ -96,7 +180,36 @@ async fn bounded_chat_completion_is_non_streamed_and_uses_requested_limit() {
     assert_eq!(request["stream"], false);
     assert_eq!(request["max_tokens"], 512);
     assert_eq!(request["tools"], serde_json::Value::Null);
+    assert_eq!(
+        request["chat_template_kwargs"]["enable_thinking"],
+        serde_json::Value::Bool(false)
+    );
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn bounded_chat_completion_rejects_empty_model_output_as_unavailable() {
+    let response = (
+        StatusCode::OK,
+        axum::Json(json!({
+            "choices": [{"message": {"content": ""}, "finish_reason": "stop"}]
+        })),
+    )
+        .into_response();
+    let (base_url, _) = spawn_server(response).await;
+    let client = BaseRtClient::new(base_url, "test-key");
+
+    let error = client
+        .chat_complete_bounded(
+            "configured-model",
+            vec![Message::system("system"), Message::user("user")],
+            0.1,
+            512,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "BaseRT returned an empty completion");
 }
 
 #[tokio::test]

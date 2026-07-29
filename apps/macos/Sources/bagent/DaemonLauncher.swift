@@ -60,8 +60,10 @@ enum DaemonLaunchAgent {
 enum BaseRTLaunchAgent {
     static let label = "com.bagent.basert"
     static let model = "basecompute/Qwen3-4B-Instruct-2507"
+    static let synthesisModel = "basecompute/Qwen3.6-35B-A3B"
     static let apiKey = "basert-local"
     static let port = 8082
+    static let idleTimeoutSeconds = 20 * 60
 
     static var plistURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -73,15 +75,33 @@ enum BaseRTLaunchAgent {
             .appendingPathComponent("Library/Logs/bagent/basert.log")
     }
 
-    static func plistContent(binaryPath: String) -> String {
+    static var modelRegistryURL: URL {
+        FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!
+            .appendingPathComponent("bagent/basert-models", isDirectory: true)
+    }
+
+    static func cachedModelURL(_ modelID: String) -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Caches/baseRT/models")
+            .appendingPathComponent(modelID)
+            .appendingPathComponent("default-q4/model.base")
+    }
+
+    static func plistContent(
+        binaryPath: String,
+        modelDirectory: String = modelRegistryURL.path
+    ) -> String {
         let arguments = [
             binaryPath,
             "serve",
-            model,
+            "--model-dir", modelDirectory,
             "--host", "127.0.0.1",
             "--port", String(port),
             "--api-key", apiKey,
-            "--max-context", "40960",
+            "--idle-timeout", String(idleTimeoutSeconds),
+            "--max-context", "16384",
             "--kv-bits", "4",
             "--max-tokens", "2048",
             "--max-batch-size", "1",
@@ -132,14 +152,16 @@ enum BaseRTLaunchAgent {
 @MainActor
 final class DaemonLauncher {
     func launch() {
-        Task { await ensureBaseRTRunning() }
-
         guard let url = findBinary() else {
             print("[bagentd] binary not found — run `cargo build` first")
             return
         }
         terminateLegacyChildDaemon()
-        installAndStart(binary: url)
+        Task {
+            async let baseRT: Void = ensureBaseRTRunning()
+            await installAndStart(binary: url)
+            await baseRT
+        }
     }
 
     /// Intentionally does not stop the daemon: scheduled automations keep
@@ -154,12 +176,16 @@ final class DaemonLauncher {
 
     // MARK: - launchd
 
-    private func installAndStart(binary: URL) {
+    private func installAndStart(binary: URL) async {
         let env = [
             "BAGENT_BASERT_BASE_URL": "http://127.0.0.1:8082/v1",
             "BAGENT_BASERT_API_KEY": BaseRTLaunchAgent.apiKey,
             "BAGENT_DEFAULT_MODEL": BaseRTLaunchAgent.model,
             "BAGENT_CLASSIFIER_MODEL": BaseRTLaunchAgent.model,
+            "BAGENT_SYNTHESIS_MODEL_PATH":
+                BaseRTLaunchAgent.cachedModelURL(BaseRTLaunchAgent.synthesisModel).path,
+            "BAGENT_SYNTHESIS_FALLBACK_MODEL_PATH":
+                BaseRTLaunchAgent.cachedModelURL(BaseRTLaunchAgent.model).path,
         ]
         let plist = DaemonLaunchAgent.plistContent(binaryPath: binary.path, environment: env)
         let plistURL = DaemonLaunchAgent.plistURL
@@ -175,8 +201,15 @@ final class DaemonLauncher {
         }
         // Deterministic restart into the current binary + env on every app
         // launch (same semantics the app had when it owned the process).
+        let previousPID = launchdManagedPid()
         _ = runLaunchctl(["bootout", "gui/\(getuid())/\(DaemonLaunchAgent.label)"])
-        let status = runLaunchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
+        if let previousPID {
+            for _ in 0..<60 {
+                if kill(previousPID, 0) != 0 { break }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        let status = await bootstrapLaunchAgent(plistURL: plistURL)
         print(status == 0
             ? "[bagentd] launchd agent bootstrapped"
             : "[bagentd] launchctl bootstrap failed (\(status))")
@@ -197,6 +230,18 @@ final class DaemonLauncher {
             print("[bagentd] launchctl \(args.first ?? "") failed: \(error)")
             return -1
         }
+    }
+
+    private func bootstrapLaunchAgent(plistURL: URL) async -> Int32 {
+        var status: Int32 = -1
+        for attempt in 1...3 {
+            status = runLaunchctl(["bootstrap", "gui/\(getuid())", plistURL.path])
+            if status == 0 { return status }
+            if attempt < 3 {
+                try? await Task.sleep(for: .milliseconds(750))
+            }
+        }
+        return status
     }
 
     /// Pre-launchd app versions spawned bagentd as a child and recorded its
@@ -246,6 +291,12 @@ final class DaemonLauncher {
     // MARK: - BaseRT autostart
 
     private func ensureBaseRTRunning() async {
+        do {
+            try prepareBaseRTModelRegistry()
+        } catch {
+            print("[BaseRT] failed to prepare model registry: \(error)")
+            return
+        }
         if await isBaseRTReady() {
             print("[BaseRT] bagent runtime already ready on port \(BaseRTLaunchAgent.port)")
             return
@@ -276,23 +327,87 @@ final class DaemonLauncher {
         }
 
         _ = runLaunchctl(["bootout", "gui/\(getuid())/\(BaseRTLaunchAgent.label)"])
-        let status = runLaunchctl([
-            "bootstrap", "gui/\(getuid())", BaseRTLaunchAgent.plistURL.path,
-        ])
+        // BaseRT may spend several seconds draining/unmapping model weights after
+        // launchd removes the old job. Wait for the dedicated port to close so
+        // the replacement cannot lose a bind race and disappear.
+        if let healthURL = URL(string: "http://127.0.0.1:8082/health") {
+            for _ in 0..<60 {
+                if await authenticatedGet(healthURL) == nil { break }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        let status = await bootstrapLaunchAgent(plistURL: BaseRTLaunchAgent.plistURL)
         guard status == 0 else {
             print("[BaseRT] launchctl bootstrap failed (\(status))")
             return
         }
 
-        // First serve may download the model, so keep polling without blocking UI.
-        for attempt in 1...600 {
+        // Service readiness is independent of optional model availability.
+        // The daemon starts in parallel; its runtime manager owns bounded
+        // preferred-model readiness and fallback.
+        for attempt in 1...20 {
             try? await Task.sleep(for: .milliseconds(500))
             if await isBaseRTReady() {
                 print("[BaseRT] ready after \(attempt) poll(s)")
                 return
             }
         }
-        print("[BaseRT] did not become ready within 5 minutes; see \(BaseRTLaunchAgent.logURL.path)")
+        print("[BaseRT] did not become ready within 10 seconds; see \(BaseRTLaunchAgent.logURL.path)")
+    }
+
+    private func prepareBaseRTModelRegistry() throws {
+        let registry = BaseRTLaunchAgent.modelRegistryURL
+        try FileManager.default.createDirectory(
+            at: registry,
+            withIntermediateDirectories: true
+        )
+        for legacyName in ["fallback-4b.base", "synthesis-35b.base"] {
+            let legacyLink = registry.appendingPathComponent(legacyName)
+            if FileManager.default.fileExists(atPath: legacyLink.path)
+                || (try? FileManager.default.attributesOfItem(atPath: legacyLink.path)) != nil {
+                try FileManager.default.removeItem(at: legacyLink)
+            }
+        }
+        for modelID in [
+            BaseRTLaunchAgent.model,
+            BaseRTLaunchAgent.synthesisModel,
+        ] {
+            let sourceDirectory = BaseRTLaunchAgent.cachedModelURL(modelID)
+                .deletingLastPathComponent()
+            let modelSource = sourceDirectory.appendingPathComponent("model.base")
+            let metadataSource = sourceDirectory.appendingPathComponent("hub.json")
+            guard FileManager.default.fileExists(atPath: modelSource.path),
+                  FileManager.default.fileExists(atPath: metadataSource.path) else {
+                print("[BaseRT] cached model unavailable: \(modelID)")
+                continue
+            }
+            let destinationDirectory = registry
+                .appendingPathComponent(modelID)
+                .appendingPathComponent("default-q4")
+            try FileManager.default.createDirectory(
+                at: destinationDirectory,
+                withIntermediateDirectories: true
+            )
+            for (source, filename) in [
+                (modelSource, "model.base"),
+                (metadataSource, "hub.json"),
+            ] {
+                let link = destinationDirectory.appendingPathComponent(filename)
+                if let destination = try? FileManager.default.destinationOfSymbolicLink(
+                    atPath: link.path
+                ), destination == source.path {
+                    continue
+                }
+                if FileManager.default.fileExists(atPath: link.path)
+                    || (try? FileManager.default.attributesOfItem(atPath: link.path)) != nil {
+                    try FileManager.default.removeItem(at: link)
+                }
+                try FileManager.default.createSymbolicLink(
+                    at: link,
+                    withDestinationURL: source
+                )
+            }
+        }
     }
 
     private func isBaseRTReady() async -> Bool {
@@ -306,7 +421,7 @@ final class DaemonLauncher {
               let models = value["data"] as? [[String: Any]] else {
             return false
         }
-        return models.contains { $0["id"] as? String == BaseRTLaunchAgent.model }
+        return models.allSatisfy { $0["id"] is String }
     }
 
     private func authenticatedGet(_ url: URL) async -> Data? {

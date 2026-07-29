@@ -7,6 +7,26 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8082/v1";
 pub const DEFAULT_API_KEY: &str = "basert-local";
 pub const DEFAULT_CHAT_MODEL: &str = "basecompute/Qwen3-4B-Instruct-2507";
 
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub loaded: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelLoadRequest {
+    pub id: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelReadiness {
+    pub id: String,
+    pub known: bool,
+    pub loaded: bool,
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ToolDefFunction {
     pub name: String,
@@ -176,6 +196,15 @@ impl BaseRtClient {
     }
 
     pub async fn models(&self) -> Result<Vec<String>> {
+        Ok(self
+            .inspect_models()
+            .await?
+            .into_iter()
+            .map(|model| model.id)
+            .collect())
+    }
+
+    pub async fn inspect_models(&self) -> Result<Vec<ModelInfo>> {
         let response = self
             .get(format!("{}/models", self.base_url))
             .send()
@@ -186,11 +215,43 @@ impl BaseRtClient {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|item| item["id"].as_str().map(str::to_owned))
+            .filter_map(|item| {
+                item["id"].as_str().map(|id| ModelInfo {
+                    id: id.to_owned(),
+                    loaded: item["loaded"].as_bool().unwrap_or(true),
+                })
+            })
             .collect::<Vec<_>>();
-        models.sort();
-        models.dedup();
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        models.dedup_by(|left, right| left.id == right.id);
         Ok(models)
+    }
+
+    pub async fn model_readiness(&self, model: &str) -> Result<ModelReadiness> {
+        let models = self.inspect_models().await?;
+        let matching = models.iter().find(|candidate| candidate.id == model);
+        Ok(ModelReadiness {
+            id: model.to_string(),
+            known: matching.is_some(),
+            loaded: matching.is_some_and(|candidate| candidate.loaded),
+        })
+    }
+
+    pub async fn load_model(&self, request: &ModelLoadRequest) -> Result<ModelReadiness> {
+        if request.id.trim().is_empty() {
+            return Err(anyhow!("model id must not be empty"));
+        }
+        if request.path.trim().is_empty() {
+            return Err(anyhow!("model path must not be empty"));
+        }
+        let response = self
+            .post(format!("{}/models/load", self.base_url))
+            .json(&serde_json::json!({"path": request.path}))
+            .send()
+            .await
+            .context("POST /v1/models/load")?;
+        response_ok(response, "POST /v1/models/load").await?;
+        self.model_readiness(&request.id).await
     }
 
     pub async fn unload_model(&self, model: &str) -> Result<()> {
@@ -354,6 +415,9 @@ impl BaseRtClient {
             "stream": false,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "chat_template_kwargs": {
+                "enable_thinking": false
+            },
         });
         if let Some(format) = response_format {
             body["response_format"] = format;
@@ -365,10 +429,14 @@ impl BaseRtClient {
             .await
             .context("POST /v1/chat/completions")?;
         let value = response_json(response, "POST /v1/chat/completions").await?;
-        Ok(value["choices"][0]["message"]["content"]
+        let content = value["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or_default()
-            .to_string())
+            .to_string();
+        if content.trim().is_empty() {
+            return Err(anyhow!("BaseRT returned an empty completion"));
+        }
+        Ok(content)
     }
 
     pub async fn generate_raw(

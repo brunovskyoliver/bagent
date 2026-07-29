@@ -68,6 +68,8 @@ struct AppState {
     evidence_orchestrator: agent_exec::EvidenceOrchestratorFlag,
     attachments_dir: PathBuf,
     inference: BaseRtClient,
+    /// Shared preferred/fallback synthesis lifecycle for chat and automations.
+    synthesis: Arc<evidence::SynthesisService>,
     mail: Option<MailConnector>,
     notes: Option<NotesConnector>,
     fs: Option<FsConnector>,
@@ -326,6 +328,7 @@ async fn wait_for_shutdown_signal() {
 }
 
 async fn cleanup_runtime_resources(state: &AppState) {
+    state.synthesis.shutdown().await;
     cleanup_basert_models(state).await;
 
     if let Err(e) = state.whatsapp.stop().await {
@@ -442,6 +445,12 @@ async fn main() -> Result<()> {
     let basert_api_key =
         std::env::var("BAGENT_BASERT_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
     let inference = BaseRtClient::new(basert_base_url, basert_api_key);
+    let synthesis = evidence::SynthesisService::new(
+        Arc::new(inference.clone()),
+        Arc::new(evidence::SystemSynthesisClock::default()),
+        Arc::new(evidence::SystemMemoryPressureSignal::from_environment()),
+        evidence::SynthesisConfig::from_environment(),
+    );
 
     // MemoryStore uses a separate connection with std::sync::Mutex (blocking SQLite ops)
     let mem_conn = rusqlite::Connection::open(data_dir.join("bagent.db"))?;
@@ -459,23 +468,6 @@ async fn main() -> Result<()> {
         env = agent_exec::EVIDENCE_ORCHESTRATOR_FLAG_ENV,
         "typed Mail evidence orchestrator feature flag"
     );
-
-    // Warm the configured BaseRT model without blocking daemon startup.
-    {
-        let warmup_inference = inference.clone();
-        let warmup_chat_model = default_model.clone();
-        tokio::spawn(async move {
-            match warmup_inference
-                .generate_raw(&warmup_chat_model, "Reply with one period.", 0.0)
-                .await
-            {
-                Ok(_) => tracing::info!(model = %warmup_chat_model, "warmup: BaseRT model loaded"),
-                Err(e) => {
-                    tracing::debug!(model = %warmup_chat_model, "warmup: BaseRT unavailable: {e}")
-                }
-            }
-        });
-    }
 
     // Automated mail sync: battery-aware interval poller
     // On AC power:      every 5 minutes
@@ -672,6 +664,7 @@ async fn main() -> Result<()> {
         evidence_orchestrator,
         attachments_dir,
         inference,
+        synthesis,
         mail,
         notes,
         fs,
@@ -691,6 +684,7 @@ async fn main() -> Result<()> {
             bagent_automations::policy::MAX_CONCURRENT_RUNS,
         )),
     };
+    state.synthesis.start_maintenance().await;
 
     // Daemon-owned automation scheduler: recovery at startup, then sleeps
     // until the next due instant (woken immediately by automations_changed).
