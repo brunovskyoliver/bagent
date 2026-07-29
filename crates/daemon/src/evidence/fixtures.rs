@@ -194,6 +194,10 @@ pub(crate) fn redirected_readable_page() -> EvidenceResults {
                 bytes_read: 120,
                 characters_extracted: 50,
                 extraction: ExtractionStatus::Readable,
+                quality: ExtractionQuality {
+                    useful_text_length: 50,
+                    ..Default::default()
+                },
                 authority: SourceAuthority::FirstParty,
                 source_identity: SourceIdentity::new("publisher-example").unwrap(),
                 passages: vec![EvidencePassage {

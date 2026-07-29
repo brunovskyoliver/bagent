@@ -26,9 +26,9 @@ use filesystem_connector::{
 use whatsapp_connector::WhatsappSendTarget;
 
 use crate::evidence::{
-    execute_evidence_turn, Classification, Completeness, EvidenceBundle, EvidenceContext,
-    EvidenceIntent, EvidenceIntentClassifier, EvidenceOrigin, EvidenceRequest, ValidationOutcome,
-    EVIDENCE_SCHEMA_VERSION,
+    assess_claim_relevance, execute_evidence_turn, Classification, Completeness, EvidenceBundle,
+    EvidenceContext, EvidenceIntent, EvidenceIntentClassifier, EvidenceOrigin, EvidenceRequest,
+    ValidationOutcome, EVIDENCE_SCHEMA_VERSION,
 };
 use crate::{
     audit_fs, json_str_arg, request_tool_approval, run_aerospace, save_last_file_ref,
@@ -1184,17 +1184,51 @@ impl WebSynthesisValidationFailure {
 }
 
 fn markdown_citation_urls(response: &str) -> Vec<Url> {
-    let mut remaining = response;
     let mut urls = Vec::new();
-    while let Some(start) = remaining.find("](") {
-        let after = &remaining[start + 2..];
-        let Some(end) = after.find(')') else {
-            break;
+    let mut offset = 0usize;
+    while let Some(relative_start) = response[offset..].find("](") {
+        let destination_start = offset + relative_start + 2;
+        let after = &response[destination_start..];
+        let trimmed = after.trim_start();
+        let whitespace = after.len() - trimmed.len();
+        let (destination, consumed) = if let Some(angle) = trimmed.strip_prefix('<') {
+            let Some(end) = angle.find('>') else {
+                break;
+            };
+            let suffix = &angle[end + 1..];
+            let closing_whitespace = suffix.len() - suffix.trim_start().len();
+            if !suffix.trim_start().starts_with(')') {
+                offset = destination_start + whitespace + end + 2;
+                continue;
+            }
+            (&angle[..end], whitespace + end + closing_whitespace + 3)
+        } else {
+            let mut depth = 1usize;
+            let mut end = None;
+            for (index, character) in trimmed.char_indices() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            end = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                break;
+            };
+            let raw = trimmed[..end].trim();
+            let destination = raw.split_whitespace().next().unwrap_or_default();
+            (destination, whitespace + end + 1)
         };
-        if let Ok(url) = Url::parse(after[..end].trim()) {
+        if let Ok(url) = Url::parse(destination) {
             urls.push(url);
         }
-        remaining = &after[end + 1..];
+        offset = destination_start + consumed;
     }
     urls
 }
@@ -1207,7 +1241,7 @@ fn contains_unparsed_http_url(response: &str, citations: &[Url]) -> bool {
     scrubbed.contains("http://") || scrubbed.contains("https://")
 }
 
-fn claim_segments(response: &str) -> Vec<&str> {
+fn claim_segments(response: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut start = 0usize;
     let bytes = response.as_bytes();
@@ -1219,16 +1253,69 @@ fn claim_segments(response: &str) -> Vec<&str> {
         if matches!(*byte, b'.' | b'?' | b'!') && followed_by_boundary {
             let segment = response[start..=index].trim();
             if !segment.is_empty() {
-                segments.push(segment);
+                segments.push(segment.to_string());
             }
             start = index + 1;
         }
     }
     let tail = response[start..].trim();
     if !tail.is_empty() {
-        segments.push(tail);
+        segments.push(tail.to_string());
     }
-    segments
+    let mut merged: Vec<String> = Vec::new();
+    for segment in segments {
+        if markdown_citation_urls(&segment).is_empty()
+            || !remove_markdown_links(&segment)
+                .trim_matches(|character: char| {
+                    character.is_whitespace() || character.is_ascii_punctuation()
+                })
+                .is_empty()
+            || merged.is_empty()
+        {
+            merged.push(segment);
+        } else {
+            let prior = merged.last_mut().expect("non-empty checked");
+            prior.push(' ');
+            prior.push_str(&segment);
+        }
+    }
+    merged
+}
+
+fn remove_markdown_links(value: &str) -> String {
+    let mut output = String::new();
+    let mut remaining = value;
+    while let Some(label_start) = remaining.find('[') {
+        output.push_str(&remaining[..label_start]);
+        let label = &remaining[label_start + 1..];
+        let Some(destination_marker) = label.find("](") else {
+            output.push_str(&remaining[label_start..]);
+            return output;
+        };
+        let destination = &label[destination_marker + 2..];
+        let mut depth = 1usize;
+        let mut close = None;
+        for (index, character) in destination.char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        close = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            output.push_str(&remaining[label_start..]);
+            return output;
+        };
+        remaining = &destination[close + 1..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 fn is_web_disclosure(segment: &str) -> bool {
@@ -1274,7 +1361,7 @@ fn claim_is_grounded(segment: &str, citations: &[Url], bundle: &EvidenceBundle) 
     if source_text.is_empty() {
         return false;
     }
-    let claim_terms = grounding_terms(segment);
+    let claim_terms = grounding_terms(&remove_markdown_links(segment));
     let source_terms = grounding_terms(&source_text);
     let claim_numbers = claim_terms
         .iter()
@@ -1337,11 +1424,11 @@ fn validate_web_synthesis_output(
         .filter(|segment| segment.chars().any(char::is_alphanumeric))
         .filter(|segment| !is_web_disclosure(segment))
     {
-        let segment_citations = markdown_citation_urls(segment);
+        let segment_citations = markdown_citation_urls(&segment);
         if segment_citations.is_empty() {
             return Err(WebSynthesisValidationFailure::MissingCitation);
         }
-        if !claim_is_grounded(segment, &segment_citations, bundle) {
+        if !claim_is_grounded(&segment, &segment_citations, bundle) {
             return Err(WebSynthesisValidationFailure::UnsupportedClaim);
         }
     }
@@ -1372,36 +1459,171 @@ fn render_deterministic_web_result(bundle: &EvidenceBundle) -> String {
         return "Verification Shortfall: I couldn't verify this request from fetched page evidence."
             .to_string();
     }
-    let mut rendered = if bundle.completeness == Completeness::Partial {
-        "Partial Evidence: the requested verification contract could not be fully satisfied."
-            .to_string()
-    } else {
-        String::new()
-    };
     if !bundle.conflicts.is_empty() {
-        if !rendered.is_empty() {
-            rendered.push_str("\n\n");
+        if let Some(query) = web_fact_query(&bundle.intent) {
+            let claims = bundle
+                .web
+                .iter()
+                .filter_map(|item| {
+                    deterministic_fact_claim(query, item).map(|claim| {
+                        format!(
+                            "{} [Source]({}).",
+                            claim.trim_end_matches(['.', '!', '?']),
+                            item.evidence.final_url
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if claims.len() == bundle.web.len() {
+                return format!(
+                    "Fetched sources report different figures, likely reflecting different dates or definitions: {}",
+                    claims.join(" ")
+                );
+            }
         }
-        rendered.push_str("The fetched sources contain an unresolved conflict.");
+        return render_web_verification_shortfall(bundle, "the fetched sources conflict");
     }
-    for item in &bundle.web {
-        if !rendered.is_empty() {
-            rendered.push_str("\n\n");
+    let item = &bundle.web[0];
+    let claim = if let Some(query) = web_fact_query(&bundle.intent) {
+        deterministic_fact_claim(query, item)
+    } else {
+        deterministic_direct_page_description(item)
+    };
+    let Some(claim) = claim else {
+        return render_web_verification_shortfall(
+            bundle,
+            "no answer-quality passage was available",
+        );
+    };
+    let qualification = if bundle.completeness == Completeness::Partial {
+        "Partially verified: "
+    } else {
+        ""
+    };
+    format!(
+        "{}{} [Source]({}).",
+        qualification,
+        claim.trim_end_matches(['.', '!', '?']),
+        item.evidence.final_url
+    )
+}
+
+fn web_fact_query(intent: &EvidenceIntent) -> Option<&str> {
+    match intent {
+        EvidenceIntent::WebFact { query, .. } => Some(query),
+        EvidenceIntent::AnalyzeQuotedEvidence { intent } => web_fact_query(intent),
+        _ => None,
+    }
+}
+
+fn deterministic_direct_page_description(item: &crate::evidence::WebBundleItem) -> Option<String> {
+    if item.evidence.quality.low_quality_reason.is_some() {
+        return None;
+    }
+    let (description_index, description) = item
+        .evidence
+        .passages
+        .iter()
+        .enumerate()
+        .filter(|(_, passage)| passage.text.chars().count() >= 40)
+        .find_map(|(index, passage)| {
+            concise_sentence_prefix(&passage.text, 320).map(|description| (index, description))
+        })?;
+    let heading = item.evidence.passages[..description_index]
+        .iter()
+        .map(|passage| passage.text.trim())
+        .find(|text| (3..=80).contains(&text.chars().count()));
+    Some(match heading {
+        Some(heading)
+            if !description
+                .to_lowercase()
+                .starts_with(&heading.to_lowercase()) =>
+        {
+            format!("{heading}: {description}")
         }
-        let excerpt = item
-            .evidence
-            .passages
-            .iter()
-            .map(|passage| passage.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        rendered.push_str(&format!(
-            "{} [Source]({})",
-            normalized_mail_body_excerpt(&excerpt),
-            item.evidence.final_url
-        ));
+        _ => description,
+    })
+}
+
+fn deterministic_fact_claim(query: &str, item: &crate::evidence::WebBundleItem) -> Option<String> {
+    if item.evidence.quality.low_quality_reason.is_some() {
+        return None;
     }
-    rendered
+    item.evidence.passages.iter().find_map(|passage| {
+        let sentences = sentence_like_chunks(&passage.text);
+        sentences
+            .into_iter()
+            .find(|sentence| assess_claim_relevance(query, sentence).eligible)
+            .and_then(|sentence| concise_sentence_prefix(sentence, 260))
+    })
+}
+
+fn sentence_like_chunks(value: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let bytes = value.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(*byte, b'.' | b'!' | b'?')
+            && bytes
+                .get(index + 1)
+                .is_none_or(|next| next.is_ascii_whitespace())
+        {
+            let chunk = value[start..=index].trim();
+            if !chunk.is_empty() {
+                chunks.push(chunk);
+            }
+            start = index + 1;
+        }
+    }
+    let tail = value[start..].trim();
+    if !tail.is_empty() {
+        chunks.push(tail);
+    }
+    chunks
+}
+
+fn concise_sentence_prefix(value: &str, max_chars: usize) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() < 20 {
+        return None;
+    }
+    if let Some(sentence) = sentence_like_chunks(&normalized)
+        .into_iter()
+        .find(|sentence| sentence.chars().count() >= 40)
+    {
+        return Some(truncate_at_word(sentence, max_chars));
+    }
+    Some(truncate_at_word(&normalized, max_chars))
+}
+
+fn truncate_at_word(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.trim().to_string();
+    }
+    let prefix = value.chars().take(max_chars).collect::<String>();
+    prefix
+        .rsplit_once(char::is_whitespace)
+        .map(|(bounded, _)| bounded)
+        .unwrap_or(prefix.as_str())
+        .trim()
+        .to_string()
+}
+
+fn render_web_verification_shortfall(bundle: &EvidenceBundle, reason: &str) -> String {
+    let links = bundle
+        .web
+        .iter()
+        .map(|item| {
+            let label = item.evidence.final_url.host_str().unwrap_or("source");
+            format!("[{label}]({})", item.evidence.final_url)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if links.is_empty() {
+        format!("Verification Shortfall: {reason}.")
+    } else {
+        format!("Verification Shortfall: {reason}. Sources checked: {links}.")
+    }
 }
 
 async fn run_web_evidence_synthesis(
@@ -1412,6 +1634,7 @@ async fn run_web_evidence_synthesis(
     bundle: &EvidenceBundle,
     tool_calls_used: usize,
     approvals_denied: usize,
+    audit_db: Option<&std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>>,
 ) -> Result<ExecOutcome, ExecError> {
     let request = build_web_synthesis_request(original_request, bundle);
     let completion = inference.chat_complete_bounded(model, request, 0.1, WEB_SYNTHESIS_MAX_TOKENS);
@@ -1434,6 +1657,13 @@ async fn run_web_evidence_synthesis(
                     reason = validation.reason(),
                     "web evidence synthesis output rejected"
                 );
+                if let Some(db) = audit_db {
+                    audit_fs(
+                        db,
+                        "web_synthesis_rejected",
+                        &json!({"reason": validation.reason()}),
+                    );
+                }
                 render_deterministic_web_result(bundle)
             }
         },
@@ -1595,6 +1825,7 @@ pub(crate) async fn run_agent_loop(
                         &bundle,
                         tool_calls_used,
                         approvals_denied,
+                        Some(db),
                     )
                     .await;
                 }
@@ -3620,6 +3851,7 @@ mod tests {
             &bundle,
             acquired.operations_executed,
             acquired.approvals_denied,
+            None,
         )
         .await
         .expect("live web synthesis should return model output or deterministic rendering");
@@ -3853,6 +4085,18 @@ mod tests {
         };
         let valid = "Fetched, source-linked evidence [Source](https://example.com/final).";
         assert!(validate_web_synthesis_output(valid, &bundle).is_ok());
+        assert!(validate_web_synthesis_output(
+            "Fetched, source-linked evidence. [Source](<https://example.com/final>)",
+            &bundle
+        )
+        .is_ok());
+        assert_eq!(
+            validate_web_synthesis_output(
+                "Fetched, source-linked evidence. [Source](<https://example.com/final>",
+                &bundle
+            ),
+            Err(WebSynthesisValidationFailure::MissingCitation)
+        );
         assert_eq!(
             validate_web_synthesis_output(
                 "Invented claim. [Source](https://attacker.example/fake)",
@@ -3885,6 +4129,7 @@ mod tests {
             &bundle,
             1,
             0,
+            None,
         )
         .await
         .unwrap();
@@ -3940,6 +4185,7 @@ mod tests {
             &bundle,
             1,
             0,
+            None,
         )
         .await
         .unwrap();
@@ -3948,6 +4194,137 @@ mod tests {
         assert!(outcome.final_text.contains("https://example.com/final"));
         assert_eq!(rx.recv().await.unwrap()["content"], outcome.final_text);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn deterministic_web_fallback_is_concise_and_never_dumps_raw_passages() {
+        use crate::evidence::{fixtures, EvidenceValidator};
+
+        let results = fixtures::redirected_readable_page();
+        let requested_url = results.web_fetches[0]
+            .value
+            .as_ref()
+            .unwrap()
+            .requested_url
+            .clone();
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebDirectPage { url: requested_url });
+        let ValidationOutcome::Bundle(mut bundle) =
+            EvidenceValidator::validate("turn-web-fallback", &plan, results)
+        else {
+            panic!("readable direct page should validate");
+        };
+        bundle.web[0].evidence.passages[0].text = format!(
+            "Example Domain This domain is for illustrative examples in documents. {}",
+            "Navigation Menu Privacy Cookie Settings ".repeat(80)
+        );
+
+        let rendered = render_deterministic_web_result(&bundle);
+
+        assert!(rendered.contains("illustrative examples"));
+        assert!(rendered.contains("[Source](https://example.com/final)"));
+        assert!(rendered.chars().count() < 500);
+        assert!(!rendered.contains("Cookie Settings Cookie Settings"));
+    }
+
+    #[test]
+    fn deterministic_web_fallback_reports_typed_numeric_conflicts_with_adjacent_citations() {
+        use crate::evidence::{
+            fixtures, EvidenceConflict, EvidenceId, EvidenceValidator, VerificationLevel,
+        };
+
+        let mut results = fixtures::two_independent_readable_pages();
+        results.web_fetches[0].value.as_mut().unwrap().passages[0].text =
+            "The population of Bratislava was 475,503 at the end of 2024.".into();
+        results.web_fetches[1].value.as_mut().unwrap().passages[0].text =
+            "The urban-area population estimate for Bratislava was 440,948 in 2025.".into();
+        results.conflicts.push(EvidenceConflict {
+            evidence_ids: vec![
+                EvidenceId::new("web-1").unwrap(),
+                EvidenceId::new("web-2").unwrap(),
+            ],
+            description: "Population definitions differ.".into(),
+        });
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava?".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        let ValidationOutcome::Bundle(bundle) =
+            EvidenceValidator::validate("turn-web-conflict-fallback", &plan, results)
+        else {
+            panic!("two fetched sources should remain eligible");
+        };
+
+        let rendered = render_deterministic_web_result(&bundle);
+
+        assert!(rendered.contains("475,503"));
+        assert!(rendered.contains("440,948"));
+        assert!(rendered.contains("different dates or definitions"));
+        assert!(rendered.contains("475,503 at the end of 2024 [Source]("));
+        assert!(!rendered.contains("Verification Shortfall"));
+    }
+
+    #[tokio::test]
+    async fn synthesis_rejection_reason_is_recorded_without_response_or_evidence_content() {
+        use crate::evidence::{fixtures, EvidenceValidator};
+        use rusqlite::Connection;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let results = fixtures::redirected_readable_page();
+        let requested_url = results.web_fetches[0]
+            .value
+            .as_ref()
+            .unwrap()
+            .requested_url
+            .clone();
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebDirectPage { url: requested_url });
+        let ValidationOutcome::Bundle(bundle) =
+            EvidenceValidator::validate("turn-web-audit", &plan, results)
+        else {
+            panic!("readable direct page should validate");
+        };
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        db.lock()
+            .await
+            .execute(
+                "CREATE TABLE audit_entries (
+                    id INTEGER PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    model TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+        let rejected = "Unsupported private passage text. [Source](https://attacker.example/fake)";
+        let (client, _) = synthesis_test_client(rejected).await;
+        let (tx, _rx) = mpsc::channel(4);
+
+        run_web_evidence_synthesis(
+            &client,
+            &EventSink::new(tx),
+            "configured-4b",
+            "read the page",
+            &bundle,
+            1,
+            0,
+            Some(&db),
+        )
+        .await
+        .unwrap();
+
+        let payload: String = db
+            .lock()
+            .await
+            .query_row(
+                "SELECT payload FROM audit_entries WHERE action = 'web_synthesis_rejected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload, r#"{"reason":"unallowlisted_citation"}"#);
+        assert!(!payload.contains("Unsupported private passage"));
+        assert!(!payload.contains("Fetched, source-linked evidence"));
     }
 
     #[test]

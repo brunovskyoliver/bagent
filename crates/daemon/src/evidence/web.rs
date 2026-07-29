@@ -8,18 +8,21 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use reqwest::{header, Url};
+use scraper::{ElementRef, Html, Selector};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CandidateId, EvidenceContribution, EvidenceId, EvidenceIntent, EvidenceOperation,
-    EvidencePassage, EvidencePlan, EvidenceResults, ExecutionStatus, ExtractionStatus, FailureCode,
-    OperationResult, ProviderResult, ProviderSet, ProviderStatus, SourceAuthority, SourceIdentity,
+    CandidateId, ClaimEvidenceRelevance, EvidenceContribution, EvidenceId, EvidenceIntent,
+    EvidenceOperation, EvidencePassage, EvidencePlan, EvidenceResults, ExecutionStatus,
+    ExtractionLowQualityReason, ExtractionQuality, ExtractionStatus, FailureCode, OperationResult,
+    ProviderResult, ProviderSet, ProviderStatus, SourceAuthority, SourceIdentity,
     ValidatedReference, WebCandidate, WebFetchEvidence, WebProvider, WebSearchResult,
 };
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_BODY_BYTES: usize = 2_000_000;
-const MAX_EXTRACTED_CHARS: usize = 6_000;
+const MAX_PASSAGE_CHARS: usize = 1_200;
+const MAX_EXTRACTED_PASSAGES: usize = 64;
 const MAX_LINKS: usize = 30;
 const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Gecko/20100101 Firefox/128.0";
@@ -672,6 +675,7 @@ async fn typed_fetch<N: WebNetwork>(
         bytes_read,
         characters_extracted: 0,
         extraction: ExtractionStatus::Empty,
+        quality: ExtractionQuality::default(),
         authority: authority_for(candidate.provider, &final_url),
         source_identity: source_identity_for(&final_url),
         passages: Vec::new(),
@@ -688,20 +692,32 @@ async fn typed_fetch<N: WebNetwork>(
         ExecutionStatus::Failed(FailureCode::UnsupportedContentType)
     } else {
         let body = String::from_utf8_lossy(&response.body);
-        let readable = if evidence.content_type.contains("html") || evidence.content_type.is_empty()
-        {
-            html_to_text(&body)
-        } else {
-            body.split_whitespace().collect::<Vec<_>>().join(" ")
+        let extracted =
+            if evidence.content_type.contains("html") || evidence.content_type.is_empty() {
+                extract_main_content(&body)
+            } else {
+                let text = normalize_visible_text(&body);
+                MainContent {
+                    passages: split_bounded_passages(&[text.clone()]),
+                    useful_text_length: text.chars().count(),
+                    boilerplate_ratio_basis_points: 0,
+                }
+            };
+        evidence.characters_extracted = extracted
+            .passages
+            .iter()
+            .map(|passage| passage.chars().count())
+            .sum::<usize>()
+            .min(u64::MAX as usize) as u64;
+        evidence.quality = ExtractionQuality {
+            useful_text_length: extracted.useful_text_length.min(u64::MAX as usize) as u64,
+            boilerplate_ratio_basis_points: extracted.boilerplate_ratio_basis_points,
+            query_coverage_basis_points: 0,
+            low_quality_reason: extraction_low_quality_reason(&extracted),
         };
-        evidence.characters_extracted = readable.chars().count().min(u64::MAX as usize) as u64;
-        let passage = readable
-            .chars()
-            .take(MAX_EXTRACTED_CHARS)
-            .collect::<String>();
         let truncated =
-            response.body_truncated || evidence.characters_extracted > MAX_EXTRACTED_CHARS as u64;
-        if passage.trim().is_empty() {
+            response.body_truncated || extracted.passages.len() >= MAX_EXTRACTED_PASSAGES;
+        if extracted.passages.is_empty() {
             evidence.extraction = ExtractionStatus::Empty;
             ExecutionStatus::Failed(FailureCode::EmptyExtraction)
         } else {
@@ -710,22 +726,30 @@ async fn typed_fetch<N: WebNetwork>(
             } else {
                 ExtractionStatus::Readable
             };
-            evidence.passages.push(EvidencePassage {
-                passage_id: passage_id_for_url(&final_url, 1),
-                text: passage,
-                truncated,
-            });
+            evidence.passages = extracted
+                .passages
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| EvidencePassage {
+                    passage_id: passage_id_for_url(&final_url, index + 1),
+                    text,
+                    truncated,
+                })
+                .collect();
             if evidence.content_type.contains("html") || evidence.content_type.is_empty() {
                 evidence.links = extract_validated_links(&body, &final_url, MAX_LINKS);
             }
             ExecutionStatus::Succeeded
         }
     };
-    let contribution = if matches!(execution, ExecutionStatus::Succeeded)
+    let contribution = if evidence.quality.low_quality_reason.is_some() {
+        EvidenceContribution::Irrelevant
+    } else if matches!(execution, ExecutionStatus::Succeeded)
         && matches!(
             evidence.extraction,
             ExtractionStatus::Readable | ExtractionStatus::ReadableTruncated
-        ) {
+        )
+    {
         EvidenceContribution::Satisfied
     } else {
         EvidenceContribution::Empty
@@ -942,11 +966,121 @@ fn normalized_ranking_terms(query: &str) -> Vec<String> {
         .to_ascii_lowercase()
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|term| term.len() >= 3 && !stop_words.contains(term))
-        .map(str::to_string)
+        .map(|term| {
+            term.strip_suffix('s')
+                .filter(|singular| singular.len() >= 4)
+                .unwrap_or(term)
+                .to_string()
+        })
         .collect::<Vec<_>>();
     terms.sort();
     terms.dedup();
     terms
+}
+
+pub(crate) fn assess_claim_relevance(query: &str, passage: &str) -> ClaimEvidenceRelevance {
+    let query_terms = normalized_ranking_terms(query);
+    let passage_terms = normalized_ranking_terms(passage);
+    let covered = query_terms
+        .iter()
+        .filter(|term| {
+            passage_terms
+                .iter()
+                .any(|passage_term| passage_term == *term)
+        })
+        .count();
+    let query_coverage_basis_points = if query_terms.is_empty() {
+        0
+    } else {
+        ((covered.saturating_mul(10_000) / query_terms.len()).min(10_000)) as u16
+    };
+    let numeric_required = query_requires_numeric_or_date_evidence(query);
+    let numeric_or_date_relevant = numeric_required
+        && if query_requires_claim_number(query) {
+            passage_contains_claim_number(query, passage)
+        } else {
+            passage.chars().any(|character| character.is_ascii_digit())
+        };
+    let minimum_covered_terms = if numeric_required {
+        query_terms.len().min(2)
+    } else {
+        usize::from(!query_terms.is_empty())
+    };
+    ClaimEvidenceRelevance {
+        query_coverage_basis_points,
+        numeric_or_date_relevant,
+        eligible: covered >= minimum_covered_terms
+            && (!numeric_required || numeric_or_date_relevant),
+    }
+}
+
+fn query_requires_claim_number(query: &str) -> bool {
+    let normalized = query.to_ascii_lowercase();
+    [
+        "population",
+        "price",
+        "cost",
+        "rate",
+        "percent",
+        "number",
+        "how many",
+        "how much",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
+}
+
+fn passage_contains_claim_number(query: &str, passage: &str) -> bool {
+    let population = query.to_ascii_lowercase().contains("population");
+    let characters = passage.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < characters.len() {
+        if !characters[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < characters.len()
+            && (characters[index].is_ascii_digit()
+                || matches!(characters[index], ',' | '.' | '\u{a0}'))
+        {
+            index += 1;
+        }
+        let citation_reference =
+            start > 0 && characters[start - 1] == '[' && characters.get(index) == Some(&']');
+        let digits = characters[start..index]
+            .iter()
+            .filter(|character| character.is_ascii_digit())
+            .collect::<String>();
+        let year_only = digits.len() == 4
+            && digits
+                .parse::<u16>()
+                .is_ok_and(|value| (1900..=2100).contains(&value));
+        if !citation_reference && !year_only && (!population || digits.len() >= 3) {
+            return true;
+        }
+    }
+    false
+}
+
+fn query_requires_numeric_or_date_evidence(query: &str) -> bool {
+    let normalized = query.to_ascii_lowercase();
+    [
+        "population",
+        "price",
+        "cost",
+        "rate",
+        "percent",
+        "number",
+        "how many",
+        "how much",
+        "current",
+        "latest",
+        "date",
+        "year",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
 }
 
 fn candidate_authority_score(candidate: &WebCandidate, query_terms: &[String]) -> u8 {
@@ -1236,6 +1370,292 @@ fn failed_without_value<T>(
     }
 }
 
+#[derive(Debug)]
+struct MainContent {
+    passages: Vec<String>,
+    useful_text_length: usize,
+    boilerplate_ratio_basis_points: u16,
+}
+
+fn extract_main_content(html: &str) -> MainContent {
+    let document = Html::parse_document(html);
+    let main_selector =
+        Selector::parse("main, article, [role='main'], #content, #main-content, .main-content")
+            .expect("static main-content selector");
+    let body_selector = Selector::parse("body").expect("static body selector");
+    let block_selector = Selector::parse("h1, h2, h3, h4, p, blockquote, figcaption, tr, li")
+        .expect("static readable block selector");
+    let title_selector = Selector::parse("title").expect("static title selector");
+    let anchor_selector = Selector::parse("a").expect("static anchor selector");
+
+    let root = document
+        .select(&main_selector)
+        .max_by_key(|element| normalized_element_text(element).chars().count())
+        .or_else(|| document.select(&body_selector).next())
+        .unwrap_or_else(|| document.root_element());
+    let heading_selector = Selector::parse("h1").expect("static primary-heading selector");
+    let page_heading = root
+        .select(&heading_selector)
+        .next()
+        .map(|heading| normalized_element_text(&heading))
+        .filter(|heading| !heading.is_empty());
+    let total_visible = normalized_element_text(&document.root_element())
+        .chars()
+        .count();
+    let mut blocks = Vec::new();
+    let mut seen = HashSet::new();
+
+    for element in root.select(&block_selector) {
+        if element_has_boilerplate_ancestor(&element, &root) {
+            continue;
+        }
+        let mut text = normalized_element_text(&element);
+        if element.value().name() == "tr"
+            && page_heading.as_ref().is_some_and(|heading| {
+                !normalized_dedup_text(&text).contains(&normalized_dedup_text(heading))
+            })
+        {
+            text = format!("{}: {text}", page_heading.as_deref().unwrap_or_default());
+        }
+        if text.is_empty() || text_is_cookie_or_menu_boilerplate(&text) {
+            continue;
+        }
+        let link_chars = element
+            .select(&anchor_selector)
+            .map(|anchor| normalized_element_text(&anchor).chars().count())
+            .sum::<usize>();
+        let text_chars = text.chars().count();
+        if text_chars > 0 && link_chars.saturating_mul(100) / text_chars > 55 {
+            continue;
+        }
+        if seen.insert(normalized_dedup_text(&text)) {
+            blocks.push(text);
+        }
+    }
+
+    let heading = blocks
+        .iter()
+        .find(|block| block.chars().count() <= 180)
+        .cloned();
+    if let Some(title) = document
+        .select(&title_selector)
+        .next()
+        .map(|element| normalized_element_text(&element))
+        .filter(|title| !title.is_empty())
+    {
+        let title_key = normalized_dedup_text(&title);
+        let duplicates_heading = heading.as_ref().is_some_and(|heading| {
+            let heading_key = normalized_dedup_text(heading);
+            title_key == heading_key
+                || title_key.starts_with(&heading_key)
+                || heading_key.starts_with(&title_key)
+        });
+        if !duplicates_heading && seen.insert(title_key) {
+            blocks.insert(0, title);
+        }
+    }
+
+    let useful_text_length = blocks.iter().map(|block| block.chars().count()).sum();
+    let removed = total_visible.saturating_sub(useful_text_length);
+    let boilerplate_ratio_basis_points = if total_visible == 0 {
+        10_000
+    } else {
+        ((removed.saturating_mul(10_000) / total_visible).min(10_000)) as u16
+    };
+    MainContent {
+        passages: split_bounded_passages(&blocks),
+        useful_text_length,
+        boilerplate_ratio_basis_points,
+    }
+}
+
+fn normalized_element_text(element: &ElementRef<'_>) -> String {
+    let text = element
+        .descendants()
+        .filter_map(|node| {
+            let text = node.value().as_text()?;
+            let hidden = node
+                .ancestors()
+                .filter_map(ElementRef::wrap)
+                .any(|ancestor| {
+                    matches!(
+                        ancestor.value().name(),
+                        "script" | "style" | "noscript" | "template"
+                    )
+                });
+            (!hidden).then(|| text.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalize_visible_text(&text)
+}
+
+fn normalize_visible_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalized_dedup_text(text: &str) -> String {
+    text.to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn element_has_boilerplate_ancestor(element: &ElementRef<'_>, root: &ElementRef<'_>) -> bool {
+    for ancestor in element.ancestors() {
+        let Some(ancestor) = ElementRef::wrap(ancestor) else {
+            continue;
+        };
+        if ancestor == *root {
+            break;
+        }
+        let tag = ancestor.value().name();
+        if matches!(
+            tag,
+            "script"
+                | "style"
+                | "noscript"
+                | "nav"
+                | "header"
+                | "footer"
+                | "aside"
+                | "form"
+                | "button"
+                | "menu"
+        ) {
+            return true;
+        }
+        let marker = format!(
+            "{} {} {}",
+            ancestor.attr("id").unwrap_or_default(),
+            ancestor.attr("class").unwrap_or_default(),
+            ancestor.attr("role").unwrap_or_default()
+        )
+        .to_ascii_lowercase();
+        if [
+            "nav",
+            "menu",
+            "header",
+            "footer",
+            "sidebar",
+            "cookie",
+            "consent",
+            "banner",
+            "breadcrumb",
+            "toolbar",
+            "masthead",
+            "mw-panel",
+            "toc",
+        ]
+        .iter()
+        .any(|term| marker.contains(term))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn text_is_cookie_or_menu_boilerplate(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    let cookie = [
+        "accept all cookies",
+        "accept cookies",
+        "reject cookies",
+        "cookie settings",
+        "cookie preferences",
+        "manage consent",
+        "privacy choices",
+        "we use cookies",
+    ]
+    .iter()
+    .any(|phrase| normalized.contains(phrase));
+    let navigation_terms = [
+        "home",
+        "main page",
+        "menu",
+        "products",
+        "services",
+        "departments",
+        "careers",
+        "contact",
+        "sign in",
+        "log in",
+        "random article",
+        "privacy",
+        "privacy policy",
+        "terms",
+        "terms of use",
+        "sitemap",
+        "skip to content",
+    ];
+    let navigation = !text.contains(['.', '!', '?'])
+        && text.split_whitespace().count() <= 60
+        && navigation_terms
+            .iter()
+            .filter(|phrase| normalized.contains(**phrase))
+            .count()
+            >= 3;
+    cookie || navigation
+}
+
+fn split_bounded_passages(blocks: &[String]) -> Vec<String> {
+    let mut passages = Vec::new();
+    for block in blocks {
+        for chunk in split_long_block(block) {
+            passages.push(chunk);
+            if passages.len() >= MAX_EXTRACTED_PASSAGES {
+                return passages;
+            }
+        }
+    }
+    passages
+}
+
+fn split_long_block(block: &str) -> Vec<String> {
+    if block.chars().count() <= MAX_PASSAGE_CHARS {
+        return vec![block.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for word in block.split_whitespace() {
+        if word.chars().count() > MAX_PASSAGE_CHARS {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let characters = word.chars().collect::<Vec<_>>();
+            chunks.extend(
+                characters
+                    .chunks(MAX_PASSAGE_CHARS)
+                    .map(|chunk| chunk.iter().collect::<String>()),
+            );
+            continue;
+        }
+        if !current.is_empty()
+            && current.chars().count() + 1 + word.chars().count() > MAX_PASSAGE_CHARS
+        {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn extraction_low_quality_reason(content: &MainContent) -> Option<ExtractionLowQualityReason> {
+    if content.useful_text_length < 60 {
+        Some(ExtractionLowQualityReason::TooLittleUsefulText)
+    } else {
+        None
+    }
+}
+
 fn html_to_text(html: &str) -> String {
     let mut out = String::new();
     let mut skip_tag: Option<String> = None;
@@ -1522,6 +1942,215 @@ mod tests {
             requested_url,
             snippet: "discovery only".to_string(),
         }
+    }
+
+    #[test]
+    fn population_relevance_requires_a_value_not_only_a_year_or_citation_number() {
+        let query = "What is the current population of Bratislava?";
+
+        assert!(!assess_claim_relevance(query, "Bratislava: Population (2025) [7]").eligible);
+        assert!(
+            assess_claim_relevance(
+                query,
+                "Bratislava's 2026 population is estimated at 485,917"
+            )
+            .eligible
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_page_extraction_keeps_the_description_without_duplicate_title_or_navigation() {
+        let network = MockNetwork::default();
+        network.reply(
+            "example.com",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<!doctype html>
+                <html><head><title>Example Domain</title><style>body { color: red }</style></head>
+                <body>
+                  <header><a href="/">Example Domain</a><nav><a href="/menu">Menu</a></nav></header>
+                  <main><h1>Example Domain</h1>
+                    <p>This domain is for use in illustrative examples in documents.</p>
+                    <p>You may use this domain in literature without prior coordination.</p>
+                  </main>
+                  <footer><a href="/privacy">Privacy</a></footer>
+                  <script>window.trackEverything()</script>
+                </body></html>"#,
+            )),
+        );
+
+        let result = typed_fetch(
+            &network,
+            &candidate("https://example.com/", WebProvider::Direct, 1),
+        )
+        .await;
+        let evidence = result.value.expect("typed evidence");
+        let text = evidence
+            .passages
+            .iter()
+            .map(|passage| passage.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert_eq!(text.matches("Example Domain").count(), 1);
+        assert!(text.contains("illustrative examples"));
+        assert!(!text.contains("Menu"));
+        assert!(!text.contains("Privacy"));
+        assert!(!text.contains("trackEverything"));
+        assert!(evidence.quality.useful_text_length >= 100);
+        assert!(evidence.quality.boilerplate_ratio_basis_points > 0);
+        assert_eq!(evidence.quality.low_quality_reason, None);
+    }
+
+    #[tokio::test]
+    async fn article_extraction_excludes_wikipedia_navigation_and_keeps_infobox_population() {
+        let network = MockNetwork::default();
+        network.reply(
+            "en.wikipedia.org",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Bratislava - Wikipedia</title></head><body>
+                <header><nav>Main page Contents Current events Random article About Wikipedia</nav></header>
+                <div id="mw-panel"><a href="/wiki/Main_Page">Navigation</a></div>
+                <main id="content"><h1>Bratislava</h1>
+                  <table class="infobox"><tr><th>Population</th><td>475,503 (2024)</td></tr></table>
+                  <div class="mw-parser-output">
+                    <p>Bratislava is the capital and largest city of Slovakia.</p>
+                    <h2>Demographics</h2>
+                    <p>The city had an estimated population of 475,503 in 2024.</p>
+                  </div>
+                </main>
+                <footer>Privacy policy About Wikipedia Disclaimers</footer>
+                </body></html>"#,
+            )),
+        );
+
+        let result = typed_fetch(
+            &network,
+            &candidate(
+                "https://en.wikipedia.org/wiki/Bratislava",
+                WebProvider::Wikipedia,
+                1,
+            ),
+        )
+        .await;
+        let evidence = result.value.expect("typed evidence");
+        let text = evidence
+            .passages
+            .iter()
+            .map(|passage| passage.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(text.contains("Population 475,503 (2024)"));
+        assert!(text.contains("capital and largest city"));
+        assert!(!text.contains("Random article"));
+        assert!(!text.contains("Privacy policy"));
+    }
+
+    #[tokio::test]
+    async fn extraction_keeps_bounded_passages_beyond_the_old_initial_character_cap() {
+        let network = MockNetwork::default();
+        let filler = "Background context about the city. ".repeat(240);
+        let body = format!(
+            "<html><head><title>City report</title></head><body><main><article>\
+             <h1>City report</h1><p>{filler}</p><h2>Population</h2>\
+             <p>The current official population is 475,503 residents as of 2024.</p>\
+             </article></main></body></html>"
+        );
+        network.reply("report.example", Ok(response(200, "text/html", &body)));
+
+        let result = typed_fetch(
+            &network,
+            &candidate("https://report.example/city", WebProvider::DuckDuckGo, 1),
+        )
+        .await;
+        let evidence = result.value.expect("typed evidence");
+
+        assert!(evidence.passages.len() > 1);
+        assert!(evidence
+            .passages
+            .iter()
+            .any(|passage| passage.text.contains("475,503")));
+        assert!(evidence
+            .passages
+            .iter()
+            .all(|passage| passage.text.chars().count() <= MAX_PASSAGE_CHARS));
+    }
+
+    #[tokio::test]
+    async fn high_link_density_menus_are_not_fetched_evidence() {
+        let network = MockNetwork::default();
+        network.reply(
+            "links.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>City profile</title></head><body>
+                <main>
+                  <p>Home Products Services Departments Careers Contact Privacy Sitemap</p>
+                  <div class="directory"><p>
+                    <a href="/a">Departments</a> <a href="/b">Services</a>
+                    <a href="/c">Forms</a> <a href="/d">Contact</a>
+                  </p></div>
+                  <h1>City profile</h1>
+                  <p>Bratislava is the capital of Slovakia on the Danube.</p>
+                </main></body></html>"#,
+            )),
+        );
+
+        let result = typed_fetch(
+            &network,
+            &candidate("https://links.example/", WebProvider::Direct, 1),
+        )
+        .await;
+        let evidence = result.value.expect("typed evidence");
+        let text = evidence
+            .passages
+            .iter()
+            .map(|passage| passage.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(text.contains("capital of Slovakia"));
+        assert!(!text.contains("Departments"));
+        assert!(!text.contains("Services"));
+        assert!(!text.contains("Careers"));
+    }
+
+    #[tokio::test]
+    async fn high_boilerplate_ratio_does_not_disqualify_valid_main_content() {
+        let network = MockNetwork::default();
+        let navigation =
+            "Home Products Services Departments Careers Contact Privacy Sitemap ".repeat(250);
+        let body = format!(
+            r#"<html><head><title>City profile</title></head><body>
+            <header><nav>{navigation}</nav></header>
+            <main><h1>City profile</h1>
+              <p>Bratislava is Slovakia's capital, located on the Danube near Austria and Hungary.</p>
+            </main>
+            <footer>{navigation}</footer>
+            </body></html>"#
+        );
+        network.reply("ratio.example", Ok(response(200, "text/html", &body)));
+
+        let result = typed_fetch(
+            &network,
+            &candidate("https://ratio.example/", WebProvider::Direct, 1),
+        )
+        .await;
+        let evidence = result.value.expect("typed evidence");
+
+        assert!(evidence.quality.boilerplate_ratio_basis_points >= 9_000);
+        assert_eq!(evidence.quality.low_quality_reason, None);
+        assert_eq!(result.contribution, EvidenceContribution::Satisfied);
+        assert!(evidence.passages.iter().any(|passage| {
+            passage
+                .text
+                .contains("Slovakia's capital, located on the Danube")
+        }));
     }
 
     #[tokio::test]
@@ -1836,7 +2465,11 @@ mod tests {
         );
         network.reply(
             "final.example",
-            Ok(response(200, "text/html", "<p>verified fact</p>")),
+            Ok(response(
+                200,
+                "text/html",
+                "<main><p>This is a sufficiently descriptive verified fact from the final source page.</p></main>",
+            )),
         );
         let candidate = candidate("https://start.example/", WebProvider::Direct, 1);
         let result = typed_fetch(&network, &candidate).await;
@@ -1953,9 +2586,10 @@ mod tests {
         assert_eq!(result.value.unwrap().extraction, ExtractionStatus::Empty);
 
         let readable = MockNetwork::default();
+        const OLD_INITIAL_CHARACTER_CAP: usize = 6_000;
         let long = format!(
             "<p>{}</p><a href=\"/same\">Same page</a><a href=\"https://other.example/no\">Other</a>",
-            "x".repeat(MAX_EXTRACTED_CHARS + 10)
+            "x".repeat(OLD_INITIAL_CHARACTER_CAP + 10)
         );
         readable.reply("readable.example", Ok(response(200, "text/html", &long)));
         let result = typed_fetch(
@@ -1964,11 +2598,13 @@ mod tests {
         )
         .await;
         let evidence = result.value.unwrap();
-        assert_eq!(evidence.extraction, ExtractionStatus::ReadableTruncated);
-        assert_eq!(
-            evidence.passages[0].text.chars().count(),
-            MAX_EXTRACTED_CHARS
-        );
+        assert_eq!(evidence.extraction, ExtractionStatus::Readable);
+        assert!(evidence.passages.len() > 1);
+        assert!(evidence
+            .passages
+            .iter()
+            .all(|passage| passage.text.chars().count() <= MAX_PASSAGE_CHARS));
+        assert!(evidence.characters_extracted > OLD_INITIAL_CHARACTER_CAP as u64);
         assert_eq!(evidence.links.len(), 1);
         assert_eq!(
             evidence.links[0].url.as_str(),
@@ -2071,6 +2707,10 @@ mod tests {
                 bytes_read: 8,
                 characters_extracted: 8,
                 extraction,
+                quality: ExtractionQuality {
+                    useful_text_length: u64::from(extraction == ExtractionStatus::Readable) * 8,
+                    ..Default::default()
+                },
                 authority: SourceAuthority::FirstParty,
                 source_identity: source_identity_for(&candidate.requested_url),
                 passages: if extraction == ExtractionStatus::Readable {

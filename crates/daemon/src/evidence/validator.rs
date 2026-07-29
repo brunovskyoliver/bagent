@@ -355,10 +355,11 @@ fn validate_web(
             matches!(
                 evidence.extraction,
                 ExtractionStatus::Readable | ExtractionStatus::ReadableTruncated
-            ) && evidence
-                .passages
-                .iter()
-                .any(|passage| !passage.text.trim().is_empty())
+            ) && evidence.quality.low_quality_reason.is_none()
+                && evidence
+                    .passages
+                    .iter()
+                    .any(|passage| !passage.text.trim().is_empty())
         })
         .filter_map(|evidence| {
             let mut sanitized = evidence.clone();
@@ -382,13 +383,43 @@ fn validate_web(
         })
         .collect::<Vec<_>>();
     if fetched.is_empty() {
+        let fetched_links = results
+            .web_fetches
+            .iter()
+            .filter(|result| matches!(result.execution, ExecutionStatus::Succeeded))
+            .filter_map(|result| result.value.as_ref())
+            .filter(|evidence| match intent {
+                EvidenceIntent::WebDirectPage { url } => evidence.requested_url == *url,
+                EvidenceIntent::WebFact { .. } => {
+                    searched_candidates
+                        .get(&evidence.candidate_id)
+                        .is_some_and(|url| *url == evidence.requested_url)
+                        || validated_exploration_urls.contains(&evidence.requested_url)
+                }
+                _ => false,
+            })
+            .filter(|evidence| evidence.final_url.host_str().is_some())
+            .map(|evidence| evidence.final_url.clone())
+            .collect::<HashSet<_>>();
+        let source_suffix = if fetched_links.is_empty() {
+            String::new()
+        } else {
+            let mut links = fetched_links
+                .into_iter()
+                .map(|url| format!("[{}]({url})", url.host_str().expect("filtered source host")))
+                .collect::<Vec<_>>();
+            links.sort();
+            format!(" Sources fetched but not usable: {}.", links.join(", "))
+        };
         return ValidationOutcome::Recovery(RecoveryOutcome {
             kind: RecoveryKind::VerificationShortfall,
             requested: EvidenceCounts {
                 web_sources: requested_sources,
                 ..Default::default()
             },
-            message: "Verification Shortfall: I couldn't verify this request from fetched page evidence. You can retry or provide a direct authoritative URL.".to_string(),
+            message: format!(
+                "Verification Shortfall: I couldn't verify this request from fetched page evidence.{source_suffix} You can retry or provide a direct authoritative URL."
+            ),
             missing: shortfall(
                 EvidenceRequirement::FetchedSources {
                     count: requested_sources,

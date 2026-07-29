@@ -423,10 +423,34 @@ pub(crate) struct WebFetchEvidence {
     pub bytes_read: u64,
     pub characters_extracted: u64,
     pub extraction: ExtractionStatus,
+    pub quality: ExtractionQuality,
     pub authority: SourceAuthority,
     pub source_identity: SourceIdentity,
     pub passages: Vec<EvidencePassage>,
     pub links: Vec<ValidatedReference>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExtractionQuality {
+    pub useful_text_length: u64,
+    pub boilerplate_ratio_basis_points: u16,
+    pub query_coverage_basis_points: u16,
+    pub low_quality_reason: Option<ExtractionLowQualityReason>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ClaimEvidenceRelevance {
+    pub query_coverage_basis_points: u16,
+    pub numeric_or_date_relevant: bool,
+    pub eligible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ExtractionLowQualityReason {
+    TooLittleUsefulText,
+    MostlyBoilerplate,
+    LowQueryCoverage,
+    NoClaimRelevantPassage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

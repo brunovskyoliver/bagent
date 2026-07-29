@@ -6,12 +6,12 @@ use serde_json::json;
 use url::Url;
 
 use super::{
-    candidate_is_first_party, direct_web_candidate, linked_web_candidate, prepare_web_candidates,
-    AppleMailEvidenceAdapter, EvidenceConflict, EvidenceContribution, EvidenceIntent,
-    EvidenceOperation, EvidencePlanner, EvidenceRequest, EvidenceResults, ExecutionStatus,
-    ExtractionStatus, FailureCode, MailEvidenceAdapter, MailHeaderEvidence, OperationResult,
-    ProviderSet, SourceAuthority, TypedWebAdapter, TypedWebEvidenceAdapter, ValidationOutcome,
-    VerificationLevel, WebCandidate, WebFetchEvidence, WebProvider,
+    assess_claim_relevance, candidate_is_first_party, direct_web_candidate, linked_web_candidate,
+    prepare_web_candidates, AppleMailEvidenceAdapter, EvidenceConflict, EvidenceContribution,
+    EvidenceIntent, EvidenceOperation, EvidencePlanner, EvidenceRequest, EvidenceResults,
+    ExecutionStatus, ExtractionStatus, FailureCode, MailEvidenceAdapter, MailHeaderEvidence,
+    OperationResult, ProviderSet, SourceAuthority, TypedWebAdapter, TypedWebEvidenceAdapter,
+    ValidationOutcome, VerificationLevel, WebCandidate, WebFetchEvidence, WebProvider,
 };
 use crate::{
     agent_exec::{EventSink, ExecOrigin, Gate, ToolKind},
@@ -338,6 +338,7 @@ where
         let mut completed = HashMap::new();
         while let Some((candidate, mut result)) = inflight.next().await {
             apply_ranked_authority(query, &candidate, &mut result);
+            apply_passage_selection(intent, &mut result);
             if result.execution.retryable()
                 && result.attempts < 2
                 && attempts_used < plan.budget.web_fetch_attempts
@@ -356,6 +357,7 @@ where
                         let retry = adapter.fetch(&candidate).await;
                         merge_retry(&mut result, retry);
                         apply_ranked_authority(query, &candidate, &mut result);
+                        apply_passage_selection(intent, &mut result);
                     }
                     Admission::Denied => {
                         approvals_denied += 1;
@@ -485,6 +487,195 @@ fn apply_ranked_authority(
     }
 }
 
+fn apply_passage_selection(
+    intent: &EvidenceIntent,
+    result: &mut OperationResult<WebFetchEvidence>,
+) {
+    let Some(evidence) = result.value.as_mut() else {
+        return;
+    };
+    if !matches!(result.execution, ExecutionStatus::Succeeded) {
+        return;
+    }
+    if matches!(
+        evidence.quality.low_quality_reason,
+        Some(
+            super::ExtractionLowQualityReason::TooLittleUsefulText
+                | super::ExtractionLowQualityReason::MostlyBoilerplate
+        )
+    ) {
+        evidence.passages.clear();
+        result.contribution = EvidenceContribution::Irrelevant;
+        return;
+    }
+    match intent {
+        EvidenceIntent::WebDirectPage { .. } => {
+            select_direct_page_passages(evidence);
+        }
+        EvidenceIntent::WebFact { query, .. } => {
+            rank_fact_passages(query, evidence);
+            if evidence.passages.is_empty() {
+                result.contribution = EvidenceContribution::Irrelevant;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn select_direct_page_passages(evidence: &mut WebFetchEvidence) {
+    if evidence.passages.len() <= 6 {
+        return;
+    }
+    let mut selected = evidence
+        .passages
+        .iter()
+        .enumerate()
+        .filter(|(_, passage)| {
+            let length = passage.text.chars().count();
+            (3..=120).contains(&length)
+                && !passage
+                    .text
+                    .chars()
+                    .any(|character| character.is_ascii_digit())
+                && !passage.text.contains(['.', '!', '?'])
+        })
+        .take(2)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut descriptive = evidence
+        .passages
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected.contains(index))
+        .map(|(index, passage)| {
+            let words = passage
+                .text
+                .split_whitespace()
+                .count()
+                .min(usize::from(u16::MAX)) as u16;
+            let sentences = passage
+                .text
+                .matches(['.', '!', '?'])
+                .count()
+                .min(usize::from(u8::MAX)) as u8;
+            let numbers = passage
+                .text
+                .split_whitespace()
+                .filter(|word| word.chars().any(|character| character.is_ascii_digit()))
+                .count()
+                .min(usize::from(u8::MAX)) as u8;
+            (index, sentences, words, numbers)
+        })
+        .collect::<Vec<_>>();
+    descriptive.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    selected.extend(
+        descriptive
+            .into_iter()
+            .take(6usize.saturating_sub(selected.len()))
+            .map(|(index, _, _, _)| index),
+    );
+    evidence.passages = selected
+        .into_iter()
+        .map(|index| evidence.passages[index].clone())
+        .collect();
+}
+
+fn rank_fact_passages(query: &str, evidence: &mut WebFetchEvidence) {
+    let mut contextual_headings = evidence
+        .passages
+        .iter()
+        .filter(|passage| {
+            passage.text.chars().count() <= 120
+                && !passage
+                    .text
+                    .chars()
+                    .any(|character| character.is_ascii_digit())
+                && !passage.text.contains(['.', '!', '?'])
+        })
+        .map(|passage| {
+            (
+                passage.text.clone(),
+                assess_claim_relevance(query, &passage.text).query_coverage_basis_points,
+            )
+        })
+        .filter(|(_, coverage)| *coverage > 0)
+        .collect::<Vec<_>>();
+    contextual_headings.sort_by(|left, right| right.1.cmp(&left.1));
+    for passage in &mut evidence.passages {
+        if !passage
+            .text
+            .chars()
+            .any(|character| character.is_ascii_digit())
+            || assess_claim_relevance(query, &passage.text).eligible
+        {
+            continue;
+        }
+        for (heading, _) in &contextual_headings {
+            let contextual = format!("{heading}: {}", passage.text);
+            if contextual.chars().count() <= 1_200
+                && assess_claim_relevance(query, &contextual).eligible
+            {
+                passage.text = contextual;
+                break;
+            }
+        }
+    }
+
+    let mut ranked = evidence
+        .passages
+        .drain(..)
+        .enumerate()
+        .map(|(index, passage)| {
+            let relevance = assess_claim_relevance(query, &passage.text);
+            (passage, index, relevance)
+        })
+        .collect::<Vec<_>>();
+    let max_coverage = ranked
+        .iter()
+        .map(|(_, _, relevance)| relevance.query_coverage_basis_points)
+        .max()
+        .unwrap_or_default();
+    evidence.quality.query_coverage_basis_points = max_coverage;
+    if max_coverage == 0 {
+        evidence.quality.low_quality_reason =
+            Some(super::ExtractionLowQualityReason::LowQueryCoverage);
+        return;
+    }
+    if !ranked.iter().any(|(_, _, relevance)| relevance.eligible) {
+        evidence.quality.low_quality_reason =
+            Some(super::ExtractionLowQualityReason::NoClaimRelevantPassage);
+        return;
+    }
+
+    evidence.quality.low_quality_reason = None;
+    ranked.retain(|(_, _, relevance)| relevance.query_coverage_basis_points > 0);
+    ranked.sort_by(|left, right| {
+        right
+            .2
+            .query_coverage_basis_points
+            .cmp(&left.2.query_coverage_basis_points)
+            .then_with(|| {
+                right
+                    .2
+                    .numeric_or_date_relevant
+                    .cmp(&left.2.numeric_or_date_relevant)
+            })
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    evidence.passages = ranked
+        .into_iter()
+        .take(6)
+        .map(|(passage, _, _)| passage)
+        .collect();
+}
+
 fn merge_retry(
     first: &mut OperationResult<WebFetchEvidence>,
     retry: OperationResult<WebFetchEvidence>,
@@ -509,10 +700,11 @@ fn web_contract_satisfied(
             matches!(
                 evidence.extraction,
                 ExtractionStatus::Readable | ExtractionStatus::ReadableTruncated
-            ) && evidence
-                .passages
-                .iter()
-                .any(|passage| !passage.text.trim().is_empty())
+            ) && evidence.quality.low_quality_reason.is_none()
+                && evidence
+                    .passages
+                    .iter()
+                    .any(|passage| !passage.text.trim().is_empty())
         })
         .collect::<Vec<_>>();
     match intent {
@@ -1231,6 +1423,10 @@ mod tests {
                 bytes_read: text.len() as u64,
                 characters_extracted: text.chars().count() as u64,
                 extraction: ExtractionStatus::Readable,
+                quality: super::super::ExtractionQuality {
+                    useful_text_length: text.chars().count() as u64,
+                    ..Default::default()
+                },
                 authority: SourceAuthority::Other,
                 source_identity: super::super::SourceIdentity::new(source).unwrap(),
                 passages: vec![super::super::EvidencePassage {
@@ -1245,6 +1441,30 @@ mod tests {
                 links: Vec::new(),
             },
         )
+    }
+
+    fn readable_passages(
+        candidate: &WebCandidate,
+        final_url: &str,
+        source: &str,
+        passages: &[&str],
+    ) -> OperationResult<WebFetchEvidence> {
+        let mut result = readable_fetch(candidate, final_url, source, &passages.join(" "));
+        let evidence = result.value.as_mut().expect("readable evidence");
+        evidence.passages = passages
+            .iter()
+            .enumerate()
+            .map(|(index, text)| super::super::EvidencePassage {
+                passage_id: super::super::EvidenceId::new(format!(
+                    "passage-{}-{}",
+                    candidate.rank, index
+                ))
+                .unwrap(),
+                text: (*text).to_string(),
+                truncated: false,
+            })
+            .collect();
+        result
     }
 
     fn scripted_web_adapter(
@@ -1340,7 +1560,7 @@ mod tests {
                             candidate,
                             candidate.requested_url.as_str(),
                             "same-source.example",
-                            "The value is 41.",
+                            "The example value is 41.",
                         ),
                     ]
                 } else {
@@ -1353,9 +1573,9 @@ mod tests {
                             "independent.example"
                         },
                         if index == 2 {
-                            "The value is 42."
+                            "The example value is 42."
                         } else {
-                            "The value is 41."
+                            "The example value is 41."
                         },
                     )]
                 }
@@ -1438,5 +1658,151 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn web_fact_retains_query_relevant_numeric_passages_instead_of_page_beginning() {
+        let candidate = web_candidate("https://bratislava.sk/population", 1);
+        let adapter = scripted_web_adapter(
+            vec![candidate.clone()],
+            vec![vec![readable_passages(
+                &candidate,
+                candidate.requested_url.as_str(),
+                "bratislava.sk",
+                &[
+                    "Home Services City office Contact Sitemap",
+                    "Bratislava has a long history and many cultural institutions.",
+                    "Population data",
+                    "Bratislava had 475,503 residents as of 31 December 2024.",
+                    "Related links and archived reports",
+                ],
+            )]],
+        );
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava?".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let outcome = execute_web_plan(adapter, &mut gate, "turn-population", &plan, "en").await;
+
+        let ValidationOutcome::Bundle(bundle) = outcome.validation else {
+            panic!("claim-relevant numeric evidence should be eligible");
+        };
+        let evidence = &bundle.web[0].evidence;
+        assert!(evidence.passages[0].text.contains("475,503"));
+        assert!(evidence
+            .passages
+            .iter()
+            .all(|passage| !passage.text.contains("Home Services")));
+        assert!(evidence.quality.query_coverage_basis_points > 0);
+        assert_eq!(evidence.quality.low_quality_reason, None);
+    }
+
+    #[tokio::test]
+    async fn irrelevant_nonempty_web_text_becomes_verification_shortfall() {
+        let candidate = web_candidate("https://bratislava.sk/population", 1);
+        let adapter = scripted_web_adapter(
+            vec![candidate.clone()],
+            vec![vec![readable_passages(
+                &candidate,
+                candidate.requested_url.as_str(),
+                "bratislava.sk",
+                &["Home Products Careers Privacy Sign in Contact us"],
+            )]],
+        );
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava?".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let outcome = execute_web_plan(adapter, &mut gate, "turn-low-quality", &plan, "en").await;
+
+        let ValidationOutcome::Recovery(recovery) = outcome.validation else {
+            panic!("irrelevant navigation must not become Fetched Evidence");
+        };
+        assert_eq!(
+            recovery.kind,
+            super::super::RecoveryKind::VerificationShortfall
+        );
+        assert!(recovery.message.starts_with("Verification Shortfall:"));
+        assert!(!recovery.message.contains("Home Products"));
+        assert!(recovery
+            .message
+            .contains("[bratislava.sk](https://bratislava.sk/population)"));
+    }
+
+    #[tokio::test]
+    async fn current_numeric_fact_rejects_an_unrelated_number_about_the_right_subject() {
+        let candidate = web_candidate("https://bratislava.sk/history", 1);
+        let adapter = scripted_web_adapter(
+            vec![candidate.clone()],
+            vec![vec![readable_passages(
+                &candidate,
+                candidate.requested_url.as_str(),
+                "bratislava.sk",
+                &["Bratislava was first mentioned in writing in 907."],
+            )]],
+        );
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava?".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let outcome = execute_web_plan(adapter, &mut gate, "turn-wrong-number", &plan, "en").await;
+
+        assert!(matches!(outcome.validation, ValidationOutcome::Recovery(_)));
+    }
+
+    #[tokio::test]
+    async fn direct_page_selection_prefers_descriptive_content_beyond_front_matter() {
+        let url = "https://report.example/about";
+        let candidate = web_candidate(url, 1);
+        let adapter = scripted_web_adapter(
+            vec![candidate.clone()],
+            vec![vec![readable_passages(
+                &candidate,
+                url,
+                "report.example",
+                &[
+                    "Organization profile",
+                    "Published 2026",
+                    "Reference 12345",
+                    "Edition 7",
+                    "Document 42",
+                    "Updated 2026",
+                    "Record 88",
+                    "This organization provides community services and publishes practical guidance for residents.",
+                ],
+            )]],
+        );
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebDirectPage {
+            url: Url::parse(url).unwrap(),
+        });
+
+        let outcome =
+            execute_web_plan(adapter, &mut gate, "turn-direct-description", &plan, "en").await;
+
+        let ValidationOutcome::Bundle(bundle) = outcome.validation else {
+            panic!("descriptive direct page should be eligible");
+        };
+        assert_eq!(
+            bundle.web[0].evidence.passages[0].text,
+            "Organization profile"
+        );
+        assert!(bundle.web[0].evidence.passages[1]
+            .text
+            .contains("provides community services"));
     }
 }
