@@ -303,6 +303,8 @@ pub(crate) struct OperationResult<T> {
     pub contribution: EvidenceContribution,
     pub value: Option<T>,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub invalid_items: u8,
 }
 
 impl<T> OperationResult<T> {
@@ -314,6 +316,7 @@ impl<T> OperationResult<T> {
             contribution: EvidenceContribution::Satisfied,
             value: Some(value),
             duration_ms: 0,
+            invalid_items: 0,
         }
     }
 
@@ -329,6 +332,19 @@ impl<T> OperationResult<T> {
             contribution,
             value: None,
             duration_ms: 0,
+            invalid_items: 0,
+        }
+    }
+
+    pub(crate) fn suppressed_duplicate(key: OperationKey) -> Self {
+        Self {
+            key,
+            attempts: 0,
+            execution: ExecutionStatus::Succeeded,
+            contribution: EvidenceContribution::Duplicate,
+            value: None,
+            duration_ms: 0,
+            invalid_items: 0,
         }
     }
 
@@ -487,6 +503,7 @@ pub(crate) struct EvidenceShortfall {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ShortfallReason {
     Empty,
+    Malformed,
     Denied,
     Unavailable,
     BodyUnavailable,
@@ -552,6 +569,8 @@ pub(crate) struct RecoveryOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryKind {
     Empty,
+    InvalidInput,
+    Malformed,
     Unavailable,
     Denied,
     VerificationShortfall,

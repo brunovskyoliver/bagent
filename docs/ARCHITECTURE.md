@@ -166,6 +166,11 @@ There is no routing pipeline — it was replaced by an agentic tool-calling loop
 (the model sees native tool definitions and decides what to call). `MODEL_ROUTER.md`
 described the old design and has been removed.
 
+Stage 2 of the typed Mail evidence rollout is locally opt-in with
+`BAGENT_EVIDENCE_ORCHESTRATOR=1`. When enabled, only the existing recent-Mail summary
+prefetch seam uses the typed adapter/orchestrator; all other routing remains on the
+agentic loop. The flag defaults off and does not enable Stage 3 intent routing.
+
 - Local BaseRT (`basecompute/Qwen3-4B-Instruct-2507`) → chat, tool calls, and classifiers.
 - Retrieval uses SQLite FTS5 only. Screen frames are processed by Apple Vision
   OCR locally and only extracted text reaches the model; image attachments are rejected.

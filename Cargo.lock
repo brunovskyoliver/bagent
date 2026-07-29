@@ -269,6 +269,7 @@ dependencies = [
  "anyhow",
  "apple-mail-connector",
  "apple-notes-connector",
+ "async-trait",
  "axum",
  "bagent-agent",
  "bagent-attachments",

@@ -198,6 +198,36 @@ fn validator_distinguishes_complete_partial_empty_denied_and_unavailable_mail() 
 }
 
 #[test]
+fn validator_keeps_invalid_mail_input_distinct_from_empty_and_unavailable() {
+    use super::{
+        EvidenceContribution, EvidenceOperation, EvidenceResults, ExecutionStatus, FailureCode,
+        OperationResult,
+    };
+
+    let plan = EvidencePlanner::plan(EvidenceIntent::MailTargeted {
+        query: String::new(),
+        needs_content: false,
+    });
+    let operation = EvidenceOperation::MailSearch {
+        normalized_query: String::new(),
+        limit: 10,
+    };
+    let results = EvidenceResults {
+        mail_search: vec![OperationResult::without_value(
+            operation.key(),
+            ExecutionStatus::Failed(FailureCode::InvalidInput),
+            EvidenceContribution::Empty,
+        )],
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        EvidenceValidator::validate("turn-invalid", &plan, results),
+        ValidationOutcome::Recovery(recovery) if recovery.kind == RecoveryKind::InvalidInput
+    ));
+}
+
+#[test]
 fn duplicate_mail_identifiers_do_not_satisfy_the_reading_batch() {
     let plan = EvidencePlanner::plan(EvidenceIntent::MailLatestContent {
         count: 3,
@@ -240,14 +270,14 @@ fn validator_never_promotes_search_snippets_and_uses_final_fetched_urls() {
     );
 }
 
-#[test]
-fn fake_adapters_are_deterministic_and_record_canonical_operations() {
+#[tokio::test]
+async fn fake_adapters_are_deterministic_and_record_canonical_operations() {
     use super::{FakeMailAdapter, MailEvidenceAdapter};
 
     let mut fake = FakeMailAdapter::with_three_readable_messages();
-    let headers = fake.list(3, false);
+    let headers = fake.list(3, false).await;
     let first_id = headers.value.unwrap()[0].connector_id.clone();
-    let _body = fake.read(&first_id);
+    let _body = fake.read(&first_id).await;
 
     assert_eq!(fake.operations().len(), 2);
     assert_eq!(fake.operations()[0].key().as_str(), "mail_list:3:false");

@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{
-    BodyState, CitationTarget, Completeness, EvidenceBundle, EvidenceCounts, EvidenceExclusion,
-    EvidenceIntent, EvidencePlan, EvidenceRequirement, EvidenceResults, EvidenceShortfall,
-    ExecutionStatus, ExtractionStatus, MailBundleItem, MailHeaderEvidence, RecoveryKind,
-    RecoveryOutcome, ShortfallReason, SourceAuthority, ValidationOutcome, WebBundleItem,
-    EVIDENCE_SCHEMA_VERSION,
+    BodyState, CitationTarget, Completeness, EvidenceBundle, EvidenceContribution, EvidenceCounts,
+    EvidenceExclusion, EvidenceIntent, EvidencePlan, EvidenceRequirement, EvidenceResults,
+    EvidenceShortfall, ExecutionStatus, ExtractionStatus, FailureCode, MailBundleItem,
+    MailHeaderEvidence, OperationResult, RecoveryKind, RecoveryOutcome, ShortfallReason,
+    SourceAuthority, ValidationOutcome, WebBundleItem, EVIDENCE_SCHEMA_VERSION,
 };
 
 pub(crate) struct EvidenceValidator;
@@ -79,7 +79,7 @@ fn validate_mail_headers(
         results
             .mail_list
             .iter()
-            .filter(|result| matches!(result.execution, ExecutionStatus::Succeeded))
+            .filter(|result| usable_mail_headers(result))
             .filter_map(|result| result.value.as_ref())
             .flatten()
             .cloned(),
@@ -91,20 +91,12 @@ fn validate_mail_headers(
                 mail_headers: requested,
                 ..Default::default()
             },
-            shortfall(
-                EvidenceRequirement::MailHeaders { count: requested },
-                requested,
-                ShortfallReason::Empty,
-            ),
+            mail_header_shortfalls(&results, requested, 0),
             Vec::new(),
         );
     }
     let acquired = usize_to_u8(headers.len()).min(requested);
-    let missing = shortfall(
-        EvidenceRequirement::MailHeaders { count: requested },
-        requested.saturating_sub(acquired),
-        ShortfallReason::Empty,
-    );
+    let missing = mail_header_shortfalls(&results, requested, acquired);
     bundle(
         turn_id,
         plan,
@@ -142,7 +134,7 @@ fn validate_mail_content(
         results
             .mail_list
             .iter()
-            .filter(|result| matches!(result.execution, ExecutionStatus::Succeeded))
+            .filter(|result| usable_mail_headers(result))
             .filter_map(|result| result.value.as_ref())
             .flatten()
             .cloned(),
@@ -179,6 +171,7 @@ fn validate_mail_content(
         usize_to_u8(readable.len()),
         usize_to_u8(excluded.len()),
         batch_count,
+        invalid_mail_header_count(&results),
     );
 
     if readable.is_empty() {
@@ -239,7 +232,7 @@ fn validate_targeted_mail(
         results
             .mail_search
             .iter()
-            .filter(|result| matches!(result.execution, ExecutionStatus::Succeeded))
+            .filter(|result| usable_mail_headers(result))
             .filter_map(|result| result.value.as_ref())
             .flatten()
             .cloned(),
@@ -448,6 +441,52 @@ fn distinct_headers(
         .collect()
 }
 
+fn usable_mail_headers(result: &OperationResult<Vec<MailHeaderEvidence>>) -> bool {
+    matches!(result.execution, ExecutionStatus::Succeeded)
+        || matches!(
+            result.execution,
+            ExecutionStatus::Failed(FailureCode::ParseFailure)
+        ) && result.contribution == EvidenceContribution::Partial
+}
+
+fn invalid_mail_header_count(results: &EvidenceResults) -> u8 {
+    results
+        .mail_list
+        .iter()
+        .chain(results.mail_search.iter())
+        .map(|result| result.invalid_items)
+        .fold(0u8, u8::saturating_add)
+}
+
+fn mail_header_shortfalls(
+    results: &EvidenceResults,
+    requested_count: u8,
+    acquired_count: u8,
+) -> Vec<EvidenceShortfall> {
+    let requirement = EvidenceRequirement::MailHeaders {
+        count: requested_count,
+    };
+    let mut remaining = requested_count.saturating_sub(acquired_count);
+    let malformed = invalid_mail_header_count(results).min(remaining);
+    let mut missing = Vec::new();
+    if malformed > 0 {
+        missing.push(EvidenceShortfall {
+            requirement: requirement.clone(),
+            missing_count: malformed,
+            reason: ShortfallReason::Malformed,
+        });
+        remaining = remaining.saturating_sub(malformed);
+    }
+    if remaining > 0 {
+        missing.push(EvidenceShortfall {
+            requirement,
+            missing_count: remaining,
+            reason: ShortfallReason::Empty,
+        });
+    }
+    missing
+}
+
 fn mail_recovery(
     results: &EvidenceResults,
     requested: EvidenceCounts,
@@ -466,6 +505,16 @@ fn mail_recovery(
         .any(|status| matches!(status, ExecutionStatus::Denied))
     {
         RecoveryKind::Denied
+    } else if executions
+        .iter()
+        .any(|status| matches!(status, ExecutionStatus::Failed(FailureCode::InvalidInput)))
+    {
+        RecoveryKind::InvalidInput
+    } else if executions
+        .iter()
+        .any(|status| matches!(status, ExecutionStatus::Failed(FailureCode::ParseFailure)))
+    {
+        RecoveryKind::Malformed
     } else if executions.iter().any(|status| {
         matches!(
             status,
@@ -493,6 +542,12 @@ fn mail_recovery(
         RecoveryKind::Empty => {
             "The Mail query succeeded but returned no matching evidence. You can broaden the request or try again later."
         }
+        RecoveryKind::InvalidInput => {
+            "The Mail request was invalid and was not executed. Check the search terms or message selection and try again."
+        }
+        RecoveryKind::Malformed => {
+            "Mail returned malformed message metadata that could not be used safely. Refresh Mail and try again."
+        }
         RecoveryKind::Denied => {
             "Mail access was denied. You can approve access and retry when you are ready."
         }
@@ -519,6 +574,7 @@ fn mail_body_shortfalls(
     acquired_count: u8,
     excluded_count: u8,
     batch_count: u8,
+    malformed_count: u8,
 ) -> Vec<EvidenceShortfall> {
     let requirement = EvidenceRequirement::MailBodies {
         count: requested_count,
@@ -530,6 +586,7 @@ fn mail_body_shortfalls(
             requested_count.saturating_sub(batch_count),
             ShortfallReason::BatchLimit,
         ),
+        (malformed_count, ShortfallReason::Malformed),
         (
             usize_to_u8(
                 results
@@ -565,6 +622,19 @@ fn mail_body_shortfalls(
                     .count(),
             ),
             ShortfallReason::Empty,
+        ),
+        (
+            usize_to_u8(
+                results
+                    .mail_bodies
+                    .iter()
+                    .filter(|result| {
+                        result.contribution == EvidenceContribution::Duplicate
+                            && result.attempts == 0
+                    })
+                    .count(),
+            ),
+            ShortfallReason::Duplicate,
         ),
         (excluded_count, ShortfallReason::ExcludedAsInstruction),
     ];

@@ -64,6 +64,8 @@ struct AppState {
     debug_dir: PathBuf,
     /// Small fast model for intent/correction classifiers — never blocks chat TTFT.
     classifier_model: String,
+    /// Local opt-in rollback flag for the Stage 2 typed Mail evidence path.
+    evidence_orchestrator: agent_exec::EvidenceOrchestratorFlag,
     attachments_dir: PathBuf,
     inference: BaseRtClient,
     mail: Option<MailConnector>,
@@ -451,6 +453,12 @@ async fn main() -> Result<()> {
         std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
     let classifier_model =
         std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
+    let evidence_orchestrator = agent_exec::EvidenceOrchestratorFlag::from_local_env();
+    tracing::info!(
+        enabled = evidence_orchestrator == agent_exec::EvidenceOrchestratorFlag::Enabled,
+        env = agent_exec::EVIDENCE_ORCHESTRATOR_FLAG_ENV,
+        "typed Mail evidence orchestrator feature flag"
+    );
 
     // Warm the configured BaseRT model without blocking daemon startup.
     {
@@ -661,6 +669,7 @@ async fn main() -> Result<()> {
         default_model,
         debug_dir,
         classifier_model,
+        evidence_orchestrator,
         attachments_dir,
         inference,
         mail,

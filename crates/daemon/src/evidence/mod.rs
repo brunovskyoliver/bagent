@@ -2,12 +2,14 @@
 
 mod adapters;
 mod classifier;
+mod orchestrator;
 mod planner;
 mod types;
 mod validator;
 
 pub(crate) use adapters::*;
 pub(crate) use classifier::*;
+pub(crate) use orchestrator::*;
 pub(crate) use planner::*;
 pub(crate) use types::*;
 pub(crate) use validator::*;
