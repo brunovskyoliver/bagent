@@ -893,6 +893,129 @@ pub(crate) async fn acquire_web_plan<A: TypedWebEvidenceAdapter>(
     results
 }
 
+pub(crate) fn prepare_web_candidates(query: &str, candidates: &mut Vec<WebCandidate>) {
+    deduplicate_candidates(candidates);
+    let query_terms = normalized_ranking_terms(query);
+    candidates.sort_by(|left, right| {
+        candidate_rank_key(left, &query_terms).cmp(&candidate_rank_key(right, &query_terms))
+    });
+}
+
+fn candidate_rank_key(candidate: &WebCandidate, query_terms: &[String]) -> (u8, u16, u16, String) {
+    let host = candidate
+        .requested_url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    let haystack = format!(
+        "{} {} {}",
+        candidate.title.to_ascii_lowercase(),
+        host,
+        candidate.requested_url.path().to_ascii_lowercase()
+    );
+    let relevant = query_terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count()
+        .min(usize::from(u16::MAX)) as u16;
+    let authority = candidate_authority_score(candidate, query_terms);
+    let freshness = candidate_freshness_score(candidate);
+    (
+        authority,
+        u16::MAX.saturating_sub(relevant),
+        u16::MAX.saturating_sub(freshness),
+        format!(
+            "{:05}:{}",
+            candidate.rank,
+            normalized_url_string(&candidate.requested_url)
+        ),
+    )
+}
+
+fn normalized_ranking_terms(query: &str) -> Vec<String> {
+    let stop_words = [
+        "a", "an", "and", "are", "current", "for", "from", "how", "is", "latest", "of", "on",
+        "the", "today", "what", "which", "who", "with",
+    ];
+    let mut terms = query
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|term| term.len() >= 3 && !stop_words.contains(term))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    terms.sort();
+    terms.dedup();
+    terms
+}
+
+fn candidate_authority_score(candidate: &WebCandidate, query_terms: &[String]) -> u8 {
+    let host = candidate
+        .requested_url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    let labels = host.split('.').collect::<Vec<_>>();
+    let registrable_label = labels
+        .get(labels.len().saturating_sub(2))
+        .copied()
+        .unwrap_or_default();
+    if host.ends_with(".gov")
+        || host.ends_with(".gov.sk")
+        || host.ends_with(".europa.eu")
+        || query_terms
+            .iter()
+            .any(|term| term.len() >= 4 && registrable_label == term)
+    {
+        0
+    } else if candidate.provider == WebProvider::Wikipedia {
+        1
+    } else {
+        2
+    }
+}
+
+fn candidate_freshness_score(candidate: &WebCandidate) -> u16 {
+    let value = format!("{} {}", candidate.title, candidate.requested_url.path());
+    value
+        .split(|character: char| !character.is_ascii_digit())
+        .filter_map(|part| {
+            (part.len() == 4)
+                .then(|| part.parse::<u16>().ok())
+                .flatten()
+        })
+        .filter(|year| (2000..=2100).contains(year))
+        .max()
+        .unwrap_or_default()
+}
+
+pub(crate) fn candidate_is_first_party(query: &str, candidate: &WebCandidate) -> bool {
+    candidate_authority_score(candidate, &normalized_ranking_terms(query)) == 0
+}
+
+pub(crate) fn direct_web_candidate(url: &Url) -> WebCandidate {
+    WebCandidate {
+        candidate_id: candidate_id_for_url(url),
+        provider: WebProvider::Direct,
+        rank: 1,
+        title: url.to_string(),
+        requested_url: url.clone(),
+        snippet: String::new(),
+    }
+}
+
+pub(crate) fn linked_web_candidate(reference: &ValidatedReference, rank: u16) -> WebCandidate {
+    WebCandidate {
+        candidate_id: candidate_id_for_url(&reference.url),
+        provider: WebProvider::Direct,
+        rank,
+        title: reference.label.clone(),
+        requested_url: reference.url.clone(),
+        snippet: String::new(),
+    }
+}
+
 fn deduplicate_candidates(candidates: &mut Vec<WebCandidate>) {
     let mut seen = HashSet::new();
     candidates.retain(|candidate| {
@@ -1034,7 +1157,26 @@ fn authority_for(provider: WebProvider, final_url: &Url) -> SourceAuthority {
 }
 
 fn source_identity_for(url: &Url) -> SourceIdentity {
-    SourceIdentity::new(url.host_str().unwrap_or("unknown")).expect("nonempty source host")
+    let host = url
+        .host_str()
+        .unwrap_or("unknown")
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    let labels = host.split('.').collect::<Vec<_>>();
+    let identity = if labels.len() >= 3
+        && matches!(
+            labels[labels.len() - 2],
+            "co" | "com" | "gov" | "org" | "net" | "ac"
+        )
+        && labels.last().is_some_and(|label| label.len() == 2)
+    {
+        labels[labels.len() - 3..].join(".")
+    } else if labels.len() >= 2 {
+        labels[labels.len() - 2..].join(".")
+    } else {
+        host
+    };
+    SourceIdentity::new(identity).expect("nonempty source host")
 }
 
 fn candidate_id_for_url(url: &Url) -> CandidateId {
@@ -1531,6 +1673,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_challenge_does_not_prevent_another_provider_from_succeeding() {
+        let network = MockNetwork::default();
+        network.reply(
+            "lite.duckduckgo.com",
+            Ok(response(200, "text/html", "anomaly-modal captcha")),
+        );
+        network.reply(
+            "en.wikipedia.org",
+            Ok(response(
+                200,
+                "application/json",
+                r#"{"pages":[{"title":"Recovered","key":"Recovered"}]}"#,
+            )),
+        );
+        let result = typed_search(
+            &network,
+            "recovered",
+            "en",
+            &ProviderSet(vec![WebProvider::DuckDuckGo, WebProvider::Wikipedia]),
+        )
+        .await
+        .value
+        .unwrap();
+        assert_eq!(result.providers[0].status, ProviderStatus::Challenged);
+        assert_eq!(
+            result.providers[1].status,
+            ProviderStatus::Succeeded { result_count: 1 }
+        );
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].provider, WebProvider::Wikipedia);
+    }
+
+    #[tokio::test]
     async fn search_retry_uses_the_second_global_attempt_and_ddg_invalid_is_not_empty() {
         let retry = MockNetwork::default();
         retry.reply("en.wikipedia.org", Err(WebNetworkError::TimedOut));
@@ -1607,6 +1782,18 @@ mod tests {
                 "{address} must remain public"
             );
         }
+    }
+
+    #[test]
+    fn source_identity_uses_the_final_registrable_source_not_distinct_subpage_hosts() {
+        let first = Url::parse("https://news.example.com/one").unwrap();
+        let second = Url::parse("https://docs.example.com/two").unwrap();
+        let independent = Url::parse("https://example.org/three").unwrap();
+        assert_eq!(source_identity_for(&first), source_identity_for(&second));
+        assert_ne!(
+            source_identity_for(&first),
+            source_identity_for(&independent)
+        );
     }
 
     #[test]

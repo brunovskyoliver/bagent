@@ -80,8 +80,9 @@ bagent/
 ## Status
 
 Working. The UI is the notch surface only — see [`docs/UI_DESIGN.md`](docs/UI_DESIGN.md)
-before touching anything visual. Chat runs through an agentic tool-calling loop
-(no routing pipeline).
+before touching anything visual. Chat normally runs through the agentic tool-calling
+loop; deterministically recognized Mail and web evidence requests can use the local
+feature-flagged typed Evidence Orchestrator.
 
 Build: `cargo build --workspace`, then `make bundle && open bagent.app` from `apps/macos/`.
 

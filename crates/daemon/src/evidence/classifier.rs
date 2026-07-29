@@ -15,7 +15,8 @@ impl EvidenceIntentClassifier {
             &normalized,
             &["mail", "email", "e mail", "inbox", "posta", "sprava"],
         );
-        let explicit_url = extract_http_url(text);
+        let explicit_urls = extract_http_urls(text);
+        let explicit_url = (explicit_urls.len() == 1).then(|| explicit_urls[0].clone());
         let web_fact = is_web_fact(&normalized);
         let explicit_web_scope = explicit_url.is_some()
             || has_any(
@@ -56,6 +57,15 @@ impl EvidenceIntentClassifier {
                 vec![
                     ("Inspect Mail", EvidenceScope::MailContent),
                     ("Research the web", EvidenceScope::Web),
+                ],
+            );
+        }
+        if explicit_urls.len() > 1 {
+            return clarification(
+                "Which web page should I inspect first?",
+                vec![
+                    ("Inspect the first page", EvidenceScope::Web),
+                    ("Inspect the second page", EvidenceScope::Web),
                 ],
             );
         }
@@ -175,12 +185,14 @@ fn has_any(value: &str, terms: &[&str]) -> bool {
     terms.iter().any(|term| value.contains(term))
 }
 
-fn extract_http_url(text: &str) -> Option<Url> {
-    text.split_whitespace().find_map(|word| {
-        let candidate = word.trim_matches(|c: char| ".,;:!?()[]{}<>\"'".contains(c));
-        let url = Url::parse(candidate).ok()?;
-        matches!(url.scheme(), "http" | "https").then_some(url)
-    })
+fn extract_http_urls(text: &str) -> Vec<Url> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let candidate = word.trim_matches(|c: char| ".,;:!?()[]{}<>\"'".contains(c));
+            let url = Url::parse(candidate).ok()?;
+            matches!(url.scheme(), "http" | "https").then_some(url)
+        })
+        .collect()
 }
 
 fn explicit_count(normalized: &str) -> Option<i16> {
@@ -277,6 +289,10 @@ fn needs_corroboration(normalized: &str) -> bool {
             "compare",
             "versus",
             " vs ",
+            "current",
+            "today",
+            "latest",
+            "weather",
             "prices",
             "price",
             "conflict",
@@ -289,6 +305,9 @@ fn needs_corroboration(normalized: &str) -> bool {
             "investment",
             "consequential",
             "porovnaj",
+            "aktual",
+            "dnes",
+            "pocasie",
             "ceny",
             "pravne",
             "financ",

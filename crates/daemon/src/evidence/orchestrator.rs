@@ -1,12 +1,17 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use async_trait::async_trait;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::json;
+use url::Url;
 
 use super::{
-    AppleMailEvidenceAdapter, EvidenceContribution, EvidenceIntent, EvidenceOperation,
-    EvidencePlanner, EvidenceRequest, EvidenceResults, ExecutionStatus, FailureCode,
-    MailEvidenceAdapter, MailHeaderEvidence, OperationResult, ValidationOutcome,
+    candidate_is_first_party, direct_web_candidate, linked_web_candidate, prepare_web_candidates,
+    AppleMailEvidenceAdapter, EvidenceConflict, EvidenceContribution, EvidenceIntent,
+    EvidenceOperation, EvidencePlanner, EvidenceRequest, EvidenceResults, ExecutionStatus,
+    ExtractionStatus, FailureCode, MailEvidenceAdapter, MailHeaderEvidence, OperationResult,
+    ProviderSet, SourceAuthority, TypedWebAdapter, TypedWebEvidenceAdapter, ValidationOutcome,
+    VerificationLevel, WebCandidate, WebFetchEvidence, WebProvider,
 };
 use crate::{
     agent_exec::{EventSink, ExecOrigin, Gate, ToolKind},
@@ -42,6 +47,14 @@ pub(crate) enum Admission {
 pub(crate) trait EvidenceOperationGate {
     async fn admit(&mut self, operation: &EvidenceOperation) -> Admission;
 
+    async fn admit_web_fetch(
+        &mut self,
+        operation: &EvidenceOperation,
+        _validated_url: &Url,
+    ) -> Admission {
+        self.admit(operation).await
+    }
+
     async fn record_execution(&mut self, _operation: &EvidenceOperation) {}
 }
 
@@ -55,28 +68,25 @@ struct ExistingPolicyGate<'a> {
 impl EvidenceOperationGate for ExistingPolicyGate<'_> {
     async fn admit(&mut self, operation: &EvidenceOperation) -> Admission {
         let args = operation_args(operation);
-        let gate = Gate::new(&self.state.rules, self.origin);
-        match gate.level("mail_inbox", &args, ToolKind::ReadOnly) {
-            ApprovalLevel::Auto => Admission::Allowed,
-            ApprovalLevel::Forbidden => Admission::Denied,
-            ApprovalLevel::Ask => {
-                let approved = request_tool_approval(
-                    self.state,
-                    self.sink,
-                    self.origin,
-                    "mail_inbox",
-                    &self
-                        .origin
-                        .describe("Čítanie poštovej schránky (Apple Mail)"),
-                )
-                .await;
-                if approved {
-                    Admission::Allowed
-                } else {
-                    Admission::Denied
-                }
-            }
-        }
+        let rule_name = match operation {
+            EvidenceOperation::WebSearch { .. } => "web.search",
+            EvidenceOperation::WebFetch { .. } => return Admission::Denied,
+            _ => "mail_inbox",
+        };
+        self.admit_rule(rule_name, &args, operation).await
+    }
+
+    async fn admit_web_fetch(
+        &mut self,
+        operation: &EvidenceOperation,
+        validated_url: &Url,
+    ) -> Admission {
+        self.admit_rule(
+            "web.fetch",
+            &json!({"url": validated_url.as_str()}),
+            operation,
+        )
+        .await
     }
 
     async fn record_execution(&mut self, operation: &EvidenceOperation) {
@@ -97,26 +107,70 @@ impl EvidenceOperationGate for ExistingPolicyGate<'_> {
     }
 }
 
+impl ExistingPolicyGate<'_> {
+    async fn admit_rule(
+        &self,
+        rule_name: &str,
+        args: &serde_json::Value,
+        operation: &EvidenceOperation,
+    ) -> Admission {
+        let gate = Gate::new(&self.state.rules, self.origin);
+        match gate.level(rule_name, args, ToolKind::ReadOnly) {
+            ApprovalLevel::Auto => Admission::Allowed,
+            ApprovalLevel::Forbidden => Admission::Denied,
+            ApprovalLevel::Ask => {
+                let description = match operation {
+                    EvidenceOperation::WebSearch { .. } => "Web search",
+                    EvidenceOperation::WebFetch { .. } => "Reading a selected web page",
+                    _ => "Čítanie poštovej schránky (Apple Mail)",
+                };
+                let approved = request_tool_approval(
+                    self.state,
+                    self.sink,
+                    self.origin,
+                    rule_name,
+                    &self.origin.describe(description),
+                )
+                .await;
+                if approved {
+                    Admission::Allowed
+                } else {
+                    Admission::Denied
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn execute_evidence_turn(
     ctx: EvidenceContext<'_>,
     request: EvidenceRequest,
     intent: EvidenceIntent,
 ) -> Result<EvidenceTurnOutcome, EvidenceExecError> {
-    if !is_mail_intent(&intent) {
-        return Err(EvidenceExecError::UnsupportedIntent);
-    }
-
     let plan = EvidencePlanner::plan(intent);
     let mut gate = ExistingPolicyGate {
         state: ctx.state,
         sink: ctx.sink,
         origin: ctx.origin,
     };
-    let outcome = if let Some(connector) = ctx.state.mail.clone() {
-        let mut adapter = AppleMailEvidenceAdapter::new(connector);
-        execute_mail_plan(&mut adapter, &mut gate, &request.turn_id, &plan).await
+    let outcome = if is_mail_intent(&plan.intent) {
+        if let Some(connector) = ctx.state.mail.clone() {
+            let mut adapter = AppleMailEvidenceAdapter::new(connector);
+            execute_mail_plan(&mut adapter, &mut gate, &request.turn_id, &plan).await
+        } else {
+            execute_unavailable_mail_plan(&mut gate, &request.turn_id, &plan).await
+        }
+    } else if is_web_intent(&plan.intent) {
+        execute_web_plan(
+            TypedWebAdapter::production(),
+            &mut gate,
+            &request.turn_id,
+            &plan,
+            "en",
+        )
+        .await
     } else {
-        execute_unavailable_mail_plan(&mut gate, &request.turn_id, &plan).await
+        return Err(EvidenceExecError::UnsupportedIntent);
     };
     Ok(outcome)
 }
@@ -128,6 +182,359 @@ fn is_mail_intent(intent: &EvidenceIntent) -> bool {
         | EvidenceIntent::MailTargeted { .. } => true,
         EvidenceIntent::AnalyzeQuotedEvidence { intent } => is_mail_intent(intent),
         EvidenceIntent::WebDirectPage { .. } | EvidenceIntent::WebFact { .. } => false,
+    }
+}
+
+fn is_web_intent(intent: &EvidenceIntent) -> bool {
+    match intent {
+        EvidenceIntent::WebDirectPage { .. } | EvidenceIntent::WebFact { .. } => true,
+        EvidenceIntent::AnalyzeQuotedEvidence { intent } => is_web_intent(intent),
+        _ => false,
+    }
+}
+
+pub(crate) async fn execute_web_plan<A, G>(
+    adapter: A,
+    gate: &mut G,
+    turn_id: &str,
+    plan: &super::EvidencePlan,
+    lang: &str,
+) -> EvidenceTurnOutcome
+where
+    A: TypedWebEvidenceAdapter,
+    G: EvidenceOperationGate + Send,
+{
+    let intent = match &plan.intent {
+        EvidenceIntent::AnalyzeQuotedEvidence { intent } => intent.as_ref(),
+        intent => intent,
+    };
+    let mut results = EvidenceResults::default();
+    let mut operations_executed = 0usize;
+    let mut approvals_denied = 0usize;
+    let mut candidates = match intent {
+        EvidenceIntent::WebDirectPage { url } => vec![direct_web_candidate(url)],
+        EvidenceIntent::WebFact { query, .. } => {
+            let providers = ProviderSet(vec![WebProvider::Wikipedia, WebProvider::DuckDuckGo]);
+            let operation = EvidenceOperation::WebSearch {
+                normalized_query: query.clone(),
+                provider_set: providers.clone(),
+            };
+            let mut search = match gate.admit(&operation).await {
+                Admission::Allowed => {
+                    gate.record_execution(&operation).await;
+                    let result = adapter.search(query, lang, &providers).await;
+                    operations_executed += usize::from(result.attempts);
+                    result
+                }
+                Admission::Denied => {
+                    approvals_denied += 1;
+                    denied_result(&operation)
+                }
+            };
+            let mut candidates = search
+                .value
+                .as_ref()
+                .map(|value| value.candidates.clone())
+                .unwrap_or_default();
+            prepare_web_candidates(query, &mut candidates);
+            if let Some(value) = search.value.as_mut() {
+                value.candidates = candidates.clone();
+            }
+            results.web_searches.push(search);
+            candidates
+        }
+        _ => {
+            return EvidenceTurnOutcome {
+                validation: super::EvidenceValidator::validate(turn_id, plan, results),
+                operations_executed,
+                approvals_denied,
+            };
+        }
+    };
+    let query = match intent {
+        EvidenceIntent::WebFact { query, .. } => query.as_str(),
+        EvidenceIntent::WebDirectPage { .. } => "",
+        _ => "",
+    };
+    prepare_web_candidates(query, &mut candidates);
+    let mut queue = VecDeque::from(candidates);
+    let mut seen_operations = HashSet::new();
+    let mut attempts_used = 0u8;
+    let mut exploration_rounds = 0u8;
+    let concurrency = plan.budget.max_parallel_fetches.clamp(1, 2);
+
+    loop {
+        if web_contract_satisfied(intent, &results.web_fetches)
+            || attempts_used >= plan.budget.web_fetch_attempts
+        {
+            break;
+        }
+        if queue.is_empty() {
+            if exploration_rounds >= plan.budget.optional_exploration_rounds {
+                break;
+            }
+            exploration_rounds += 1;
+            let mut links = results
+                .web_fetches
+                .iter()
+                .filter_map(|result| result.value.as_ref())
+                .flat_map(|evidence| evidence.links.iter())
+                .enumerate()
+                .map(|(index, reference)| {
+                    linked_web_candidate(
+                        reference,
+                        index.saturating_add(1).min(usize::from(u16::MAX)) as u16,
+                    )
+                })
+                .collect::<Vec<_>>();
+            prepare_web_candidates(query, &mut links);
+            queue.extend(links);
+            if queue.is_empty() {
+                break;
+            }
+        }
+
+        let mut inflight = FuturesUnordered::new();
+        let mut scheduled = Vec::new();
+        while inflight.len() < usize::from(concurrency)
+            && attempts_used < plan.budget.web_fetch_attempts
+        {
+            let Some(candidate) = queue.pop_front() else {
+                break;
+            };
+            let operation = EvidenceOperation::WebFetch {
+                candidate_id: candidate.candidate_id.clone(),
+            };
+            if !seen_operations.insert(operation.key()) {
+                results
+                    .web_fetches
+                    .push(OperationResult::suppressed_duplicate(operation.key()));
+                continue;
+            }
+            match gate
+                .admit_web_fetch(&operation, &candidate.requested_url)
+                .await
+            {
+                Admission::Allowed => {
+                    gate.record_execution(&operation).await;
+                    attempts_used += 1;
+                    operations_executed += 1;
+                    scheduled.push(candidate.candidate_id.clone());
+                    let task_adapter = adapter.clone();
+                    inflight.push(async move {
+                        let result = task_adapter.fetch(&candidate).await;
+                        (candidate, result)
+                    });
+                }
+                Admission::Denied => {
+                    approvals_denied += 1;
+                    results.web_fetches.push(denied_result(&operation));
+                }
+            }
+        }
+        if inflight.is_empty() {
+            continue;
+        }
+        let mut completed = HashMap::new();
+        while let Some((candidate, mut result)) = inflight.next().await {
+            apply_ranked_authority(query, &candidate, &mut result);
+            if result.execution.retryable()
+                && result.attempts < 2
+                && attempts_used < plan.budget.web_fetch_attempts
+            {
+                let operation = EvidenceOperation::WebFetch {
+                    candidate_id: candidate.candidate_id.clone(),
+                };
+                match gate
+                    .admit_web_fetch(&operation, &candidate.requested_url)
+                    .await
+                {
+                    Admission::Allowed => {
+                        gate.record_execution(&operation).await;
+                        attempts_used += 1;
+                        operations_executed += 1;
+                        let retry = adapter.fetch(&candidate).await;
+                        merge_retry(&mut result, retry);
+                        apply_ranked_authority(query, &candidate, &mut result);
+                    }
+                    Admission::Denied => {
+                        approvals_denied += 1;
+                    }
+                }
+            }
+            completed.insert(candidate.candidate_id, result);
+        }
+        for candidate_id in scheduled {
+            if let Some(mut result) = completed.remove(&candidate_id) {
+                if let Some(evidence) = result.value.as_ref() {
+                    let duplicate_source = results.web_fetches.iter().any(|prior| {
+                        prior.value.as_ref().is_some_and(|prior| {
+                            prior.final_url == evidence.final_url
+                                || prior.source_identity == evidence.source_identity
+                                    && matches!(
+                                        intent,
+                                        EvidenceIntent::WebFact {
+                                            verification: VerificationLevel::SingleAuthoritative,
+                                            ..
+                                        }
+                                    )
+                        })
+                    });
+                    if duplicate_source {
+                        result.contribution = EvidenceContribution::Duplicate;
+                    }
+                }
+                results.web_fetches.push(result);
+            }
+        }
+    }
+    if matches!(
+        intent,
+        EvidenceIntent::WebFact {
+            verification: VerificationLevel::Corroborated,
+            ..
+        }
+    ) {
+        results.conflicts = detect_web_conflicts(&results.web_fetches);
+    }
+
+    EvidenceTurnOutcome {
+        validation: super::EvidenceValidator::validate(turn_id, plan, results),
+        operations_executed,
+        approvals_denied,
+    }
+}
+
+fn detect_web_conflicts(results: &[OperationResult<WebFetchEvidence>]) -> Vec<EvidenceConflict> {
+    let usable = results
+        .iter()
+        .filter(|result| matches!(result.execution, ExecutionStatus::Succeeded))
+        .filter_map(|result| result.value.as_ref())
+        .filter(|evidence| !evidence.passages.is_empty())
+        .collect::<Vec<_>>();
+    for (left_index, left) in usable.iter().enumerate() {
+        for right in usable.iter().skip(left_index + 1) {
+            if left.source_identity == right.source_identity {
+                continue;
+            }
+            let left_text = left
+                .passages
+                .iter()
+                .map(|passage| passage.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            let right_text = right
+                .passages
+                .iter()
+                .map(|passage| passage.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            let left_scalars = scalar_claim_tokens(&left_text);
+            let right_scalars = scalar_claim_tokens(&right_text);
+            let numeric_conflict = !left_scalars.is_empty()
+                && !right_scalars.is_empty()
+                && left_scalars.is_disjoint(&right_scalars);
+            let negation_conflict = contains_negation(&left_text) != contains_negation(&right_text);
+            if numeric_conflict || negation_conflict {
+                return vec![EvidenceConflict {
+                    evidence_ids: vec![left.evidence_id.clone(), right.evidence_id.clone()],
+                    description: "Independent fetched sources contain unresolved differing claims."
+                        .to_string(),
+                }];
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn scalar_claim_tokens(text: &str) -> HashSet<String> {
+    text.split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|character: char| {
+                    !character.is_ascii_digit() && !matches!(character, '.' | ',' | '%' | '$' | '€')
+                })
+                .to_string()
+        })
+        .filter(|token| token.chars().any(|character| character.is_ascii_digit()))
+        .collect()
+}
+
+fn contains_negation(text: &str) -> bool {
+    [" no ", " not ", " never ", "false", "cannot", "can't"]
+        .iter()
+        .any(|term| text.contains(term))
+}
+
+fn apply_ranked_authority(
+    query: &str,
+    candidate: &WebCandidate,
+    result: &mut OperationResult<WebFetchEvidence>,
+) {
+    if !query.is_empty() {
+        if let Some(evidence) = result.value.as_mut() {
+            let mut final_candidate = candidate.clone();
+            final_candidate.requested_url = evidence.final_url.clone();
+            if !candidate_is_first_party(query, &final_candidate) {
+                return;
+            }
+            evidence.authority = SourceAuthority::FirstParty;
+        }
+    }
+}
+
+fn merge_retry(
+    first: &mut OperationResult<WebFetchEvidence>,
+    retry: OperationResult<WebFetchEvidence>,
+) {
+    first.attempts = first.attempts.saturating_add(retry.attempts);
+    first.duration_ms = first.duration_ms.saturating_add(retry.duration_ms);
+    first.execution = retry.execution;
+    first.contribution = retry.contribution;
+    first.value = retry.value;
+    first.invalid_items = first.invalid_items.saturating_add(retry.invalid_items);
+}
+
+fn web_contract_satisfied(
+    intent: &EvidenceIntent,
+    results: &[OperationResult<WebFetchEvidence>],
+) -> bool {
+    let usable = results
+        .iter()
+        .filter(|result| matches!(result.execution, ExecutionStatus::Succeeded))
+        .filter_map(|result| result.value.as_ref())
+        .filter(|evidence| {
+            matches!(
+                evidence.extraction,
+                ExtractionStatus::Readable | ExtractionStatus::ReadableTruncated
+            ) && evidence
+                .passages
+                .iter()
+                .any(|passage| !passage.text.trim().is_empty())
+        })
+        .collect::<Vec<_>>();
+    match intent {
+        EvidenceIntent::WebDirectPage { .. } => !usable.is_empty(),
+        EvidenceIntent::WebFact {
+            verification: VerificationLevel::SingleAuthoritative,
+            ..
+        } => usable
+            .iter()
+            .any(|evidence| evidence.authority == SourceAuthority::FirstParty),
+        EvidenceIntent::WebFact {
+            verification: VerificationLevel::Corroborated,
+            ..
+        } => {
+            usable
+                .iter()
+                .map(|evidence| &evidence.source_identity)
+                .collect::<HashSet<_>>()
+                .len()
+                >= 2
+        }
+        _ => false,
     }
 }
 
@@ -318,7 +725,10 @@ fn operation_args(operation: &EvidenceOperation) -> serde_json::Value {
             let rowid = message_id.as_str().parse::<i64>().ok();
             json!({"rowid": rowid})
         }
-        _ => json!({}),
+        EvidenceOperation::WebSearch {
+            normalized_query, ..
+        } => json!({"query": normalized_query}),
+        EvidenceOperation::WebFetch { .. } => json!({}),
     }
 }
 
@@ -363,6 +773,7 @@ mod tests {
     use super::*;
     use crate::evidence::{
         Completeness, EvidencePlanner, MailBodyEvidence, RecoveryKind, ValidatedMailId,
+        WebSearchResult,
     };
     use std::sync::{Arc, Mutex};
 
@@ -686,6 +1097,11 @@ mod tests {
             message_id: ValidatedMailId::new("42").unwrap(),
         };
         assert_eq!(operation_args(&read), json!({"rowid": 42}));
+        let search = EvidenceOperation::WebSearch {
+            normalized_query: "current fact".into(),
+            provider_set: ProviderSet(vec![WebProvider::Wikipedia, WebProvider::DuckDuckGo]),
+        };
+        assert_eq!(operation_args(&search), json!({"query": "current fact"}));
     }
 
     #[test]
@@ -697,5 +1113,330 @@ mod tests {
             }),
         };
         assert!(!is_mail_intent(&intent));
+    }
+
+    #[derive(Clone)]
+    struct ScriptedWebAdapter {
+        search: OperationResult<WebSearchResult>,
+        fetches: Arc<Mutex<HashMap<String, VecDeque<OperationResult<WebFetchEvidence>>>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TypedWebEvidenceAdapter for ScriptedWebAdapter {
+        async fn search(
+            &self,
+            _query: &str,
+            _lang: &str,
+            _providers: &ProviderSet,
+        ) -> OperationResult<WebSearchResult> {
+            self.calls.lock().unwrap().push("search".into());
+            self.search.clone()
+        }
+
+        async fn fetch(&self, candidate: &WebCandidate) -> OperationResult<WebFetchEvidence> {
+            use std::sync::atomic::Ordering;
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("fetch:{}", candidate.candidate_id.as_str()));
+            self.fetches
+                .lock()
+                .unwrap()
+                .get_mut(candidate.candidate_id.as_str())
+                .and_then(VecDeque::pop_front)
+                .expect("scripted fetch result")
+        }
+    }
+
+    struct WebRecordingGate {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl EvidenceOperationGate for WebRecordingGate {
+        async fn admit(&mut self, operation: &EvidenceOperation) -> Admission {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("gate:{}", operation.key().as_str()));
+            Admission::Allowed
+        }
+
+        async fn admit_web_fetch(
+            &mut self,
+            operation: &EvidenceOperation,
+            _validated_url: &Url,
+        ) -> Admission {
+            self.admit(operation).await
+        }
+
+        async fn record_execution(&mut self, operation: &EvidenceOperation) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("execute:{}", operation.key().as_str()));
+        }
+    }
+
+    fn web_candidate(url: &str, rank: u16) -> WebCandidate {
+        let url = Url::parse(url).unwrap();
+        let mut candidate = direct_web_candidate(&url);
+        candidate.provider = WebProvider::DuckDuckGo;
+        candidate.rank = rank;
+        candidate.title = format!("Acme authoritative fact {rank}");
+        candidate
+    }
+
+    fn web_search_result(candidates: Vec<WebCandidate>) -> OperationResult<WebSearchResult> {
+        OperationResult::succeeded(
+            EvidenceOperation::WebSearch {
+                normalized_query: "Acme fact online".into(),
+                provider_set: ProviderSet(vec![WebProvider::Wikipedia, WebProvider::DuckDuckGo]),
+            }
+            .key(),
+            WebSearchResult {
+                providers: Vec::new(),
+                candidates,
+            },
+        )
+    }
+
+    fn readable_fetch(
+        candidate: &WebCandidate,
+        final_url: &str,
+        source: &str,
+        text: &str,
+    ) -> OperationResult<WebFetchEvidence> {
+        OperationResult::succeeded(
+            EvidenceOperation::WebFetch {
+                candidate_id: candidate.candidate_id.clone(),
+            }
+            .key(),
+            WebFetchEvidence {
+                evidence_id: super::super::EvidenceId::new(format!("evidence-{}", candidate.rank))
+                    .unwrap(),
+                candidate_id: candidate.candidate_id.clone(),
+                requested_url: candidate.requested_url.clone(),
+                final_url: Url::parse(final_url).unwrap(),
+                redirect_chain: vec![Url::parse(final_url).unwrap()],
+                http_status: 200,
+                content_type: "text/html".into(),
+                bytes_read: text.len() as u64,
+                characters_extracted: text.chars().count() as u64,
+                extraction: ExtractionStatus::Readable,
+                authority: SourceAuthority::Other,
+                source_identity: super::super::SourceIdentity::new(source).unwrap(),
+                passages: vec![super::super::EvidencePassage {
+                    passage_id: super::super::EvidenceId::new(format!(
+                        "passage-{}",
+                        candidate.rank
+                    ))
+                    .unwrap(),
+                    text: text.into(),
+                    truncated: false,
+                }],
+                links: Vec::new(),
+            },
+        )
+    }
+
+    fn scripted_web_adapter(
+        candidates: Vec<WebCandidate>,
+        scripts: Vec<Vec<OperationResult<WebFetchEvidence>>>,
+    ) -> ScriptedWebAdapter {
+        let mut fetches = HashMap::new();
+        for (candidate, results) in candidates.iter().zip(scripts) {
+            fetches
+                .entry(candidate.candidate_id.as_str().to_string())
+                .or_insert_with(|| VecDeque::from(results));
+        }
+        ScriptedWebAdapter {
+            search: web_search_result(candidates),
+            fetches: Arc::new(Mutex::new(fetches)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fact_is_gated_immediately_and_stops_on_ranked_first_party_evidence() {
+        let first_party = web_candidate("https://acme.com/fact", 2);
+        let reference = web_candidate("https://en.wikipedia.org/wiki/Acme", 1);
+        let reference_failure = OperationResult::without_value(
+            EvidenceOperation::WebFetch {
+                candidate_id: reference.candidate_id.clone(),
+            }
+            .key(),
+            ExecutionStatus::Failed(FailureCode::Http4xx(404)),
+            EvidenceContribution::Empty,
+        );
+        let adapter = scripted_web_adapter(
+            vec![reference, first_party.clone()],
+            vec![
+                vec![reference_failure],
+                vec![readable_fetch(
+                    &first_party,
+                    "https://acme.com/final",
+                    "acme.com",
+                    "Acme reports the fact is 42.",
+                )],
+            ],
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut gate = WebRecordingGate { log: log.clone() };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Acme fact online".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let outcome = execute_web_plan(adapter, &mut gate, "turn-web", &plan, "en").await;
+
+        let ValidationOutcome::Bundle(bundle) = outcome.validation else {
+            panic!("first-party fetched evidence should satisfy the fact");
+        };
+        assert_eq!(bundle.acquired.web_sources, 1);
+        assert_eq!(
+            bundle.citation_allowlist[0].url.as_str(),
+            "https://acme.com/final"
+        );
+        let log = log.lock().unwrap();
+        assert!(log[0].starts_with("gate:web_search:"));
+        assert!(log[1].starts_with("execute:web_search:"));
+        assert!(log[2].starts_with("gate:web_fetch:"));
+        assert!(log[3].starts_with("execute:web_fetch:"));
+    }
+
+    #[tokio::test]
+    async fn corroborated_web_enforces_independence_retry_budget_duplicates_and_concurrency() {
+        use std::sync::atomic::Ordering;
+
+        let candidates = (1..=6)
+            .map(|rank| web_candidate(&format!("https://site{rank}.example/fact"), rank))
+            .collect::<Vec<_>>();
+        let transient = OperationResult::without_value(
+            EvidenceOperation::WebFetch {
+                candidate_id: candidates[0].candidate_id.clone(),
+            }
+            .key(),
+            ExecutionStatus::TimedOut,
+            EvidenceContribution::Empty,
+        );
+        let scripts = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                if index == 0 {
+                    vec![
+                        transient.clone(),
+                        readable_fetch(
+                            candidate,
+                            candidate.requested_url.as_str(),
+                            "same-source.example",
+                            "The value is 41.",
+                        ),
+                    ]
+                } else {
+                    vec![readable_fetch(
+                        candidate,
+                        candidate.requested_url.as_str(),
+                        if index == 1 {
+                            "same-source.example"
+                        } else {
+                            "independent.example"
+                        },
+                        if index == 2 {
+                            "The value is 42."
+                        } else {
+                            "The value is 41."
+                        },
+                    )]
+                }
+            })
+            .collect::<Vec<_>>();
+        let adapter = scripted_web_adapter(candidates, scripts);
+        let observed = adapter.clone();
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "compare current example values".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+
+        let outcome = execute_web_plan(adapter, &mut gate, "turn-corroborated", &plan, "en").await;
+
+        let ValidationOutcome::Bundle(bundle) = outcome.validation else {
+            panic!("two independent fetched sources should produce a bundle");
+        };
+        assert_eq!(outcome.operations_executed, 6);
+        assert_eq!(bundle.acquired.web_sources, 2);
+        assert_eq!(bundle.conflicts.len(), 1);
+        assert!(observed.max_active.load(Ordering::SeqCst) <= 2);
+        assert_eq!(
+            observed
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("fetch:"))
+                .count(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_duplicate_web_operations_are_suppressed_before_gate_and_fetch() {
+        let first = web_candidate("https://acme.com/fact?utm_source=one", 1);
+        let second = web_candidate("https://acme.com/fact#top", 2);
+        assert_eq!(first.candidate_id, second.candidate_id);
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    "https://acme.com/fact",
+                    "acme.com",
+                    "Acme fact is 42.",
+                )],
+                Vec::new(),
+            ],
+        );
+        let observed = adapter.clone();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut gate = WebRecordingGate { log: log.clone() };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Acme fact online".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let outcome = execute_web_plan(adapter, &mut gate, "turn-duplicate", &plan, "en").await;
+
+        assert!(matches!(outcome.validation, ValidationOutcome::Bundle(_)));
+        assert_eq!(
+            observed
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("fetch:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.starts_with("gate:web_fetch:"))
+                .count(),
+            1
+        );
     }
 }

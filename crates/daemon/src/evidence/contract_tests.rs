@@ -93,7 +93,7 @@ fn classifies_targeted_mail_urls_and_web_verification_level() {
         classifier.classify("what is the current population of Bratislava?"),
         Classification::Recognized(EvidenceIntent::WebFact {
             query: "what is the current population of Bratislava?".into(),
-            verification: VerificationLevel::SingleAuthoritative,
+            verification: VerificationLevel::Corroborated,
         })
     );
     assert_eq!(

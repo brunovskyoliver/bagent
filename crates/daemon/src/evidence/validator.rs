@@ -319,6 +319,13 @@ fn validate_web(
             )
         })
         .collect::<HashMap<_, _>>();
+    let validated_exploration_urls = results
+        .web_fetches
+        .iter()
+        .filter_map(|result| result.value.as_ref())
+        .flat_map(|evidence| evidence.links.iter())
+        .map(|reference| reference.url.clone())
+        .collect::<HashSet<_>>();
     let mut seen_sources = HashSet::new();
     let mut exclusions = Vec::new();
     let fetched = results
@@ -335,9 +342,10 @@ fn validate_web(
         .filter(|evidence| match intent {
             EvidenceIntent::WebDirectPage { url } => evidence.requested_url == *url,
             EvidenceIntent::WebFact { verification, .. } => {
-                searched_candidates
+                (searched_candidates
                     .get(&evidence.candidate_id)
                     .is_some_and(|url| *url == evidence.requested_url)
+                    || validated_exploration_urls.contains(&evidence.requested_url))
                     && (matches!(verification, super::VerificationLevel::Corroborated)
                         || evidence.authority == SourceAuthority::FirstParty)
             }
@@ -380,7 +388,7 @@ fn validate_web(
                 web_sources: requested_sources,
                 ..Default::default()
             },
-            message: "I couldn't verify this request from fetched page evidence. You can retry or provide a direct authoritative URL.".to_string(),
+            message: "Verification Shortfall: I couldn't verify this request from fetched page evidence. You can retry or provide a direct authoritative URL.".to_string(),
             missing: shortfall(
                 EvidenceRequirement::FetchedSources {
                     count: requested_sources,
