@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use basert_connector::{BaseRtClient, Message, ModelInfo, ModelLoadRequest};
+use basert_connector::{
+    BaseRtClient, BaseRtCompletionError, BaseRtLogCheckpoint, BaseRtRuntimeFault, Message,
+    ModelInfo, ModelLoadRequest,
+};
 use serde::Serialize;
 use std::{
     path::PathBuf,
@@ -17,7 +20,9 @@ pub(crate) const FALLBACK_SYNTHESIS_MODEL: &str = "basecompute/Qwen3-4B-Instruct
 pub(crate) const SYNTHESIS_MODEL_IDLE_TTL: Duration = Duration::from_secs(20 * 60);
 pub(crate) const SYNTHESIS_COLD_READY_TIMEOUT: Duration = Duration::from_secs(45);
 pub(crate) const SYNTHESIS_WARM_TIMEOUT: Duration = Duration::from_secs(20);
-pub(crate) const SYNTHESIS_FALLBACK_TIMEOUT: Duration = Duration::from_secs(25);
+pub(crate) const SYNTHESIS_FALLBACK_TIMEOUT: Duration = Duration::from_secs(20);
+const PREFERRED_MIN_FREE_PERCENT: u64 = 25;
+const PREFERRED_MIN_AVAILABLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SynthesisConfig {
@@ -74,6 +79,19 @@ pub(crate) trait SynthesisModelClient: Send + Sync {
     async fn inspect_models(&self) -> Result<Vec<ModelInfo>>;
     async fn load_model(&self, request: &ModelLoadRequest) -> Result<()>;
     async fn unload_model(&self, model: &str) -> Result<()>;
+    async fn restart_runtime(&self) -> Result<()> {
+        Err(anyhow!("BaseRT runtime restart is unsupported"))
+    }
+    async fn runtime_fault_checkpoint(&self) -> Option<BaseRtLogCheckpoint> {
+        None
+    }
+    async fn detect_runtime_fault_since(
+        &self,
+        _checkpoint: Option<BaseRtLogCheckpoint>,
+        _wait: Duration,
+    ) -> Option<BaseRtRuntimeFault> {
+        None
+    }
     async fn complete(&self, request: SynthesisModelRequest) -> Result<String>;
 }
 
@@ -90,6 +108,22 @@ impl SynthesisModelClient for BaseRtClient {
 
     async fn unload_model(&self, model: &str) -> Result<()> {
         BaseRtClient::unload_model(self, model).await
+    }
+
+    async fn restart_runtime(&self) -> Result<()> {
+        super::runtime_control::restart_managed_basert(self).await
+    }
+
+    async fn runtime_fault_checkpoint(&self) -> Option<BaseRtLogCheckpoint> {
+        BaseRtClient::runtime_log_checkpoint(self).await
+    }
+
+    async fn detect_runtime_fault_since(
+        &self,
+        checkpoint: Option<BaseRtLogCheckpoint>,
+        wait: Duration,
+    ) -> Option<BaseRtRuntimeFault> {
+        BaseRtClient::detect_runtime_fault_since(self, checkpoint, wait).await
     }
 
     async fn complete(&self, request: SynthesisModelRequest) -> Result<String> {
@@ -167,23 +201,40 @@ impl MemoryPressureSignal for SystemMemoryPressureSignal {
                 .output()
                 .await;
             let Ok(output) = output else {
-                return false;
+                return true;
             };
-            let report = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-            if report.contains("critical") || report.contains("warn") {
+            let report = String::from_utf8_lossy(&output.stdout);
+            let normalized = report.to_ascii_lowercase();
+            if normalized.contains("critical") || normalized.contains("warn") {
                 return true;
             }
-            report
-                .split(|character: char| !character.is_ascii_digit())
-                .filter_map(|part| part.parse::<u8>().ok())
-                .next_back()
-                .is_some_and(|free_percent| free_percent <= 15)
+            !preferred_memory_admitted(&report)
         }
         #[cfg(not(target_os = "macos"))]
         {
             false
         }
     }
+}
+
+fn preferred_memory_admitted(report: &str) -> bool {
+    let physical_bytes = report
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("The system has "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok());
+    let free_percent = report
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("System-wide memory free percentage:")
+        })
+        .and_then(|rest| rest.trim().trim_end_matches('%').parse::<u64>().ok());
+    let (Some(physical_bytes), Some(free_percent)) = (physical_bytes, free_percent) else {
+        return false;
+    };
+    let available_bytes = physical_bytes.saturating_mul(free_percent) / 100;
+    free_percent >= PREFERRED_MIN_FREE_PERCENT && available_bytes >= PREFERRED_MIN_AVAILABLE_BYTES
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -289,6 +340,7 @@ struct RuntimeState {
     preferred_last_use: Option<Duration>,
     preferred_active: usize,
     fallback_owned: bool,
+    poisoned: bool,
 }
 
 pub(crate) struct ModelRuntimeManager {
@@ -342,22 +394,9 @@ impl ModelRuntimeManager {
     ) -> Result<PreferredLease> {
         let started = self.clock.monotonic();
         let _lifecycle = self.lifecycle_lock.lock().await;
-        if self.pressure.under_pressure().await {
-            self.unload_preferred_if_idle().await;
-            observer
-                .record(phase_event(
-                    Some(&self.config.preferred_model),
-                    SynthesisPhase::LoadingSynthesisModel,
-                    elapsed_ms(self.clock.monotonic(), started),
-                    false,
-                    false,
-                    false,
-                    Some("memory_pressure"),
-                ))
-                .await;
-            return Err(anyhow!("memory pressure"));
+        if self.state.lock().expect("runtime state lock").poisoned {
+            return Err(anyhow!("BaseRT runtime poisoned"));
         }
-
         let loaded = match self.model_loaded(&self.config.preferred_model).await {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -376,6 +415,20 @@ impl ModelRuntimeManager {
             }
         };
         if !loaded {
+            if self.pressure.under_pressure().await {
+                observer
+                    .record(phase_event(
+                        Some(&self.config.preferred_model),
+                        SynthesisPhase::LoadingSynthesisModel,
+                        elapsed_ms(self.clock.monotonic(), started),
+                        false,
+                        false,
+                        false,
+                        Some("memory_pressure"),
+                    ))
+                    .await;
+                return Err(anyhow!("memory pressure"));
+            }
             if self.model_loaded(&self.config.fallback_model).await? {
                 self.client
                     .unload_model(&self.config.fallback_model)
@@ -400,12 +453,36 @@ impl ModelRuntimeManager {
                 id: self.config.preferred_model.clone(),
                 path: self.config.preferred_path.to_string_lossy().into_owned(),
             };
+            let fault_checkpoint = self.client.runtime_fault_checkpoint().await;
             let readiness = async {
                 self.client.load_model(&request).await?;
                 self.wait_until_loaded(&self.config.preferred_model).await
             };
             match tokio::time::timeout(self.config.cold_ready_timeout, readiness).await {
                 Err(_) => {
+                    if let Some(fault) = self
+                        .client
+                        .detect_runtime_fault_since(fault_checkpoint, Duration::from_millis(250))
+                        .await
+                    {
+                        self.mark_poisoned();
+                        observer
+                            .record(phase_event(
+                                Some(&self.config.preferred_model),
+                                SynthesisPhase::LoadingSynthesisModel,
+                                elapsed_ms(self.clock.monotonic(), started),
+                                false,
+                                false,
+                                false,
+                                Some(fault.category()),
+                            ))
+                            .await;
+                        return Err(anyhow!(BaseRtCompletionError::RuntimeFault(fault)));
+                    }
+                    // The server-side load may outlive cancellation of the
+                    // HTTP future. Treat an unproven timeout as an unhealthy
+                    // process boundary so fallback cannot overlap it.
+                    self.mark_poisoned();
                     observer
                         .record(phase_event(
                             Some(&self.config.preferred_model),
@@ -420,6 +497,10 @@ impl ModelRuntimeManager {
                     return Err(anyhow!("preferred model readiness timeout"));
                 }
                 Ok(Err(error)) => {
+                    let failure = ModelFailure::from_error(&error);
+                    if failure.is_poisoning() {
+                        self.mark_poisoned();
+                    }
                     observer
                         .record(phase_event(
                             Some(&self.config.preferred_model),
@@ -428,7 +509,7 @@ impl ModelRuntimeManager {
                             false,
                             false,
                             false,
-                            Some(normalized_failure_reason(&error.to_string())),
+                            Some(failure.category()),
                         ))
                         .await;
                     return Err(error);
@@ -475,7 +556,16 @@ impl ModelRuntimeManager {
             }
             idle.await;
         }
-        self.unload_preferred_if_idle().await;
+        let poisoned = self.state.lock().expect("runtime state lock").poisoned;
+        if poisoned {
+            self.client.restart_runtime().await?;
+            let mut state = self.state.lock().expect("runtime state lock");
+            state.preferred_last_use = None;
+            state.fallback_owned = false;
+            state.poisoned = false;
+        } else {
+            self.retire_preferred_if_idle().await?;
+        }
         if self.model_loaded(&self.config.fallback_model).await? {
             return Ok(());
         }
@@ -510,26 +600,37 @@ impl ModelRuntimeManager {
             .any(|candidate| candidate.id == model && candidate.loaded))
     }
 
-    async fn unload_preferred_if_idle(&self) {
+    fn mark_poisoned(&self) {
+        self.state.lock().expect("runtime state lock").poisoned = true;
+    }
+
+    async fn retire_preferred_if_idle(&self) -> Result<()> {
         let active = self
             .state
             .lock()
             .expect("runtime state lock")
             .preferred_active;
         if active > 0 {
-            return;
+            return Ok(());
         }
         if self
             .model_loaded(&self.config.preferred_model)
             .await
             .unwrap_or(false)
         {
-            let _ = self.client.unload_model(&self.config.preferred_model).await;
+            self.client
+                .unload_model(&self.config.preferred_model)
+                .await?;
+            // BaseRT can retain Metal/wired allocations after API unload while
+            // reporting zero loaded weights and very low RSS. A process restart
+            // is the only observed clean boundary before another residency.
+            self.client.restart_runtime().await?;
         }
         self.state
             .lock()
             .expect("runtime state lock")
             .preferred_last_use = None;
+        Ok(())
     }
 
     pub(crate) async fn maintain(&self) {
@@ -545,15 +646,14 @@ impl ModelRuntimeManager {
                 state.preferred_active,
             )
         };
-        let pressure = self.pressure.under_pressure().await;
-        if active == 0 && (idle_expired || pressure) {
-            self.unload_preferred_if_idle().await;
+        if active == 0 && idle_expired {
+            let _ = self.retire_preferred_if_idle().await;
         }
     }
 
     pub(crate) async fn shutdown(&self) {
         let _lifecycle = self.lifecycle_lock.lock().await;
-        self.unload_preferred_if_idle().await;
+        let _ = self.retire_preferred_if_idle().await;
     }
 }
 
@@ -698,16 +798,28 @@ impl SynthesisService {
                                     }
                                 }
                             }
-                            CompletionAttempt::Failed => {
-                                self.deterministic(contract, observer, Some("repair_model_failed"))
+                            CompletionAttempt::Failed(failure) => {
+                                if failure.is_poisoning() {
+                                    self.runtime.mark_poisoned();
+                                    self.fallback(contract, observer, initial).await
+                                } else {
+                                    self.deterministic(
+                                        contract,
+                                        observer,
+                                        Some("repair_model_failed"),
+                                    )
                                     .await
+                                }
                             }
                         }
                     }
                 }
             }
-            CompletionAttempt::Failed => {
+            CompletionAttempt::Failed(failure) => {
                 drop(lease);
+                if failure.is_poisoning() {
+                    self.runtime.mark_poisoned();
+                }
                 self.fallback(contract, observer, initial).await
             }
         }
@@ -769,8 +881,27 @@ impl SynthesisService {
             temperature: contract.temperature(),
             max_tokens: contract.max_tokens(),
         };
+        let fault_checkpoint = self.client.runtime_fault_checkpoint().await;
         match tokio::time::timeout(timeout, self.client.complete(request)).await {
             Err(_) => {
+                if let Some(fault) = self
+                    .client
+                    .detect_runtime_fault_since(fault_checkpoint, Duration::from_millis(250))
+                    .await
+                {
+                    observer
+                        .record(phase_event(
+                            Some(model),
+                            phase,
+                            duration_ms(started.elapsed()),
+                            false,
+                            fallback,
+                            repair,
+                            Some(fault.category()),
+                        ))
+                        .await;
+                    return CompletionAttempt::Failed(ModelFailure::Poisoned(fault));
+                }
                 observer
                     .record(phase_event(
                         Some(model),
@@ -782,9 +913,10 @@ impl SynthesisService {
                         Some("timeout"),
                     ))
                     .await;
-                CompletionAttempt::Failed
+                CompletionAttempt::Failed(ModelFailure::IndeterminateTimeout)
             }
             Ok(Err(error)) => {
+                let failure = ModelFailure::from_error(&error);
                 observer
                     .record(phase_event(
                         Some(model),
@@ -793,10 +925,10 @@ impl SynthesisService {
                         false,
                         fallback,
                         repair,
-                        Some(normalized_failure_reason(&error.to_string())),
+                        Some(failure.category()),
                     ))
                     .await;
-                CompletionAttempt::Failed
+                CompletionAttempt::Failed(failure)
             }
             Ok(Ok(response)) => {
                 observer
@@ -833,6 +965,7 @@ impl SynthesisService {
                 None,
             ))
             .await;
+        let fault_checkpoint = self.client.runtime_fault_checkpoint().await;
         let path = async {
             self.runtime.ensure_fallback().await?;
             self.client
@@ -869,6 +1002,10 @@ impl SynthesisService {
                 }
             }
             Ok(Err(error)) => {
+                let failure = ModelFailure::from_error(&error);
+                if failure.is_poisoning() {
+                    self.runtime.mark_poisoned();
+                }
                 observer
                     .record(phase_event(
                         Some(&self.config.fallback_model),
@@ -877,13 +1014,20 @@ impl SynthesisService {
                         false,
                         true,
                         false,
-                        Some(normalized_failure_reason(&error.to_string())),
+                        Some(failure.category()),
                     ))
                     .await;
                 self.deterministic(contract, observer, Some("model_unavailable"))
                     .await
             }
             Err(_) => {
+                let fault = self
+                    .client
+                    .detect_runtime_fault_since(fault_checkpoint, Duration::from_millis(250))
+                    .await;
+                // Cancellation does not prove the server-side load/completion
+                // ended. Force a clean process before any later request.
+                self.runtime.mark_poisoned();
                 observer
                     .record(phase_event(
                         Some(&self.config.fallback_model),
@@ -892,7 +1036,7 @@ impl SynthesisService {
                         true,
                         true,
                         false,
-                        Some("timeout"),
+                        Some(fault.map_or("timeout", BaseRtRuntimeFault::category)),
                     ))
                     .await;
                 self.deterministic(contract, observer, Some("model_unavailable"))
@@ -933,7 +1077,36 @@ impl SynthesisService {
 
 enum CompletionAttempt {
     Completed(String),
-    Failed,
+    Failed(ModelFailure),
+}
+
+enum ModelFailure {
+    Poisoned(BaseRtRuntimeFault),
+    IndeterminateTimeout,
+    Reason(&'static str),
+}
+
+impl ModelFailure {
+    fn from_error(error: &anyhow::Error) -> Self {
+        match error.downcast_ref::<BaseRtCompletionError>() {
+            Some(BaseRtCompletionError::RuntimeFault(fault)) => Self::Poisoned(*fault),
+            Some(BaseRtCompletionError::Truncated) => Self::Reason("truncated"),
+            Some(BaseRtCompletionError::Empty) => Self::Reason("empty"),
+            None => Self::Reason(normalized_failure_reason(&error.to_string())),
+        }
+    }
+
+    fn category(&self) -> &'static str {
+        match self {
+            Self::Poisoned(fault) => fault.category(),
+            Self::IndeterminateTimeout => "timeout",
+            Self::Reason(reason) => reason,
+        }
+    }
+
+    fn is_poisoning(&self) -> bool {
+        matches!(self, Self::Poisoned(_) | Self::IndeterminateTimeout)
+    }
 }
 
 fn validate_transcript(messages: &[Message]) -> Result<()> {
@@ -981,7 +1154,11 @@ fn duration_ms(duration: Duration) -> u64 {
 
 pub(crate) fn normalized_failure_reason(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
-    if normalized.contains("timeout") || normalized.contains("timed out") {
+    if normalized.contains("truncated") {
+        "truncated"
+    } else if normalized.contains("empty completion") {
+        "empty"
+    } else if normalized.contains("timeout") || normalized.contains("timed out") {
         "timeout"
     } else if normalized.contains("memory pressure") {
         "memory_pressure"
@@ -1019,6 +1196,7 @@ mod tests {
     enum Behavior {
         Response(&'static str),
         Error(&'static str),
+        RuntimeFault(BaseRtRuntimeFault),
         Pending,
     }
 
@@ -1028,6 +1206,9 @@ mod tests {
         behaviors: Mutex<VecDeque<Behavior>>,
         requests: Mutex<Vec<SynthesisModelRequest>>,
         loads: AtomicUsize,
+        restarts: AtomicUsize,
+        restart_behavior: Mutex<Option<Behavior>>,
+        timeout_fault: Mutex<Option<BaseRtRuntimeFault>>,
         unloads: Mutex<Vec<String>>,
         load_behavior: Mutex<Option<Behavior>>,
         load_delay: Mutex<Option<Duration>>,
@@ -1081,6 +1262,9 @@ mod tests {
             }
             match self.load_behavior.lock().await.take() {
                 Some(Behavior::Error(error)) => return Err(anyhow!(error)),
+                Some(Behavior::RuntimeFault(fault)) => {
+                    return Err(anyhow!(BaseRtCompletionError::RuntimeFault(fault)));
+                }
                 Some(Behavior::Pending) => std::future::pending::<()>().await,
                 _ => {}
             }
@@ -1098,11 +1282,35 @@ mod tests {
             Ok(())
         }
 
+        async fn restart_runtime(&self) -> Result<()> {
+            self.restarts.fetch_add(1, Ordering::SeqCst);
+            if let Some(Behavior::Error(error)) = self.restart_behavior.lock().await.take() {
+                return Err(anyhow!(error));
+            }
+            self.loaded.lock().await.clear();
+            Ok(())
+        }
+
+        async fn runtime_fault_checkpoint(&self) -> Option<BaseRtLogCheckpoint> {
+            None
+        }
+
+        async fn detect_runtime_fault_since(
+            &self,
+            _checkpoint: Option<BaseRtLogCheckpoint>,
+            _wait: Duration,
+        ) -> Option<BaseRtRuntimeFault> {
+            self.timeout_fault.lock().await.take()
+        }
+
         async fn complete(&self, request: SynthesisModelRequest) -> Result<String> {
             self.requests.lock().await.push(request);
             match self.behaviors.lock().await.pop_front() {
                 Some(Behavior::Response(response)) => Ok(response.to_string()),
                 Some(Behavior::Error(error)) => Err(anyhow!(error)),
+                Some(Behavior::RuntimeFault(fault)) => {
+                    Err(anyhow!(BaseRtCompletionError::RuntimeFault(fault)))
+                }
                 Some(Behavior::Pending) => std::future::pending::<Result<String>>().await,
                 None => Err(anyhow!("unexpected model request")),
             }
@@ -1259,6 +1467,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_completion_failures_have_specific_reasons() {
+        assert_eq!(
+            ModelFailure::from_error(&anyhow!(BaseRtCompletionError::RuntimeFault(
+                BaseRtRuntimeFault::MetalOutOfMemory
+            )))
+            .category(),
+            "metal_oom"
+        );
+        assert_eq!(
+            ModelFailure::from_error(&anyhow!(BaseRtCompletionError::RuntimeFault(
+                BaseRtRuntimeFault::MetalCommandBuffer
+            )))
+            .category(),
+            "metal_command_buffer"
+        );
+        assert_eq!(
+            ModelFailure::from_error(&anyhow!(BaseRtCompletionError::RuntimeFault(
+                BaseRtRuntimeFault::MetalDevice
+            )))
+            .category(),
+            "metal_device"
+        );
+        assert_eq!(
+            ModelFailure::from_error(&anyhow!(BaseRtCompletionError::Truncated)).category(),
+            "truncated"
+        );
+        assert_eq!(
+            ModelFailure::from_error(&anyhow!(BaseRtCompletionError::Empty)).category(),
+            "empty"
+        );
+    }
+
+    #[test]
+    fn preferred_memory_admission_requires_percentage_and_absolute_headroom() {
+        let safe = "The system has 34359738368 (2097152 pages with a page size of 16384).\n\
+                    System-wide memory free percentage: 30%";
+        let low_percentage =
+            "The system has 34359738368 (2097152 pages with a page size of 16384).\n\
+                              System-wide memory free percentage: 24%";
+        let low_absolute =
+            "The system has 17179869184 (1048576 pages with a page size of 16384).\n\
+                            System-wide memory free percentage: 30%";
+        assert!(preferred_memory_admitted(safe));
+        assert!(!preferred_memory_admitted(low_percentage));
+        assert!(!preferred_memory_admitted(low_absolute));
+        assert!(!preferred_memory_admitted("unparseable"));
+    }
+
     #[tokio::test]
     async fn first_eligible_request_cold_loads_preferred_once() {
         let client = FakeModelClient::with_behaviors([Behavior::Response("valid")]);
@@ -1376,6 +1633,7 @@ mod tests {
             client.unloads.lock().await.as_slice(),
             [PREFERRED_SYNTHESIS_MODEL]
         );
+        assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
         let loaded = client.loaded.lock().await;
         assert!(!loaded.contains(PREFERRED_SYNTHESIS_MODEL));
         assert!(loaded.contains(FALLBACK_SYNTHESIS_MODEL));
@@ -1483,11 +1741,15 @@ mod tests {
             client.unloads.lock().await.as_slice(),
             [PREFERRED_SYNTHESIS_MODEL]
         );
+        assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn memory_pressure_unloads_idle_preferred() {
-        let client = FakeModelClient::with_behaviors([Behavior::Response("valid")]);
+    async fn load_admission_pressure_does_not_evict_an_existing_preferred_residency() {
+        let client = FakeModelClient::with_behaviors([
+            Behavior::Response("valid"),
+            Behavior::Response("valid"),
+        ]);
         let pressure = Arc::new(FakePressure::default());
         let service = service(
             client.clone(),
@@ -1499,10 +1761,28 @@ mod tests {
             .await;
         pressure.0.store(true, Ordering::SeqCst);
         service.maintain().await;
-        assert_eq!(
-            client.unloads.lock().await.as_slice(),
-            [PREFERRED_SYNTHESIS_MODEL]
-        );
+        let result = service
+            .synthesize(&TestContract::default(), &NoopSynthesisObserver)
+            .await;
+        assert_eq!(result.route, SynthesisRoute::Preferred);
+        assert!(client.unloads.lock().await.is_empty());
+        assert_eq!(client.restarts.load(Ordering::SeqCst), 0);
+        assert_eq!(client.loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_pressure_rejects_a_new_preferred_load_and_uses_fallback() {
+        let client = FakeModelClient::with_behaviors([Behavior::Response("fallback")]);
+        let pressure = Arc::new(FakePressure(AtomicBool::new(true)));
+        let service = service(client.clone(), Arc::new(FakeClock::default()), pressure);
+        let result = service
+            .synthesize(&TestContract::default(), &NoopSynthesisObserver)
+            .await;
+        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(client.loads.load(Ordering::SeqCst), 1);
+        let requests = client.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_id, FALLBACK_SYNTHESIS_MODEL);
     }
 
     #[tokio::test]
@@ -1641,6 +1921,175 @@ mod tests {
             .await;
         assert_eq!(result.route, SynthesisRoute::Deterministic);
         assert_eq!(result.text, "deterministic");
+    }
+
+    #[tokio::test]
+    async fn fallback_timeout_marks_runtime_poisoned_before_any_later_request() {
+        let client =
+            FakeModelClient::with_behaviors([Behavior::Error("transport"), Behavior::Pending]);
+        *client.timeout_fault.lock().await = Some(BaseRtRuntimeFault::MetalDevice);
+        let service = service(
+            client.clone(),
+            Arc::new(FakeClock::default()),
+            Arc::new(FakePressure::default()),
+        );
+
+        let result = service
+            .synthesize(&TestContract::default(), &NoopSynthesisObserver)
+            .await;
+
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
+        assert!(
+            service
+                .runtime
+                .state
+                .lock()
+                .expect("runtime state lock")
+                .poisoned
+        );
+        assert_eq!(client.requests.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn metal_failure_restarts_runtime_before_single_bounded_fallback() {
+        let client = FakeModelClient::with_behaviors([
+            Behavior::RuntimeFault(BaseRtRuntimeFault::MetalOutOfMemory),
+            Behavior::Response("fallback"),
+        ]);
+        client.set_loaded(PREFERRED_SYNTHESIS_MODEL).await;
+        let service = service(
+            client.clone(),
+            Arc::new(FakeClock::default()),
+            Arc::new(FakePressure::default()),
+        );
+
+        let result = service
+            .synthesize(&TestContract::default(), &NoopSynthesisObserver)
+            .await;
+
+        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
+        let requests = client.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].model_id, PREFERRED_SYNTHESIS_MODEL);
+        assert_eq!(requests[1].model_id, FALLBACK_SYNTHESIS_MODEL);
+    }
+
+    #[tokio::test]
+    async fn metal_failure_during_preferred_load_restarts_before_fallback() {
+        let client = FakeModelClient::with_behaviors([Behavior::Response("fallback")]);
+        *client.load_behavior.lock().await =
+            Some(Behavior::RuntimeFault(BaseRtRuntimeFault::MetalOutOfMemory));
+        let service = service(
+            client.clone(),
+            Arc::new(FakeClock::default()),
+            Arc::new(FakePressure::default()),
+        );
+
+        let result = service
+            .synthesize(&TestContract::default(), &NoopSynthesisObserver)
+            .await;
+
+        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
+        let requests = client.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_id, FALLBACK_SYNTHESIS_MODEL);
+    }
+
+    #[tokio::test]
+    async fn delayed_metal_fault_after_completion_timeout_restarts_before_fallback() {
+        let client =
+            FakeModelClient::with_behaviors([Behavior::Pending, Behavior::Response("fallback")]);
+        *client.timeout_fault.lock().await = Some(BaseRtRuntimeFault::MetalCommandBuffer);
+        client.set_loaded(PREFERRED_SYNTHESIS_MODEL).await;
+        let service = service(
+            client.clone(),
+            Arc::new(FakeClock::default()),
+            Arc::new(FakePressure::default()),
+        );
+
+        let result = service
+            .synthesize(&TestContract::default(), &NoopSynthesisObserver)
+            .await;
+
+        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
+        let requests = client.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].model_id, FALLBACK_SYNTHESIS_MODEL);
+    }
+
+    #[tokio::test]
+    async fn metal_failure_during_repair_restarts_before_fallback() {
+        let client = FakeModelClient::with_behaviors([
+            Behavior::Response("invalid"),
+            Behavior::RuntimeFault(BaseRtRuntimeFault::MetalCommandBuffer),
+            Behavior::Response("fallback"),
+        ]);
+        client.set_loaded(PREFERRED_SYNTHESIS_MODEL).await;
+        let service = service(
+            client.clone(),
+            Arc::new(FakeClock::default()),
+            Arc::new(FakePressure::default()),
+        );
+
+        let result = service
+            .synthesize(&TestContract::default(), &NoopSynthesisObserver)
+            .await;
+
+        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
+        let requests = client.requests.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].model_id, FALLBACK_SYNTHESIS_MODEL);
+    }
+
+    #[tokio::test]
+    async fn poisoned_state_suppresses_preferred_request_until_restart() {
+        let client = FakeModelClient::with_behaviors([Behavior::Response("fallback")]);
+        client.set_loaded(PREFERRED_SYNTHESIS_MODEL).await;
+        let service = service(
+            client.clone(),
+            Arc::new(FakeClock::default()),
+            Arc::new(FakePressure::default()),
+        );
+        service.runtime.mark_poisoned();
+
+        let result = service
+            .synthesize(&TestContract::default(), &NoopSynthesisObserver)
+            .await;
+
+        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
+        let requests = client.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_id, FALLBACK_SYNTHESIS_MODEL);
+    }
+
+    #[tokio::test]
+    async fn failed_poisoned_restart_suppresses_fallback_request() {
+        let client = FakeModelClient::with_behaviors([Behavior::RuntimeFault(
+            BaseRtRuntimeFault::MetalOutOfMemory,
+        )]);
+        client.set_loaded(PREFERRED_SYNTHESIS_MODEL).await;
+        *client.restart_behavior.lock().await =
+            Some(Behavior::Error("runtime restart unavailable"));
+        let service = service(
+            client.clone(),
+            Arc::new(FakeClock::default()),
+            Arc::new(FakePressure::default()),
+        );
+
+        let result = service
+            .synthesize(&TestContract::default(), &NoopSynthesisObserver)
+            .await;
+
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
+        assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
+        let requests = client.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model_id, PREFERRED_SYNTHESIS_MODEL);
     }
 
     #[tokio::test]

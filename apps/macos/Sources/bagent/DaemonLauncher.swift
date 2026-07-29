@@ -101,7 +101,7 @@ enum BaseRTLaunchAgent {
             "--port", String(port),
             "--api-key", apiKey,
             "--idle-timeout", String(idleTimeoutSeconds),
-            "--max-context", "16384",
+            "--max-context", "4096",
             "--kv-bits", "4",
             "--max-tokens", "2048",
             "--max-batch-size", "1",
@@ -180,6 +180,7 @@ final class DaemonLauncher {
         let env = [
             "BAGENT_BASERT_BASE_URL": "http://127.0.0.1:8082/v1",
             "BAGENT_BASERT_API_KEY": BaseRTLaunchAgent.apiKey,
+            "BAGENT_BASERT_LOG_PATH": BaseRTLaunchAgent.logURL.path,
             "BAGENT_DEFAULT_MODEL": BaseRTLaunchAgent.model,
             "BAGENT_CLASSIFIER_MODEL": BaseRTLaunchAgent.model,
             "BAGENT_SYNTHESIS_MODEL_PATH":

@@ -37,7 +37,7 @@ final class DaemonLaunchAgentTests: XCTestCase {
         XCTAssertTrue(plist.contains("<string>--idle-timeout</string>"))
         XCTAssertTrue(plist.contains("<string>1200</string>"))
         XCTAssertTrue(plist.contains("<string>--max-context</string>"))
-        XCTAssertTrue(plist.contains("<string>16384</string>"))
+        XCTAssertTrue(plist.contains("<string>4096</string>"))
         XCTAssertTrue(plist.contains("<string>8082</string>"))
         XCTAssertTrue(plist.contains("<string>basert-local</string>"))
         XCTAssertFalse(plist.contains("<string>8080</string>"))

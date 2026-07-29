@@ -825,7 +825,7 @@ const EVIDENCE_SYNTHESIS_SYSTEM_PROMPT: &str =
      schemas, validation, or any other implementation detail. Do not add a preamble, describe the \
      input, invent facts, or imply access to other messages.";
 
-const MAIL_SYNTHESIS_MAX_TOKENS: u32 = 512;
+const MAIL_SYNTHESIS_MAX_TOKENS: u32 = 256;
 #[cfg(test)]
 const MAIL_SYNTHESIS_TIMEOUT: Duration = Duration::from_secs(25);
 const MAIL_SYNTHESIS_MAX_CHARS: usize = 8_192;
@@ -1316,7 +1316,7 @@ const WEB_SYNTHESIS_SYSTEM_PROMPT: &str =
      IDs, validation, search snippets, redirect checks, or other implementation details. Do not \
      use model memory or add uncited facts.";
 
-const WEB_SYNTHESIS_MAX_TOKENS: u32 = 512;
+const WEB_SYNTHESIS_MAX_TOKENS: u32 = 256;
 const WEB_SYNTHESIS_MAX_CHARS: usize = 8_192;
 
 fn build_web_synthesis_request(original_request: &str, bundle: &EvidenceBundle) -> Vec<Message> {
@@ -4874,9 +4874,79 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires all three installed BaseRT models and explicit acceptance runtime"]
     async fn stage8_live_frozen_bundle_matrix_and_performance() {
-        use crate::evidence::{fixtures, EvidenceValidator};
-        use basert_connector::{BaseRtClient, ModelLoadRequest, DEFAULT_API_KEY, DEFAULT_BASE_URL};
+        use crate::evidence::{
+            fixtures, EvidenceValidator, MemoryPressureSignal, SystemMemoryPressureSignal,
+        };
+        use basert_connector::{
+            BaseRtClient, BaseRtCompletionError, ModelLoadRequest, DEFAULT_API_KEY,
+            DEFAULT_BASE_URL,
+        };
         use std::time::Instant;
+
+        fn poisoning_category(error: &anyhow::Error) -> Option<&'static str> {
+            match error.downcast_ref::<BaseRtCompletionError>() {
+                Some(BaseRtCompletionError::RuntimeFault(fault)) => Some(fault.category()),
+                _ => None,
+            }
+        }
+
+        async fn command_stdout(program: &str, arguments: &[&str]) -> String {
+            tokio::process::Command::new(program)
+                .args(arguments)
+                .output()
+                .await
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .unwrap_or_default()
+        }
+
+        async fn structural_runtime_snapshot(client: &BaseRtClient) -> serde_json::Value {
+            let pressure_report = command_stdout("/usr/bin/memory_pressure", &["-Q"]).await;
+            let free_percent = pressure_report.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("System-wide memory free percentage:")
+                    .and_then(|value| value.trim().trim_end_matches('%').parse::<u64>().ok())
+            });
+            let swap_report = command_stdout("/usr/sbin/sysctl", &["-n", "vm.swapusage"]).await;
+            let swap_used_mib = swap_report
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(3)
+                .find(|parts| parts[0] == "used" && parts[1] == "=")
+                .and_then(|parts| parts[2].trim_end_matches('M').parse::<f64>().ok());
+            let pid = command_stdout(
+                "/usr/sbin/lsof",
+                &["-nP", "-iTCP:8082", "-sTCP:LISTEN", "-t"],
+            )
+            .await
+            .lines()
+            .next()
+            .and_then(|value| value.parse::<u32>().ok());
+            let rss_kib = if let Some(pid) = pid {
+                let pid = pid.to_string();
+                command_stdout("/bin/ps", &["-p", &pid, "-o", "rss="])
+                    .await
+                    .parse::<u64>()
+                    .ok()
+            } else {
+                None
+            };
+            let loaded_models = client
+                .inspect_models()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|candidate| candidate.loaded)
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>();
+            json!({
+                "memory_free_percent": free_percent,
+                "swap_used_mib": swap_used_mib,
+                "basert_rss_kib": rss_kib,
+                "loaded_models": loaded_models,
+            })
+        }
 
         async fn unload_all(client: &BaseRtClient, models: &[(&str, &str)]) {
             let loaded = client.inspect_models().await.unwrap_or_default();
@@ -4897,7 +4967,8 @@ mod tests {
             contract: &dyn SynthesisContract,
             phase: &str,
             sample: usize,
-        ) {
+            output_cap: u32,
+        ) -> bool {
             let messages = contract.initial_request();
             assert_eq!(messages.len(), 2);
             assert_eq!(messages[0].role, "system");
@@ -4909,15 +4980,12 @@ mod tests {
                 .iter()
                 .map(|message| message.content.len())
                 .sum::<usize>();
+            let runtime_before = structural_runtime_snapshot(client).await;
+            let fault_checkpoint = client.runtime_log_checkpoint().await;
             let started = Instant::now();
             let response = tokio::time::timeout(
                 Duration::from_secs(20),
-                client.chat_complete_bounded(
-                    model,
-                    messages,
-                    contract.temperature(),
-                    contract.max_tokens(),
-                ),
+                client.chat_complete_bounded(model, messages, contract.temperature(), output_cap),
             )
             .await;
             let latency_ms = started.elapsed().as_millis() as u64;
@@ -4925,9 +4993,39 @@ mod tests {
             let mut repaired_valid = false;
             let mut repair_latency_ms = 0u64;
             let mut completion_chars = 0usize;
+            let mut failure_category = None;
+            let mut poisoned = false;
             let outcome = match response {
-                Err(_) => "timeout",
-                Ok(Err(_)) => "model_error",
+                Err(_) => {
+                    if let Some(fault) = client
+                        .detect_runtime_fault_since(fault_checkpoint, Duration::from_millis(250))
+                        .await
+                    {
+                        poisoned = true;
+                        failure_category = Some(fault.category());
+                        "model_error"
+                    } else {
+                        poisoned = true;
+                        failure_category = Some("transport/model_error");
+                        "timeout"
+                    }
+                }
+                Ok(Err(error)) => {
+                    let reason = poisoning_category(&error).unwrap_or_else(|| {
+                        crate::evidence::normalized_failure_reason(&error.to_string())
+                    });
+                    poisoned = poisoning_category(&error).is_some();
+                    failure_category = Some(if poisoned {
+                        reason
+                    } else if error.to_string().to_ascii_lowercase().contains("truncated") {
+                        "truncated"
+                    } else if error.to_string().to_ascii_lowercase().contains("empty") {
+                        "empty"
+                    } else {
+                        "transport/model_error"
+                    });
+                    "model_error"
+                }
                 Ok(Ok(response)) => {
                     completion_chars = response.len();
                     match contract.validate(&response) {
@@ -4936,6 +5034,19 @@ mod tests {
                             "valid"
                         }
                         Err(errors) => {
+                            failure_category = errors.first().map(|reason| match reason.as_str() {
+                                "empty_response" => "empty",
+                                "output_too_long" => "malformed",
+                                "missing_mail_coverage"
+                                | "missing_shortfall"
+                                | "missing_conflict" => "missing_coverage",
+                                "missing_citation" | "unallowlisted_citation" => "missing_citation",
+                                "unsupported_claim" | "unsupported_identifier_or_url" => {
+                                    "unsupported_claim"
+                                }
+                                "internal_metadata" => "internal_metadata",
+                                _ => "malformed",
+                            });
                             let repair_messages = contract.repair_request(&errors);
                             assert_eq!(repair_messages.len(), 2);
                             assert_eq!(repair_messages[0].role, "system");
@@ -4943,6 +5054,7 @@ mod tests {
                             assert!(repair_messages.iter().all(|message| {
                                 message.tool_calls.is_empty() && message.tool_call_id.is_none()
                             }));
+                            let repair_fault_checkpoint = client.runtime_log_checkpoint().await;
                             let repair_started = Instant::now();
                             let repaired = tokio::time::timeout(
                                 Duration::from_secs(20),
@@ -4950,15 +5062,51 @@ mod tests {
                                     model,
                                     repair_messages,
                                     contract.temperature(),
-                                    contract.max_tokens(),
+                                    output_cap,
                                 ),
                             )
                             .await;
                             repair_latency_ms = repair_started.elapsed().as_millis() as u64;
-                            repaired_valid = matches!(
-                                repaired,
-                                Ok(Ok(ref value)) if contract.validate(value).is_ok()
-                            );
+                            repaired_valid = match repaired {
+                                Ok(Ok(ref value)) => contract.validate(value).is_ok(),
+                                Ok(Err(ref error)) => {
+                                    if let Some(reason) = poisoning_category(error) {
+                                        poisoned = true;
+                                        failure_category = Some(reason);
+                                    } else if error
+                                        .to_string()
+                                        .to_ascii_lowercase()
+                                        .contains("truncated")
+                                    {
+                                        failure_category = Some("truncated");
+                                    } else if error
+                                        .to_string()
+                                        .to_ascii_lowercase()
+                                        .contains("empty")
+                                    {
+                                        failure_category = Some("empty");
+                                    } else {
+                                        poisoned = true;
+                                        failure_category = Some("transport/model_error");
+                                    }
+                                    false
+                                }
+                                Err(_) => {
+                                    if let Some(fault) = client
+                                        .detect_runtime_fault_since(
+                                            repair_fault_checkpoint,
+                                            Duration::from_millis(250),
+                                        )
+                                        .await
+                                    {
+                                        poisoned = true;
+                                        failure_category = Some(fault.category());
+                                    } else {
+                                        failure_category = Some("transport/model_error");
+                                    }
+                                    false
+                                }
+                            };
                             if repaired_valid {
                                 "repaired"
                             } else {
@@ -4983,11 +5131,21 @@ mod tests {
                     "repaired_valid": repaired_valid,
                     "grounded": initial_valid || repaired_valid,
                     "outcome": outcome,
+                    "failure_category": failure_category,
+                    "poisoned": poisoned,
+                    "output_cap": output_cap,
+                    "max_context": std::env::var("BAGENT_STAGE8_CONTEXT")
+                        .unwrap_or_else(|_| "4096".into()),
+                    "kv_bits": std::env::var("BAGENT_STAGE8_KV_BITS")
+                        .unwrap_or_else(|_| "4".into()),
+                    "max_batch_size": 1,
+                    "runtime_before": runtime_before,
                     "tools": 0,
                     "system_messages": 1,
                     "user_messages": 1,
                 })
             );
+            !poisoned
         }
 
         let mail_plan = EvidencePlanner::plan(EvidenceIntent::MailLatestContent {
@@ -5061,7 +5219,64 @@ mod tests {
             .unwrap()
             .join("Library/Caches/baseRT/models");
         let client = BaseRtClient::new(DEFAULT_BASE_URL, DEFAULT_API_KEY);
-        unload_all(&client, &models).await;
+        let trial_only = std::env::var_os("BAGENT_STAGE8_TRIAL_ONLY").is_some();
+        let skip_load = std::env::var_os("BAGENT_STAGE8_SKIP_LOAD").is_some();
+        if !trial_only || !skip_load {
+            unload_all(&client, &models).await;
+        }
+        let output_cap = std::env::var("BAGENT_STAGE8_OUTPUT_CAP")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| matches!(value, 256 | 512))
+            .unwrap_or(512);
+        if trial_only {
+            let pressure = SystemMemoryPressureSignal::from_environment();
+            if pressure.under_pressure().await {
+                println!(
+                    "STAGE8_TRIAL_SKIPPED {}",
+                    json!({"reason": "memory_admission", "output_cap": output_cap})
+                );
+                unload_all(&client, &models).await;
+                return;
+            }
+            let model_index = std::env::var("BAGENT_STAGE8_MODEL_INDEX")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value < models.len())
+                .unwrap_or(2);
+            let preferred = models[model_index];
+            if !skip_load {
+                client
+                    .load_model(&ModelLoadRequest {
+                        id: preferred.0.into(),
+                        path: cache.join(preferred.1).to_string_lossy().into_owned(),
+                    })
+                    .await
+                    .expect("35B trial model must load");
+            }
+            let request_count = std::env::var("BAGENT_STAGE8_REQUEST_COUNT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(30);
+            for sample in 1..=request_count {
+                let (workload, contract) = workloads[(sample - 1) % workloads.len()];
+                if !run_sample(
+                    &client,
+                    preferred.0,
+                    workload,
+                    contract,
+                    "clean_process_trial",
+                    sample,
+                    output_cap,
+                )
+                .await
+                {
+                    break;
+                }
+            }
+            unload_all(&client, &models).await;
+            return;
+        }
 
         for (model, relative_path) in models {
             let load_started = Instant::now();
@@ -5082,7 +5297,19 @@ mod tests {
             );
             if loaded.is_ok() {
                 for (index, (workload, contract)) in workloads.iter().enumerate() {
-                    run_sample(&client, model, workload, *contract, "matrix", index + 1).await;
+                    if !run_sample(
+                        &client,
+                        model,
+                        workload,
+                        *contract,
+                        "matrix",
+                        index + 1,
+                        output_cap,
+                    )
+                    .await
+                    {
+                        break;
+                    }
                 }
             }
             let _ = client.unload_model(model).await;
@@ -5116,6 +5343,7 @@ mod tests {
                     &mail_contract,
                     "cold",
                     cold_sample,
+                    output_cap,
                 )
                 .await;
             }
@@ -5131,7 +5359,19 @@ mod tests {
         if loaded.is_ok() {
             for sample in 1..=30 {
                 let (workload, contract) = workloads[(sample - 1) % workloads.len()];
-                run_sample(&client, preferred.0, workload, contract, "warm", sample).await;
+                if !run_sample(
+                    &client,
+                    preferred.0,
+                    workload,
+                    contract,
+                    "warm",
+                    sample,
+                    output_cap,
+                )
+                .await
+                {
+                    break;
+                }
             }
         }
         unload_all(&client, &models).await;

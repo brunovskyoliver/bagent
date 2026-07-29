@@ -7,7 +7,8 @@ use axum::{
     Router,
 };
 use basert_connector::{
-    BaseRtClient, ChatStreamEvent, Message, ModelLoadRequest, ModelReadiness, ToolDef,
+    classify_basert_runtime_fault, BaseRtClient, BaseRtCompletionError, BaseRtRuntimeFault,
+    ChatStreamEvent, Message, ModelLoadRequest, ModelReadiness, ToolDef,
 };
 use futures_util::StreamExt;
 use serde_json::json;
@@ -360,6 +361,168 @@ async fn bounded_chat_completion_rejects_empty_model_output_as_unavailable() {
         .unwrap_err()
         .to_string();
     assert_eq!(error, "BaseRT returned an empty completion");
+}
+
+#[tokio::test]
+async fn bounded_chat_completion_reports_output_cap_truncation() {
+    let response = (
+        StatusCode::OK,
+        axum::Json(json!({
+            "choices": [{"message": {"content": "partial"}, "finish_reason": "length"}]
+        })),
+    )
+        .into_response();
+    let (base_url, _) = spawn_server(response).await;
+    let client = BaseRtClient::new(base_url, "test-key");
+
+    let error = client
+        .chat_complete_bounded(
+            "configured-model",
+            vec![Message::system("system"), Message::user("user")],
+            0.1,
+            256,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(error, "BaseRT generation truncated at output cap");
+}
+
+#[tokio::test]
+async fn metal_log_fault_overrides_http_error_and_suppresses_the_next_request() {
+    let log_path = std::env::temp_dir().join(format!(
+        "bagent-basert-metal-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let log_path = log_path.clone();
+            let requests = requests.clone();
+            move || {
+                let log_path = log_path.clone();
+                let requests = requests.clone();
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::fs::write(
+                        log_path,
+                        "[baseRT][metal] command buffer failed: Insufficient Memory \
+                         (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)",
+                    )
+                    .await
+                    .unwrap();
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = BaseRtClient::new(format!("http://{address}/v1"), "test-key")
+        .with_runtime_log_path(&log_path);
+
+    let first = client
+        .chat_complete_bounded(
+            "configured-model",
+            vec![Message::system("system"), Message::user("user")],
+            0.1,
+            256,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        first.downcast_ref::<BaseRtCompletionError>(),
+        Some(&BaseRtCompletionError::RuntimeFault(
+            BaseRtRuntimeFault::MetalOutOfMemory
+        ))
+    );
+
+    let second = client
+        .chat_complete_bounded(
+            "configured-model",
+            vec![Message::system("system"), Message::user("user")],
+            0.1,
+            256,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        second.downcast_ref::<BaseRtCompletionError>(),
+        Some(&BaseRtCompletionError::RuntimeFault(
+            BaseRtRuntimeFault::MetalOutOfMemory
+        ))
+    );
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the poisoned process must not receive a second request"
+    );
+    let _ = tokio::fs::remove_file(log_path).await;
+}
+
+#[tokio::test]
+async fn metal_fault_is_detected_after_same_or_larger_log_rotation() {
+    let log_path = std::env::temp_dir().join(format!(
+        "bagent-basert-rotation-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let rotated_path = log_path.with_extension("old");
+    tokio::fs::write(&log_path, "x".repeat(128)).await.unwrap();
+    let client =
+        BaseRtClient::new("http://127.0.0.1:1/v1", "test-key").with_runtime_log_path(&log_path);
+    let checkpoint = client.runtime_log_checkpoint().await;
+    tokio::fs::rename(&log_path, &rotated_path).await.unwrap();
+    tokio::fs::write(
+        &log_path,
+        format!(
+            "[baseRT][metal] command buffer failed: device was lost{}",
+            "y".repeat(128)
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        client
+            .detect_runtime_fault_since(checkpoint, Duration::ZERO)
+            .await,
+        Some(BaseRtRuntimeFault::MetalDevice)
+    );
+    let _ = tokio::fs::remove_file(log_path).await;
+    let _ = tokio::fs::remove_file(rotated_path).await;
+}
+
+#[test]
+fn normalizes_only_poisoning_metal_log_signatures() {
+    assert_eq!(
+        classify_basert_runtime_fault(
+            "[baseRT][metal] command buffer failed: Insufficient Memory \
+             (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
+        ),
+        Some(BaseRtRuntimeFault::MetalOutOfMemory)
+    );
+    assert_eq!(
+        classify_basert_runtime_fault("[baseRT][metal] device was lost"),
+        Some(BaseRtRuntimeFault::MetalDevice)
+    );
+    assert_eq!(
+        classify_basert_runtime_fault("[baseRT][metal] command buffer failed: internal error"),
+        Some(BaseRtRuntimeFault::MetalCommandBuffer)
+    );
+    assert_eq!(
+        classify_basert_runtime_fault("Model loaded via API; prompt=261 completion=1"),
+        None
+    );
 }
 
 #[tokio::test]

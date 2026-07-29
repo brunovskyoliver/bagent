@@ -1,12 +1,106 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::sync::RwLock;
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
+    sync::RwLock,
+};
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8082/v1";
 pub const DEFAULT_API_KEY: &str = "basert-local";
 pub const DEFAULT_CHAT_MODEL: &str = "basecompute/Qwen3-4B-Instruct-2507";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseRtRuntimeFault {
+    MetalOutOfMemory,
+    MetalDevice,
+    MetalCommandBuffer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseRtCompletionError {
+    RuntimeFault(BaseRtRuntimeFault),
+    Truncated,
+    Empty,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BaseRtLogCheckpoint {
+    length: u64,
+    file_id: Option<u64>,
+}
+
+impl fmt::Display for BaseRtCompletionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeFault(fault) => {
+                write!(formatter, "BaseRT runtime poisoned: {}", fault.category())
+            }
+            Self::Truncated => formatter.write_str("BaseRT generation truncated at output cap"),
+            Self::Empty => formatter.write_str("BaseRT returned an empty completion"),
+        }
+    }
+}
+
+impl std::error::Error for BaseRtCompletionError {}
+
+impl BaseRtRuntimeFault {
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::MetalOutOfMemory => "metal_oom",
+            Self::MetalDevice => "metal_device",
+            Self::MetalCommandBuffer => "metal_command_buffer",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::MetalOutOfMemory => 1,
+            Self::MetalDevice => 2,
+            Self::MetalCommandBuffer => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::MetalOutOfMemory),
+            2 => Some(Self::MetalDevice),
+            3 => Some(Self::MetalCommandBuffer),
+            _ => None,
+        }
+    }
+}
+
+pub fn classify_basert_runtime_fault(log_delta: &str) -> Option<BaseRtRuntimeFault> {
+    let normalized = log_delta.to_ascii_lowercase();
+    if normalized.contains("kiogpucommandbuffercallbackerroroutofmemory")
+        || (normalized.contains("[basert][metal]")
+            && (normalized.contains("insufficient memory") || normalized.contains("out of memory")))
+    {
+        Some(BaseRtRuntimeFault::MetalOutOfMemory)
+    } else if normalized.contains("[basert][metal]")
+        && (normalized.contains("device lost")
+            || normalized.contains("device was lost")
+            || normalized.contains("device removed"))
+    {
+        Some(BaseRtRuntimeFault::MetalDevice)
+    } else if normalized.contains("[basert][metal]") && normalized.contains("command buffer failed")
+    {
+        Some(BaseRtRuntimeFault::MetalCommandBuffer)
+    } else {
+        None
+    }
+}
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ModelInfo {
@@ -159,6 +253,8 @@ pub struct BaseRtClient {
     api_key: String,
     http: reqwest::Client,
     model_lifecycle: Arc<RwLock<()>>,
+    runtime_log_path: Option<PathBuf>,
+    runtime_fault: Arc<AtomicU8>,
 }
 
 impl BaseRtClient {
@@ -168,6 +264,9 @@ impl BaseRtClient {
             .strip_suffix("/v1")
             .unwrap_or(&base_url)
             .to_string();
+        let runtime_log_path = (base_url == DEFAULT_BASE_URL)
+            .then(|| std::env::var_os("BAGENT_BASERT_LOG_PATH").map(PathBuf::from))
+            .flatten();
         Self {
             base_url,
             server_root,
@@ -178,7 +277,109 @@ impl BaseRtClient {
                 .build()
                 .expect("build BaseRT HTTP client"),
             model_lifecycle: Arc::new(RwLock::new(())),
+            runtime_log_path,
+            runtime_fault: Arc::new(AtomicU8::new(0)),
         }
+    }
+
+    /// Observe an operational log owned by the configured BaseRT runtime.
+    /// Only bytes appended after a completion begins are inspected.
+    pub fn with_runtime_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.runtime_log_path = Some(path.into());
+        self
+    }
+
+    pub fn runtime_fault(&self) -> Option<BaseRtRuntimeFault> {
+        BaseRtRuntimeFault::from_code(self.runtime_fault.load(Ordering::SeqCst))
+    }
+
+    pub async fn runtime_log_checkpoint(&self) -> Option<BaseRtLogCheckpoint> {
+        let path = self.runtime_log_path.as_ref()?;
+        let metadata = tokio::fs::metadata(path).await.ok();
+        #[cfg(unix)]
+        let file_id = metadata.as_ref().map(std::os::unix::fs::MetadataExt::ino);
+        #[cfg(not(unix))]
+        let file_id = None;
+        Some(BaseRtLogCheckpoint {
+            length: metadata.as_ref().map(|value| value.len()).unwrap_or(0),
+            file_id,
+        })
+    }
+
+    async fn runtime_fault_since(
+        &self,
+        checkpoint: Option<BaseRtLogCheckpoint>,
+    ) -> Option<BaseRtRuntimeFault> {
+        let (path, checkpoint) = (self.runtime_log_path.as_ref()?, checkpoint?);
+        let mut file = tokio::fs::File::open(path).await.ok()?;
+        let metadata = file.metadata().await.ok()?;
+        let length = metadata.len();
+        #[cfg(unix)]
+        let current_file_id = Some(std::os::unix::fs::MetadataExt::ino(&metadata));
+        #[cfg(not(unix))]
+        let current_file_id = None;
+        let same_file = checkpoint.file_id == current_file_id;
+        if same_file && length == checkpoint.length {
+            return None;
+        }
+        // Read the newest bounded window. If the file rotated or truncated,
+        // start from the new file instead of treating the state as clean.
+        const MAX_FAULT_SCAN_BYTES: u64 = 256 * 1024;
+        let appended_start = if !same_file || length < checkpoint.length {
+            0
+        } else {
+            checkpoint.length
+        };
+        let start = appended_start.max(length.saturating_sub(MAX_FAULT_SCAN_BYTES));
+        file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
+        let mut delta = Vec::with_capacity((length - start) as usize);
+        file.take(MAX_FAULT_SCAN_BYTES)
+            .read_to_end(&mut delta)
+            .await
+            .ok()?;
+        classify_basert_runtime_fault(&String::from_utf8_lossy(&delta))
+    }
+
+    pub async fn detect_runtime_fault_since(
+        &self,
+        checkpoint: Option<BaseRtLogCheckpoint>,
+        wait: Duration,
+    ) -> Option<BaseRtRuntimeFault> {
+        checkpoint?;
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(fault) = self.runtime_fault_since(checkpoint).await {
+                self.runtime_fault.store(fault.code(), Ordering::SeqCst);
+                return Some(fault);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn clear_runtime_fault(&self) {
+        self.runtime_fault.store(0, Ordering::SeqCst);
+    }
+
+    async fn completion_fault_error_since(
+        &self,
+        checkpoint: Option<BaseRtLogCheckpoint>,
+        wait_for_log_flush: bool,
+    ) -> Option<anyhow::Error> {
+        let wait = if wait_for_log_flush {
+            Duration::from_millis(250)
+        } else {
+            Duration::ZERO
+        };
+        self.detect_runtime_fault_since(checkpoint, wait)
+            .await
+            .map(|fault| anyhow!(BaseRtCompletionError::RuntimeFault(fault)))
     }
 
     fn get(&self, url: String) -> reqwest::RequestBuilder {
@@ -250,13 +451,30 @@ impl BaseRtClient {
         // Clones used by the daemon share this guard, so a legacy 4B
         // completion cannot overlap a 35B lifecycle transition.
         let _lifecycle = self.model_lifecycle.write().await;
-        let response = self
+        let log_cursor = self.runtime_log_checkpoint().await;
+        let response = match self
             .post(format!("{}/models/load", self.base_url))
             .json(&serde_json::json!({"path": request.path}))
             .send()
             .await
-            .context("POST /v1/models/load")?;
-        response_ok(response, "POST /v1/models/load").await?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(fault) = self.completion_fault_error_since(log_cursor, true).await {
+                    return Err(fault);
+                }
+                return Err(error).context("POST /v1/models/load");
+            }
+        };
+        if let Err(error) = response_ok(response, "POST /v1/models/load").await {
+            if let Some(fault) = self.completion_fault_error_since(log_cursor, true).await {
+                return Err(fault);
+            }
+            return Err(error);
+        }
+        if let Some(fault) = self.completion_fault_error_since(log_cursor, true).await {
+            return Err(fault);
+        }
         self.model_readiness(&request.id).await
     }
 
@@ -417,7 +635,11 @@ impl BaseRtClient {
         max_tokens: u32,
         response_format: Option<serde_json::Value>,
     ) -> Result<String> {
+        if let Some(fault) = self.runtime_fault() {
+            return Err(anyhow!(BaseRtCompletionError::RuntimeFault(fault)));
+        }
         let _model_request_guard = self.model_lifecycle.read().await;
+        let log_cursor = self.runtime_log_checkpoint().await;
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
@@ -431,19 +653,51 @@ impl BaseRtClient {
         if let Some(format) = response_format {
             body["response_format"] = format;
         }
-        let response = self
+        let response = match self
             .post(format!("{}/chat/completions", self.base_url))
             .json(&body)
             .send()
             .await
-            .context("POST /v1/chat/completions")?;
-        let value = response_json(response, "POST /v1/chat/completions").await?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(fault) = self.completion_fault_error_since(log_cursor, true).await {
+                    return Err(fault);
+                }
+                return Err(error).context("POST /v1/chat/completions");
+            }
+        };
+        let value = match response_json(response, "POST /v1/chat/completions").await {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(fault) = self.completion_fault_error_since(log_cursor, true).await {
+                    return Err(fault);
+                }
+                return Err(error);
+            }
+        };
         let content = value["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or_default()
             .to_string();
+        if let Some(fault) = self
+            .detect_runtime_fault_since(
+                log_cursor,
+                if content.chars().count() <= 3 {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::ZERO
+                },
+            )
+            .await
+        {
+            return Err(anyhow!(BaseRtCompletionError::RuntimeFault(fault)));
+        }
+        if value["choices"][0]["finish_reason"].as_str() == Some("length") {
+            return Err(anyhow!(BaseRtCompletionError::Truncated));
+        }
         if content.trim().is_empty() {
-            return Err(anyhow!("BaseRT returned an empty completion"));
+            return Err(anyhow!(BaseRtCompletionError::Empty));
         }
         Ok(content)
     }
