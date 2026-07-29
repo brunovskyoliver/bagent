@@ -325,6 +325,18 @@ struct DaemonClient: Sendable {
         case web
     }
 
+    enum EvidencePolishStatus: String, Sendable, Equatable {
+        case skipped, accepted, rejected
+        case timedOut = "timed_out"
+        case unavailable
+        case memoryIneligible = "memory_ineligible"
+    }
+
+    struct EvidencePolishEvent: Sendable, Equatable {
+        let turnId: String
+        let status: EvidencePolishStatus
+    }
+
     struct EvidencePhaseEvent: Sendable, Equatable {
         let turnId: String
         let phase: EvidencePhase
@@ -371,6 +383,7 @@ struct DaemonClient: Sendable {
         case evidencePhase(EvidencePhaseEvent)
         case logicalActivityStarted(LogicalActivityEvent)
         case logicalActivityCompleted(LogicalActivityEvent)
+        case evidencePolish(EvidencePolishEvent)
         case evidenceOutcome(EvidenceOutcomeEvent)
         case sourceDiscovered(TranscriptSource)
         case debugTrace(DebugTraceSummary)
@@ -450,6 +463,12 @@ struct DaemonClient: Sendable {
                 sourceCount: event.source_count ?? 0,
                 message: message
             ))
+        case "evidence_polish":
+            guard let turnId = event.turn_id,
+                  let rawStatus = event.status,
+                  let status = EvidencePolishStatus(rawValue: rawStatus)
+            else { return nil }
+            return .evidencePolish(.init(turnId: turnId, status: status))
         default:
             return nil
         }

@@ -508,6 +508,27 @@ pub(crate) struct EvidenceBundle {
     pub citation_allowlist: Vec<CitationTarget>,
 }
 
+/// The complete, user-ready grounded answer constructed solely from a
+/// validated Evidence Bundle. Model output can never mutate this record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalGroundedAnswer {
+    pub text: String,
+    pub completeness: Completeness,
+    pub outcome_status: CanonicalOutcomeStatus,
+    pub covered_evidence_ids: Vec<EvidenceId>,
+    pub citation_targets: Vec<Url>,
+    pub conflicts: Vec<EvidenceConflict>,
+    pub shortfalls: Vec<EvidenceShortfall>,
+    pub source_identities: Vec<SourceIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanonicalOutcomeStatus {
+    Verified,
+    Partial,
+    VerificationShortfall,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Completeness {
     Complete,

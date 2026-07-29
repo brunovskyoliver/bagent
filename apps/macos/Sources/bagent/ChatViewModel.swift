@@ -31,6 +31,7 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     var evidencePhase: DaemonClient.EvidencePhaseEvent? = nil
     var evidenceActivities: [EvidenceLogicalActivity] = []
     var evidenceOutcome: DaemonClient.EvidenceOutcomeEvent? = nil
+    var evidencePolishStatus: DaemonClient.EvidencePolishStatus? = nil
     var sources: [DaemonClient.TranscriptSource] = []
     var attachments: [ChatAttachment] = []
     /// Set when the assistant's response found a specific mail message.
@@ -1803,6 +1804,8 @@ final class ChatViewModel: ObservableObject {
                     case .evidenceOutcome(let event):
                         messages[idx].evidenceOutcome = event
                         toolStatus = EvidencePresentation.outcomeLabel(event)
+                    case .evidencePolish(let event):
+                        messages[idx].evidencePolishStatus = event.status
                     case .sourceDiscovered(let source):
                         if !messages[idx].sources.contains(where: { $0.id == source.id }) {
                             messages[idx].sources.append(source)

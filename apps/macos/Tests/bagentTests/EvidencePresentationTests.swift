@@ -21,6 +21,9 @@ final class EvidenceEventDecodingTests: XCTestCase {
              "duration_ms":125,"attempt_count":2,"retries":1,"duplicates_suppressed":0}
             """,
             """
+            {"type":"evidence_polish","turn_id":"turn-1","status":"rejected"}
+            """,
+            """
             {"type":"evidence_outcome","turn_id":"turn-1","state":"verified","kind":"web",
              "acquired":2,"requested":2,"source_count":2,"message":"Web verified · 2 sources"}
             """,
@@ -33,25 +36,29 @@ final class EvidenceEventDecodingTests: XCTestCase {
             "evidence_phase",
             "logical_activity_started",
             "logical_activity_completed",
+            "evidence_polish",
             "evidence_outcome",
         ])
         XCTAssertEqual(decoded[0].phase, "reading")
         XCTAssertEqual(decoded[1].activity_id, "evidence:a")
         XCTAssertEqual(decoded[2].source_domains, ["example.com"])
-        XCTAssertEqual(decoded[3].outcome_kind, "web")
+        XCTAssertEqual(decoded[3].status, "rejected")
+        XCTAssertEqual(decoded[4].outcome_kind, "web")
 
         let chatEvents = decoded.compactMap(DaemonClient.evidenceChatEvent(from:))
-        XCTAssertEqual(chatEvents.count, 4)
+        XCTAssertEqual(chatEvents.count, 5)
         guard case .evidencePhase(let phase) = chatEvents[0],
               case .logicalActivityStarted(let started) = chatEvents[1],
               case .logicalActivityCompleted(let completed) = chatEvents[2],
-              case .evidenceOutcome(let outcome) = chatEvents[3]
+              case .evidencePolish(let polish) = chatEvents[3],
+              case .evidenceOutcome(let outcome) = chatEvents[4]
         else {
             return XCTFail("typed evidence event mapping changed")
         }
         XCTAssertEqual(phase.phase, .reading)
         XCTAssertEqual(started.executionStatus, .inProgress)
         XCTAssertEqual(completed.contribution, .satisfied)
+        XCTAssertEqual(polish.status, .rejected)
         XCTAssertEqual(outcome.state, .verified)
     }
 }

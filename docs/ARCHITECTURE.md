@@ -166,11 +166,20 @@ There is no routing pipeline — it was replaced by an agentic tool-calling loop
 (the model sees native tool definitions and decides what to call). `MODEL_ROUTER.md`
 described the old design and has been removed.
 
-Stage 3 of the typed Mail evidence rollout is locally opt-in with
+The typed Mail/web evidence-answer path is locally opt-in with
 `BAGENT_EVIDENCE_ORCHESTRATOR=1`. When enabled, deterministically classified latest-Mail
-Header Listings and Content Readings use the typed adapter/orchestrator. Targeted Mail,
-ambiguous or mixed Mail/web turns, web evidence, and unrelated requests remain on the
-agentic loop. The flag defaults off, restoring all legacy routing.
+Header Listings, Content Readings, direct pages, and factual web verification use the
+typed adapter/orchestrator. Targeted Mail, ambiguous or mixed turns, and unrelated
+requests remain on the agentic loop. The flag defaults off, restoring legacy routing.
+
+For every validated Evidence Bundle, the daemon first builds a complete
+`CanonicalGroundedAnswer`. This deterministic record owns coverage, citations,
+conflicts, shortfalls, source identities, and evidence outcome. Qwen3.6-35B-A3B may
+optionally polish wording with context 4,096, KV4, 256 output tokens, batch size 1,
+and the 25%/8 GiB admission gate. Polished text replaces the canonical text only after
+bundle and canonical-invariant validation. Rejection, timeout, unavailability, memory
+ineligibility, or runtime poisoning preserves the canonical bytes. The 4B model is not
+a grounding-quality fallback. Structured synthesis remains a disabled experiment.
 
 - Local BaseRT (`basecompute/Qwen3-4B-Instruct-2507`) → chat, tool calls, and classifiers.
 - Retrieval uses SQLite FTS5 only. Screen frames are processed by Apple Vision

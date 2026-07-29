@@ -164,6 +164,7 @@ fn sanitize_event(event: &Value) -> Option<Value> {
             | "logical_activity_started"
             | "logical_activity_completed"
             | "evidence_validation"
+            | "evidence_polish"
             | "evidence_outcome"
     ) {
         return None;
@@ -185,6 +186,7 @@ fn sanitize_event(event: &Value) -> Option<Value> {
         "state",
         "kind",
         "decision",
+        "status",
     ];
     for key in allowed_strings {
         if let Some(value) = event.get(key).and_then(|value| safe_string(value, 160)) {
@@ -287,9 +289,17 @@ mod tests {
             "exclusion_count": 2,
             "raw_decision_context": private,
         }));
+        recorder.record(&json!({
+            "type": "evidence_polish",
+            "turn_id": "turn-private",
+            "status": "rejected",
+            "model_output": private,
+            "validation_detail": private,
+        }));
         let exported = recorder.export("turn-private").unwrap().to_string();
         assert!(exported.contains("\"normalized_operation\":\"mail.read\""));
         assert!(exported.contains("\"decision\":\"bundle_partial\""));
+        assert!(exported.contains("\"status\":\"rejected\""));
         assert!(!exported.contains(private));
         for forbidden in [
             "prompt",

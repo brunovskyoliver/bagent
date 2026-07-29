@@ -93,10 +93,10 @@ cover deterministic validator and rendering behavior.
 | At least 85/90 grounded after repair | Fail: 32/90 |
 
 The adoption threshold fails. The structured envelope is therefore retained
-only as a disabled experiment. The current strict free-form internal contract
-is not replaced, and model-generated citation parsing/sentence-position
-enforcement is not removed from that retained path. Existing deterministic
-rendering remains the production safety terminal.
+only as a disabled experiment. The better-performing strict free-form contract
+is retained solely for optional 35B wording polish. Deterministic rendering is
+the canonical grounded answer, not merely a safety terminal; no model acceptance
+rate is a correctness dependency.
 
 ## Verification and final state
 

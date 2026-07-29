@@ -8,6 +8,12 @@ Overall verdict: **FAIL**
 
 Stage 9 authorization: **NOT AUTHORIZED**
 
+Superseding implementation decision: deterministic rendering is now the canonical
+grounded answer path. The 42/90 strict free-form result is treated only as an optional
+polish acceptance measurement, never as evidence correctness. See
+`ADR-0001-DETERMINISTIC-GROUNDING.md`. This does not change the failed Stage 8 verdict
+or authorize Stage 9.
+
 `BAGENT_EVIDENCE_ORCHESTRATOR` remains disabled by default and was removed from
 the live daemon environment after acceptance. No prompt, Mail content, fetched
 passage, raw connector identifier, model answer, or credential was retained in

@@ -630,6 +630,7 @@ fn is_evidence_event(event: &serde_json::Value) -> bool {
                 | "logical_activity_started"
                 | "logical_activity_completed"
                 | "evidence_validation"
+                | "evidence_polish"
                 | "evidence_outcome"
         )
     )
@@ -956,6 +957,7 @@ mod tests {
             "logical_activity_started",
             "logical_activity_completed",
             "evidence_validation",
+            "evidence_polish",
             "evidence_outcome",
         ] {
             assert!(is_evidence_event(&json!({"type": event_type})));

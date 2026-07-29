@@ -15,6 +15,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+use super::CanonicalGroundedAnswer;
+
 pub(crate) const PREFERRED_SYNTHESIS_MODEL: &str = "basecompute/Qwen3.6-35B-A3B";
 pub(crate) const FALLBACK_SYNTHESIS_MODEL: &str = "basecompute/Qwen3-4B-Instruct-2507";
 pub(crate) const SYNTHESIS_MODEL_IDLE_TTL: Duration = Duration::from_secs(20 * 60);
@@ -316,11 +318,18 @@ pub(crate) trait SynthesisContract: Send + Sync {
     fn initial_request(&self) -> Vec<Message>;
     fn repair_request(&self, validation_errors: &[String]) -> Vec<Message>;
     fn validate(&self, response: &str) -> std::result::Result<(), Vec<String>>;
+    fn validate_polish(
+        &self,
+        response: &str,
+        _canonical: &CanonicalGroundedAnswer,
+    ) -> std::result::Result<(), Vec<String>> {
+        self.validate(response)
+    }
     fn render_validated(&self, response: &str) -> std::result::Result<String, Vec<String>> {
         self.validate(response)?;
         Ok(response.to_string())
     }
-    fn deterministic_render(&self) -> String;
+    fn canonical_answer(&self) -> CanonicalGroundedAnswer;
     fn max_tokens(&self) -> u32;
     fn temperature(&self) -> f32;
 }
@@ -333,10 +342,22 @@ pub(crate) enum SynthesisRoute {
     Deterministic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PolishStatus {
+    Skipped,
+    Accepted,
+    Rejected,
+    TimedOut,
+    Unavailable,
+    MemoryIneligible,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SynthesisOutcome {
     pub text: String,
     pub route: SynthesisRoute,
+    pub polish_status: PolishStatus,
 }
 
 #[derive(Debug, Default)]
@@ -608,6 +629,19 @@ impl ModelRuntimeManager {
         self.state.lock().expect("runtime state lock").poisoned = true;
     }
 
+    async fn recover_poisoned(&self) {
+        if !self.state.lock().expect("runtime state lock").poisoned {
+            return;
+        }
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        if self.client.restart_runtime().await.is_ok() {
+            let mut state = self.state.lock().expect("runtime state lock");
+            state.preferred_last_use = None;
+            state.fallback_owned = false;
+            state.poisoned = false;
+        }
+    }
+
     async fn retire_preferred_if_idle(&self) -> Result<()> {
         let active = self
             .state
@@ -727,18 +761,44 @@ impl SynthesisService {
             inner: observer,
         };
         let observer = &correlated;
+        // The canonical answer is complete before model admission. It remains
+        // the byte-for-byte terminal answer unless optional polish is accepted.
+        let canonical = contract.canonical_answer();
+        let canonical_text = canonical.text.clone();
         if !contract.eligible() {
-            return self.deterministic(contract, observer, None).await;
+            return self
+                .canonical(canonical_text, observer, PolishStatus::Skipped, None)
+                .await;
         }
         let initial = contract.initial_request();
         if validate_transcript(&initial).is_err() {
             return self
-                .deterministic(contract, observer, Some("invalid_transcript"))
+                .canonical(
+                    canonical_text,
+                    observer,
+                    PolishStatus::Rejected,
+                    Some("invalid_transcript"),
+                )
                 .await;
         }
         let lease = match self.runtime.preferred_lease(observer).await {
             Ok(lease) => lease,
-            Err(_) => return self.fallback(contract, observer, initial).await,
+            Err(error) => {
+                let status = if normalized_failure_reason(&error.to_string()) == "memory_pressure" {
+                    PolishStatus::MemoryIneligible
+                } else {
+                    PolishStatus::Unavailable
+                };
+                self.runtime.recover_poisoned().await;
+                return self
+                    .canonical(
+                        canonical_text,
+                        observer,
+                        status,
+                        Some(normalized_failure_reason(&error.to_string())),
+                    )
+                    .await;
+            }
         };
         let preferred = self
             .complete_with_phase(
@@ -754,16 +814,24 @@ impl SynthesisService {
             .await;
         match preferred {
             CompletionAttempt::Completed(response) => {
-                let validation = self.validate(contract, &response, observer, false).await;
+                let validation = self
+                    .validate(contract, &response, &canonical, observer, false)
+                    .await;
                 match validation {
                     Ok(()) => match contract.render_validated(&response) {
                         Ok(text) => SynthesisOutcome {
                             text,
                             route: SynthesisRoute::Preferred,
+                            polish_status: PolishStatus::Accepted,
                         },
                         Err(_) => {
-                            self.deterministic(contract, observer, Some("validated_render_failed"))
-                                .await
+                            self.canonical(
+                                canonical_text.clone(),
+                                observer,
+                                PolishStatus::Rejected,
+                                Some("validated_render_failed"),
+                            )
+                            .await
                         }
                     },
                     Err(errors) => {
@@ -771,9 +839,10 @@ impl SynthesisService {
                         if validate_transcript(&repair).is_err() {
                             drop(lease);
                             return self
-                                .deterministic(
-                                    contract,
+                                .canonical(
+                                    canonical_text,
                                     observer,
+                                    PolishStatus::Rejected,
                                     Some("invalid_repair_transcript"),
                                 )
                                 .await;
@@ -793,25 +862,31 @@ impl SynthesisService {
                         drop(lease);
                         match repaired {
                             CompletionAttempt::Completed(response) => {
-                                match self.validate(contract, &response, observer, true).await {
+                                match self
+                                    .validate(contract, &response, &canonical, observer, true)
+                                    .await
+                                {
                                     Ok(()) => match contract.render_validated(&response) {
                                         Ok(text) => SynthesisOutcome {
                                             text,
                                             route: SynthesisRoute::Repaired,
+                                            polish_status: PolishStatus::Accepted,
                                         },
                                         Err(_) => {
-                                            self.deterministic(
-                                                contract,
+                                            self.canonical(
+                                                canonical_text.clone(),
                                                 observer,
+                                                PolishStatus::Rejected,
                                                 Some("validated_render_failed"),
                                             )
                                             .await
                                         }
                                     },
                                     Err(_) => {
-                                        self.deterministic(
-                                            contract,
+                                        self.canonical(
+                                            canonical_text.clone(),
                                             observer,
+                                            PolishStatus::Rejected,
                                             Some("repair_validation_failed"),
                                         )
                                         .await
@@ -821,15 +896,21 @@ impl SynthesisService {
                             CompletionAttempt::Failed(failure) => {
                                 if failure.is_poisoning() {
                                     self.runtime.mark_poisoned();
-                                    self.fallback(contract, observer, initial).await
-                                } else {
-                                    self.deterministic(
-                                        contract,
-                                        observer,
-                                        Some("repair_model_failed"),
-                                    )
-                                    .await
+                                    self.runtime.recover_poisoned().await;
                                 }
+                                let status =
+                                    if matches!(failure, ModelFailure::IndeterminateTimeout) {
+                                        PolishStatus::TimedOut
+                                    } else {
+                                        PolishStatus::Unavailable
+                                    };
+                                self.canonical(
+                                    canonical_text,
+                                    observer,
+                                    status,
+                                    Some(failure.category()),
+                                )
+                                .await
                             }
                         }
                     }
@@ -839,8 +920,15 @@ impl SynthesisService {
                 drop(lease);
                 if failure.is_poisoning() {
                     self.runtime.mark_poisoned();
+                    self.runtime.recover_poisoned().await;
                 }
-                self.fallback(contract, observer, initial).await
+                let status = if matches!(failure, ModelFailure::IndeterminateTimeout) {
+                    PolishStatus::TimedOut
+                } else {
+                    PolishStatus::Unavailable
+                };
+                self.canonical(canonical_text, observer, status, Some(failure.category()))
+                    .await
             }
         }
     }
@@ -849,11 +937,12 @@ impl SynthesisService {
         &self,
         contract: &dyn SynthesisContract,
         response: &str,
+        canonical: &CanonicalGroundedAnswer,
         observer: &dyn RuntimeObserver,
         repair: bool,
     ) -> std::result::Result<(), Vec<String>> {
         let started = Instant::now();
-        let result = contract.validate(response);
+        let result = contract.validate_polish(response, canonical);
         observer
             .record(phase_event(
                 None,
@@ -967,108 +1056,11 @@ impl SynthesisService {
         }
     }
 
-    async fn fallback(
+    async fn canonical(
         &self,
-        contract: &dyn SynthesisContract,
+        text: String,
         observer: &dyn RuntimeObserver,
-        messages: Vec<Message>,
-    ) -> SynthesisOutcome {
-        let started = Instant::now();
-        observer
-            .record(phase_event(
-                Some(&self.config.fallback_model),
-                SynthesisPhase::FallingBack,
-                0,
-                false,
-                true,
-                false,
-                None,
-            ))
-            .await;
-        let fault_checkpoint = self.client.runtime_fault_checkpoint().await;
-        let path = async {
-            self.runtime.ensure_fallback().await?;
-            self.client
-                .complete(SynthesisModelRequest {
-                    model_id: self.config.fallback_model.clone(),
-                    messages,
-                    temperature: contract.temperature(),
-                    max_tokens: contract.max_tokens(),
-                })
-                .await
-        };
-        match tokio::time::timeout(self.config.fallback_timeout, path).await {
-            Ok(Ok(response)) => {
-                observer
-                    .record(phase_event(
-                        Some(&self.config.fallback_model),
-                        SynthesisPhase::FallingBack,
-                        duration_ms(started.elapsed()),
-                        false,
-                        true,
-                        false,
-                        None,
-                    ))
-                    .await;
-                match self.validate(contract, &response, observer, false).await {
-                    Ok(()) => SynthesisOutcome {
-                        text: response,
-                        route: SynthesisRoute::Fallback,
-                    },
-                    Err(_) => {
-                        self.deterministic(contract, observer, Some("fallback_validation_failed"))
-                            .await
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                let failure = ModelFailure::from_error(&error);
-                if failure.is_poisoning() {
-                    self.runtime.mark_poisoned();
-                }
-                observer
-                    .record(phase_event(
-                        Some(&self.config.fallback_model),
-                        SynthesisPhase::FallingBack,
-                        duration_ms(started.elapsed()),
-                        false,
-                        true,
-                        false,
-                        Some(failure.category()),
-                    ))
-                    .await;
-                self.deterministic(contract, observer, Some("model_unavailable"))
-                    .await
-            }
-            Err(_) => {
-                let fault = self
-                    .client
-                    .detect_runtime_fault_since(fault_checkpoint, Duration::from_millis(250))
-                    .await;
-                // Cancellation does not prove the server-side load/completion
-                // ended. Force a clean process before any later request.
-                self.runtime.mark_poisoned();
-                observer
-                    .record(phase_event(
-                        Some(&self.config.fallback_model),
-                        SynthesisPhase::FallingBack,
-                        duration_ms(started.elapsed()),
-                        true,
-                        true,
-                        false,
-                        Some(fault.map_or("timeout", BaseRtRuntimeFault::category)),
-                    ))
-                    .await;
-                self.deterministic(contract, observer, Some("model_unavailable"))
-                    .await
-            }
-        }
-    }
-
-    async fn deterministic(
-        &self,
-        contract: &dyn SynthesisContract,
-        observer: &dyn RuntimeObserver,
+        polish_status: PolishStatus,
         reason: Option<&str>,
     ) -> SynthesisOutcome {
         observer
@@ -1082,15 +1074,10 @@ impl SynthesisService {
                 reason,
             ))
             .await;
-        let mut text = contract.deterministic_render();
-        if reason == Some("model_unavailable") {
-            text = format!(
-                "Model synthesis was unavailable; showing verified evidence directly.\n\n{text}"
-            );
-        }
         SynthesisOutcome {
             text,
             route: SynthesisRoute::Deterministic,
+            polish_status,
         }
     }
 }
@@ -1433,8 +1420,17 @@ mod tests {
             }
         }
 
-        fn deterministic_render(&self) -> String {
-            "deterministic".into()
+        fn canonical_answer(&self) -> CanonicalGroundedAnswer {
+            CanonicalGroundedAnswer {
+                text: "deterministic".into(),
+                completeness: super::super::Completeness::Complete,
+                outcome_status: super::super::CanonicalOutcomeStatus::Verified,
+                covered_evidence_ids: Vec::new(),
+                citation_targets: Vec::new(),
+                conflicts: Vec::new(),
+                shortfalls: Vec::new(),
+                source_identities: Vec::new(),
+            }
         }
 
         fn max_tokens(&self) -> u32 {
@@ -1548,6 +1544,8 @@ mod tests {
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
         assert_eq!(result.route, SynthesisRoute::Preferred);
+        assert_eq!(result.text, "valid");
+        assert_eq!(result.polish_status, PolishStatus::Accepted);
         assert_eq!(client.loads.load(Ordering::SeqCst), 1);
         assert_eq!(
             client.requests.lock().await[0].model_id,
@@ -1660,7 +1658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_owned_fallback_is_unloaded_before_preferred_is_reloaded() {
+    async fn unavailable_polish_preserves_canonical_without_loading_fallback() {
         let client = FakeModelClient::with_behaviors([
             Behavior::Response("fallback"),
             Behavior::Response("valid"),
@@ -1679,14 +1677,10 @@ mod tests {
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
 
-        assert_eq!(fallback.route, SynthesisRoute::Fallback);
+        assert_eq!(fallback.route, SynthesisRoute::Deterministic);
+        assert_eq!(fallback.polish_status, PolishStatus::Unavailable);
         assert_eq!(preferred.route, SynthesisRoute::Preferred);
-        assert!(client
-            .unloads
-            .lock()
-            .await
-            .iter()
-            .any(|model| model == FALLBACK_SYNTHESIS_MODEL));
+        assert!(client.unloads.lock().await.is_empty());
         let loaded = client.loaded.lock().await;
         assert!(loaded.contains(PREFERRED_SYNTHESIS_MODEL));
         assert!(!loaded.contains(FALLBACK_SYNTHESIS_MODEL));
@@ -1791,22 +1785,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_pressure_rejects_a_new_preferred_load_and_uses_fallback() {
+    async fn memory_pressure_preserves_canonical_without_model_request() {
         let client = FakeModelClient::with_behaviors([Behavior::Response("fallback")]);
         let pressure = Arc::new(FakePressure(AtomicBool::new(true)));
         let service = service(client.clone(), Arc::new(FakeClock::default()), pressure);
         let result = service
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
-        assert_eq!(result.route, SynthesisRoute::Fallback);
-        assert_eq!(client.loads.load(Ordering::SeqCst), 1);
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
+        assert_eq!(result.text, "deterministic");
+        assert_eq!(result.polish_status, PolishStatus::MemoryIneligible);
+        assert_eq!(client.loads.load(Ordering::SeqCst), 0);
         let requests = client.requests.lock().await;
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].model_id, FALLBACK_SYNTHESIS_MODEL);
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]
-    async fn cold_load_timeout_falls_back_once() {
+    async fn cold_load_timeout_preserves_canonical() {
         let client = FakeModelClient::with_behaviors([Behavior::Response("fallback")]);
         *client.load_behavior.lock().await = Some(Behavior::Pending);
         let service = service(
@@ -1817,12 +1812,13 @@ mod tests {
         let result = service
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
-        assert_eq!(result.route, SynthesisRoute::Fallback);
-        assert_eq!(client.requests.lock().await.len(), 1);
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
+        assert_eq!(result.text, "deterministic");
+        assert_eq!(client.requests.lock().await.len(), 0);
     }
 
     #[tokio::test]
-    async fn preferred_synthesis_timeout_falls_back_once() {
+    async fn preferred_synthesis_timeout_preserves_canonical() {
         let client =
             FakeModelClient::with_behaviors([Behavior::Pending, Behavior::Response("fallback")]);
         let service = service(
@@ -1833,12 +1829,13 @@ mod tests {
         let result = service
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
-        assert_eq!(result.route, SynthesisRoute::Fallback);
-        assert_eq!(client.requests.lock().await.len(), 2);
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
+        assert_eq!(result.polish_status, PolishStatus::TimedOut);
+        assert_eq!(client.requests.lock().await.len(), 1);
     }
 
     #[tokio::test]
-    async fn preferred_transport_or_unavailability_falls_back_once() {
+    async fn preferred_transport_or_unavailability_preserves_canonical() {
         for error in ["transport failure", "model unavailable"] {
             let client = FakeModelClient::with_behaviors([
                 Behavior::Error(error),
@@ -1852,8 +1849,9 @@ mod tests {
             let result = service
                 .synthesize(&TestContract::default(), &NoopSynthesisObserver)
                 .await;
-            assert_eq!(result.route, SynthesisRoute::Fallback);
-            assert_eq!(client.requests.lock().await.len(), 2);
+            assert_eq!(result.route, SynthesisRoute::Deterministic);
+            assert_eq!(result.text, "deterministic");
+            assert_eq!(client.requests.lock().await.len(), 1);
         }
     }
 
@@ -1920,6 +1918,7 @@ mod tests {
             SynthesisOutcome {
                 text: "deterministic".into(),
                 route: SynthesisRoute::Deterministic,
+                polish_status: PolishStatus::Rejected,
             }
         );
         assert_eq!(client.requests.lock().await.len(), 2);
@@ -1944,7 +1943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_timeout_marks_runtime_poisoned_before_any_later_request() {
+    async fn failed_polish_preserves_canonical_without_invoking_fallback() {
         let client =
             FakeModelClient::with_behaviors([Behavior::Error("transport"), Behavior::Pending]);
         *client.timeout_fault.lock().await = Some(BaseRtRuntimeFault::MetalDevice);
@@ -1959,15 +1958,8 @@ mod tests {
             .await;
 
         assert_eq!(result.route, SynthesisRoute::Deterministic);
-        assert!(
-            service
-                .runtime
-                .state
-                .lock()
-                .expect("runtime state lock")
-                .poisoned
-        );
-        assert_eq!(client.requests.lock().await.len(), 2);
+        assert_eq!(result.text, "deterministic");
+        assert_eq!(client.requests.lock().await.len(), 1);
     }
 
     #[tokio::test]
@@ -1987,12 +1979,11 @@ mod tests {
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
 
-        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
         assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
         let requests = client.requests.lock().await;
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].model_id, PREFERRED_SYNTHESIS_MODEL);
-        assert_eq!(requests[1].model_id, FALLBACK_SYNTHESIS_MODEL);
     }
 
     #[tokio::test]
@@ -2010,11 +2001,10 @@ mod tests {
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
 
-        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
         assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
         let requests = client.requests.lock().await;
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].model_id, FALLBACK_SYNTHESIS_MODEL);
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]
@@ -2033,11 +2023,10 @@ mod tests {
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
 
-        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
         assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
         let requests = client.requests.lock().await;
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].model_id, FALLBACK_SYNTHESIS_MODEL);
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]
@@ -2058,11 +2047,10 @@ mod tests {
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
 
-        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
         assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
         let requests = client.requests.lock().await;
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[2].model_id, FALLBACK_SYNTHESIS_MODEL);
+        assert_eq!(requests.len(), 2);
     }
 
     #[tokio::test]
@@ -2080,11 +2068,10 @@ mod tests {
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
 
-        assert_eq!(result.route, SynthesisRoute::Fallback);
+        assert_eq!(result.route, SynthesisRoute::Deterministic);
         assert_eq!(client.restarts.load(Ordering::SeqCst), 1);
         let requests = client.requests.lock().await;
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].model_id, FALLBACK_SYNTHESIS_MODEL);
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]
