@@ -316,6 +316,10 @@ pub(crate) trait SynthesisContract: Send + Sync {
     fn initial_request(&self) -> Vec<Message>;
     fn repair_request(&self, validation_errors: &[String]) -> Vec<Message>;
     fn validate(&self, response: &str) -> std::result::Result<(), Vec<String>>;
+    fn render_validated(&self, response: &str) -> std::result::Result<String, Vec<String>> {
+        self.validate(response)?;
+        Ok(response.to_string())
+    }
     fn deterministic_render(&self) -> String;
     fn max_tokens(&self) -> u32;
     fn temperature(&self) -> f32;
@@ -752,9 +756,15 @@ impl SynthesisService {
             CompletionAttempt::Completed(response) => {
                 let validation = self.validate(contract, &response, observer, false).await;
                 match validation {
-                    Ok(()) => SynthesisOutcome {
-                        text: response,
-                        route: SynthesisRoute::Preferred,
+                    Ok(()) => match contract.render_validated(&response) {
+                        Ok(text) => SynthesisOutcome {
+                            text,
+                            route: SynthesisRoute::Preferred,
+                        },
+                        Err(_) => {
+                            self.deterministic(contract, observer, Some("validated_render_failed"))
+                                .await
+                        }
                     },
                     Err(errors) => {
                         let repair = contract.repair_request(&errors);
@@ -784,9 +794,19 @@ impl SynthesisService {
                         match repaired {
                             CompletionAttempt::Completed(response) => {
                                 match self.validate(contract, &response, observer, true).await {
-                                    Ok(()) => SynthesisOutcome {
-                                        text: response,
-                                        route: SynthesisRoute::Repaired,
+                                    Ok(()) => match contract.render_validated(&response) {
+                                        Ok(text) => SynthesisOutcome {
+                                            text,
+                                            route: SynthesisRoute::Repaired,
+                                        },
+                                        Err(_) => {
+                                            self.deterministic(
+                                                contract,
+                                                observer,
+                                                Some("validated_render_failed"),
+                                            )
+                                            .await
+                                        }
                                     },
                                     Err(_) => {
                                         self.deterministic(
