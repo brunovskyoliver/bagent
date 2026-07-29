@@ -325,6 +325,12 @@ fn validate_web(
         .web_fetches
         .iter()
         .filter(|result| matches!(result.execution, ExecutionStatus::Succeeded))
+        .filter(|result| {
+            matches!(
+                result.contribution,
+                EvidenceContribution::Satisfied | EvidenceContribution::Partial
+            )
+        })
         .filter_map(|result| result.value.as_ref())
         .filter(|evidence| match intent {
             EvidenceIntent::WebDirectPage { url } => evidence.requested_url == *url,

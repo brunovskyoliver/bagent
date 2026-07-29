@@ -389,9 +389,9 @@ pub(crate) async fn build_tools(state: &AppState, vision: bool) -> Vec<ToolDef> 
         "web_search",
         "Search the public web (DuckDuckGo + Wikipedia). Returns result lines: title | url | snippet. \
          Use for facts, current events, prices, or to identify an entity (e.g. what company makes a product) \
-         before searching mail or files. Follow up with web_fetch on the best URL when snippets are not enough. \
-         IMPORTANT: Answer factual questions ONLY from these results, cite the source URL, \
-         and say the answer was not found rather than guessing.",
+         before searching mail or files. Snippets are discovery data only: always follow up with web_fetch \
+         before using a result as factual evidence. Cite only the final URL returned by a readable web_fetch, \
+         and say the answer was not verified rather than guessing.",
         json!({
             "type": "object",
             "properties": {

@@ -396,6 +396,8 @@ pub(crate) enum ProviderStatus {
     Succeeded { result_count: u16 },
     Empty,
     Challenged,
+    TimedOut,
+    InvalidResponse,
     Failed(FailureCode),
 }
 
