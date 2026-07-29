@@ -5454,7 +5454,7 @@ mod tests {
         let plan = EvidencePlanner::plan(EvidenceIntent::WebDirectPage { url });
         let mut gate = ScriptedGate::default();
         let acquired = execute_web_plan(
-            TypedWebAdapter::production(),
+            TypedWebAdapter::production(None),
             &mut gate,
             "turn-live-web-smoke",
             &plan,

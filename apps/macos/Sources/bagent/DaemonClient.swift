@@ -1260,6 +1260,17 @@ struct DaemonClient: Sendable {
 
     // MARK: - Odoo (Phase 6B — MCP)
 
+    func configureTavily(apiKey: String?) async throws {
+        let c = try await loadCreds()
+        var req = authedRequest("/web/tavily/config", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let api_key: String? }
+        req.httpBody = try JSONEncoder().encode(Body(api_key: apiKey))
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try validateOK(data: data, response: response)
+    }
+
     struct OdooConfigResult: Decodable, Sendable {
         let ok: Bool
         let version: String?

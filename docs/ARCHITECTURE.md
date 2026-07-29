@@ -172,6 +172,13 @@ Header Listings, Content Readings, direct pages, and factual web verification us
 typed adapter/orchestrator. Targeted Mail, ambiguous or mixed turns, and unrelated
 requests remain on the agentic loop. The flag defaults off, restoring legacy routing.
 
+The bounded typed route uses Tavily Basic plus DuckDuckGo when the signed app supplies a
+Tavily key ephemerally from Keychain. Without a key it retains Wikipedia plus DuckDuckGo;
+the legacy tool stays on that keyless provider set. Tavily is discovery-only and is never
+retried; fetched pages still pass the complete DNS, redirect, SSRF, extraction, relevance,
+authority, and independent-source pipeline. See
+[`TAVILY_WEB_DISCOVERY.md`](TAVILY_WEB_DISCOVERY.md) for free-tier setup and budgets.
+
 For every validated Evidence Bundle, the daemon first builds a complete
 `CanonicalGroundedAnswer`. This deterministic record owns coverage, citations,
 conflicts, shortfalls, source identities, and evidence outcome. Qwen3.6-35B-A3B may

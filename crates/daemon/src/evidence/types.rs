@@ -227,6 +227,7 @@ impl ProviderSet {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum WebProvider {
+    Tavily,
     DuckDuckGo,
     Wikipedia,
     Direct,
@@ -235,6 +236,7 @@ pub(crate) enum WebProvider {
 impl WebProvider {
     fn as_str(&self) -> &'static str {
         match self {
+            Self::Tavily => "tavily",
             Self::DuckDuckGo => "duckduckgo",
             Self::Wikipedia => "wikipedia",
             Self::Direct => "direct",

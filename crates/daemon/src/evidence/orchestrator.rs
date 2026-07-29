@@ -12,9 +12,9 @@ use super::{
     EvidenceContribution, EvidenceIntent, EvidenceOperation, EvidencePhase, EvidencePhaseEvent,
     EvidencePlanner, EvidenceRequest, EvidenceResults, ExecutionStatus, ExtractionStatus,
     FailureCode, LogicalActivityCompletion, LogicalActivityEvent, MailBodyEvidence,
-    MailEvidenceAdapter, MailHeaderEvidence, OperationResult, ProviderSet, SourceAuthority,
-    TypedWebAdapter, TypedWebEvidenceAdapter, ValidationOutcome, VerificationLevel, WebCandidate,
-    WebFetchEvidence, WebProvider, WebSearchResult,
+    MailEvidenceAdapter, MailHeaderEvidence, OperationResult, SourceAuthority, TypedWebAdapter,
+    TypedWebEvidenceAdapter, ValidationOutcome, VerificationLevel, WebCandidate, WebFetchEvidence,
+    WebSearchResult,
 };
 use crate::{
     agent_exec::{EventSink, ExecOrigin, Gate, ToolKind},
@@ -256,8 +256,9 @@ pub(crate) async fn execute_evidence_turn(
             execute_unavailable_mail_plan(&mut gate, &request.turn_id, &plan).await
         }
     } else if is_web_intent(&plan.intent) {
+        let tavily_api_key = ctx.state.tavily_api_key.read().await.clone();
         execute_web_plan(
-            TypedWebAdapter::production(),
+            TypedWebAdapter::production(tavily_api_key),
             &mut gate,
             &request.turn_id,
             &plan,
@@ -309,7 +310,7 @@ where
     let mut candidates = match intent {
         EvidenceIntent::WebDirectPage { url } => vec![direct_web_candidate(url)],
         EvidenceIntent::WebFact { query, .. } => {
-            let providers = ProviderSet(vec![WebProvider::Wikipedia, WebProvider::DuckDuckGo]);
+            let providers = super::web::web_provider_set(adapter.tavily_configured());
             let operation = EvidenceOperation::WebSearch {
                 normalized_query: query.clone(),
                 provider_set: providers.clone(),
@@ -1541,8 +1542,8 @@ fn push_list_or_search(
 mod tests {
     use super::*;
     use crate::evidence::{
-        Completeness, EvidencePlanner, MailBodyEvidence, RecoveryKind, ValidatedMailId,
-        WebSearchResult,
+        Completeness, EvidencePlanner, MailBodyEvidence, ProviderSet, RecoveryKind,
+        ValidatedMailId, WebProvider, WebSearchResult,
     };
     use std::sync::{Arc, Mutex};
 

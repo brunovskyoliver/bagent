@@ -88,6 +88,9 @@ struct AppState {
     /// Odoo connector — in-memory only; API key never written to disk.
     /// Swift pushes credentials from Keychain lazily when an Odoo turn needs it.
     odoo: Arc<RwLock<Option<OdooConnector>>>,
+    /// Tavily key is supplied ephemerally by the signed app from Keychain.
+    /// It is never persisted by the daemon or included in diagnostics.
+    tavily_api_key: Arc<RwLock<Option<String>>>,
     /// WhatsApp Web bridge connector. Always present; owns the bridge subprocess.
     /// Bridge can autostart when a prior LocalAuth session exists, and is also
     /// controlled explicitly via `/whatsapp/start` and `/whatsapp/stop`.
@@ -646,6 +649,7 @@ async fn main() -> Result<()> {
 
     // Odoo connector — starts unconfigured; Swift configures it lazily via POST /odoo/config.
     let odoo: Arc<RwLock<Option<OdooConnector>>> = Arc::new(RwLock::new(None));
+    let tavily_api_key: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
 
     // WhatsApp connector — always present; autostarts only for prior paired sessions.
     let whatsapp = Arc::new(WhatsappConnector::new(WhatsappConfig::default()));
@@ -682,6 +686,7 @@ async fn main() -> Result<()> {
         task_rater,
         codex,
         odoo,
+        tavily_api_key,
         whatsapp,
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
@@ -797,6 +802,7 @@ async fn main() -> Result<()> {
         .route("/odoo/config", post(odoo_config_handler))
         .route("/odoo/status", get(odoo_status_handler))
         .route("/odoo/open", post(odoo_open_handler))
+        .route("/web/tavily/config", post(tavily_config_handler))
         // Phase 11 — WhatsApp connector
         .route("/whatsapp/status", get(whatsapp_status_handler))
         .route("/whatsapp/start", post(whatsapp_start_handler))
@@ -3459,6 +3465,32 @@ async fn odoo_open_handler(Json(body): Json<OdooOpenReq>) -> impl IntoResponse {
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
         ),
     }
+}
+
+#[derive(Deserialize)]
+struct TavilyConfigRequest {
+    api_key: Option<String>,
+}
+
+/// Receives the Tavily credential from the signed app's Keychain and keeps it
+/// only for this daemon process lifetime.
+async fn tavily_config_handler(
+    State(state): State<AppState>,
+    Json(body): Json<TavilyConfigRequest>,
+) -> impl IntoResponse {
+    let key = body
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if key.is_some_and(|value| value.len() > 512) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "invalid_api_key" })),
+        );
+    }
+    *state.tavily_api_key.write().await = key.map(str::to_string);
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
 
 // ── WhatsApp handlers (Phase 11) ─────────────────────────────────────────────

@@ -53,6 +53,15 @@ pub(crate) trait WebNetwork: Send + Sync {
         url: &Url,
         pinned: &[SocketAddr],
     ) -> Result<WebHttpResponse, WebNetworkError>;
+    async fn post_json(
+        &self,
+        _url: &Url,
+        _pinned: &[SocketAddr],
+        _bearer_token: &str,
+        _body: &serde_json::Value,
+    ) -> Result<WebHttpResponse, WebNetworkError> {
+        Err(WebNetworkError::Failed)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,50 +96,82 @@ impl WebNetwork for ReqwestWebNetwork {
             .user_agent(USER_AGENT)
             .build()
             .map_err(|_| WebNetworkError::Failed)?;
-        let mut response = client
+        let response = client
             .get(url.clone())
             .send()
             .await
             .map_err(normalize_reqwest)?;
-        let peer_addr = response
-            .remote_addr()
-            .ok_or(WebNetworkError::InvalidResponse)?;
-        let status = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let location = response
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let mut body = Vec::new();
-        let mut body_truncated = false;
-        while let Some(chunk) = response.chunk().await.map_err(normalize_reqwest)? {
-            let remaining = MAX_BODY_BYTES.saturating_sub(body.len());
-            if chunk.len() > remaining {
-                body.extend_from_slice(&chunk[..remaining]);
-                body_truncated = true;
-                break;
-            }
-            body.extend_from_slice(&chunk);
-            if body.len() == MAX_BODY_BYTES {
-                body_truncated = true;
-                break;
-            }
-        }
-        Ok(WebHttpResponse {
-            status,
-            content_type,
-            location,
-            body,
-            body_truncated,
-            peer_addr,
-        })
+        bounded_response(response).await
     }
+
+    async fn post_json(
+        &self,
+        url: &Url,
+        pinned: &[SocketAddr],
+        bearer_token: &str,
+        body: &serde_json::Value,
+    ) -> Result<WebHttpResponse, WebNetworkError> {
+        let host = url.host_str().ok_or(WebNetworkError::InvalidResponse)?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve_to_addrs(host, pinned)
+            .user_agent(USER_AGENT)
+            .build()
+            .map_err(|_| WebNetworkError::Failed)?;
+        let response = client
+            .post(url.clone())
+            .bearer_auth(bearer_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(normalize_reqwest)?;
+        bounded_response(response).await
+    }
+}
+
+async fn bounded_response(
+    mut response: reqwest::Response,
+) -> Result<WebHttpResponse, WebNetworkError> {
+    let peer_addr = response
+        .remote_addr()
+        .ok_or(WebNetworkError::InvalidResponse)?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut body = Vec::new();
+    let mut body_truncated = false;
+    while let Some(chunk) = response.chunk().await.map_err(normalize_reqwest)? {
+        let remaining = MAX_BODY_BYTES.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            body_truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() == MAX_BODY_BYTES {
+            body_truncated = true;
+            break;
+        }
+    }
+    Ok(WebHttpResponse {
+        status,
+        content_type,
+        location,
+        body,
+        body_truncated,
+        peer_addr,
+    })
 }
 
 fn normalize_reqwest(error: reqwest::Error) -> WebNetworkError {
@@ -150,20 +191,23 @@ fn normalize_reqwest(error: reqwest::Error) -> WebNetworkError {
 
 pub(crate) struct TypedWebAdapter<N = ReqwestWebNetwork> {
     network: Arc<N>,
+    tavily_api_key: Option<Arc<str>>,
 }
 
 impl<N> Clone for TypedWebAdapter<N> {
     fn clone(&self) -> Self {
         Self {
             network: Arc::clone(&self.network),
+            tavily_api_key: self.tavily_api_key.clone(),
         }
     }
 }
 
 impl TypedWebAdapter<ReqwestWebNetwork> {
-    pub(crate) fn production() -> Self {
+    pub(crate) fn production(tavily_api_key: Option<String>) -> Self {
         Self {
             network: Arc::new(ReqwestWebNetwork),
+            tavily_api_key: tavily_api_key.map(Arc::from),
         }
     }
 }
@@ -171,12 +215,18 @@ impl TypedWebAdapter<ReqwestWebNetwork> {
 impl<N> TypedWebAdapter<N> {
     #[cfg(test)]
     fn new(network: Arc<N>) -> Self {
-        Self { network }
+        Self {
+            network,
+            tavily_api_key: None,
+        }
     }
 }
 
 #[async_trait]
 pub(crate) trait TypedWebEvidenceAdapter: Clone + Send + Sync + 'static {
+    fn tavily_configured(&self) -> bool {
+        false
+    }
     async fn search(
         &self,
         query: &str,
@@ -188,13 +238,23 @@ pub(crate) trait TypedWebEvidenceAdapter: Clone + Send + Sync + 'static {
 
 #[async_trait]
 impl<N: WebNetwork + 'static> TypedWebEvidenceAdapter for TypedWebAdapter<N> {
+    fn tavily_configured(&self) -> bool {
+        self.tavily_api_key.is_some()
+    }
     async fn search(
         &self,
         query: &str,
         lang: &str,
         providers: &ProviderSet,
     ) -> OperationResult<WebSearchResult> {
-        typed_search(self.network.as_ref(), query, lang, providers).await
+        typed_search_with_tavily_key(
+            self.network.as_ref(),
+            query,
+            lang,
+            providers,
+            self.tavily_api_key.as_deref(),
+        )
+        .await
     }
 
     async fn fetch(&self, candidate: &WebCandidate) -> OperationResult<WebFetchEvidence> {
@@ -206,13 +266,17 @@ pub(crate) async fn production_web_search(
     query: &str,
     lang: &str,
 ) -> OperationResult<WebSearchResult> {
-    TypedWebAdapter::production()
-        .search(
-            query,
-            lang,
-            &ProviderSet(vec![WebProvider::Wikipedia, WebProvider::DuckDuckGo]),
-        )
+    TypedWebAdapter::production(None)
+        .search(query, lang, &web_provider_set(false))
         .await
+}
+
+pub(crate) fn web_provider_set(tavily_configured: bool) -> ProviderSet {
+    if tavily_configured {
+        ProviderSet(vec![WebProvider::Tavily, WebProvider::DuckDuckGo])
+    } else {
+        ProviderSet(vec![WebProvider::Wikipedia, WebProvider::DuckDuckGo])
+    }
 }
 
 pub(crate) async fn production_web_fetch(url: &str) -> OperationResult<WebFetchEvidence> {
@@ -230,7 +294,7 @@ pub(crate) async fn production_web_fetch(url: &str) -> OperationResult<WebFetchE
         requested_url,
         snippet: String::new(),
     };
-    TypedWebAdapter::production().fetch(&candidate).await
+    TypedWebAdapter::production(None).fetch(&candidate).await
 }
 
 pub(crate) fn render_legacy_search(
@@ -357,6 +421,16 @@ async fn typed_search<N: WebNetwork>(
     lang: &str,
     providers: &ProviderSet,
 ) -> OperationResult<WebSearchResult> {
+    typed_search_with_tavily_key(network, query, lang, providers, None).await
+}
+
+async fn typed_search_with_tavily_key<N: WebNetwork>(
+    network: &N,
+    query: &str,
+    lang: &str,
+    providers: &ProviderSet,
+    tavily_key: Option<&str>,
+) -> OperationResult<WebSearchResult> {
     let operation = EvidenceOperation::WebSearch {
         normalized_query: query.to_string(),
         provider_set: providers.clone(),
@@ -378,13 +452,15 @@ async fn typed_search<N: WebNetwork>(
         let mut outcome = match provider {
             WebProvider::Wikipedia => search_wikipedia(network, query, lang).await,
             WebProvider::DuckDuckGo => search_duckduckgo(network, query).await,
+            WebProvider::Tavily => search_tavily(network, query, tavily_key).await,
             WebProvider::Direct => ProviderSearch::InvalidResponse,
         };
-        if outcome.retryable() && attempts_used < 2 {
+        if outcome.retryable_for(provider) && attempts_used < 2 {
             attempts_used += 1;
             outcome = match provider {
                 WebProvider::Wikipedia => search_wikipedia(network, query, lang).await,
                 WebProvider::DuckDuckGo => search_duckduckgo(network, query).await,
+                WebProvider::Tavily => search_tavily(network, query, tavily_key).await,
                 WebProvider::Direct => ProviderSearch::InvalidResponse,
             };
         }
@@ -469,16 +545,17 @@ enum ProviderSearch {
 }
 
 impl ProviderSearch {
-    fn retryable(&self) -> bool {
-        matches!(self, Self::TimedOut)
-            || matches!(
-                self,
-                Self::Failed(
-                    FailureCode::ConnectionReset
-                        | FailureCode::RateLimited
-                        | FailureCode::Http5xx(_)
-                )
-            )
+    fn retryable_for(&self, provider: WebProvider) -> bool {
+        provider != WebProvider::Tavily
+            && (matches!(self, Self::TimedOut)
+                || matches!(
+                    self,
+                    Self::Failed(
+                        FailureCode::ConnectionReset
+                            | FailureCode::RateLimited
+                            | FailureCode::Http5xx(_)
+                    )
+                ))
     }
 }
 
@@ -590,6 +667,81 @@ async fn search_duckduckgo<N: WebNetwork>(network: &N, query: &str) -> ProviderS
     } else {
         ProviderSearch::InvalidResponse
     }
+}
+
+async fn search_tavily<N: WebNetwork>(
+    network: &N,
+    query: &str,
+    api_key: Option<&str>,
+) -> ProviderSearch {
+    let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
+        return ProviderSearch::Failed(FailureCode::ConnectorUnavailable);
+    };
+    let url = Url::parse("https://api.tavily.com/search").expect("static Tavily URL");
+    let pinned = match resolve_safe_addresses(network, &url).await {
+        Ok(addresses) => addresses,
+        Err(error) => return provider_network_error(error),
+    };
+    let body = serde_json::json!({
+        "query": query,
+        "search_depth": "basic",
+        "max_results": 6,
+        "include_answer": false,
+        "include_raw_content": false,
+        "include_images": false
+    });
+    let response = match network.post_json(&url, &pinned, api_key, &body).await {
+        Ok(response) => response,
+        Err(error) => return provider_network_error(network_failure(error)),
+    };
+    if !pinned
+        .iter()
+        .any(|address| address.ip() == response.peer_addr.ip())
+        || is_prohibited_ip(response.peer_addr.ip())
+    {
+        return ProviderSearch::Failed(FailureCode::UnsafeDestination);
+    }
+    if response.status == 429 {
+        return ProviderSearch::Failed(FailureCode::RateLimited);
+    }
+    if response.status >= 500 {
+        return ProviderSearch::Failed(FailureCode::Http5xx(response.status));
+    }
+    if !(200..300).contains(&response.status) {
+        return ProviderSearch::Failed(FailureCode::Http4xx(response.status));
+    }
+    if response.body_truncated {
+        return ProviderSearch::InvalidResponse;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response.body) else {
+        return ProviderSearch::InvalidResponse;
+    };
+    let Some(results) = value.get("results").and_then(serde_json::Value::as_array) else {
+        return ProviderSearch::InvalidResponse;
+    };
+    let candidates = results
+        .iter()
+        .take(6)
+        .enumerate()
+        .filter_map(|(index, result)| {
+            let title = result.get("title")?.as_str()?.trim();
+            let url = Url::parse(result.get("url")?.as_str()?).ok()?;
+            if title.is_empty() {
+                return None;
+            }
+            Some(RawCandidate {
+                rank: index.saturating_add(1).min(usize::from(u16::MAX)) as u16,
+                title: title.to_string(),
+                url,
+                snippet: result
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect();
+    ProviderSearch::Candidates(candidates)
 }
 
 fn provider_network_error(error: FailureCode) -> ProviderSearch {
@@ -818,6 +970,29 @@ async fn request_once<N: WebNetwork>(
     Ok(response)
 }
 
+async fn resolve_safe_addresses<N: WebNetwork>(
+    network: &N,
+    url: &Url,
+) -> Result<Vec<SocketAddr>, FailureCode> {
+    validate_url_shape(url).map_err(|_| FailureCode::UnsafeDestination)?;
+    let host = url.host_str().ok_or(FailureCode::UnsafeDestination)?;
+    if host.parse::<IpAddr>().is_ok_and(is_prohibited_ip) {
+        return Err(FailureCode::UnsafeDestination);
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or(FailureCode::UnsafeDestination)?;
+    let addresses = network.resolve(host, port).await.map_err(network_failure)?;
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| is_prohibited_ip(address.ip()))
+    {
+        return Err(FailureCode::UnsafeDestination);
+    }
+    Ok(addresses)
+}
+
 fn network_failure(error: WebNetworkError) -> FailureCode {
     match error {
         WebNetworkError::TimedOut => FailureCode::ConnectorUnavailable,
@@ -847,7 +1022,7 @@ pub(crate) async fn acquire_web_plan<A: TypedWebEvidenceAdapter>(
             snippet: String::new(),
         }],
         EvidenceIntent::WebFact { query, .. } => {
-            let providers = ProviderSet(vec![WebProvider::Wikipedia, WebProvider::DuckDuckGo]);
+            let providers = web_provider_set(adapter.tavily_configured());
             let search = adapter.search(query, lang, &providers).await;
             let candidates = search
                 .value
@@ -1336,6 +1511,12 @@ fn authority_for(provider: WebProvider, final_url: &Url) -> SourceAuthority {
     match provider {
         WebProvider::Wikipedia => SourceAuthority::AuthoritativeReference,
         WebProvider::Direct => SourceAuthority::FirstParty,
+        WebProvider::Tavily => match final_url.host_str().unwrap_or_default() {
+            host if host.ends_with(".gov") || host.ends_with(".gov.sk") => {
+                SourceAuthority::FirstParty
+            }
+            _ => SourceAuthority::Other,
+        },
         WebProvider::DuckDuckGo => match final_url.host_str().unwrap_or_default() {
             host if host.ends_with(".gov") || host.ends_with(".gov.sk") => {
                 SourceAuthority::FirstParty
@@ -1965,6 +2146,23 @@ mod tests {
                 .and_then(VecDeque::pop_front)
                 .unwrap_or_else(|| Ok(response(200, "text/html", "<p>readable</p>")))
         }
+
+        async fn post_json(
+            &self,
+            url: &Url,
+            _pinned: &[SocketAddr],
+            _bearer_token: &str,
+            _body: &serde_json::Value,
+        ) -> Result<WebHttpResponse, WebNetworkError> {
+            let host = url.host_str().unwrap().to_string();
+            self.calls.lock().unwrap().push(host.clone());
+            self.replies
+                .lock()
+                .unwrap()
+                .get_mut(&host)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or_else(|| Ok(response(200, "application/json", r#"{"results":[]}"#)))
+        }
     }
 
     fn response(status: u16, content_type: &str, body: &str) -> WebHttpResponse {
@@ -2265,6 +2463,157 @@ mod tests {
         assert_eq!(first.candidates[0].rank, 1);
         assert_eq!(first.candidates[0].title, "Rust");
         assert!(first.candidates[0].snippet.contains("language"));
+    }
+
+    #[tokio::test]
+    async fn tavily_basic_search_returns_discovery_candidates_only() {
+        let network = MockNetwork::default();
+        network.reply(
+            "api.tavily.com",
+            Ok(response(
+                200,
+                "application/json",
+                r#"{"results":[
+                    {"title":"Official population","url":"https://statistics.example/population","content":"Population table"},
+                    {"title":"Independent report","url":"https://report.example/city","content":"Independent estimate"}
+                ]}"#,
+            )),
+        );
+
+        let ProviderSearch::Candidates(candidates) =
+            search_tavily(&network, "city population", Some("tvly-test-secret")).await
+        else {
+            panic!("Tavily should return typed candidates");
+        };
+
+        assert_eq!(network.call_count("api.tavily.com"), 1);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].rank, 1);
+        assert_eq!(candidates[0].title, "Official population");
+        assert_eq!(candidates[0].snippet, "Population table");
+        assert_eq!(
+            candidates[0].url.as_str(),
+            "https://statistics.example/population"
+        );
+    }
+
+    #[tokio::test]
+    async fn tavily_missing_key_quota_and_malformed_response_are_typed() {
+        let missing = MockNetwork::default();
+        assert!(matches!(
+            search_tavily(&missing, "query", None).await,
+            ProviderSearch::Failed(FailureCode::ConnectorUnavailable)
+        ));
+        assert_eq!(missing.call_count("api.tavily.com"), 0);
+
+        let quota = MockNetwork::default();
+        quota.reply(
+            "api.tavily.com",
+            Ok(response(429, "application/json", r#"{"detail":"quota"}"#)),
+        );
+        assert!(matches!(
+            search_tavily(&quota, "query", Some("tvly-test-secret")).await,
+            ProviderSearch::Failed(FailureCode::RateLimited)
+        ));
+
+        let malformed = MockNetwork::default();
+        malformed.reply(
+            "api.tavily.com",
+            Ok(response(
+                200,
+                "application/json",
+                r#"{"answer":"not requested"}"#,
+            )),
+        );
+        assert!(matches!(
+            search_tavily(&malformed, "query", Some("tvly-test-secret")).await,
+            ProviderSearch::InvalidResponse
+        ));
+    }
+
+    #[tokio::test]
+    async fn tavily_rejects_unsafe_result_urls_before_fetch() {
+        let network = MockNetwork::default();
+        network.reply(
+            "api.tavily.com",
+            Ok(response(
+                200,
+                "application/json",
+                r#"{"results":[
+                    {"title":"Local","url":"http://127.0.0.1/admin","content":"unsafe"},
+                    {"title":"Public","url":"https://public.example/report","content":"safe"}
+                ]}"#,
+            )),
+        );
+        let result = typed_search_with_tavily_key(
+            &network,
+            "report",
+            "en",
+            &ProviderSet(vec![WebProvider::Tavily]),
+            Some("tvly-test-secret"),
+        )
+        .await;
+        let value = result.value.unwrap();
+        assert_eq!(value.candidates.len(), 1);
+        assert_eq!(
+            value.candidates[0].requested_url.as_str(),
+            "https://public.example/report"
+        );
+        assert_eq!(
+            value.providers[0].status,
+            ProviderStatus::Succeeded { result_count: 1 }
+        );
+    }
+
+    #[test]
+    fn tavily_replaces_challenge_prone_discovery_only_when_configured() {
+        assert_eq!(
+            web_provider_set(true),
+            ProviderSet(vec![WebProvider::Tavily, WebProvider::DuckDuckGo])
+        );
+        assert_eq!(
+            web_provider_set(false),
+            ProviderSet(vec![WebProvider::Wikipedia, WebProvider::DuckDuckGo])
+        );
+    }
+
+    #[tokio::test]
+    async fn tavily_quota_does_not_retry_and_preserves_duckduckgo_fallback() {
+        let network = MockNetwork::default();
+        network.reply(
+            "api.tavily.com",
+            Ok(response(429, "application/json", r#"{"detail":"quota"}"#)),
+        );
+        network.reply(
+            "lite.duckduckgo.com",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<a rel="nofollow" href="https://fallback.example/">Fallback</a>"#,
+            )),
+        );
+
+        let result = typed_search_with_tavily_key(
+            &network,
+            "fallback",
+            "en",
+            &web_provider_set(true),
+            Some("tvly-test-secret"),
+        )
+        .await;
+        let value = result.value.unwrap();
+        assert_eq!(result.attempts, 2);
+        assert_eq!(network.call_count("api.tavily.com"), 1);
+        assert_eq!(network.call_count("lite.duckduckgo.com"), 1);
+        assert_eq!(
+            value.providers[0].status,
+            ProviderStatus::Failed(FailureCode::RateLimited)
+        );
+        assert_eq!(
+            value.providers[1].status,
+            ProviderStatus::Succeeded { result_count: 1 }
+        );
+        assert_eq!(value.candidates[0].provider, WebProvider::DuckDuckGo);
     }
 
     #[tokio::test]

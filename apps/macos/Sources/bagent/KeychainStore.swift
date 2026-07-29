@@ -84,6 +84,20 @@ enum KeychainStore {
     }
 }
 
+// MARK: - Tavily web discovery
+
+extension KeychainStore {
+    static let tavilyAPIKeyKey = "bagent.tavily.apikey"
+
+    static func saveTavilyAPIKey(_ apiKey: String) -> Bool {
+        save(key: tavilyAPIKeyKey, value: apiKey)
+    }
+
+    static func loadTavilyAPIKey() -> String? {
+        load(key: tavilyAPIKeyKey)
+    }
+}
+
 // MARK: - Odoo-specific keys
 
 extension KeychainStore {

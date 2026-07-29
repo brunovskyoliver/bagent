@@ -1553,6 +1553,8 @@ final class ChatViewModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
+        let tavilyKey = KeychainStore.loadTavilyAPIKey().flatMap { $0.isEmpty ? nil : $0 }
+        try? await client.configureTavily(apiKey: tavilyKey)
         // Odoo connects lazily on the first Odoo turn, avoiding MCP startup and
         // Keychain prompts during app launch.
         await refreshWhatsappStatusNow()
