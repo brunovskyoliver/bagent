@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    Completeness, EvidenceBundle, EvidenceContribution, EvidenceCounts, EvidenceIntent,
+    BodyOrigin, Completeness, EvidenceBundle, EvidenceContribution, EvidenceCounts, EvidenceIntent,
     EvidenceOperation, ExecutionStatus, FailureCode, RecoveryKind, ValidationOutcome,
 };
 
@@ -100,6 +100,8 @@ pub(crate) struct LogicalActivityEvent {
     pub retries: u8,
     pub duplicates_suppressed: u8,
     pub failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_origin: Option<BodyOrigin>,
 }
 
 impl LogicalActivityEvent {
@@ -119,6 +121,7 @@ impl LogicalActivityEvent {
             retries: 0,
             duplicates_suppressed: 0,
             failure_reason: None,
+            body_origin: None,
         }
     }
 
@@ -142,6 +145,7 @@ impl LogicalActivityEvent {
             retries: completion.attempt_count.saturating_sub(1),
             duplicates_suppressed: completion.duplicates_suppressed,
             failure_reason: normalized_failure(&completion.execution),
+            body_origin: completion.body_origin,
         }
     }
 }
@@ -155,6 +159,7 @@ pub(crate) struct LogicalActivityCompletion {
     pub duration_ms: u64,
     pub attempt_count: u8,
     pub duplicates_suppressed: u8,
+    pub body_origin: Option<BodyOrigin>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,6 +599,7 @@ mod tests {
             duration_ms: 42,
             attempt_count: 2,
             duplicates_suppressed: 1,
+            body_origin: None,
         };
         let started = LogicalActivityEvent::started("turn", &operation);
         let completed = LogicalActivityEvent::completed("turn", &operation, &completion);
@@ -615,11 +621,35 @@ mod tests {
             duration_ms: 1,
             attempt_count: 1,
             duplicates_suppressed: 0,
+            body_origin: None,
         };
         let event = LogicalActivityEvent::completed("turn", &operation, &completion);
         assert_eq!(event.execution_status, LogicalActivityState::Succeeded);
         assert_eq!(event.contribution, EvidenceContribution::Empty);
         assert_eq!(event.evidence_count, 0);
+    }
+
+    #[test]
+    fn mail_body_origin_is_structural_logical_activity_metadata() {
+        let operation = EvidenceOperation::MailRead {
+            message_id: super::super::ValidatedMailId::new("fixture-id").unwrap(),
+        };
+        let completion = LogicalActivityCompletion {
+            execution: ExecutionStatus::Succeeded,
+            contribution: EvidenceContribution::Satisfied,
+            evidence_count: 1,
+            source_domains: Vec::new(),
+            duration_ms: 12,
+            attempt_count: 1,
+            duplicates_suppressed: 0,
+            body_origin: Some(BodyOrigin::MailAutomation),
+        };
+
+        let event = LogicalActivityEvent::completed("turn", &operation, &completion);
+
+        assert_eq!(event.body_origin, Some(BodyOrigin::MailAutomation));
+        let serialized = serde_json::to_value(event).unwrap();
+        assert_eq!(serialized["body_origin"], "mail_automation");
     }
 
     #[test]

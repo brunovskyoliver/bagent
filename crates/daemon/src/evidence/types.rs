@@ -370,6 +370,15 @@ pub(crate) struct MailBodyEvidence {
     pub header_id: EvidenceId,
     pub body: String,
     pub body_state: BodyState,
+    pub body_origin: BodyOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BodyOrigin {
+    LocalEmlx,
+    MailAutomation,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

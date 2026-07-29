@@ -61,11 +61,20 @@ pub enum MailBodyHydrationState {
     AutomationFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailBodyOrigin {
+    LocalEmlx,
+    MailAutomation,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HydratedMailMessage {
     pub message: MailMessage,
     pub state: MailBodyHydrationState,
     pub used_automation: bool,
+    pub body_origin: MailBodyOrigin,
 }
 
 /// Filter parameters for [`MailConnector::search_messages`].
@@ -993,6 +1002,7 @@ where
             message,
             state,
             used_automation: false,
+            body_origin: MailBodyOrigin::LocalEmlx,
         };
     }
     if message.body_available {
@@ -1001,6 +1011,7 @@ where
             message,
             state: MailBodyHydrationState::Empty,
             used_automation: false,
+            body_origin: MailBodyOrigin::LocalEmlx,
         };
     }
 
@@ -1030,6 +1041,14 @@ where
         message,
         state,
         used_automation: true,
+        body_origin: if matches!(
+            state,
+            MailBodyHydrationState::Readable | MailBodyHydrationState::Empty
+        ) {
+            MailBodyOrigin::MailAutomation
+        } else {
+            MailBodyOrigin::Unavailable
+        },
     }
 }
 
@@ -1624,6 +1643,7 @@ mod tests {
             4_000
         );
         assert!(!hydrated.used_automation);
+        assert_eq!(hydrated.body_origin, MailBodyOrigin::LocalEmlx);
         assert!(!fallback_called.load(Ordering::SeqCst));
     }
 
@@ -1647,6 +1667,7 @@ mod tests {
         );
         assert!(hydrated.message.body_available);
         assert!(hydrated.used_automation);
+        assert_eq!(hydrated.body_origin, MailBodyOrigin::MailAutomation);
     }
 
     #[test]
@@ -1676,8 +1697,20 @@ mod tests {
         .await;
 
         assert_eq!(hydrated.state, MailBodyHydrationState::Empty);
+        assert_eq!(hydrated.body_origin, MailBodyOrigin::MailAutomation);
         assert!(hydrated.message.body_available);
         assert_eq!(hydrated.message.body.as_deref(), Some("   "));
+    }
+
+    #[tokio::test]
+    async fn unavailable_automation_has_unavailable_origin() {
+        let hydrated = hydrate_loaded_message(hydration_message(None, false), |_| async {
+            Ok(MailAutomationBody::Unavailable)
+        })
+        .await;
+
+        assert_eq!(hydrated.state, MailBodyHydrationState::Unavailable);
+        assert_eq!(hydrated.body_origin, MailBodyOrigin::Unavailable);
     }
 
     #[test]

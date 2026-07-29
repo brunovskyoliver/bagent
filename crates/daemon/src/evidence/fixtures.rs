@@ -50,6 +50,7 @@ pub(crate) fn mixed_read_denial_and_unavailable() -> EvidenceResults {
         header_id: evidence_id("header-3"),
         body: String::new(),
         body_state: BodyState::UnavailableLocally,
+        body_origin: BodyOrigin::Unavailable,
     });
     results.mail_bodies[2].contribution = EvidenceContribution::Partial;
     results
@@ -72,6 +73,7 @@ pub(crate) fn one_unavailable_of_three() -> EvidenceResults {
         header_id: evidence_id("header-3"),
         body: String::new(),
         body_state: BodyState::UnavailableLocally,
+        body_origin: BodyOrigin::Unavailable,
     });
     results.mail_bodies[2].contribution = EvidenceContribution::Partial;
     results
@@ -85,6 +87,7 @@ pub(crate) fn all_bodies_unavailable() -> EvidenceResults {
             header_id: evidence_id(&format!("header-{}", index + 1)),
             body: String::new(),
             body_state: BodyState::UnavailableLocally,
+            body_origin: BodyOrigin::Unavailable,
         });
         result.contribution = EvidenceContribution::Partial;
     }
@@ -274,6 +277,7 @@ fn readable_body(header: &MailHeaderEvidence, body: String) -> MailBodyEvidence 
         header_id: header.evidence_id.clone(),
         body,
         body_state: BodyState::Readable,
+        body_origin: BodyOrigin::LocalEmlx,
     }
 }
 

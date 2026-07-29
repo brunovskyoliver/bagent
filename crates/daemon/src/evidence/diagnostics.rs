@@ -166,6 +166,7 @@ fn sanitize_event(event: &Value) -> Option<Value> {
             | "evidence_validation"
             | "evidence_polish"
             | "evidence_outcome"
+            | "evidence_acquisition_diagnostic"
     ) {
         return None;
     }
@@ -187,6 +188,13 @@ fn sanitize_event(event: &Value) -> Option<Value> {
         "kind",
         "decision",
         "status",
+        "body_origin",
+        "provider",
+        "provider_status",
+        "source_identity",
+        "authority",
+        "extraction_result",
+        "rejection_reason",
     ];
     for key in allowed_strings {
         if let Some(value) = event.get(key).and_then(|value| safe_string(value, 160)) {
@@ -207,6 +215,13 @@ fn sanitize_event(event: &Value) -> Option<Value> {
         "missing_count",
         "conflict_count",
         "exclusion_count",
+        "candidate_count",
+        "rank",
+        "relevance_score",
+        "search_attempts_used",
+        "search_attempt_budget",
+        "fetch_attempts_used",
+        "fetch_attempt_budget",
     ];
     for key in allowed_numbers {
         if let Some(value) = event.get(key).and_then(Value::as_u64) {
@@ -263,6 +278,7 @@ mod tests {
             "retries": 0,
             "duplicates_suppressed": 0,
             "failure_reason": null,
+            "body_origin": "mail_automation",
             "prompt": private,
             "subject": private,
             "body": private,
@@ -300,6 +316,7 @@ mod tests {
         assert!(exported.contains("\"normalized_operation\":\"mail.read\""));
         assert!(exported.contains("\"decision\":\"bundle_partial\""));
         assert!(exported.contains("\"status\":\"rejected\""));
+        assert!(exported.contains("\"body_origin\":\"mail_automation\""));
         assert!(!exported.contains(private));
         for forbidden in [
             "prompt",

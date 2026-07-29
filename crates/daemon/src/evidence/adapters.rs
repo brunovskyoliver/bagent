@@ -1,10 +1,11 @@
 use super::{
-    BodyState, CandidateId, EvidenceContribution, EvidenceId, EvidenceOperation, ExecutionStatus,
-    FailureCode, MailBodyEvidence, MailHeaderEvidence, OperationResult, ProviderSet,
-    ValidatedMailId, WebFetchEvidence, WebSearchResult,
+    BodyOrigin, BodyState, CandidateId, EvidenceContribution, EvidenceId, EvidenceOperation,
+    ExecutionStatus, FailureCode, MailBodyEvidence, MailHeaderEvidence, OperationResult,
+    ProviderSet, ValidatedMailId, WebFetchEvidence, WebSearchResult,
 };
 use apple_mail_connector::{
-    HydratedMailMessage, MailBodyHydrationState, MailConnector, MailMessage, MailSearchFilter,
+    HydratedMailMessage, MailBodyHydrationState, MailBodyOrigin, MailConnector, MailMessage,
+    MailSearchFilter,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -203,6 +204,7 @@ impl<B: AppleMailBackend> MailEvidenceAdapter for AppleMailEvidenceAdapter<B> {
                     header_id: opaque_evidence_id("mail-header", rowid),
                     body: String::new(),
                     body_state: BodyState::UnavailableLocally,
+                    body_origin: BodyOrigin::Unavailable,
                 };
                 value_result(operation, body, EvidenceContribution::Empty, duration_ms)
             }
@@ -285,6 +287,11 @@ fn hydrated_mail_body_result(
     duration_ms: u64,
 ) -> OperationResult<MailBodyEvidence> {
     let message = hydrated.message;
+    let body_origin = match hydrated.body_origin {
+        MailBodyOrigin::LocalEmlx => BodyOrigin::LocalEmlx,
+        MailBodyOrigin::MailAutomation => BodyOrigin::MailAutomation,
+        MailBodyOrigin::Unavailable => BodyOrigin::Unavailable,
+    };
     if message.rowid <= 0 {
         return failed_result(
             operation,
@@ -350,6 +357,7 @@ fn hydrated_mail_body_result(
             header_id: opaque_evidence_id("mail-header", message.rowid),
             body,
             body_state,
+            body_origin,
         },
         contribution,
         duration_ms,
@@ -693,6 +701,7 @@ mod apple_mail_adapter_tests {
             message,
             state,
             used_automation: false,
+            body_origin: MailBodyOrigin::LocalEmlx,
         }
     }
 
@@ -882,6 +891,29 @@ mod apple_mail_adapter_tests {
 
         assert_eq!(unavailable.body_state, BodyState::UnavailableLocally);
         assert_eq!(empty.body_state, BodyState::Empty);
+    }
+
+    #[tokio::test]
+    async fn typed_body_result_carries_automation_origin() {
+        let mail = message(53, Some("Hydrated body."), true);
+        let hydrated = HydratedMailMessage {
+            message: mail.clone(),
+            state: MailBodyHydrationState::Readable,
+            used_automation: true,
+            body_origin: MailBodyOrigin::MailAutomation,
+        };
+        let mut messages = HashMap::new();
+        messages.insert(53, Ok(Some(hydrated)));
+        let mut adapter = AppleMailEvidenceAdapter::from_backend(StubAppleMailBackend {
+            listed: Ok(vec![mail]),
+            searched: Ok(Vec::new()),
+            messages,
+        });
+        let header = adapter.list(1, false).await.value.unwrap().remove(0);
+
+        let body = adapter.read(&header.connector_id).await.value.unwrap();
+
+        assert_eq!(body.body_origin, BodyOrigin::MailAutomation);
     }
 
     #[tokio::test]

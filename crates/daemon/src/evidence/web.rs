@@ -335,7 +335,7 @@ pub(crate) fn render_legacy_fetch(result: &OperationResult<WebFetchEvidence>) ->
         String::new()
     } else {
         format!(
-            "\n\nLinks (same site — web_fetch a promising one when the answer is on a subpage):{links}"
+            "\n\nValidated links — web_fetch a promising relevant reference before using it:{links}"
         )
     };
     format!(
@@ -923,6 +923,49 @@ pub(crate) fn prepare_web_candidates(query: &str, candidates: &mut Vec<WebCandid
     candidates.sort_by(|left, right| {
         candidate_rank_key(left, &query_terms).cmp(&candidate_rank_key(right, &query_terms))
     });
+    diversify_candidates_by_source(candidates);
+}
+
+fn diversify_candidates_by_source(candidates: &mut Vec<WebCandidate>) {
+    let mut first = Vec::new();
+    let mut repeats = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in candidates.drain(..) {
+        if seen.insert(candidate_source_identity(&candidate)) {
+            first.push(candidate);
+        } else {
+            repeats.push(candidate);
+        }
+    }
+    first.extend(repeats);
+    *candidates = first;
+}
+
+pub(crate) fn candidate_source_identity(candidate: &WebCandidate) -> SourceIdentity {
+    source_identity_for(&candidate.requested_url)
+}
+
+pub(crate) fn candidate_is_query_relevant(query: &str, candidate: &WebCandidate) -> bool {
+    candidate_query_relevance_score(query, candidate) > 0
+}
+
+pub(crate) fn candidate_query_relevance_score(query: &str, candidate: &WebCandidate) -> u16 {
+    let terms = normalized_ranking_terms(query);
+    let haystack = format!(
+        "{} {} {}",
+        candidate.title.to_ascii_lowercase(),
+        candidate
+            .requested_url
+            .host_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        candidate.requested_url.path().to_ascii_lowercase()
+    );
+    if terms.is_empty() {
+        return 0;
+    }
+    let matched = terms.iter().filter(|term| haystack.contains(*term)).count();
+    ((matched.saturating_mul(10_000) / terms.len()).min(10_000)) as u16
 }
 
 fn candidate_rank_key(candidate: &WebCandidate, query_terms: &[String]) -> (u8, u16, u16, String) {
@@ -1095,12 +1138,22 @@ fn candidate_authority_score(candidate: &WebCandidate, query_terms: &[String]) -
         .get(labels.len().saturating_sub(2))
         .copied()
         .unwrap_or_default();
+    let title = candidate.title.to_ascii_lowercase();
+    let named_organization = registrable_label.len() >= 4
+        && (query_terms.iter().any(|term| term == registrable_label)
+            || query_terms.iter().enumerate().any(|(left_index, left)| {
+                query_terms.iter().enumerate().any(|(right_index, right)| {
+                    left_index != right_index && format!("{left}{right}") == registrable_label
+                })
+            }));
+    let official_metadata = title.contains("official site") || title.contains("official website");
     if host.ends_with(".gov")
         || host.ends_with(".gov.sk")
         || host.ends_with(".europa.eu")
-        || query_terms
-            .iter()
-            .any(|term| term.len() >= 4 && registrable_label == term)
+        || host.ends_with(".edu")
+        || host.ends_with(".ac.uk")
+        || host.ends_with(".int")
+        || (named_organization && official_metadata)
     {
         0
     } else if candidate.provider == WebProvider::Wikipedia {
@@ -1142,7 +1195,9 @@ pub(crate) fn direct_web_candidate(url: &Url) -> WebCandidate {
 pub(crate) fn linked_web_candidate(reference: &ValidatedReference, rank: u16) -> WebCandidate {
     WebCandidate {
         candidate_id: candidate_id_for_url(&reference.url),
-        provider: WebProvider::Direct,
+        // Discovered references are not user-supplied direct pages. They must
+        // earn first-party status from their final URL and request context.
+        provider: WebProvider::DuckDuckGo,
         rank,
         title: reference.label.clone(),
         requested_url: reference.url.clone(),
@@ -1784,9 +1839,9 @@ fn extract_validated_links(html: &str, base: &Url, max: usize) -> Vec<ValidatedR
     const MAX_ANCHOR_CHARS: usize = 60;
     let mut links = Vec::new();
     let mut seen = HashSet::new();
-    let Some(host) = base.host_str() else {
+    if base.host_str().is_none() {
         return links;
-    };
+    }
     let mut rest = html;
     while links.len() < max {
         let Some(anchor_position) = rest.find("<a ") else {
@@ -1824,9 +1879,6 @@ fn extract_validated_links(html: &str, base: &Url, max: usize) -> Vec<ValidatedR
         let Ok(url) = normalize_url(&joined) else {
             continue;
         };
-        if url.host_str() != Some(host) {
-            continue;
-        }
         let label = html_to_text(inner)
             .chars()
             .take(MAX_ANCHOR_CHARS)
@@ -2426,6 +2478,52 @@ mod tests {
     }
 
     #[test]
+    fn candidates_are_diversified_by_registrable_source_before_repeats() {
+        let mut candidates = vec![
+            candidate("https://news.example.com/one", WebProvider::DuckDuckGo, 1),
+            candidate("https://www.example.com/two", WebProvider::DuckDuckGo, 2),
+            candidate("https://independent.test/three", WebProvider::DuckDuckGo, 3),
+        ];
+
+        prepare_web_candidates("example current fact", &mut candidates);
+
+        assert_eq!(
+            candidate_source_identity(&candidates[0]).as_str(),
+            "example.com"
+        );
+        assert_eq!(
+            candidate_source_identity(&candidates[1]).as_str(),
+            "independent.test"
+        );
+        assert_eq!(
+            candidate_source_identity(&candidates[2]).as_str(),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn named_official_organization_site_is_first_party_without_rank_trust() {
+        let mut official = candidate(
+            "https://www.worldbank.org/en/topic/population",
+            WebProvider::DuckDuckGo,
+            99,
+        );
+        official.title = "World Bank Official Website".into();
+        let mut ranked_high = candidate(
+            "https://publisher.example/world-bank",
+            WebProvider::DuckDuckGo,
+            1,
+        );
+        ranked_high.title = "World Bank analysis".into();
+
+        assert!(candidate_is_first_party("World Bank population", &official));
+        assert!(!candidate_is_first_party(
+            "World Bank population",
+            &ranked_high
+        ));
+    }
+
+    #[test]
     fn legacy_rendering_marks_connector_content_untrusted() {
         let search = OperationResult::succeeded(
             EvidenceOperation::WebSearch {
@@ -2605,11 +2703,12 @@ mod tests {
             .iter()
             .all(|passage| passage.text.chars().count() <= MAX_PASSAGE_CHARS));
         assert!(evidence.characters_extracted > OLD_INITIAL_CHARACTER_CAP as u64);
-        assert_eq!(evidence.links.len(), 1);
+        assert_eq!(evidence.links.len(), 2);
         assert_eq!(
             evidence.links[0].url.as_str(),
             "https://readable.example/same"
         );
+        assert_eq!(evidence.links[1].url.as_str(), "https://other.example/no");
     }
 
     #[derive(Clone)]

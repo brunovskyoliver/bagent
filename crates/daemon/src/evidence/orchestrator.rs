@@ -6,14 +6,15 @@ use serde_json::json;
 use url::Url;
 
 use super::{
-    assess_claim_relevance, candidate_is_first_party, direct_web_candidate, linked_web_candidate,
-    prepare_web_candidates, AppleMailEvidenceAdapter, EvidenceConflict, EvidenceContribution,
-    EvidenceIntent, EvidenceOperation, EvidencePhase, EvidencePhaseEvent, EvidencePlanner,
-    EvidenceRequest, EvidenceResults, ExecutionStatus, ExtractionStatus, FailureCode,
-    LogicalActivityCompletion, LogicalActivityEvent, MailBodyEvidence, MailEvidenceAdapter,
-    MailHeaderEvidence, OperationResult, ProviderSet, SourceAuthority, TypedWebAdapter,
-    TypedWebEvidenceAdapter, ValidationOutcome, VerificationLevel, WebCandidate, WebFetchEvidence,
-    WebProvider, WebSearchResult,
+    assess_claim_relevance, candidate_is_first_party, candidate_is_query_relevant,
+    candidate_query_relevance_score, candidate_source_identity, direct_web_candidate,
+    linked_web_candidate, prepare_web_candidates, AppleMailEvidenceAdapter, EvidenceConflict,
+    EvidenceContribution, EvidenceIntent, EvidenceOperation, EvidencePhase, EvidencePhaseEvent,
+    EvidencePlanner, EvidenceRequest, EvidenceResults, ExecutionStatus, ExtractionStatus,
+    FailureCode, LogicalActivityCompletion, LogicalActivityEvent, MailBodyEvidence,
+    MailEvidenceAdapter, MailHeaderEvidence, OperationResult, ProviderSet, SourceAuthority,
+    TypedWebAdapter, TypedWebEvidenceAdapter, ValidationOutcome, VerificationLevel, WebCandidate,
+    WebFetchEvidence, WebProvider, WebSearchResult,
 };
 use crate::{
     agent_exec::{EventSink, ExecOrigin, Gate, ToolKind},
@@ -75,6 +76,8 @@ pub(crate) trait EvidenceOperationGate {
         _total: Option<u16>,
     ) {
     }
+
+    async fn record_acquisition_diagnostic(&mut self, _event: serde_json::Value) {}
 }
 
 struct ExistingPolicyGate<'a> {
@@ -89,6 +92,11 @@ struct ExistingPolicyGate<'a> {
 
 #[async_trait]
 impl EvidenceOperationGate for ExistingPolicyGate<'_> {
+    async fn record_acquisition_diagnostic(&mut self, mut event: serde_json::Value) {
+        event["type"] = json!("evidence_acquisition_diagnostic");
+        event["turn_id"] = json!(self.turn_id);
+        let _ = self.sink.emit(event).await;
+    }
     async fn admit(&mut self, operation: &EvidenceOperation) -> Admission {
         let args = operation_args(operation);
         let rule_name = match operation {
@@ -352,6 +360,64 @@ where
                 value.candidates = candidates.clone();
             }
             results.web_searches.push(search);
+            if let Some(search) = results.web_searches.last() {
+                record_search_diagnostics(
+                    gate,
+                    search,
+                    candidates.len(),
+                    1,
+                    plan.budget.web_search_attempts,
+                )
+                .await;
+            }
+            record_candidate_diagnostics(gate, query, &candidates, plan.budget.web_fetch_attempts)
+                .await;
+            if plan.budget.web_search_attempts > 1
+                && search_needs_diversification(intent, query, &candidates)
+            {
+                let diversified_query = diversified_search_query(intent, query, &candidates);
+                let operation = EvidenceOperation::WebSearch {
+                    normalized_query: diversified_query.clone(),
+                    provider_set: providers.clone(),
+                };
+                gate.record_activity_started(&operation).await;
+                let mut diversified = match gate.admit(&operation).await {
+                    Admission::Allowed => {
+                        gate.record_execution(&operation).await;
+                        let result = adapter.search(&diversified_query, lang, &providers).await;
+                        operations_executed += usize::from(result.attempts);
+                        result
+                    }
+                    Admission::Denied => {
+                        approvals_denied += 1;
+                        denied_result(&operation)
+                    }
+                };
+                gate.record_completion(&operation, completion_for_search(&diversified))
+                    .await;
+                if let Some(value) = diversified.value.as_mut() {
+                    candidates.append(&mut value.candidates);
+                }
+                prepare_web_candidates(query, &mut candidates);
+                results.web_searches.push(diversified);
+                if let Some(search) = results.web_searches.last() {
+                    record_search_diagnostics(
+                        gate,
+                        search,
+                        candidates.len(),
+                        2,
+                        plan.budget.web_search_attempts,
+                    )
+                    .await;
+                }
+                record_candidate_diagnostics(
+                    gate,
+                    query,
+                    &candidates,
+                    plan.budget.web_fetch_attempts,
+                )
+                .await;
+            }
             candidates
         }
         _ => {
@@ -370,6 +436,7 @@ where
     prepare_web_candidates(query, &mut candidates);
     let mut queue = VecDeque::from(candidates);
     let mut seen_operations = HashSet::new();
+    let mut attempted_source_identities = HashSet::new();
     let mut attempts_used = 0u8;
     let mut exploration_rounds = 0u8;
     let concurrency = plan.budget.max_parallel_fetches.clamp(1, 2);
@@ -410,9 +477,32 @@ where
         while inflight.len() < usize::from(concurrency)
             && attempts_used < plan.budget.web_fetch_attempts
         {
-            let Some(candidate) = queue.pop_front() else {
+            let unseen_position = queue.iter().position(|candidate| {
+                !attempted_source_identities.contains(&candidate_source_identity(candidate))
+            });
+            let candidate = if let Some(position) = unseen_position {
+                queue.remove(position).expect("queued candidate position")
+            } else if inflight.is_empty() {
+                let Some(candidate) = queue.pop_front() else {
+                    break;
+                };
+                candidate
+            } else {
                 break;
             };
+            if !attempted_source_identities.insert(candidate_source_identity(&candidate))
+                && matches!(
+                    intent,
+                    EvidenceIntent::WebFact {
+                        verification: VerificationLevel::Corroborated,
+                        ..
+                    }
+                )
+                && !inflight.is_empty()
+            {
+                queue.push_back(candidate);
+                break;
+            }
             let operation = EvidenceOperation::WebFetch {
                 candidate_id: candidate.candidate_id.clone(),
             };
@@ -435,6 +525,14 @@ where
                 .await
             {
                 Admission::Allowed => {
+                    gate.record_acquisition_diagnostic(json!({
+                        "status": "fetch_scheduled",
+                        "source_identity": candidate_source_identity(&candidate).as_str(),
+                        "rank": candidate.rank,
+                        "authority": if candidate_is_first_party(query, &candidate) { "first_party" } else { "other" },
+                        "fetch_attempts_used": attempts_used,
+                        "fetch_attempt_budget": plan.budget.web_fetch_attempts,
+                    })).await;
                     gate.record_execution(&operation).await;
                     attempts_used += 1;
                     operations_executed += 1;
@@ -506,6 +604,49 @@ where
                 };
                 gate.record_completion(&operation, completion_for_fetch(&result))
                     .await;
+                let (
+                    source_identity,
+                    authority,
+                    relevance_score,
+                    extraction_result,
+                    rejection_reason,
+                ) = fetch_diagnostic_fields(&result, query);
+                gate.record_acquisition_diagnostic(json!({
+                    "status": "fetch_completed",
+                    "source_identity": source_identity,
+                    "authority": authority,
+                    "relevance_score": relevance_score,
+                    "extraction_result": extraction_result,
+                    "rejection_reason": rejection_reason,
+                    "fetch_attempts_used": attempts_used,
+                    "fetch_attempt_budget": plan.budget.web_fetch_attempts,
+                }))
+                .await;
+                if let Some(evidence) = result.value.as_ref() {
+                    let mut discovered = evidence
+                        .links
+                        .iter()
+                        .enumerate()
+                        .map(|(index, reference)| {
+                            linked_web_candidate(
+                                reference,
+                                index.saturating_add(1).min(usize::from(u16::MAX)) as u16,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    discovered.retain(|candidate| candidate_is_query_relevant(query, candidate));
+                    prepare_web_candidates(query, &mut discovered);
+                    for candidate in discovered.into_iter().rev() {
+                        if !seen_operations.contains(
+                            &EvidenceOperation::WebFetch {
+                                candidate_id: candidate.candidate_id.clone(),
+                            }
+                            .key(),
+                        ) {
+                            queue.push_front(candidate);
+                        }
+                    }
+                }
                 results.web_fetches.push(result);
                 gate.record_phase(
                     EvidencePhase::Verifying,
@@ -530,6 +671,164 @@ where
         validation: super::EvidenceValidator::validate(turn_id, plan, results),
         operations_executed,
         approvals_denied,
+    }
+}
+
+async fn record_search_diagnostics<G: EvidenceOperationGate + Send>(
+    gate: &mut G,
+    search: &OperationResult<WebSearchResult>,
+    candidate_count: usize,
+    search_attempts_used: u8,
+    search_attempt_budget: u8,
+) {
+    if let Some(value) = &search.value {
+        for provider in &value.providers {
+            gate.record_acquisition_diagnostic(json!({
+                "status": "search_completed",
+                "provider": format!("{:?}", provider.provider).to_ascii_lowercase(),
+                "provider_status": format!("{:?}", provider.status).to_ascii_lowercase(),
+                "candidate_count": candidate_count,
+                "duration_ms": provider.duration_ms,
+                "search_attempts_used": search_attempts_used,
+                "search_attempt_budget": search_attempt_budget,
+            }))
+            .await;
+        }
+    }
+}
+
+async fn record_candidate_diagnostics<G: EvidenceOperationGate + Send>(
+    gate: &mut G,
+    query: &str,
+    candidates: &[WebCandidate],
+    fetch_attempt_budget: u8,
+) {
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        let identity = candidate_source_identity(candidate);
+        let duplicate_source = !seen.insert(identity.clone());
+        gate.record_acquisition_diagnostic(json!({
+            "status": "candidate_ranked",
+            "source_identity": identity.as_str(),
+            "rank": candidate.rank,
+            "authority": if candidate_is_first_party(query, candidate) { "first_party" } else { "other" },
+            "relevance_score": candidate_query_relevance_score(query, candidate),
+            "rejection_reason": duplicate_source.then_some("duplicate_source_deferred"),
+            "fetch_attempts_used": 0,
+            "fetch_attempt_budget": fetch_attempt_budget,
+        })).await;
+    }
+}
+
+fn fetch_diagnostic_fields(
+    result: &OperationResult<WebFetchEvidence>,
+    query: &str,
+) -> (
+    Option<String>,
+    &'static str,
+    u16,
+    &'static str,
+    Option<String>,
+) {
+    let Some(evidence) = result.value.as_ref() else {
+        return (
+            None,
+            "unknown",
+            0,
+            "no_evidence",
+            Some(format!("{:?}", result.execution).to_ascii_lowercase()),
+        );
+    };
+    let relevance = evidence
+        .passages
+        .iter()
+        .map(|passage| assess_claim_relevance(query, &passage.text).query_coverage_basis_points)
+        .max()
+        .unwrap_or_default();
+    let rejection = evidence
+        .quality
+        .low_quality_reason
+        .map(|reason| format!("{reason:?}").to_ascii_lowercase());
+    let authority = match evidence.authority {
+        SourceAuthority::FirstParty => "first_party",
+        SourceAuthority::AuthoritativeReference => "authoritative_reference",
+        SourceAuthority::Other => "other",
+    };
+    let extraction = match evidence.extraction {
+        ExtractionStatus::Readable => "readable",
+        ExtractionStatus::ReadableTruncated => "readable_truncated",
+        ExtractionStatus::Empty => "empty",
+        ExtractionStatus::Unsupported => "unsupported",
+    };
+    (
+        Some(evidence.source_identity.as_str().to_string()),
+        authority,
+        relevance,
+        extraction,
+        rejection,
+    )
+}
+
+fn search_needs_diversification(
+    intent: &EvidenceIntent,
+    query: &str,
+    candidates: &[WebCandidate],
+) -> bool {
+    match intent {
+        EvidenceIntent::WebFact {
+            verification: VerificationLevel::SingleAuthoritative,
+            ..
+        } => !candidates
+            .iter()
+            .any(|candidate| candidate_is_first_party(query, candidate)),
+        EvidenceIntent::WebFact {
+            verification: VerificationLevel::Corroborated,
+            ..
+        } => {
+            candidates
+                .iter()
+                .map(candidate_source_identity)
+                .collect::<HashSet<_>>()
+                .len()
+                < 2
+        }
+        _ => false,
+    }
+}
+
+fn diversified_search_query(
+    intent: &EvidenceIntent,
+    query: &str,
+    candidates: &[WebCandidate],
+) -> String {
+    let exclusion = candidates
+        .first()
+        .map(candidate_source_identity)
+        .map(|identity| format!(" -site:{}", identity.as_str()))
+        .unwrap_or_default();
+    match intent {
+        EvidenceIntent::WebFact {
+            verification: VerificationLevel::SingleAuthoritative,
+            ..
+        } => {
+            format!("{query} official{exclusion}")
+        }
+        EvidenceIntent::WebFact {
+            verification: VerificationLevel::Corroborated,
+            ..
+        } => {
+            let normalized = query.to_ascii_lowercase();
+            let terminology = if ["population", "rate", "percent", "number", "statistics"]
+                .iter()
+                .any(|term| normalized.contains(term))
+            {
+                " official statistics"
+            } else {
+                " official"
+            };
+            format!("{query}{terminology}{exclusion}")
+        }
+        _ => query.to_string(),
     }
 }
 
@@ -1047,6 +1346,7 @@ fn completion_for_headers(
         duration_ms: result.duration_ms,
         attempt_count: result.attempts,
         duplicates_suppressed: u8::from(result.contribution == EvidenceContribution::Duplicate),
+        body_origin: None,
     }
 }
 
@@ -1062,6 +1362,7 @@ fn completion_for_body(result: &OperationResult<MailBodyEvidence>) -> LogicalAct
         duration_ms: result.duration_ms,
         attempt_count: result.attempts,
         duplicates_suppressed: u8::from(result.contribution == EvidenceContribution::Duplicate),
+        body_origin: result.value.as_ref().map(|body| body.body_origin),
     }
 }
 
@@ -1076,6 +1377,7 @@ fn completion_for_search(result: &OperationResult<WebSearchResult>) -> LogicalAc
         duration_ms: result.duration_ms,
         attempt_count: result.attempts,
         duplicates_suppressed: u8::from(result.contribution == EvidenceContribution::Duplicate),
+        body_origin: None,
     }
 }
 
@@ -1097,6 +1399,7 @@ fn completion_for_fetch(result: &OperationResult<WebFetchEvidence>) -> LogicalAc
         duration_ms: result.duration_ms,
         attempt_count: result.attempts,
         duplicates_suppressed: u8::from(result.contribution == EvidenceContribution::Duplicate),
+        body_origin: None,
     }
 }
 
@@ -1905,7 +2208,7 @@ mod tests {
         let mut candidate = direct_web_candidate(&url);
         candidate.provider = WebProvider::DuckDuckGo;
         candidate.rank = rank;
-        candidate.title = format!("Acme authoritative fact {rank}");
+        candidate.title = format!("Acme Official Website authoritative fact {rank}");
         candidate
     }
 
