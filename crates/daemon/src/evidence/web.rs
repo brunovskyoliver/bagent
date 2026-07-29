@@ -1219,11 +1219,12 @@ pub(crate) fn assess_claim_relevance(query: &str, passage: &str) -> ClaimEvidenc
         } else {
             passage.chars().any(|character| character.is_ascii_digit())
         };
-    let minimum_covered_terms = if numeric_required {
-        query_terms.len().min(2)
-    } else {
-        usize::from(!query_terms.is_empty())
-    };
+    // A single generic overlap such as "presidential" is not enough to bind a
+    // prose claim to a multi-term entity query such as "President of
+    // Slovakia". Requiring two salient terms when available prevents an
+    // otherwise authoritative but unrelated institutional page from becoming
+    // canonical evidence.
+    let minimum_covered_terms = query_terms.len().min(2);
     ClaimEvidenceRelevance {
         query_coverage_basis_points,
         numeric_or_date_relevant,
@@ -2205,6 +2206,22 @@ mod tests {
                 "Bratislava's 2026 population is estimated at 485,917"
             )
             .eligible
+        );
+    }
+
+    #[test]
+    fn prose_fact_relevance_requires_the_queried_entity_not_one_generic_term() {
+        let query = "Who is the President of Slovakia? Use the official first-party website.";
+        assert!(
+            !assess_claim_relevance(
+                query,
+                "Throughout American history, political parties shaped presidential elections."
+            )
+            .eligible
+        );
+        assert!(
+            assess_claim_relevance(query, "The President of Slovakia is Peter Pellegrini.")
+                .eligible
         );
     }
 
