@@ -70,6 +70,36 @@ async fn authenticates_health_and_lists_models() {
 }
 
 #[tokio::test]
+async fn bounded_chat_completion_is_non_streamed_and_uses_requested_limit() {
+    let response = (
+        StatusCode::OK,
+        axum::Json(json!({
+            "choices": [{"message": {"content": "Held response"}}]
+        })),
+    )
+        .into_response();
+    let (base_url, capture) = spawn_server(response).await;
+    let client = BaseRtClient::new(base_url, "test-key");
+
+    let response = client
+        .chat_complete_bounded(
+            "configured-4b",
+            vec![Message::system("system"), Message::user("user")],
+            0.2,
+            512,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response, "Held response");
+    let request = &capture.0.lock().unwrap()[0];
+    assert_eq!(request["stream"], false);
+    assert_eq!(request["max_tokens"], 512);
+    assert_eq!(request["tools"], serde_json::Value::Null);
+    assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn streams_content_and_reassembles_fragmented_tool_calls() {
     let sse = concat!(
         "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",

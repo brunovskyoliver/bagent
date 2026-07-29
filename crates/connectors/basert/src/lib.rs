@@ -323,6 +323,54 @@ impl BaseRtClient {
         }
     }
 
+    /// Execute a non-streamed chat completion with a caller-selected output
+    /// bound. This is intended for paths that must validate the complete model
+    /// response before making any of it visible.
+    pub async fn chat_complete_bounded(
+        &self,
+        model: &str,
+        messages: Vec<Message>,
+        temperature: f32,
+        max_tokens: u32,
+    ) -> Result<String> {
+        if max_tokens == 0 {
+            return Err(anyhow!("max_tokens must be greater than zero"));
+        }
+        self.chat_complete_request(model, messages, temperature, max_tokens, None)
+            .await
+    }
+
+    async fn chat_complete_request(
+        &self,
+        model: &str,
+        messages: Vec<Message>,
+        temperature: f32,
+        max_tokens: u32,
+        response_format: Option<serde_json::Value>,
+    ) -> Result<String> {
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        });
+        if let Some(format) = response_format {
+            body["response_format"] = format;
+        }
+        let response = self
+            .post(format!("{}/chat/completions", self.base_url))
+            .json(&body)
+            .send()
+            .await
+            .context("POST /v1/chat/completions")?;
+        let value = response_json(response, "POST /v1/chat/completions").await?;
+        Ok(value["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    }
+
     pub async fn generate_raw(
         &self,
         model: &str,
@@ -354,27 +402,14 @@ impl BaseRtClient {
         temperature: f32,
         response_format: Option<serde_json::Value>,
     ) -> Result<String> {
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": false,
-            "temperature": temperature,
-            "max_tokens": 2048,
-        });
-        if let Some(format) = response_format {
-            body["response_format"] = format;
-        }
-        let response = self
-            .post(format!("{}/chat/completions", self.base_url))
-            .json(&body)
-            .send()
-            .await
-            .context("POST /v1/chat/completions")?;
-        let value = response_json(response, "POST /v1/chat/completions").await?;
-        Ok(value["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string())
+        self.chat_complete_request(
+            model,
+            vec![Message::user(prompt)],
+            temperature,
+            2_048,
+            response_format,
+        )
+        .await
     }
 
     pub async fn summarize(&self, model: &str, messages: &[Message]) -> Result<String> {
