@@ -28,6 +28,9 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     /// Presentation prefix paced independently from BaseRT transport chunks.
     var displayedContent: String = ""
     var activities: [TurnActivity] = []
+    var evidencePhase: DaemonClient.EvidencePhaseEvent? = nil
+    var evidenceActivities: [EvidenceLogicalActivity] = []
+    var evidenceOutcome: DaemonClient.EvidenceOutcomeEvent? = nil
     var sources: [DaemonClient.TranscriptSource] = []
     var attachments: [ChatAttachment] = []
     /// Set when the assistant's response found a specific mail message.
@@ -52,6 +55,101 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     var taskRating: (level: String, score: Int, reasons: [String], privacyRisk: String)? = nil
 
     enum Role { case user, assistant }
+}
+
+struct EvidenceLogicalActivity: Identifiable, Equatable {
+    let id: String
+    var operation: String
+    var executionStatus: DaemonClient.EvidenceExecutionStatus
+    var contribution: DaemonClient.EvidenceContribution
+    var evidenceCount: Int
+    var sourceDomains: [String]
+    var durationMs: Int
+    var attemptCount: Int
+    var retries: Int
+    var duplicatesSuppressed: Int
+    var failureReason: String?
+
+    init(event: DaemonClient.LogicalActivityEvent) {
+        id = event.activityId
+        operation = event.normalizedOperation
+        executionStatus = event.executionStatus
+        contribution = event.contribution
+        evidenceCount = event.evidenceCount
+        sourceDomains = event.sourceDomains
+        durationMs = event.durationMs
+        attemptCount = event.attemptCount
+        retries = event.retries
+        duplicatesSuppressed = event.duplicatesSuppressed
+        failureReason = event.failureReason
+    }
+
+    mutating func update(from event: DaemonClient.LogicalActivityEvent) {
+        operation = event.normalizedOperation
+        executionStatus = event.executionStatus
+        contribution = event.contribution
+        evidenceCount = event.evidenceCount
+        sourceDomains = event.sourceDomains
+        durationMs = event.durationMs
+        attemptCount = event.attemptCount
+        retries = event.retries
+        duplicatesSuppressed = event.duplicatesSuppressed
+        failureReason = event.failureReason
+    }
+}
+
+enum EvidencePresentation {
+    static func phaseLabel(_ event: DaemonClient.EvidencePhaseEvent) -> String {
+        let progress = progressSuffix(completed: event.completed, total: event.total)
+        switch event.phase {
+        case .findingMail: return "Finding Mail\(progress)"
+        case .reading: return "Reading\(progress)"
+        case .searching: return "Searching\(progress)"
+        case .verifying: return "Verifying\(progress)"
+        case .loadingSynthesisModel: return "Loading synthesis model"
+        case .preparingAnswer: return "Preparing answer"
+        case .repairing: return "Repairing answer"
+        case .fallingBack: return "Falling back"
+        case .validating: return "Validating answer"
+        case .deterministicRendering: return "Preparing verified result"
+        }
+    }
+
+    static func outcomeLabel(_ outcome: DaemonClient.EvidenceOutcomeEvent) -> String {
+        outcome.message
+    }
+
+    static func activityDetail(_ activity: EvidenceLogicalActivity) -> String {
+        var parts = [activity.contribution.rawValue]
+        if activity.evidenceCount > 0 {
+            parts.append("\(activity.evidenceCount) evidence")
+        }
+        if !activity.sourceDomains.isEmpty {
+            parts.append(activity.sourceDomains.joined(separator: ", "))
+        }
+        if activity.retries > 0 {
+            parts.append("\(activity.retries) retries")
+        }
+        if activity.duplicatesSuppressed > 0 {
+            parts.append("\(activity.duplicatesSuppressed) duplicates suppressed")
+        }
+        if let failure = activity.failureReason {
+            parts.append(failure)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    static func accessibilityLabel(
+        outcome: DaemonClient.EvidenceOutcomeEvent,
+        expanded: Bool
+    ) -> String {
+        "\(expanded ? "Collapse" : "Expand") evidence activity. \(outcomeLabel(outcome))"
+    }
+
+    private static func progressSuffix(completed: Int?, total: Int?) -> String {
+        guard let completed, let total, total > 0 else { return "" }
+        return " \(completed) of \(total)"
+    }
 }
 
 struct TurnActivity: Identifiable, Equatable {
@@ -806,6 +904,21 @@ final class ChatViewModel: ObservableObject {
     var isLatestAssistantStreaming: Bool {
         guard let latestAssistantMessageId else { return false }
         return streamingAssistantMessageId == latestAssistantMessageId
+    }
+
+    var latestEvidenceStatus: String? {
+        guard let message = latestAssistantMessage else { return nil }
+        if let outcome = message.evidenceOutcome {
+            return EvidencePresentation.outcomeLabel(outcome)
+        }
+        return message.evidencePhase.map(EvidencePresentation.phaseLabel)
+    }
+
+    var latestTranscriptActivityCount: Int {
+        guard let message = latestAssistantMessage else { return 0 }
+        return message.evidenceOutcome == nil && message.evidencePhase == nil
+            ? message.activities.count
+            : max(1, message.evidenceActivities.count)
     }
 
     var latestUserText: String {
@@ -1667,6 +1780,29 @@ final class ChatViewModel: ObservableObject {
                             messages[idx].activities[activityIndex].status = event.status ?? "completed"
                             messages[idx].activities[activityIndex].durationMs = event.durationMs
                         }
+                    case .evidencePhase(let event):
+                        messages[idx].evidencePhase = event
+                        toolStatus = EvidencePresentation.phaseLabel(event)
+                    case .logicalActivityStarted(let event):
+                        let activity = EvidenceLogicalActivity(event: event)
+                        if let activityIndex = messages[idx].evidenceActivities.firstIndex(
+                            where: { $0.id == activity.id }
+                        ) {
+                            messages[idx].evidenceActivities[activityIndex].update(from: event)
+                        } else {
+                            messages[idx].evidenceActivities.append(activity)
+                        }
+                    case .logicalActivityCompleted(let event):
+                        if let activityIndex = messages[idx].evidenceActivities.firstIndex(
+                            where: { $0.id == event.activityId }
+                        ) {
+                            messages[idx].evidenceActivities[activityIndex].update(from: event)
+                        } else {
+                            messages[idx].evidenceActivities.append(EvidenceLogicalActivity(event: event))
+                        }
+                    case .evidenceOutcome(let event):
+                        messages[idx].evidenceOutcome = event
+                        toolStatus = EvidencePresentation.outcomeLabel(event)
                     case .sourceDiscovered(let source):
                         if !messages[idx].sources.contains(where: { $0.id == source.id }) {
                             messages[idx].sources.append(source)

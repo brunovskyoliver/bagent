@@ -70,6 +70,8 @@ struct AppState {
     inference: BaseRtClient,
     /// Shared preferred/fallback synthesis lifecycle for chat and automations.
     synthesis: Arc<evidence::SynthesisService>,
+    /// Privacy-safe bounded structural traces for routed evidence turns.
+    evidence_diagnostics: Arc<evidence::DiagnosticRecorder>,
     mail: Option<MailConnector>,
     notes: Option<NotesConnector>,
     fs: Option<FsConnector>,
@@ -402,6 +404,9 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&attachments_dir)?;
     let debug_dir = data_dir.join("debug");
     std::fs::create_dir_all(&debug_dir)?;
+    let evidence_diagnostics = Arc::new(evidence::DiagnosticRecorder::new(
+        data_dir.join("evidence-diagnostics"),
+    )?);
     std::fs::write(data_dir.join("daemon.pid"), std::process::id().to_string())?;
 
     let mut conn = Connection::open(data_dir.join("bagent.db"))?;
@@ -665,6 +670,7 @@ async fn main() -> Result<()> {
         attachments_dir,
         inference,
         synthesis,
+        evidence_diagnostics,
         mail,
         notes,
         fs,
@@ -763,6 +769,10 @@ async fn main() -> Result<()> {
         // Phase 4H — Prompt trace debug
         .route("/debug/conversations/:id", get(debug_conversation))
         .route("/debug/traces/:id", get(debug_trace))
+        .route(
+            "/diagnostics/evidence/:turn_id/export",
+            get(evidence_diagnostic_export),
+        )
         // Skills
         .route("/skills", get(skills_list))
         .route("/skills/:name", get(skills_get))
@@ -1436,6 +1446,20 @@ async fn debug_trace(State(state): State<AppState>, Path(id): Path<String>) -> i
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         ),
+    }
+}
+
+async fn evidence_diagnostic_export(
+    State(state): State<AppState>,
+    Path(turn_id): Path<String>,
+) -> impl IntoResponse {
+    match state.evidence_diagnostics.export(&turn_id) {
+        Ok(trace) => (StatusCode::OK, Json(trace)).into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "evidence trace not found"})),
+        )
+            .into_response(),
     }
 }
 
@@ -2258,7 +2282,8 @@ async fn chat(
 
         // Forward execution events onto this request's SSE stream.
         let (ev_tx, mut ev_rx) = mpsc::channel::<serde_json::Value>(64);
-        let sink = agent_exec::EventSink::new(ev_tx);
+        let sink =
+            agent_exec::EventSink::with_diagnostics(ev_tx, state.evidence_diagnostics.clone());
         let sse_tx = tx.clone();
         let forwarder = tokio::spawn(async move {
             while let Some(v) = ev_rx.recv().await {

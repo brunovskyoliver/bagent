@@ -8,10 +8,12 @@ use url::Url;
 use super::{
     assess_claim_relevance, candidate_is_first_party, direct_web_candidate, linked_web_candidate,
     prepare_web_candidates, AppleMailEvidenceAdapter, EvidenceConflict, EvidenceContribution,
-    EvidenceIntent, EvidenceOperation, EvidencePlanner, EvidenceRequest, EvidenceResults,
-    ExecutionStatus, ExtractionStatus, FailureCode, MailEvidenceAdapter, MailHeaderEvidence,
-    OperationResult, ProviderSet, SourceAuthority, TypedWebAdapter, TypedWebEvidenceAdapter,
-    ValidationOutcome, VerificationLevel, WebCandidate, WebFetchEvidence, WebProvider,
+    EvidenceIntent, EvidenceOperation, EvidencePhase, EvidencePhaseEvent, EvidencePlanner,
+    EvidenceRequest, EvidenceResults, ExecutionStatus, ExtractionStatus, FailureCode,
+    LogicalActivityCompletion, LogicalActivityEvent, MailBodyEvidence, MailEvidenceAdapter,
+    MailHeaderEvidence, OperationResult, ProviderSet, SourceAuthority, TypedWebAdapter,
+    TypedWebEvidenceAdapter, ValidationOutcome, VerificationLevel, WebCandidate, WebFetchEvidence,
+    WebProvider, WebSearchResult,
 };
 use crate::{
     agent_exec::{EventSink, ExecOrigin, Gate, ToolKind},
@@ -56,12 +58,33 @@ pub(crate) trait EvidenceOperationGate {
     }
 
     async fn record_execution(&mut self, _operation: &EvidenceOperation) {}
+
+    async fn record_activity_started(&mut self, _operation: &EvidenceOperation) {}
+
+    async fn record_completion(
+        &mut self,
+        _operation: &EvidenceOperation,
+        _completion: LogicalActivityCompletion,
+    ) {
+    }
+
+    async fn record_phase(
+        &mut self,
+        _phase: EvidencePhase,
+        _completed: Option<u16>,
+        _total: Option<u16>,
+    ) {
+    }
 }
 
 struct ExistingPolicyGate<'a> {
     state: &'a AppState,
     sink: &'a EventSink,
     origin: &'a ExecOrigin,
+    turn_id: &'a str,
+    started_activities: HashSet<super::OperationKey>,
+    completed_activities: HashMap<super::OperationKey, LogicalActivityCompletion>,
+    duplicate_suppressions: HashMap<super::OperationKey, u8>,
 }
 
 #[async_trait]
@@ -89,12 +112,20 @@ impl EvidenceOperationGate for ExistingPolicyGate<'_> {
         .await
     }
 
+    async fn record_activity_started(&mut self, operation: &EvidenceOperation) {
+        if self.started_activities.insert(operation.key()) {
+            let _ = self
+                .sink
+                .emit(
+                    serde_json::to_value(LogicalActivityEvent::started(self.turn_id, operation))
+                        .expect("logical activity start is serializable"),
+                )
+                .await;
+        }
+    }
+
     async fn record_execution(&mut self, operation: &EvidenceOperation) {
         let tool = operation_tool_name(operation);
-        let _ = self
-            .sink
-            .emit(json!({"type": "tool_call", "tool": tool}))
-            .await;
         audit_fs(
             &self.state.db,
             "tool_call",
@@ -104,6 +135,58 @@ impl EvidenceOperationGate for ExistingPolicyGate<'_> {
                 "orchestrated": "evidence",
             }),
         );
+    }
+
+    async fn record_completion(
+        &mut self,
+        operation: &EvidenceOperation,
+        mut completion: LogicalActivityCompletion,
+    ) {
+        let key = operation.key();
+        if completion.contribution == EvidenceContribution::Duplicate {
+            let suppressed = self.duplicate_suppressions.entry(key.clone()).or_default();
+            *suppressed = suppressed.saturating_add(completion.duplicates_suppressed.max(1));
+            if let Some(original) = self.completed_activities.get(&key) {
+                completion = original.clone();
+            }
+            completion.duplicates_suppressed = *suppressed;
+        } else {
+            completion.duplicates_suppressed = completion
+                .duplicates_suppressed
+                .saturating_add(*self.duplicate_suppressions.get(&key).unwrap_or(&0));
+            self.completed_activities.insert(key, completion.clone());
+        }
+        let _ = self
+            .sink
+            .emit(
+                serde_json::to_value(LogicalActivityEvent::completed(
+                    self.turn_id,
+                    operation,
+                    &completion,
+                ))
+                .expect("logical activity completion is serializable"),
+            )
+            .await;
+    }
+
+    async fn record_phase(
+        &mut self,
+        phase: EvidencePhase,
+        completed: Option<u16>,
+        total: Option<u16>,
+    ) {
+        let _ = self
+            .sink
+            .emit(
+                serde_json::to_value(EvidencePhaseEvent::acquisition(
+                    self.turn_id,
+                    phase,
+                    completed,
+                    total,
+                ))
+                .expect("evidence phase is serializable"),
+            )
+            .await;
     }
 }
 
@@ -152,6 +235,10 @@ pub(crate) async fn execute_evidence_turn(
         state: ctx.state,
         sink: ctx.sink,
         origin: ctx.origin,
+        turn_id: &request.turn_id,
+        started_activities: HashSet::new(),
+        completed_activities: HashMap::new(),
+        duplicate_suppressions: HashMap::new(),
     };
     let outcome = if is_mail_intent(&plan.intent) {
         if let Some(connector) = ctx.state.mail.clone() {
@@ -219,6 +306,9 @@ where
                 normalized_query: query.clone(),
                 provider_set: providers.clone(),
             };
+            gate.record_phase(EvidencePhase::Searching, Some(0), Some(1))
+                .await;
+            gate.record_activity_started(&operation).await;
             let mut search = match gate.admit(&operation).await {
                 Admission::Allowed => {
                     gate.record_execution(&operation).await;
@@ -228,9 +318,30 @@ where
                 }
                 Admission::Denied => {
                     approvals_denied += 1;
-                    denied_result(&operation)
+                    let result = denied_result(&operation);
+                    gate.record_completion(&operation, completion_for_search(&result))
+                        .await;
+                    result
                 }
             };
+            if !matches!(search.execution, ExecutionStatus::Denied) {
+                gate.record_completion(&operation, completion_for_search(&search))
+                    .await;
+            }
+            gate.record_phase(
+                EvidencePhase::Searching,
+                Some(u16::from(
+                    matches!(
+                        search.contribution,
+                        EvidenceContribution::Satisfied | EvidenceContribution::Partial
+                    ) && search
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| !value.candidates.is_empty()),
+                )),
+                Some(1),
+            )
+            .await;
             let mut candidates = search
                 .value
                 .as_ref()
@@ -306,11 +417,19 @@ where
                 candidate_id: candidate.candidate_id.clone(),
             };
             if !seen_operations.insert(operation.key()) {
-                results
-                    .web_fetches
-                    .push(OperationResult::suppressed_duplicate(operation.key()));
+                let duplicate = OperationResult::suppressed_duplicate(operation.key());
+                gate.record_completion(&operation, completion_for_fetch(&duplicate))
+                    .await;
+                results.web_fetches.push(duplicate);
                 continue;
             }
+            gate.record_activity_started(&operation).await;
+            gate.record_phase(
+                EvidencePhase::Verifying,
+                Some(usable_web_source_count(&results.web_fetches)),
+                Some(required_web_source_count(intent)),
+            )
+            .await;
             match gate
                 .admit_web_fetch(&operation, &candidate.requested_url)
                 .await
@@ -328,7 +447,10 @@ where
                 }
                 Admission::Denied => {
                     approvals_denied += 1;
-                    results.web_fetches.push(denied_result(&operation));
+                    let result = denied_result(&operation);
+                    gate.record_completion(&operation, completion_for_fetch(&result))
+                        .await;
+                    results.web_fetches.push(result);
                 }
             }
         }
@@ -373,20 +495,24 @@ where
                         prior.value.as_ref().is_some_and(|prior| {
                             prior.final_url == evidence.final_url
                                 || prior.source_identity == evidence.source_identity
-                                    && matches!(
-                                        intent,
-                                        EvidenceIntent::WebFact {
-                                            verification: VerificationLevel::SingleAuthoritative,
-                                            ..
-                                        }
-                                    )
                         })
                     });
                     if duplicate_source {
                         result.contribution = EvidenceContribution::Duplicate;
                     }
                 }
+                let operation = EvidenceOperation::WebFetch {
+                    candidate_id: candidate_id.clone(),
+                };
+                gate.record_completion(&operation, completion_for_fetch(&result))
+                    .await;
                 results.web_fetches.push(result);
+                gate.record_phase(
+                    EvidencePhase::Verifying,
+                    Some(usable_web_source_count(&results.web_fetches)),
+                    Some(required_web_source_count(intent)),
+                )
+                .await;
             }
         }
     }
@@ -736,6 +862,9 @@ pub(crate) async fn execute_unavailable_mail_plan<G: EvidenceOperationGate + Sen
     plan: &super::EvidencePlan,
 ) -> EvidenceTurnOutcome {
     let operation = first_mail_operation(&plan.intent);
+    gate.record_phase(EvidencePhase::FindingMail, Some(0), Some(1))
+        .await;
+    gate.record_activity_started(&operation).await;
     let result = match gate.admit(&operation).await {
         Admission::Allowed => OperationResult::without_value(
             operation.key(),
@@ -744,6 +873,8 @@ pub(crate) async fn execute_unavailable_mail_plan<G: EvidenceOperationGate + Sen
         ),
         Admission::Denied => denied_result(&operation),
     };
+    gate.record_completion(&operation, completion_for_headers(&result))
+        .await;
     let approvals_denied = usize::from(result.execution == ExecutionStatus::Denied);
     let mut results = EvidenceResults::default();
     push_list_or_search(&operation, result, &mut results);
@@ -773,6 +904,9 @@ where
     };
 
     let first = first_mail_operation(intent);
+    gate.record_phase(EvidencePhase::FindingMail, Some(0), Some(1))
+        .await;
+    gate.record_activity_started(&first).await;
     let first_result = match gate.admit(&first).await {
         Admission::Allowed => {
             operations_executed += 1;
@@ -784,6 +918,17 @@ where
             denied_headers_result(&first)
         }
     };
+    gate.record_completion(&first, completion_for_headers(&first_result))
+        .await;
+    gate.record_phase(
+        EvidencePhase::FindingMail,
+        Some(u16::from(
+            first_result.execution == ExecutionStatus::Succeeded
+                && !first_result.value.as_ref().is_none_or(Vec::is_empty),
+        )),
+        Some(1),
+    )
+    .await;
     let headers = first_result.value.clone().unwrap_or_default();
     push_list_or_search(&first, first_result, &mut results);
 
@@ -796,10 +941,11 @@ where
         _ => 0,
     };
     let mut distinct_ids = HashSet::new();
-    let mut body_attempts = 0usize;
+    let mut distinct_reads_started = 0usize;
+    let mut attempts_used = 0usize;
     for header in headers {
-        if body_attempts >= usize::from(needs_bodies)
-            || body_attempts >= usize::from(plan.budget.mail_body_attempts)
+        if distinct_reads_started >= usize::from(needs_bodies)
+            || attempts_used >= usize::from(plan.budget.mail_body_attempts)
         {
             break;
         }
@@ -810,12 +956,21 @@ where
             unreachable!()
         };
         if !distinct_ids.insert(message_id.clone()) {
-            results
-                .mail_bodies
-                .push(OperationResult::suppressed_duplicate(operation.key()));
+            let duplicate = OperationResult::suppressed_duplicate(operation.key());
+            gate.record_completion(&operation, completion_for_body(&duplicate))
+                .await;
+            results.mail_bodies.push(duplicate);
             continue;
         }
-        body_attempts += 1;
+        distinct_reads_started += 1;
+        gate.record_activity_started(&operation).await;
+        gate.record_phase(
+            EvidencePhase::Reading,
+            Some(satisfied_mail_body_count(&results.mail_bodies)),
+            Some(u16::from(needs_bodies)),
+        )
+        .await;
+        attempts_used += 1;
         let mut result = match gate.admit(&operation).await {
             Admission::Allowed => {
                 operations_executed += 1;
@@ -833,13 +988,13 @@ where
             }
         };
         let remaining_budget =
-            usize::from(plan.budget.mail_body_attempts).saturating_sub(body_attempts);
+            usize::from(plan.budget.mail_body_attempts).saturating_sub(attempts_used);
         if result.retry_permitted(remaining_budget.min(usize::from(u8::MAX)) as u8) {
             match gate.admit(&operation).await {
                 Admission::Allowed => {
                     gate.record_execution(&operation).await;
                     operations_executed += 1;
-                    body_attempts += 1;
+                    attempts_used += 1;
                     let prior_attempts = result.attempts;
                     let prior_duration = result.duration_ms;
                     let mut retry = adapter
@@ -860,13 +1015,132 @@ where
                 }
             }
         }
+        gate.record_completion(&operation, completion_for_body(&result))
+            .await;
         results.mail_bodies.push(result);
+        gate.record_phase(
+            EvidencePhase::Reading,
+            Some(satisfied_mail_body_count(&results.mail_bodies)),
+            Some(u16::from(needs_bodies)),
+        )
+        .await;
     }
 
     EvidenceTurnOutcome {
         validation: super::EvidenceValidator::validate(turn_id, plan, results),
         operations_executed,
         approvals_denied,
+    }
+}
+
+fn completion_for_headers(
+    result: &OperationResult<Vec<MailHeaderEvidence>>,
+) -> LogicalActivityCompletion {
+    LogicalActivityCompletion {
+        execution: result.execution.clone(),
+        contribution: result.contribution,
+        evidence_count: contribution_count(
+            result.contribution,
+            result.value.as_ref().map_or(0, Vec::len),
+        ),
+        source_domains: Vec::new(),
+        duration_ms: result.duration_ms,
+        attempt_count: result.attempts,
+        duplicates_suppressed: u8::from(result.contribution == EvidenceContribution::Duplicate),
+    }
+}
+
+fn completion_for_body(result: &OperationResult<MailBodyEvidence>) -> LogicalActivityCompletion {
+    LogicalActivityCompletion {
+        execution: result.execution.clone(),
+        contribution: result.contribution,
+        evidence_count: contribution_count(
+            result.contribution,
+            usize::from(result.value.is_some()),
+        ),
+        source_domains: Vec::new(),
+        duration_ms: result.duration_ms,
+        attempt_count: result.attempts,
+        duplicates_suppressed: u8::from(result.contribution == EvidenceContribution::Duplicate),
+    }
+}
+
+fn completion_for_search(result: &OperationResult<WebSearchResult>) -> LogicalActivityCompletion {
+    LogicalActivityCompletion {
+        execution: result.execution.clone(),
+        contribution: result.contribution,
+        // Search candidates are discovery inputs. Only fetched, validated
+        // sources contribute evidence progress.
+        evidence_count: 0,
+        source_domains: Vec::new(),
+        duration_ms: result.duration_ms,
+        attempt_count: result.attempts,
+        duplicates_suppressed: u8::from(result.contribution == EvidenceContribution::Duplicate),
+    }
+}
+
+fn completion_for_fetch(result: &OperationResult<WebFetchEvidence>) -> LogicalActivityCompletion {
+    let source_domains = result
+        .value
+        .as_ref()
+        .and_then(|value| value.final_url.host_str())
+        .map(|domain| vec![domain.to_string()])
+        .unwrap_or_default();
+    LogicalActivityCompletion {
+        execution: result.execution.clone(),
+        contribution: result.contribution,
+        evidence_count: contribution_count(
+            result.contribution,
+            usize::from(result.value.is_some()),
+        ),
+        source_domains,
+        duration_ms: result.duration_ms,
+        attempt_count: result.attempts,
+        duplicates_suppressed: u8::from(result.contribution == EvidenceContribution::Duplicate),
+    }
+}
+
+fn contribution_count(contribution: EvidenceContribution, count: usize) -> u16 {
+    if matches!(
+        contribution,
+        EvidenceContribution::Satisfied | EvidenceContribution::Partial
+    ) {
+        count.min(usize::from(u16::MAX)) as u16
+    } else {
+        0
+    }
+}
+
+fn satisfied_mail_body_count(results: &[OperationResult<MailBodyEvidence>]) -> u16 {
+    results
+        .iter()
+        .map(|result| completion_for_body(result).evidence_count)
+        .sum()
+}
+
+fn usable_web_source_count(results: &[OperationResult<WebFetchEvidence>]) -> u16 {
+    results
+        .iter()
+        .filter(|result| {
+            matches!(
+                result.contribution,
+                EvidenceContribution::Satisfied | EvidenceContribution::Partial
+            )
+        })
+        .filter_map(|result| result.value.as_ref())
+        .map(|evidence| &evidence.source_identity)
+        .collect::<HashSet<_>>()
+        .len()
+        .min(usize::from(u16::MAX)) as u16
+}
+
+fn required_web_source_count(intent: &EvidenceIntent) -> u16 {
+    match intent {
+        EvidenceIntent::WebFact {
+            verification: VerificationLevel::Corroborated,
+            ..
+        } => 2,
+        _ => 1,
     }
 }
 
@@ -1026,6 +1300,77 @@ mod tests {
         reads_seen: usize,
     }
 
+    struct EventRecordingGate {
+        events: Vec<serde_json::Value>,
+        started: HashSet<super::super::OperationKey>,
+        admission: Admission,
+    }
+
+    #[async_trait]
+    impl EvidenceOperationGate for EventRecordingGate {
+        async fn admit(&mut self, _operation: &EvidenceOperation) -> Admission {
+            self.admission
+        }
+
+        async fn record_activity_started(&mut self, operation: &EvidenceOperation) {
+            if self.started.insert(operation.key()) {
+                self.events.push(
+                    serde_json::to_value(LogicalActivityEvent::started("turn-events", operation))
+                        .unwrap(),
+                );
+            }
+        }
+
+        async fn record_completion(
+            &mut self,
+            operation: &EvidenceOperation,
+            completion: LogicalActivityCompletion,
+        ) {
+            self.events.push(
+                serde_json::to_value(LogicalActivityEvent::completed(
+                    "turn-events",
+                    operation,
+                    &completion,
+                ))
+                .unwrap(),
+            );
+        }
+
+        async fn record_phase(
+            &mut self,
+            phase: EvidencePhase,
+            completed: Option<u16>,
+            total: Option<u16>,
+        ) {
+            self.events.push(
+                serde_json::to_value(EvidencePhaseEvent::acquisition(
+                    "turn-events",
+                    phase,
+                    completed,
+                    total,
+                ))
+                .unwrap(),
+            );
+        }
+    }
+
+    impl EventRecordingGate {
+        fn new() -> Self {
+            Self {
+                events: Vec::new(),
+                started: HashSet::new(),
+                admission: Admission::Allowed,
+            }
+        }
+
+        fn denying() -> Self {
+            Self {
+                admission: Admission::Denied,
+                ..Self::new()
+            }
+        }
+    }
+
     #[async_trait]
     impl EvidenceOperationGate for RecordingGate {
         async fn admit(&mut self, operation: &EvidenceOperation) -> Admission {
@@ -1078,6 +1423,184 @@ mod tests {
                 pair[1].strip_prefix("execute:")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn complete_mail_events_report_evidence_progress_not_call_count() {
+        let mut adapter = crate::evidence::FakeMailAdapter::with_three_readable_messages();
+        let mut gate = EventRecordingGate::new();
+        let plan = EvidencePlanner::plan(EvidenceIntent::MailLatestContent {
+            count: 3,
+            requested_count: 3,
+            unread_only: false,
+        });
+
+        let outcome = execute_mail_plan(&mut adapter, &mut gate, "turn-events", &plan).await;
+
+        assert!(matches!(
+            outcome.validation,
+            ValidationOutcome::Bundle(bundle) if bundle.acquired.mail_bodies == 3
+        ));
+        let final_reading = gate
+            .events
+            .iter()
+            .rev()
+            .find(|event| event["phase"] == "reading")
+            .unwrap();
+        assert_eq!(final_reading["completed"], 3);
+        assert_eq!(final_reading["total"], 3);
+        assert_eq!(
+            gate.events
+                .iter()
+                .filter(|event| event["type"] == "logical_activity_started")
+                .count(),
+            4
+        );
+        assert_eq!(
+            gate.events
+                .iter()
+                .filter(|event| {
+                    event["type"] == "logical_activity_completed"
+                        && event["evidence_count"].as_u64().unwrap_or_default() > 0
+                })
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_operation_has_a_correlated_started_and_completed_activity() {
+        let mut adapter = crate::evidence::FakeMailAdapter::with_three_readable_messages();
+        let mut gate = EventRecordingGate::denying();
+        let plan = EvidencePlanner::plan(EvidenceIntent::MailLatestHeaders {
+            count: 3,
+            unread_only: false,
+        });
+
+        let _ = execute_mail_plan(&mut adapter, &mut gate, "turn-events", &plan).await;
+
+        let activities = gate
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event["type"].as_str(),
+                    Some("logical_activity_started" | "logical_activity_completed")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities[0]["activity_id"], activities[1]["activity_id"]);
+        assert_eq!(activities[1]["execution_status"], "denied");
+        assert_eq!(activities[1]["evidence_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_suppression_is_grouped_and_does_not_increase_read_progress() {
+        let mut adapter = crate::evidence::FakeMailAdapter::with_duplicate_identifier();
+        let mut gate = EventRecordingGate::new();
+        let plan = EvidencePlanner::plan(EvidenceIntent::MailLatestContent {
+            count: 3,
+            requested_count: 3,
+            unread_only: false,
+        });
+
+        let _ = execute_mail_plan(&mut adapter, &mut gate, "turn-events", &plan).await;
+
+        let duplicate = gate
+            .events
+            .iter()
+            .find(|event| event["duplicates_suppressed"] == 1)
+            .unwrap();
+        assert_eq!(duplicate["evidence_count"], 0);
+        let final_reading = gate
+            .events
+            .iter()
+            .rev()
+            .find(|event| event["phase"] == "reading")
+            .unwrap();
+        assert_eq!(final_reading["completed"], 2);
+        assert_eq!(final_reading["total"], 3);
+    }
+
+    #[tokio::test]
+    async fn transient_retry_emits_one_started_activity_and_one_grouped_completion() {
+        struct RetryOnce {
+            inner: crate::evidence::FakeMailAdapter,
+            failed: bool,
+        }
+        #[async_trait]
+        impl MailEvidenceAdapter for RetryOnce {
+            async fn list(
+                &mut self,
+                limit: u8,
+                unread_only: bool,
+            ) -> OperationResult<Vec<MailHeaderEvidence>> {
+                self.inner.list(limit, unread_only).await
+            }
+
+            async fn search(
+                &mut self,
+                query: &str,
+                limit: u8,
+            ) -> OperationResult<Vec<MailHeaderEvidence>> {
+                self.inner.search(query, limit).await
+            }
+
+            async fn read(
+                &mut self,
+                message_id: &ValidatedMailId,
+            ) -> OperationResult<MailBodyEvidence> {
+                if !self.failed {
+                    self.failed = true;
+                    return OperationResult::without_value(
+                        EvidenceOperation::MailRead {
+                            message_id: message_id.clone(),
+                        }
+                        .key(),
+                        ExecutionStatus::TimedOut,
+                        EvidenceContribution::Empty,
+                    );
+                }
+                self.inner.read(message_id).await
+            }
+        }
+
+        let mut adapter = RetryOnce {
+            inner: crate::evidence::FakeMailAdapter::with_three_readable_messages(),
+            failed: false,
+        };
+        let mut gate = EventRecordingGate::new();
+        let plan = EvidencePlanner::plan(EvidenceIntent::MailLatestContent {
+            count: 2,
+            requested_count: 2,
+            unread_only: false,
+        });
+
+        let _ = execute_mail_plan(&mut adapter, &mut gate, "turn-events", &plan).await;
+
+        let read_completion = gate
+            .events
+            .iter()
+            .find(|event| {
+                event["type"] == "logical_activity_completed"
+                    && event["normalized_operation"] == "mail.read"
+                    && event["retries"] == 1
+            })
+            .unwrap();
+        let retried_activity_id = &read_completion["activity_id"];
+        let read_starts = gate
+            .events
+            .iter()
+            .filter(|event| {
+                event["type"] == "logical_activity_started"
+                    && event["activity_id"] == *retried_activity_id
+            })
+            .count();
+        assert_eq!(read_starts, 1);
+        assert_eq!(read_completion["attempt_count"], 2);
+        assert_eq!(read_completion["retries"], 1);
+        assert_eq!(read_completion["evidence_count"], 1);
     }
 
     #[tokio::test]
@@ -1265,13 +1788,13 @@ mod tests {
 
         let outcome = execute_mail_plan(&mut adapter, &mut gate, "turn-retry", &plan).await;
 
-        assert_eq!(adapter.read_calls, 2);
-        assert_eq!(outcome.operations_executed, 3);
+        assert_eq!(adapter.read_calls, 3);
+        assert_eq!(outcome.operations_executed, 4);
         assert!(matches!(
             outcome.validation,
             ValidationOutcome::Bundle(bundle)
-                if bundle.completeness == Completeness::Partial
-                    && bundle.acquired.mail_bodies == 1
+                if bundle.completeness == Completeness::Complete
+                    && bundle.acquired.mail_bodies == 2
         ));
         assert_eq!(
             log.lock()
@@ -1279,7 +1802,7 @@ mod tests {
                 .iter()
                 .filter(|entry| entry.starts_with("gate:mail_read:"))
                 .count(),
-            2
+            3
         );
     }
 

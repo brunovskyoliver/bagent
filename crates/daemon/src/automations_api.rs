@@ -622,6 +622,19 @@ use crate::agent_exec::{self, EventSink, ExecError, ExecOrigin, ExecOutcome};
 use bagent_automations::AutomationExecutionContext;
 use basert_connector::Message;
 
+fn is_evidence_event(event: &serde_json::Value) -> bool {
+    matches!(
+        event.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "evidence_phase"
+                | "logical_activity_started"
+                | "logical_activity_completed"
+                | "evidence_validation"
+                | "evidence_outcome"
+        )
+    )
+}
+
 /// Atomically claim execution: exactly one `running` row per automation.
 /// Returns the claimed run or `ActiveRun` when one is already in flight.
 /// Single short statement under the DB lock — released before any model work.
@@ -824,11 +837,18 @@ pub(crate) async fn execute_automation_run(
 
     let tools = agent_exec::build_tools(&state, false).await;
 
-    // Automations have no attached client; drain events (issue #7 forwards
-    // them onto the daemon broadcast).
+    // Automations have no attached chat stream. Evidence events still use the
+    // same contract and are forwarded onto the daemon-wide event stream.
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
-    let sink = EventSink::new(ev_tx);
-    let drain = tokio::spawn(async move { while ev_rx.recv().await.is_some() {} });
+    let sink = EventSink::with_diagnostics(ev_tx, state.evidence_diagnostics.clone());
+    let event_state = state.clone();
+    let drain = tokio::spawn(async move {
+        while let Some(event) = ev_rx.recv().await {
+            if is_evidence_event(&event) {
+                event_state.publish_event(event);
+            }
+        }
+    });
 
     let result = agent_exec::run_agent_loop(
         &state,
@@ -927,6 +947,21 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 17, 10, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn automation_stream_forwards_only_the_shared_evidence_contract() {
+        for event_type in [
+            "evidence_phase",
+            "logical_activity_started",
+            "logical_activity_completed",
+            "evidence_validation",
+            "evidence_outcome",
+        ] {
+            assert!(is_evidence_event(&json!({"type": event_type})));
+        }
+        assert!(!is_evidence_event(&json!({"type": "token"})));
+        assert!(!is_evidence_event(&json!({"type": "activity_completed"})));
     }
 
     fn once_at(h: u32) -> AutomationSchedule {

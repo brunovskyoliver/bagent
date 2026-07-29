@@ -2,6 +2,8 @@
 
 mod adapters;
 mod classifier;
+mod diagnostics;
+mod events;
 mod orchestrator;
 mod planner;
 mod synthesis;
@@ -11,6 +13,8 @@ mod web;
 
 pub(crate) use adapters::*;
 pub(crate) use classifier::*;
+pub(crate) use diagnostics::*;
+pub(crate) use events::*;
 pub(crate) use orchestrator::*;
 pub(crate) use planner::*;
 pub(crate) use synthesis::*;

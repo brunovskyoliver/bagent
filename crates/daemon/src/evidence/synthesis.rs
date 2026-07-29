@@ -189,8 +189,8 @@ impl MemoryPressureSignal for SystemMemoryPressureSignal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SynthesisPhase {
-    LoadingModel,
-    Synthesizing,
+    LoadingSynthesisModel,
+    PreparingAnswer,
     Repairing,
     FallingBack,
     Validating,
@@ -340,7 +340,7 @@ impl ModelRuntimeManager {
             observer
                 .record(phase_event(
                     Some(&self.config.preferred_model),
-                    SynthesisPhase::LoadingModel,
+                    SynthesisPhase::LoadingSynthesisModel,
                     elapsed_ms(self.clock.monotonic(), started),
                     false,
                     false,
@@ -357,7 +357,7 @@ impl ModelRuntimeManager {
                 observer
                     .record(phase_event(
                         Some(&self.config.preferred_model),
-                        SynthesisPhase::LoadingModel,
+                        SynthesisPhase::LoadingSynthesisModel,
                         elapsed_ms(self.clock.monotonic(), started),
                         false,
                         false,
@@ -381,7 +381,7 @@ impl ModelRuntimeManager {
             observer
                 .record(phase_event(
                     Some(&self.config.preferred_model),
-                    SynthesisPhase::LoadingModel,
+                    SynthesisPhase::LoadingSynthesisModel,
                     0,
                     false,
                     false,
@@ -402,7 +402,7 @@ impl ModelRuntimeManager {
                     observer
                         .record(phase_event(
                             Some(&self.config.preferred_model),
-                            SynthesisPhase::LoadingModel,
+                            SynthesisPhase::LoadingSynthesisModel,
                             elapsed_ms(self.clock.monotonic(), started),
                             true,
                             false,
@@ -416,7 +416,7 @@ impl ModelRuntimeManager {
                     observer
                         .record(phase_event(
                             Some(&self.config.preferred_model),
-                            SynthesisPhase::LoadingModel,
+                            SynthesisPhase::LoadingSynthesisModel,
                             elapsed_ms(self.clock.monotonic(), started),
                             false,
                             false,
@@ -434,7 +434,7 @@ impl ModelRuntimeManager {
             observer
                 .record(phase_event(
                     Some(&self.config.preferred_model),
-                    SynthesisPhase::LoadingModel,
+                    SynthesisPhase::LoadingSynthesisModel,
                     elapsed_ms(self.clock.monotonic(), started),
                     false,
                     false,
@@ -618,7 +618,7 @@ impl SynthesisService {
         };
         let preferred = self
             .complete_with_phase(
-                SynthesisPhase::Synthesizing,
+                SynthesisPhase::PreparingAnswer,
                 &self.config.preferred_model,
                 initial.clone(),
                 contract,
@@ -1685,8 +1685,8 @@ mod tests {
         let serialized = serde_json::to_string(&*observer.0.lock().await).unwrap();
         assert!(!serialized.contains("EVIDENCE_BUNDLE"));
         assert!(!serialized.contains("bounded"));
-        assert!(serialized.contains("loading_model"));
-        assert!(serialized.contains("synthesizing"));
+        assert!(serialized.contains("loading_synthesis_model"));
+        assert!(serialized.contains("preparing_answer"));
         assert!(serialized.contains("validating"));
         assert!(serialized.contains("\"turn_id\":\"test-turn\""));
     }

@@ -135,7 +135,7 @@ fn planner_sets_exact_requirements_and_hard_budgets() {
         ]
     );
     assert_eq!(plan.budget.mail_list_attempts, 1);
-    assert_eq!(plan.budget.mail_body_attempts, 3);
+    assert_eq!(plan.budget.mail_body_attempts, 6);
     assert_eq!(plan.budget.web_search_attempts, 0);
     assert_eq!(plan.budget.web_fetch_attempts, 0);
 

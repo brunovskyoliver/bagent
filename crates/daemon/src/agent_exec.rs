@@ -104,16 +104,53 @@ impl ExecOrigin {
 /// Pluggable event sink. Chat forwards to the SSE stream; automations forward
 /// to the daemon event broadcast (or discard).
 #[derive(Clone)]
-pub(crate) struct EventSink(mpsc::Sender<serde_json::Value>);
+pub(crate) struct EventSink {
+    tx: mpsc::Sender<serde_json::Value>,
+    diagnostics: Option<std::sync::Arc<crate::evidence::DiagnosticRecorder>>,
+    terminal_evidence_turns: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
 
 impl EventSink {
+    #[cfg(test)]
     pub(crate) fn new(tx: mpsc::Sender<serde_json::Value>) -> Self {
-        Self(tx)
+        Self {
+            tx,
+            diagnostics: None,
+            terminal_evidence_turns: Default::default(),
+        }
+    }
+
+    pub(crate) fn with_diagnostics(
+        tx: mpsc::Sender<serde_json::Value>,
+        diagnostics: std::sync::Arc<crate::evidence::DiagnosticRecorder>,
+    ) -> Self {
+        Self {
+            tx,
+            diagnostics: Some(diagnostics),
+            terminal_evidence_turns: Default::default(),
+        }
     }
 
     /// Returns false when the receiver is gone (client disconnected).
     pub(crate) async fn emit(&self, v: serde_json::Value) -> bool {
-        self.0.send(v).await.is_ok()
+        if v.get("type").and_then(serde_json::Value::as_str) == Some("evidence_outcome") {
+            let Some(turn_id) = v.get("turn_id").and_then(serde_json::Value::as_str) else {
+                return true;
+            };
+            if !self
+                .terminal_evidence_turns
+                .lock()
+                .expect("terminal evidence turn lock")
+                .insert(turn_id.to_string())
+            {
+                tracing::warn!(turn_id, "suppressed duplicate terminal evidence outcome");
+                return true;
+            }
+        }
+        if let Some(recorder) = &self.diagnostics {
+            recorder.record(&v);
+        }
+        self.tx.send(v).await.is_ok()
     }
 }
 
@@ -135,8 +172,21 @@ impl SynthesisObserver for EventSinkSynthesisObserver {
             failure_reason = event.failure_reason.as_deref().unwrap_or("none"),
             "evidence synthesis phase"
         );
-        let mut payload = serde_json::to_value(event).expect("phase event is serializable");
-        payload["type"] = json!("evidence_phase");
+        let phase = event.phase.into();
+        let payload = serde_json::to_value(crate::evidence::EvidencePhaseEvent {
+            event_type: "evidence_phase".to_string(),
+            turn_id: event.turn_id,
+            phase,
+            completed: None,
+            total: None,
+            model_id: event.model_id,
+            duration_ms: event.duration_ms,
+            timed_out: event.timed_out,
+            fallback: event.fallback,
+            repair: event.repair,
+            failure_reason: event.failure_reason,
+        })
+        .expect("phase event is serializable");
         let _ = self.sink.emit(payload).await;
     }
 }
@@ -1905,13 +1955,15 @@ async fn run_shared_synthesis(
     contract: &dyn SynthesisContract,
     tool_calls_used: usize,
     approvals_denied: usize,
+    terminal_outcome: crate::evidence::EvidenceOutcomeEvent,
 ) -> Result<ExecOutcome, ExecError> {
     let observer = EventSinkSynthesisObserver { sink: sink.clone() };
     let outcome = service.synthesize(contract, &observer).await;
-    if !sink
+    let delivered = sink
         .emit(json!({"type":"token","content":&outcome.text}))
-        .await
-    {
+        .await;
+    emit_evidence_outcome(sink, terminal_outcome).await;
+    if !delivered {
         return Err(ExecError::SinkClosed);
     }
     Ok(ExecOutcome {
@@ -1919,6 +1971,50 @@ async fn run_shared_synthesis(
         tool_calls_used,
         approvals_denied,
     })
+}
+
+async fn emit_evidence_outcome(sink: &EventSink, outcome: crate::evidence::EvidenceOutcomeEvent) {
+    let payload = serde_json::to_value(outcome).expect("evidence outcome is serializable");
+    let _ = sink.emit(payload).await;
+}
+
+fn evidence_validation_event(turn_id: &str, validation: &ValidationOutcome) -> serde_json::Value {
+    match validation {
+        ValidationOutcome::Bundle(bundle) => json!({
+            "type": "evidence_validation",
+            "turn_id": turn_id,
+            "decision": match bundle.completeness {
+                Completeness::Complete => "bundle_complete",
+                Completeness::Partial => "bundle_partial",
+            },
+            "eligible": true,
+            "missing_count": bundle.missing.iter()
+                .map(|shortfall| u64::from(shortfall.missing_count))
+                .sum::<u64>(),
+            "conflict_count": bundle.conflicts.len(),
+            "exclusion_count": bundle.exclusions.len(),
+        }),
+        ValidationOutcome::Recovery(recovery) => json!({
+            "type": "evidence_validation",
+            "turn_id": turn_id,
+            "decision": "recovery",
+            "eligible": false,
+            "missing_count": recovery.missing.iter()
+                .map(|shortfall| u64::from(shortfall.missing_count))
+                .sum::<u64>(),
+            "conflict_count": 0,
+            "exclusion_count": recovery.exclusions.len(),
+        }),
+        ValidationOutcome::Clarification { .. } => json!({
+            "type": "evidence_validation",
+            "turn_id": turn_id,
+            "decision": "clarification",
+            "eligible": false,
+            "missing_count": 0,
+            "conflict_count": 0,
+            "exclusion_count": 0,
+        }),
+    }
 }
 
 fn mail_tool_followup_guidance(
@@ -2014,6 +2110,7 @@ pub(crate) async fn run_agent_loop(
     let mut mail_access_denied = false;
     if let Some(RoutedEvidenceTurn { request, intent }) = routed_evidence_turn {
         let evidence_kind = evidence_kind(&intent);
+        let evidence_turn_id = request.turn_id.clone();
         let evidence = execute_evidence_turn(
             EvidenceContext {
                 state,
@@ -2037,14 +2134,24 @@ pub(crate) async fn run_agent_loop(
                 "unattended": origin.unattended(),
             }),
         );
+        let _ = sink
+            .emit(evidence_validation_event(
+                &evidence_turn_id,
+                &evidence.validation,
+            ))
+            .await;
+        let terminal_outcome =
+            crate::evidence::EvidenceOutcomeEvent::from_validation(&evidence.validation)
+                .with_turn_id(&evidence_turn_id);
         match evidence.validation {
             ValidationOutcome::Bundle(bundle) => {
                 if matches!(bundle.intent, EvidenceIntent::MailLatestHeaders { .. }) {
                     let final_text = render_mail_header_listing(&bundle);
-                    if !sink
+                    let delivered = sink
                         .emit(json!({"type":"token","content":&final_text}))
-                        .await
-                    {
+                        .await;
+                    emit_evidence_outcome(sink, terminal_outcome).await;
+                    if !delivered {
                         return Err(ExecError::SinkClosed);
                     }
                     return Ok(ExecOutcome {
@@ -2067,6 +2174,7 @@ pub(crate) async fn run_agent_loop(
                         &contract,
                         tool_calls_used,
                         approvals_denied,
+                        terminal_outcome,
                     )
                     .await;
                 }
@@ -2080,15 +2188,17 @@ pub(crate) async fn run_agent_loop(
                     &contract,
                     tool_calls_used,
                     approvals_denied,
+                    terminal_outcome,
                 )
                 .await;
             }
             ValidationOutcome::Recovery(recovery) => {
                 let final_text = recovery.message;
-                if !sink
+                let delivered = sink
                     .emit(json!({"type":"token","content":&final_text}))
-                    .await
-                {
+                    .await;
+                emit_evidence_outcome(sink, terminal_outcome).await;
+                if !delivered {
                     return Err(ExecError::SinkClosed);
                 }
                 return Ok(ExecOutcome {
@@ -2098,7 +2208,9 @@ pub(crate) async fn run_agent_loop(
                 });
             }
             ValidationOutcome::Clarification { prompt, .. } => {
-                if !sink.emit(json!({"type":"token","content":&prompt})).await {
+                let delivered = sink.emit(json!({"type":"token","content":&prompt})).await;
+                emit_evidence_outcome(sink, terminal_outcome).await;
+                if !delivered {
                     return Err(ExecError::SinkClosed);
                 }
                 return Ok(ExecOutcome {
@@ -4724,5 +4836,27 @@ mod tests {
         assert!(!should_publish_model_delta_live(3, 5, 2, 8));
         assert!(should_publish_model_delta_live(5, 5, 2, 8));
         assert!(should_publish_model_delta_live(2, 5, 8, 8));
+    }
+
+    #[tokio::test]
+    async fn event_sink_emits_exactly_one_terminal_outcome_per_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let sink = EventSink::new(tx);
+        let outcome = json!({
+            "type": "evidence_outcome",
+            "turn_id": "turn-terminal",
+            "state": "verified",
+            "kind": "mail",
+            "acquired": 3,
+            "requested": 3,
+            "source_count": 0,
+            "message": "Read 3 of 3 emails",
+        });
+        assert!(sink.emit(outcome.clone()).await);
+        assert!(sink.emit(outcome).await);
+        drop(sink);
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "evidence_outcome");
     }
 }

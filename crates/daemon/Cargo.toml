@@ -44,3 +44,7 @@ base64      = "0.22"
 notify      = { version = "6", features = ["macos_fsevent"] }
 async-trait = "0.1"
 scraper     = "0.27"
+
+[dev-dependencies]
+filetime = "0.2"
+tempfile = "3"

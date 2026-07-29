@@ -30,7 +30,10 @@ impl EvidencePlanner {
                 ],
                 EvidenceBudget {
                     mail_list_attempts: 1,
-                    mail_body_attempts: (*count).min(10),
+                    // Reserve one retry per requested body where the global
+                    // ten-attempt cap permits it. A retry must not consume the
+                    // slot for the next distinct message.
+                    mail_body_attempts: count.saturating_mul(2).min(10),
                     web_search_attempts: 0,
                     web_fetch_attempts: 0,
                     max_parallel_fetches: 0,
@@ -43,7 +46,7 @@ impl EvidencePlanner {
                 }],
                 EvidenceBudget {
                     mail_list_attempts: 1,
-                    mail_body_attempts: u8::from(*needs_content),
+                    mail_body_attempts: u8::from(*needs_content).saturating_mul(2),
                     web_search_attempts: 0,
                     web_fetch_attempts: 0,
                     max_parallel_fetches: 0,

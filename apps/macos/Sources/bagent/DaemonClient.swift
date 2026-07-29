@@ -282,6 +282,81 @@ struct DaemonClient: Sendable {
         let durationMs: Int?
     }
 
+    enum EvidencePhase: String, Sendable, Equatable {
+        case findingMail = "finding_mail"
+        case reading
+        case searching
+        case verifying
+        case loadingSynthesisModel = "loading_synthesis_model"
+        case preparingAnswer = "preparing_answer"
+        case repairing
+        case fallingBack = "falling_back"
+        case validating
+        case deterministicRendering = "deterministic_rendering"
+    }
+
+    enum EvidenceExecutionStatus: String, Sendable, Equatable {
+        case inProgress = "in_progress"
+        case succeeded
+        case failed
+        case denied
+        case timedOut = "timed_out"
+    }
+
+    enum EvidenceContribution: String, Sendable, Equatable {
+        case satisfied
+        case partial
+        case empty
+        case duplicate
+        case irrelevant
+    }
+
+    enum EvidenceOutcomeState: String, Sendable, Equatable {
+        case verified
+        case partial
+        case empty
+        case unavailable
+        case denied
+        case verificationShortfall = "verification_shortfall"
+    }
+
+    enum EvidenceOutcomeKind: String, Sendable, Equatable {
+        case mail
+        case web
+    }
+
+    struct EvidencePhaseEvent: Sendable, Equatable {
+        let turnId: String
+        let phase: EvidencePhase
+        let completed: Int?
+        let total: Int?
+    }
+
+    struct LogicalActivityEvent: Sendable, Equatable {
+        let turnId: String
+        let activityId: String
+        let normalizedOperation: String
+        let executionStatus: EvidenceExecutionStatus
+        let contribution: EvidenceContribution
+        let evidenceCount: Int
+        let sourceDomains: [String]
+        let durationMs: Int
+        let attemptCount: Int
+        let retries: Int
+        let duplicatesSuppressed: Int
+        let failureReason: String?
+    }
+
+    struct EvidenceOutcomeEvent: Sendable, Equatable {
+        let turnId: String
+        let state: EvidenceOutcomeState
+        let kind: EvidenceOutcomeKind
+        let acquired: Int
+        let requested: Int
+        let sourceCount: Int
+        let message: String
+    }
+
     struct TranscriptSource: Identifiable, Sendable, Equatable {
         let id: String
         let title: String
@@ -293,6 +368,10 @@ struct DaemonClient: Sendable {
         case token(String)
         case activityStarted(ActivityEvent)
         case activityCompleted(ActivityEvent)
+        case evidencePhase(EvidencePhaseEvent)
+        case logicalActivityStarted(LogicalActivityEvent)
+        case logicalActivityCompleted(LogicalActivityEvent)
+        case evidenceOutcome(EvidenceOutcomeEvent)
         case sourceDiscovered(TranscriptSource)
         case debugTrace(DebugTraceSummary)
         case memorySaved(id: String)
@@ -313,6 +392,67 @@ struct DaemonClient: Sendable {
         /// Phase 11: WhatsApp chat found.
         case whatsappFound(WhatsappRef)
         case done(sessionId: String?)
+    }
+
+    static func evidenceChatEvent(from event: SSEEvent) -> ChatEvent? {
+        switch event.type {
+        case "evidence_phase":
+            guard let turnId = event.turn_id,
+                  let rawPhase = event.phase,
+                  let phase = EvidencePhase(rawValue: rawPhase)
+            else { return nil }
+            return .evidencePhase(.init(
+                turnId: turnId,
+                phase: phase,
+                completed: event.completed,
+                total: event.total
+            ))
+        case "logical_activity_started", "logical_activity_completed":
+            guard let turnId = event.turn_id,
+                  let activityId = event.activity_id,
+                  let operation = event.normalized_operation,
+                  let rawExecution = event.execution_status,
+                  let execution = EvidenceExecutionStatus(rawValue: rawExecution),
+                  let rawContribution = event.contribution,
+                  let contribution = EvidenceContribution(rawValue: rawContribution)
+            else { return nil }
+            let activity = LogicalActivityEvent(
+                turnId: turnId,
+                activityId: activityId,
+                normalizedOperation: operation,
+                executionStatus: execution,
+                contribution: contribution,
+                evidenceCount: event.evidence_count ?? 0,
+                sourceDomains: event.source_domains ?? [],
+                durationMs: event.duration_ms ?? 0,
+                attemptCount: event.attempt_count ?? 0,
+                retries: event.retries ?? 0,
+                duplicatesSuppressed: event.duplicates_suppressed ?? 0,
+                failureReason: event.failure_reason
+            )
+            return event.type == "logical_activity_started"
+                ? .logicalActivityStarted(activity)
+                : .logicalActivityCompleted(activity)
+        case "evidence_outcome":
+            guard let turnId = event.turn_id,
+                  let rawState = event.state,
+                  let state = EvidenceOutcomeState(rawValue: rawState),
+                  let rawKind = event.outcome_kind,
+                  let kind = EvidenceOutcomeKind(rawValue: rawKind),
+                  let message = event.message
+            else { return nil }
+            return .evidenceOutcome(.init(
+                turnId: turnId,
+                state: state,
+                kind: kind,
+                acquired: event.acquired ?? 0,
+                requested: event.requested ?? 0,
+                sourceCount: event.source_count ?? 0,
+                message: message
+            ))
+        default:
+            return nil
+        }
     }
 
     /// Stable reference to a found Odoo record. Analogue of `MailRef` / `FileRef`.
@@ -478,6 +618,11 @@ struct DaemonClient: Sendable {
                         guard let data = json.data(using: .utf8),
                               let event = try? JSONDecoder().decode(SSEEvent.self, from: data)
                         else { continue }
+
+                        if let evidenceEvent = Self.evidenceChatEvent(from: event) {
+                            continuation.yield(evidenceEvent)
+                            continue
+                        }
 
                         switch event.type {
                         case "debug_trace":
@@ -1320,6 +1465,18 @@ struct DaemonClient: Sendable {
         return prettyJSONString(data)
     }
 
+    func evidenceDiagnosticExport(turnId: String) async throws -> String {
+        let c = try await loadCreds()
+        let encoded = turnId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? turnId
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/diagnostics/evidence/\(encoded)/export", creds: c)
+        )
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
+        }
+        return prettyJSONString(data)
+    }
+
     func clearMailCache() async throws {
         let c = try await loadCreds()
         var req = authedRequest("/mail/cache/clear", creds: c)
@@ -1403,7 +1560,7 @@ enum DaemonError: LocalizedError {
     }
 }
 
-private struct SSEEvent: Decodable {
+struct SSEEvent: Decodable {
     let type: String
     let content: String?
     let message: String?
@@ -1415,6 +1572,25 @@ private struct SSEEvent: Decodable {
     let detail: String?
     let status: String?
     let duration_ms: Int?
+    // Evidence event fields
+    let turn_id: String?
+    let phase: String?
+    let completed: Int?
+    let total: Int?
+    let activity_id: String?
+    let normalized_operation: String?
+    let execution_status: String?
+    let contribution: String?
+    let evidence_count: Int?
+    let source_domains: [String]?
+    let attempt_count: Int?
+    let retries: Int?
+    let duplicates_suppressed: Int?
+    let failure_reason: String?
+    let state: String?
+    let acquired: Int?
+    let requested: Int?
+    let source_count: Int?
     let domain: String?
     let attachments: [DaemonClient.MailAttachmentRef]?
     // mail_found event fields
@@ -1451,4 +1627,9 @@ private struct SSEEvent: Decodable {
     let chat_id: String?
     let contact_name: String?
     let snippet: String?
+
+    var outcome_kind: String? {
+        guard type == "evidence_outcome" else { return nil }
+        return kind
+    }
 }

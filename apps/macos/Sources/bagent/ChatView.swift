@@ -377,7 +377,7 @@ struct NotchWrapView: View {
         // Tool-status chip also sits above the response text during streaming.
         let toolChipExtra: CGFloat = viewModel.toolStatus == nil ? 0 : 20
         let activityExtra = NotchActivityLayout.extraHeight(
-            activityCount: viewModel.latestAssistantMessage?.activities.count ?? 0,
+            activityCount: viewModel.latestTranscriptActivityCount,
             expanded: viewModel.isActivityTranscriptExpanded
         )
         return min(
@@ -1334,7 +1334,7 @@ struct InlineNotchContent: View {
             ThinkingIndicator()
                 .scaleEffect(0.74)
             VStack(alignment: .leading, spacing: 3) {
-                Text(viewModel.toolStatus ?? "Thinking")
+                Text(viewModel.latestEvidenceStatus ?? viewModel.toolStatus ?? "Thinking")
                     .font(.system(size: 14, weight: .regular))
                     .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
                     .lineLimit(1)
@@ -1376,8 +1376,8 @@ struct InlineNotchContent: View {
                 .transition(.opacity)
             }
             if let message = viewModel.latestAssistantMessage,
-               !message.activities.isEmpty {
-                activityTranscript(message.activities, streaming: viewModel.isLatestAssistantStreaming)
+               !message.activities.isEmpty || message.evidencePhase != nil || message.evidenceOutcome != nil {
+                activityTranscript(message, streaming: viewModel.isLatestAssistantStreaming)
             }
             LatestAssistantOutputScrollView(
                 text: text,
@@ -1398,12 +1398,21 @@ struct InlineNotchContent: View {
     }
 
     @ViewBuilder
-    private func activityTranscript(_ activities: [TurnActivity], streaming: Bool) -> some View {
+    private func activityTranscript(_ message: ChatMessage, streaming: Bool) -> some View {
+        if message.evidencePhase != nil || message.evidenceOutcome != nil {
+            evidenceActivityTranscript(message, streaming: streaming)
+        } else {
+            legacyActivityTranscript(message.activities, streaming: streaming)
+        }
+    }
+
+    @ViewBuilder
+    private func legacyActivityTranscript(_ activities: [TurnActivity], streaming: Bool) -> some View {
         let current = activities.last(where: { $0.status == "running" }) ?? activities.last!
         let failureCount = activities.filter { $0.status == "failed" }.count
         let completedSummary = failureCount == 0
-            ? "\(activities.count) steps completed"
-            : "\(activities.count) steps · \(failureCount) failed"
+            ? "Legacy activity complete · \(activities.count) actions"
+            : "Legacy activity · \(activities.count) actions · \(failureCount) failed"
         Button {
             viewModel.isActivityTranscriptExpanded.toggle()
         } label: {
@@ -1449,6 +1458,86 @@ struct InlineNotchContent: View {
             .font(.system(size: 9.5))
             .padding(.leading, 2)
             .frame(maxHeight: 84)
+        }
+    }
+
+    @ViewBuilder
+    private func evidenceActivityTranscript(_ message: ChatMessage, streaming: Bool) -> some View {
+        let summary = message.evidenceOutcome.map(EvidencePresentation.outcomeLabel)
+            ?? message.evidencePhase.map(EvidencePresentation.phaseLabel)
+            ?? "Working with evidence"
+        Button {
+            viewModel.isActivityTranscriptExpanded.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: viewModel.isActivityTranscriptExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(summary).lineLimit(1)
+                Spacer(minLength: 2)
+                if streaming && message.evidenceOutcome == nil {
+                    ProgressView().controlSize(.mini)
+                }
+            }
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            message.evidenceOutcome.map {
+                EvidencePresentation.accessibilityLabel(
+                    outcome: $0,
+                    expanded: viewModel.isActivityTranscriptExpanded
+                )
+            } ?? "\(viewModel.isActivityTranscriptExpanded ? "Collapse" : "Expand") evidence activity. \(summary)"
+        )
+
+        if viewModel.isActivityTranscriptExpanded {
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(message.evidenceActivities) { activity in
+                        HStack(alignment: .firstTextBaseline, spacing: 5) {
+                            Image(systemName: evidenceActivitySymbol(activity))
+                                .foregroundStyle(
+                                    activity.executionStatus == .failed
+                                        || activity.executionStatus == .denied
+                                        || activity.executionStatus == .timedOut
+                                        ? Color.orange
+                                        : NotchWrapMetrics.notchTextSecondary
+                                )
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(activity.operation)
+                                Text(EvidencePresentation.activityDetail(activity))
+                                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                                    .lineLimit(2)
+                            }
+                            Spacer(minLength: 2)
+                            if activity.durationMs > 0 {
+                                Text(String(format: "%.1fs", Double(activity.durationMs) / 1000))
+                                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                            }
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(
+                            "\(activity.operation), \(activity.executionStatus.rawValue), \(EvidencePresentation.activityDetail(activity))"
+                        )
+                    }
+                }
+            }
+            .font(.system(size: 9.5))
+            .padding(.leading, 2)
+            .frame(maxHeight: 84)
+        }
+    }
+
+    private func evidenceActivitySymbol(_ activity: EvidenceLogicalActivity) -> String {
+        switch activity.executionStatus {
+        case .inProgress: return "circle.dotted"
+        case .failed, .denied, .timedOut: return "exclamationmark.circle"
+        case .succeeded:
+            return activity.contribution == .satisfied || activity.contribution == .partial
+                ? "checkmark.circle"
+                : "minus.circle"
         }
     }
 
