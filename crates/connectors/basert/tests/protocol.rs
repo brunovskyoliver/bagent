@@ -12,7 +12,11 @@ use basert_connector::{
 use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    sync::{oneshot, Notify},
+    time::{timeout, Duration},
+};
 
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<serde_json::Value>>>);
@@ -151,6 +155,152 @@ async fn typed_model_lifecycle_loads_checks_readiness_and_unloads() {
             )
         ]
     );
+}
+
+#[tokio::test]
+async fn model_load_and_unload_wait_for_an_active_legacy_completion() {
+    #[derive(Clone)]
+    struct CoordinationState {
+        chat_started: Arc<Notify>,
+        release_chat: Arc<Notify>,
+        lifecycle_seen: Arc<Notify>,
+    }
+
+    let state = CoordinationState {
+        chat_started: Arc::new(Notify::new()),
+        release_chat: Arc::new(Notify::new()),
+        lifecycle_seen: Arc::new(Notify::new()),
+    };
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(
+                |State(state): State<CoordinationState>, _request: Request<Body>| async move {
+                    state.chat_started.notify_one();
+                    state.release_chat.notified().await;
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"completed\"}}]}\n\n\
+                             data: [DONE]\n\n",
+                        ))
+                        .unwrap()
+                },
+            ),
+        )
+        .route(
+            "/v1/models/unload",
+            post(
+                |State(state): State<CoordinationState>, _request: Request<Body>| async move {
+                    state.lifecycle_seen.notify_one();
+                    StatusCode::OK
+                },
+            ),
+        )
+        .route(
+            "/v1/models/load",
+            post(
+                |State(state): State<CoordinationState>, _request: Request<Body>| async move {
+                    state.lifecycle_seen.notify_one();
+                    StatusCode::OK
+                },
+            ),
+        )
+        .route(
+            "/v1/models",
+            get(|| async {
+                axum::Json(json!({
+                    "data": [{
+                        "id": "basecompute/Qwen3.6-35B-A3B",
+                        "loaded": true
+                    }]
+                }))
+            }),
+        )
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = BaseRtClient::new(format!("http://{address}/v1"), "test-key");
+    let chat_client = client.clone();
+    let (chat_done_tx, chat_done_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let stream = chat_client.chat_stream(
+            "basecompute/Qwen3-4B-Instruct-2507".into(),
+            vec![Message::user("legacy request")],
+        );
+        tokio::pin!(stream);
+        let mut completed = String::new();
+        while let Some(part) = stream.next().await {
+            completed.push_str(&part.unwrap());
+        }
+        let _ = chat_done_tx.send(completed);
+    });
+    state.chat_started.notified().await;
+
+    let unload_client = client.clone();
+    let (unload_done_tx, unload_done_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let result = unload_client
+            .unload_model("basecompute/Qwen3.6-35B-A3B")
+            .await;
+        let _ = unload_done_tx.send(result);
+    });
+
+    assert!(
+        timeout(Duration::from_millis(50), state.lifecycle_seen.notified())
+            .await
+            .is_err(),
+        "unload reached BaseRT while the legacy completion was active"
+    );
+    state.release_chat.notify_one();
+    assert_eq!(chat_done_rx.await.unwrap(), "completed");
+    unload_done_rx.await.unwrap().unwrap();
+    timeout(Duration::from_secs(1), state.lifecycle_seen.notified())
+        .await
+        .expect("unload should proceed after completion releases its lease");
+
+    let chat_client = client.clone();
+    let (chat_done_tx, chat_done_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let stream = chat_client.chat_stream(
+            "basecompute/Qwen3-4B-Instruct-2507".into(),
+            vec![Message::user("legacy request")],
+        );
+        tokio::pin!(stream);
+        let mut completed = String::new();
+        while let Some(part) = stream.next().await {
+            completed.push_str(&part.unwrap());
+        }
+        let _ = chat_done_tx.send(completed);
+    });
+    state.chat_started.notified().await;
+
+    let load_client = client.clone();
+    let (load_done_tx, load_done_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let result = load_client
+            .load_model(&ModelLoadRequest {
+                id: "basecompute/Qwen3.6-35B-A3B".into(),
+                path: "/models/qwen35.base".into(),
+            })
+            .await;
+        let _ = load_done_tx.send(result);
+    });
+    assert!(
+        timeout(Duration::from_millis(50), state.lifecycle_seen.notified())
+            .await
+            .is_err(),
+        "load reached BaseRT while the legacy completion was active"
+    );
+    state.release_chat.notify_one();
+    assert_eq!(chat_done_rx.await.unwrap(), "completed");
+    assert!(load_done_rx.await.unwrap().unwrap().loaded);
+    timeout(Duration::from_secs(1), state.lifecycle_seen.notified())
+        .await
+        .expect("load should proceed after completion releases its lease");
 }
 
 #[tokio::test]

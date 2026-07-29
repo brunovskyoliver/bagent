@@ -297,6 +297,7 @@ pub(crate) struct ModelRuntimeManager {
     pressure: Arc<dyn MemoryPressureSignal>,
     config: SynthesisConfig,
     lifecycle_lock: Mutex<()>,
+    preferred_idle: Notify,
     state: StdMutex<RuntimeState>,
 }
 
@@ -309,6 +310,11 @@ impl Drop for PreferredLease {
         let mut state = self.runtime.state.lock().expect("runtime state lock");
         state.preferred_active = state.preferred_active.saturating_sub(1);
         state.preferred_last_use = Some(self.runtime.clock.monotonic());
+        let became_idle = state.preferred_active == 0;
+        drop(state);
+        if became_idle {
+            self.runtime.preferred_idle.notify_waiters();
+        }
     }
 }
 
@@ -325,6 +331,7 @@ impl ModelRuntimeManager {
             pressure,
             config,
             lifecycle_lock: Mutex::new(()),
+            preferred_idle: Notify::new(),
             state: StdMutex::new(RuntimeState::default()),
         })
     }
@@ -455,6 +462,19 @@ impl ModelRuntimeManager {
 
     async fn ensure_fallback(&self) -> Result<()> {
         let _lifecycle = self.lifecycle_lock.lock().await;
+        loop {
+            let idle = self.preferred_idle.notified();
+            if self
+                .state
+                .lock()
+                .expect("runtime state lock")
+                .preferred_active
+                == 0
+            {
+                break;
+            }
+            idle.await;
+        }
         self.unload_preferred_if_idle().await;
         if self.model_loaded(&self.config.fallback_model).await? {
             return Ok(());
@@ -1318,6 +1338,47 @@ mod tests {
             .synthesize(&TestContract::default(), &NoopSynthesisObserver)
             .await;
         assert_eq!(client.loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_waits_for_every_concurrent_preferred_lease_before_switching_models() {
+        let client = FakeModelClient::with_behaviors([]);
+        client.set_loaded(PREFERRED_SYNTHESIS_MODEL).await;
+        let service = service(
+            client.clone(),
+            Arc::new(FakeClock::default()),
+            Arc::new(FakePressure::default()),
+        );
+        let observer = CorrelatedObserver {
+            turn_id: "concurrent-fallback",
+            inner: &NoopSynthesisObserver,
+        };
+        let first = service.runtime.preferred_lease(&observer).await.unwrap();
+        let second = service.runtime.preferred_lease(&observer).await.unwrap();
+        drop(first);
+
+        let runtime = service.runtime.clone();
+        let switching = tokio::spawn(async move { runtime.ensure_fallback().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            client.unloads.lock().await.is_empty(),
+            "preferred model unloaded while a concurrent request was active"
+        );
+        assert!(!client
+            .loaded
+            .lock()
+            .await
+            .contains(FALLBACK_SYNTHESIS_MODEL));
+
+        drop(second);
+        switching.await.unwrap().unwrap();
+        assert_eq!(
+            client.unloads.lock().await.as_slice(),
+            [PREFERRED_SYNTHESIS_MODEL]
+        );
+        let loaded = client.loaded.lock().await;
+        assert!(!loaded.contains(PREFERRED_SYNTHESIS_MODEL));
+        assert!(loaded.contains(FALLBACK_SYNTHESIS_MODEL));
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tokio::sync::RwLock;
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8082/v1";
 pub const DEFAULT_API_KEY: &str = "basert-local";
@@ -157,6 +158,7 @@ pub struct BaseRtClient {
     server_root: String,
     api_key: String,
     http: reqwest::Client,
+    model_lifecycle: Arc<RwLock<()>>,
 }
 
 impl BaseRtClient {
@@ -175,6 +177,7 @@ impl BaseRtClient {
                 .timeout(Duration::from_secs(310))
                 .build()
                 .expect("build BaseRT HTTP client"),
+            model_lifecycle: Arc::new(RwLock::new(())),
         }
     }
 
@@ -244,6 +247,9 @@ impl BaseRtClient {
         if request.path.trim().is_empty() {
             return Err(anyhow!("model path must not be empty"));
         }
+        // Clones used by the daemon share this guard, so a legacy 4B
+        // completion cannot overlap a 35B lifecycle transition.
+        let _lifecycle = self.model_lifecycle.write().await;
         let response = self
             .post(format!("{}/models/load", self.base_url))
             .json(&serde_json::json!({"path": request.path}))
@@ -255,6 +261,7 @@ impl BaseRtClient {
     }
 
     pub async fn unload_model(&self, model: &str) -> Result<()> {
+        let _lifecycle = self.model_lifecycle.write().await;
         let response = self
             .post(format!("{}/models/unload", self.base_url))
             .json(&serde_json::json!({"model": model}))
@@ -288,6 +295,7 @@ impl BaseRtClient {
     ) -> impl futures_core::Stream<Item = Result<ChatStreamEvent>> + Send {
         let client = self.clone();
         async_stream::try_stream! {
+            let _model_request_guard = client.model_lifecycle.read().await;
             let response = client
                 .post(format!("{}/chat/completions", client.base_url))
                 .json(&serde_json::json!({
@@ -409,6 +417,7 @@ impl BaseRtClient {
         max_tokens: u32,
         response_format: Option<serde_json::Value>,
     ) -> Result<String> {
+        let _model_request_guard = self.model_lifecycle.read().await;
         let mut body = serde_json::json!({
             "model": model,
             "messages": messages,

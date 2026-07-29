@@ -4236,7 +4236,7 @@ mod tests {
             BaseRtClient, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL,
         };
 
-        let url = Url::parse("https://example.com/").unwrap();
+        let url = Url::parse("https://iana.org/help/example-domains").unwrap();
         let plan = EvidencePlanner::plan(EvidenceIntent::WebDirectPage { url });
         let mut gate = ScriptedGate::default();
         let acquired = execute_web_plan(
@@ -4247,8 +4247,17 @@ mod tests {
             "en",
         )
         .await;
-        let ValidationOutcome::Bundle(bundle) = acquired.validation else {
-            panic!("live direct page should produce fetched evidence");
+        let bundle = match acquired.validation {
+            ValidationOutcome::Bundle(bundle) => bundle,
+            ValidationOutcome::Recovery(recovery) => {
+                panic!(
+                    "live direct page should produce fetched evidence: kind={:?}, missing={:?}",
+                    recovery.kind, recovery.missing,
+                )
+            }
+            ValidationOutcome::Clarification { .. } => {
+                panic!("direct URL unexpectedly required clarification")
+            }
         };
         let client = BaseRtClient::new(DEFAULT_BASE_URL, DEFAULT_API_KEY);
         let (tx, _rx) = mpsc::channel(4096);
@@ -4256,7 +4265,7 @@ mod tests {
             &client,
             &EventSink::new(tx),
             DEFAULT_CHAT_MODEL,
-            "Read https://example.com/",
+            "Read https://iana.org/help/example-domains",
             &bundle,
             acquired.operations_executed,
             acquired.approvals_denied,
@@ -4265,7 +4274,9 @@ mod tests {
         .await
         .expect("live web synthesis should return model output or deterministic rendering");
 
-        assert!(outcome.final_text.contains("https://example.com/"));
+        assert!(outcome
+            .final_text
+            .contains("https://www.iana.org/help/example-domains"));
         assert!(!outcome.final_text.contains("Verification Shortfall"));
     }
 
@@ -4858,5 +4869,271 @@ mod tests {
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["type"], "evidence_outcome");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires all three installed BaseRT models and explicit acceptance runtime"]
+    async fn stage8_live_frozen_bundle_matrix_and_performance() {
+        use crate::evidence::{fixtures, EvidenceValidator};
+        use basert_connector::{BaseRtClient, ModelLoadRequest, DEFAULT_API_KEY, DEFAULT_BASE_URL};
+        use std::time::Instant;
+
+        async fn unload_all(client: &BaseRtClient, models: &[(&str, &str)]) {
+            let loaded = client.inspect_models().await.unwrap_or_default();
+            for (model, _) in models {
+                if loaded
+                    .iter()
+                    .any(|candidate| candidate.id == *model && candidate.loaded)
+                {
+                    let _ = client.unload_model(model).await;
+                }
+            }
+        }
+
+        async fn run_sample(
+            client: &BaseRtClient,
+            model: &str,
+            workload: &str,
+            contract: &dyn SynthesisContract,
+            phase: &str,
+            sample: usize,
+        ) {
+            let messages = contract.initial_request();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].role, "system");
+            assert_eq!(messages[1].role, "user");
+            assert!(messages
+                .iter()
+                .all(|message| message.tool_calls.is_empty() && message.tool_call_id.is_none()));
+            let prompt_chars = messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>();
+            let started = Instant::now();
+            let response = tokio::time::timeout(
+                Duration::from_secs(20),
+                client.chat_complete_bounded(
+                    model,
+                    messages,
+                    contract.temperature(),
+                    contract.max_tokens(),
+                ),
+            )
+            .await;
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let mut initial_valid = false;
+            let mut repaired_valid = false;
+            let mut repair_latency_ms = 0u64;
+            let mut completion_chars = 0usize;
+            let outcome = match response {
+                Err(_) => "timeout",
+                Ok(Err(_)) => "model_error",
+                Ok(Ok(response)) => {
+                    completion_chars = response.len();
+                    match contract.validate(&response) {
+                        Ok(()) => {
+                            initial_valid = true;
+                            "valid"
+                        }
+                        Err(errors) => {
+                            let repair_messages = contract.repair_request(&errors);
+                            assert_eq!(repair_messages.len(), 2);
+                            assert_eq!(repair_messages[0].role, "system");
+                            assert_eq!(repair_messages[1].role, "user");
+                            assert!(repair_messages.iter().all(|message| {
+                                message.tool_calls.is_empty() && message.tool_call_id.is_none()
+                            }));
+                            let repair_started = Instant::now();
+                            let repaired = tokio::time::timeout(
+                                Duration::from_secs(20),
+                                client.chat_complete_bounded(
+                                    model,
+                                    repair_messages,
+                                    contract.temperature(),
+                                    contract.max_tokens(),
+                                ),
+                            )
+                            .await;
+                            repair_latency_ms = repair_started.elapsed().as_millis() as u64;
+                            repaired_valid = matches!(
+                                repaired,
+                                Ok(Ok(ref value)) if contract.validate(value).is_ok()
+                            );
+                            if repaired_valid {
+                                "repaired"
+                            } else {
+                                "invalid"
+                            }
+                        }
+                    }
+                }
+            };
+            println!(
+                "STAGE8_METRIC {}",
+                json!({
+                    "phase": phase,
+                    "sample": sample,
+                    "model": model,
+                    "workload": workload,
+                    "prompt_chars": prompt_chars,
+                    "completion_chars": completion_chars,
+                    "latency_ms": latency_ms,
+                    "repair_latency_ms": repair_latency_ms,
+                    "initial_valid": initial_valid,
+                    "repaired_valid": repaired_valid,
+                    "grounded": initial_valid || repaired_valid,
+                    "outcome": outcome,
+                    "tools": 0,
+                    "system_messages": 1,
+                    "user_messages": 1,
+                })
+            );
+        }
+
+        let mail_plan = EvidencePlanner::plan(EvidenceIntent::MailLatestContent {
+            count: 3,
+            requested_count: 3,
+            unread_only: false,
+        });
+        let ValidationOutcome::Bundle(mail_bundle) = EvidenceValidator::validate(
+            "stage8-mail",
+            &mail_plan,
+            fixtures::three_readable_messages(),
+        ) else {
+            panic!("frozen Mail fixture must validate");
+        };
+        let direct_results = fixtures::redirected_readable_page();
+        let direct_url = direct_results.web_fetches[0]
+            .value
+            .as_ref()
+            .unwrap()
+            .requested_url
+            .clone();
+        let direct_plan = EvidencePlanner::plan(EvidenceIntent::WebDirectPage { url: direct_url });
+        let ValidationOutcome::Bundle(direct_bundle) =
+            EvidenceValidator::validate("stage8-direct", &direct_plan, direct_results)
+        else {
+            panic!("frozen direct-web fixture must validate");
+        };
+        let corroborated_plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current documented example fact?".into(),
+            verification: crate::evidence::VerificationLevel::Corroborated,
+        });
+        let ValidationOutcome::Bundle(corroborated_bundle) = EvidenceValidator::validate(
+            "stage8-corroborated",
+            &corroborated_plan,
+            fixtures::two_independent_readable_pages(),
+        ) else {
+            panic!("frozen corroborated-web fixture must validate");
+        };
+        let mail_contract = MailSynthesisContract {
+            original_request: "can you read me the 3 latest emails?",
+            bundle: &mail_bundle,
+        };
+        let direct_contract = WebSynthesisContract {
+            original_request: "Read the requested direct page.",
+            bundle: &direct_bundle,
+        };
+        let corroborated_contract = WebSynthesisContract {
+            original_request: "Verify the current documented example fact with two sources.",
+            bundle: &corroborated_bundle,
+        };
+        let workloads: [(&str, &dyn SynthesisContract); 3] = [
+            ("mail", &mail_contract),
+            ("direct_web", &direct_contract),
+            ("corroborated_web", &corroborated_contract),
+        ];
+        let models = [
+            (
+                "basecompute/Qwen3-4B-Instruct-2507",
+                "basecompute/Qwen3-4B-Instruct-2507/default-q4/model.base",
+            ),
+            (
+                "basecompute/Qwen3-8B",
+                "basecompute/Qwen3-8B/default-q4/model.base",
+            ),
+            (
+                "basecompute/Qwen3.6-35B-A3B",
+                "basecompute/Qwen3.6-35B-A3B/default-q4/model.base",
+            ),
+        ];
+        let cache = dirs::home_dir()
+            .unwrap()
+            .join("Library/Caches/baseRT/models");
+        let client = BaseRtClient::new(DEFAULT_BASE_URL, DEFAULT_API_KEY);
+        unload_all(&client, &models).await;
+
+        for (model, relative_path) in models {
+            let load_started = Instant::now();
+            let loaded = client
+                .load_model(&ModelLoadRequest {
+                    id: model.into(),
+                    path: cache.join(relative_path).to_string_lossy().into_owned(),
+                })
+                .await;
+            println!(
+                "STAGE8_LOAD {}",
+                json!({
+                    "phase": "matrix",
+                    "model": model,
+                    "load_ms": load_started.elapsed().as_millis() as u64,
+                    "loaded": loaded.as_ref().is_ok_and(|value| value.loaded),
+                })
+            );
+            if loaded.is_ok() {
+                for (index, (workload, contract)) in workloads.iter().enumerate() {
+                    run_sample(&client, model, workload, *contract, "matrix", index + 1).await;
+                }
+            }
+            let _ = client.unload_model(model).await;
+        }
+
+        let preferred = models[2];
+        for cold_sample in 1..=3 {
+            unload_all(&client, &models).await;
+            let load_started = Instant::now();
+            let loaded = client
+                .load_model(&ModelLoadRequest {
+                    id: preferred.0.into(),
+                    path: cache.join(preferred.1).to_string_lossy().into_owned(),
+                })
+                .await;
+            println!(
+                "STAGE8_LOAD {}",
+                json!({
+                    "phase": "cold",
+                    "sample": cold_sample,
+                    "model": preferred.0,
+                    "load_ms": load_started.elapsed().as_millis() as u64,
+                    "loaded": loaded.as_ref().is_ok_and(|value| value.loaded),
+                })
+            );
+            if loaded.is_ok() {
+                run_sample(
+                    &client,
+                    preferred.0,
+                    "mail",
+                    &mail_contract,
+                    "cold",
+                    cold_sample,
+                )
+                .await;
+            }
+            let _ = client.unload_model(preferred.0).await;
+        }
+
+        let loaded = client
+            .load_model(&ModelLoadRequest {
+                id: preferred.0.into(),
+                path: cache.join(preferred.1).to_string_lossy().into_owned(),
+            })
+            .await;
+        if loaded.is_ok() {
+            for sample in 1..=30 {
+                let (workload, contract) = workloads[(sample - 1) % workloads.len()];
+                run_sample(&client, preferred.0, workload, contract, "warm", sample).await;
+            }
+        }
+        unload_all(&client, &models).await;
     }
 }
