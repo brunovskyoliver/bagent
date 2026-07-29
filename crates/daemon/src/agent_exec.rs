@@ -596,7 +596,7 @@ fn mail_tool_succeeded(tool: &str, result: &str) -> bool {
             .unwrap_or(false),
         "mail_read" => {
             result.starts_with("From:")
-                && !result.contains("[body unavailable locally")
+                && !result.contains("[body unavailable")
                 && result.contains("\n\n")
         }
         _ => false,

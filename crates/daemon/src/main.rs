@@ -2477,18 +2477,12 @@ async fn mail_message(State(state): State<AppState>, Path(rowid): Path<i64>) -> 
         );
     };
 
-    let mut msg = match tokio::task::spawn_blocking(move || mail.get_message(rowid)).await {
-        Ok(Ok(Some(m))) => m,
-        Ok(Ok(None)) => {
+    let hydrated = match mail.hydrate_message(rowid).await {
+        Ok(Some(hydrated)) => hydrated,
+        Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "message not found" })),
-            )
-        }
-        Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
             )
         }
         Err(e) => {
@@ -2498,19 +2492,18 @@ async fn mail_message(State(state): State<AppState>, Path(rowid): Path<i64>) -> 
             )
         }
     };
-
-    // emlx not locally cached → try AppleScript fallback (needs Automation → Mail)
-    if msg.body.is_none() {
-        if let Some(body) = apple_mail_connector::body_via_applescript(&msg.subject).await {
-            msg.language = apple_mail_connector::detect_language(&body);
-            msg.body = Some(body);
-            msg.body_available = true;
-        }
-    }
+    let state = hydrated.state;
+    let used_automation = hydrated.used_automation;
+    let msg = hydrated.message;
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "message": msg, "pii": true })),
+        Json(serde_json::json!({
+            "message": msg,
+            "body_hydration": state,
+            "body_hydrated_via_automation": used_automation,
+            "pii": true
+        })),
     )
 }
 
@@ -4226,23 +4219,30 @@ async fn tool_mail_read(
     let Some(rowid) = args["rowid"].as_i64() else {
         return ("rowid is required.".to_string(), None);
     };
-    let m = mail.clone();
-    match tokio::task::spawn_blocking(move || m.get_message(rowid)).await {
-        Ok(Ok(Some(mut msg))) => {
-            // emlx not cached → on-demand AppleScript fetch (same as mail_message handler)
-            if msg.body.is_none() {
-                if let Some(body) = apple_mail_connector::body_via_applescript(&msg.subject).await {
-                    msg.body = Some(body);
-                }
-            }
-            let body: String = msg
-                .body
-                .as_deref()
-                .unwrap_or(
+    match mail.hydrate_message(rowid).await {
+        Ok(Some(hydrated)) => {
+            let msg = hydrated.message;
+            let unavailable = match hydrated.state {
+                apple_mail_connector::MailBodyHydrationState::Unavailable => Some(
                     "[body unavailable locally — call mail_open with this rowid to open it in Mail.app]",
-                )
+                ),
+                apple_mail_connector::MailBodyHydrationState::AutomationDenied => {
+                    Some("[body unavailable — Mail.app Automation access was denied]")
+                }
+                apple_mail_connector::MailBodyHydrationState::AutomationTimedOut => {
+                    Some("[body unavailable — Mail.app Automation timed out]")
+                }
+                apple_mail_connector::MailBodyHydrationState::AutomationFailed => {
+                    Some("[body unavailable — Mail.app Automation failed]")
+                }
+                apple_mail_connector::MailBodyHydrationState::Readable
+                | apple_mail_connector::MailBodyHydrationState::Empty => None,
+            };
+            let body: String = unavailable
+                .or(msg.body.as_deref())
+                .unwrap_or("")
                 .chars()
-                .take(4000)
+                .take(4_000)
                 .collect();
             let date = chrono::DateTime::from_timestamp(msg.received_at, 0)
                 .map(|d| d.to_rfc3339())
@@ -4256,8 +4256,7 @@ async fn tool_mail_read(
                 Some(r),
             )
         }
-        Ok(Ok(None)) => ("No message with that rowid.".to_string(), None),
-        Ok(Err(e)) => (format!("Mail error: {e}"), None),
+        Ok(None) => ("No message with that rowid.".to_string(), None),
         Err(e) => (format!("Mail error: {e}"), None),
     }
 }

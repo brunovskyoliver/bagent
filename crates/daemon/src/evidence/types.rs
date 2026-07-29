@@ -267,6 +267,7 @@ pub(crate) enum FailureCode {
     ParseFailure,
     ModelUnavailable,
     ModelInvalidOutput,
+    AutomationFailed,
     OtherNormalized,
 }
 

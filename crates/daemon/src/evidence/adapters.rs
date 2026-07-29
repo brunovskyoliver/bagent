@@ -3,7 +3,9 @@ use super::{
     FailureCode, MailBodyEvidence, MailHeaderEvidence, OperationResult, ProviderSet,
     ValidatedMailId, WebFetchEvidence, WebSearchResult,
 };
-use apple_mail_connector::{MailConnector, MailMessage, MailSearchFilter};
+use apple_mail_connector::{
+    HydratedMailMessage, MailBodyHydrationState, MailConnector, MailMessage, MailSearchFilter,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -38,6 +40,7 @@ pub(crate) trait MailEvidenceAdapter {
     async fn read(&mut self, message_id: &ValidatedMailId) -> OperationResult<MailBodyEvidence>;
 }
 
+#[async_trait]
 pub(crate) trait AppleMailBackend: Clone + Send + Sync + 'static {
     fn list_inbox(
         &self,
@@ -50,7 +53,10 @@ pub(crate) trait AppleMailBackend: Clone + Send + Sync + 'static {
         filter: &MailSearchFilter,
     ) -> Result<Vec<MailMessage>, AppleMailBackendError>;
 
-    fn get_message(&self, rowid: i64) -> Result<Option<MailMessage>, AppleMailBackendError>;
+    async fn hydrate_message(
+        &self,
+        rowid: i64,
+    ) -> Result<Option<HydratedMailMessage>, AppleMailBackendError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +66,7 @@ pub(crate) enum AppleMailBackendError {
     ConnectionReset,
 }
 
+#[async_trait]
 impl AppleMailBackend for MailConnector {
     fn list_inbox(
         &self,
@@ -76,8 +83,13 @@ impl AppleMailBackend for MailConnector {
         MailConnector::search_messages(self, filter).map_err(normalize_backend_error)
     }
 
-    fn get_message(&self, rowid: i64) -> Result<Option<MailMessage>, AppleMailBackendError> {
-        MailConnector::get_message(self, rowid).map_err(normalize_backend_error)
+    async fn hydrate_message(
+        &self,
+        rowid: i64,
+    ) -> Result<Option<HydratedMailMessage>, AppleMailBackendError> {
+        MailConnector::hydrate_message(self, rowid)
+            .await
+            .map_err(normalize_backend_error)
     }
 }
 
@@ -181,12 +193,11 @@ impl<B: AppleMailBackend> MailEvidenceAdapter for AppleMailEvidenceAdapter<B> {
         }
 
         let started = Instant::now();
-        let backend = self.backend.clone();
-        let result = tokio::task::spawn_blocking(move || backend.get_message(rowid)).await;
+        let result = self.backend.hydrate_message(rowid).await;
         let duration_ms = elapsed_ms(started);
         match result {
-            Ok(Ok(Some(message))) => mail_body_result(operation, message, duration_ms),
-            Ok(Ok(None)) => {
+            Ok(Some(hydrated)) => hydrated_mail_body_result(operation, hydrated, duration_ms),
+            Ok(None) => {
                 let body = MailBodyEvidence {
                     evidence_id: opaque_evidence_id("mail-body", rowid),
                     header_id: opaque_evidence_id("mail-header", rowid),
@@ -195,13 +206,7 @@ impl<B: AppleMailBackend> MailEvidenceAdapter for AppleMailEvidenceAdapter<B> {
                 };
                 value_result(operation, body, EvidenceContribution::Empty, duration_ms)
             }
-            Ok(Err(error)) => backend_error_result(operation, error, duration_ms),
-            Err(_) => failed_result(
-                operation,
-                FailureCode::OtherNormalized,
-                EvidenceContribution::Empty,
-                duration_ms,
-            ),
+            Err(error) => backend_error_result(operation, error, duration_ms),
         }
     }
 }
@@ -274,11 +279,12 @@ fn mail_header_evidence(message: MailMessage) -> Result<MailHeaderEvidence, Fail
     })
 }
 
-fn mail_body_result(
+fn hydrated_mail_body_result(
     operation: EvidenceOperation,
-    message: MailMessage,
+    hydrated: HydratedMailMessage,
     duration_ms: u64,
 ) -> OperationResult<MailBodyEvidence> {
+    let message = hydrated.message;
     if message.rowid <= 0 {
         return failed_result(
             operation,
@@ -287,20 +293,55 @@ fn mail_body_result(
             duration_ms,
         );
     }
-    let (body, body_state, contribution) = match message.body {
-        Some(body) if !body.trim().is_empty() => (
-            body.chars().take(4_000).collect(),
+    let (body, body_state, contribution) = match hydrated.state {
+        MailBodyHydrationState::Readable => (
+            message
+                .body
+                .unwrap_or_default()
+                .chars()
+                .take(4_000)
+                .collect(),
             BodyState::Readable,
             EvidenceContribution::Satisfied,
         ),
-        Some(_) if message.body_available => {
+        MailBodyHydrationState::Empty => {
             (String::new(), BodyState::Empty, EvidenceContribution::Empty)
         }
-        _ => (
+        MailBodyHydrationState::Unavailable => (
             String::new(),
             BodyState::UnavailableLocally,
             EvidenceContribution::Empty,
         ),
+        MailBodyHydrationState::AutomationDenied => {
+            return OperationResult {
+                key: operation.key(),
+                attempts: 1,
+                execution: ExecutionStatus::Denied,
+                contribution: EvidenceContribution::Empty,
+                value: None,
+                duration_ms,
+                invalid_items: 0,
+            };
+        }
+        MailBodyHydrationState::AutomationTimedOut => {
+            return OperationResult {
+                key: operation.key(),
+                attempts: 1,
+                execution: ExecutionStatus::TimedOut,
+                contribution: EvidenceContribution::Empty,
+                value: None,
+                duration_ms,
+                invalid_items: 0,
+            };
+        }
+        MailBodyHydrationState::AutomationFailed => {
+            return failed_result(
+                operation,
+                FailureCode::AutomationFailed,
+                EvidenceContribution::Empty,
+                duration_ms,
+            );
+        }
     };
     value_result(
         operation,
@@ -591,7 +632,7 @@ mod apple_mail_adapter_tests {
     struct StubAppleMailBackend {
         listed: Result<Vec<MailMessage>, AppleMailBackendError>,
         searched: Result<Vec<MailMessage>, AppleMailBackendError>,
-        messages: HashMap<i64, Result<Option<MailMessage>, AppleMailBackendError>>,
+        messages: HashMap<i64, Result<Option<HydratedMailMessage>, AppleMailBackendError>>,
     }
 
     impl Default for StubAppleMailBackend {
@@ -604,6 +645,7 @@ mod apple_mail_adapter_tests {
         }
     }
 
+    #[async_trait]
     impl AppleMailBackend for StubAppleMailBackend {
         fn list_inbox(
             &self,
@@ -620,7 +662,10 @@ mod apple_mail_adapter_tests {
             self.searched.clone()
         }
 
-        fn get_message(&self, rowid: i64) -> Result<Option<MailMessage>, AppleMailBackendError> {
+        async fn hydrate_message(
+            &self,
+            rowid: i64,
+        ) -> Result<Option<HydratedMailMessage>, AppleMailBackendError> {
             self.messages.get(&rowid).cloned().unwrap_or(Ok(None))
         }
     }
@@ -640,6 +685,14 @@ mod apple_mail_adapter_tests {
             language: Some("en".into()),
             attachments: Vec::new(),
             message_id: None,
+        }
+    }
+
+    fn hydrated(message: MailMessage, state: MailBodyHydrationState) -> HydratedMailMessage {
+        HydratedMailMessage {
+            message,
+            state,
+            used_automation: false,
         }
     }
 
@@ -709,7 +762,13 @@ mod apple_mail_adapter_tests {
 
         let readable_mixed_message = message(42, Some("Readable"), true);
         let mut mixed_messages = HashMap::new();
-        mixed_messages.insert(42, Ok(Some(readable_mixed_message.clone())));
+        mixed_messages.insert(
+            42,
+            Ok(Some(hydrated(
+                readable_mixed_message.clone(),
+                MailBodyHydrationState::Readable,
+            ))),
+        );
         let mixed_backend = StubAppleMailBackend {
             listed: Ok(vec![readable_mixed_message, message(0, None, false)]),
             searched: Ok(Vec::new()),
@@ -758,7 +817,13 @@ mod apple_mail_adapter_tests {
 
         let readable_message = message(42, Some("A real locally cached body."), true);
         let mut messages = HashMap::new();
-        messages.insert(42, Ok(Some(readable_message.clone())));
+        messages.insert(
+            42,
+            Ok(Some(hydrated(
+                readable_message.clone(),
+                MailBodyHydrationState::Readable,
+            ))),
+        );
         let readable_backend = StubAppleMailBackend {
             listed: Ok(vec![readable_message]),
             searched: Ok(Vec::new()),
@@ -790,8 +855,20 @@ mod apple_mail_adapter_tests {
         let unavailable_message = message(51, None, false);
         let empty_message = message(52, Some("   "), true);
         let mut messages = HashMap::new();
-        messages.insert(51, Ok(Some(unavailable_message.clone())));
-        messages.insert(52, Ok(Some(empty_message.clone())));
+        messages.insert(
+            51,
+            Ok(Some(hydrated(
+                unavailable_message.clone(),
+                MailBodyHydrationState::Unavailable,
+            ))),
+        );
+        messages.insert(
+            52,
+            Ok(Some(hydrated(
+                empty_message.clone(),
+                MailBodyHydrationState::Empty,
+            ))),
+        );
         let backend = StubAppleMailBackend {
             listed: Ok(vec![unavailable_message, empty_message]),
             searched: Ok(Vec::new()),
@@ -808,10 +885,63 @@ mod apple_mail_adapter_tests {
     }
 
     #[tokio::test]
+    async fn real_adapter_preserves_automation_denial_timeout_and_failure() {
+        let denied_message = message(61, None, false);
+        let timed_out_message = message(62, None, false);
+        let failed_message = message(63, None, false);
+        let mut messages = HashMap::new();
+        messages.insert(
+            61,
+            Ok(Some(hydrated(
+                denied_message.clone(),
+                MailBodyHydrationState::AutomationDenied,
+            ))),
+        );
+        messages.insert(
+            62,
+            Ok(Some(hydrated(
+                timed_out_message.clone(),
+                MailBodyHydrationState::AutomationTimedOut,
+            ))),
+        );
+        messages.insert(
+            63,
+            Ok(Some(hydrated(
+                failed_message.clone(),
+                MailBodyHydrationState::AutomationFailed,
+            ))),
+        );
+        let backend = StubAppleMailBackend {
+            listed: Ok(vec![denied_message, timed_out_message, failed_message]),
+            searched: Ok(Vec::new()),
+            messages,
+        };
+        let mut adapter = AppleMailEvidenceAdapter::from_backend(backend);
+        let headers = adapter.list(3, false).await.value.unwrap();
+
+        let denied = adapter.read(&headers[0].connector_id).await;
+        let timed_out = adapter.read(&headers[1].connector_id).await;
+        let failed = adapter.read(&headers[2].connector_id).await;
+
+        assert_eq!(denied.execution, ExecutionStatus::Denied);
+        assert_eq!(timed_out.execution, ExecutionStatus::TimedOut);
+        assert_eq!(
+            failed.execution,
+            ExecutionStatus::Failed(FailureCode::AutomationFailed)
+        );
+    }
+
+    #[tokio::test]
     async fn synthesis_safe_typed_payload_never_contains_raw_mail_rowids() {
         let readable_message = message(987_654_321, Some("Grounded body."), true);
         let mut messages = HashMap::new();
-        messages.insert(987_654_321, Ok(Some(readable_message.clone())));
+        messages.insert(
+            987_654_321,
+            Ok(Some(hydrated(
+                readable_message.clone(),
+                MailBodyHydrationState::Readable,
+            ))),
+        );
         let backend = StubAppleMailBackend {
             listed: Ok(vec![readable_message]),
             searched: Ok(Vec::new()),

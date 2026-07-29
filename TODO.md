@@ -153,7 +153,7 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
   - [x] Tool: `GET /mail/message/:rowid` (includes body from emlx)
   - [x] Language detection per message (whatlang — sk/en/cs/de)
   - [x] Incremental sync: `POST /mail/sync` → upserts into `mail_cache` (V3 migration), updates `connectors.last_sync_at`; `fetch_tool_context` reads cache first, falls back to live Envelope Index
-  - [x] AppleScript body fallback for non-cached IMAP messages (`body_via_applescript` via osascript; requires Automation → Mail)
+  - [x] AppleScript body fallback for non-cached IMAP messages (`MailConnector::hydrate_message` via osascript; requires Automation → Mail)
 - [x] `crates/connectors/apple_notes/`:
   - [x] SQLite read path for metadata (title, snippet, folder, dates)
   - [x] JXA body retrieval via `osascript -l JavaScript`
