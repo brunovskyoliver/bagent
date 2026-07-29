@@ -2550,6 +2550,8 @@ fn canonical_web_answer(bundle: &EvidenceBundle) -> crate::evidence::CanonicalGr
         completeness: bundle.completeness,
         outcome_status: if shortfall {
             crate::evidence::CanonicalOutcomeStatus::VerificationShortfall
+        } else if !bundle.conflicts.is_empty() {
+            crate::evidence::CanonicalOutcomeStatus::Conflict
         } else if bundle.completeness == Completeness::Partial {
             crate::evidence::CanonicalOutcomeStatus::Partial
         } else {
@@ -2582,23 +2584,39 @@ fn render_canonical_web_text(bundle: &EvidenceBundle) -> String {
                 .web
                 .iter()
                 .filter_map(|item| {
-                    deterministic_fact_claim(query, item).map(|claim| {
+                    deterministic_conflict_claim(query, item).map(|claim| {
+                        let reference_date = claim
+                            .reference_date
+                            .as_deref()
+                            .map(|date| format!("; reference date: {date}"))
+                            .unwrap_or_default();
+                        let definition = claim
+                            .population_definition
+                            .as_deref()
+                            .map(|definition| format!("; population definition: {definition}"))
+                            .unwrap_or_default();
                         format!(
-                            "{} [Source]({}).",
-                            claim.trim_end_matches(['.', '!', '?']),
+                            "- source: {}; reported figure: {}{}{}. [Source]({}).",
+                            item.evidence.source_identity.as_str(),
+                            claim.reported_figure,
+                            reference_date,
+                            definition,
                             item.evidence.final_url
                         )
                     })
                 })
                 .collect::<Vec<_>>();
-            if claims.len() == bundle.web.len() {
+            if claims.len() >= 2 {
                 return format!(
-                    "Fetched sources report different figures, likely reflecting different dates or definitions: {}",
-                    claims.join(" ")
+                    "Fetched sources report unresolved conflicting figures; no source was selected as the winner:\n{}",
+                    claims.join("\n")
                 );
             }
         }
-        return render_web_verification_shortfall(bundle, "the fetched sources conflict");
+        return render_web_verification_shortfall(
+            bundle,
+            "fewer than two independent answer-quality claims remained after excluding figures without a reliably associated date or definition",
+        );
     }
     if matches!(
         bundle.intent,
@@ -2709,9 +2727,154 @@ fn deterministic_fact_claim(query: &str, item: &crate::evidence::WebBundleItem) 
         let sentences = sentence_like_chunks(&passage.text);
         sentences
             .into_iter()
-            .find(|sentence| assess_claim_relevance(query, sentence).eligible)
+            .find(|sentence| {
+                structurally_supported_fact_claim(sentence)
+                    && assess_claim_relevance(query, sentence).eligible
+            })
             .and_then(|sentence| concise_sentence_prefix(sentence, 260))
     })
+}
+
+struct DeterministicConflictClaim {
+    reported_figure: String,
+    reference_date: Option<String>,
+    population_definition: Option<String>,
+}
+
+fn deterministic_conflict_claim(
+    query: &str,
+    item: &crate::evidence::WebBundleItem,
+) -> Option<DeterministicConflictClaim> {
+    let claim = deterministic_fact_claim(query, item)?;
+    let numeric_tokens = claim
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| !character.is_ascii_digit() && character != ',')
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let figures = numeric_tokens
+        .iter()
+        .copied()
+        .filter(|token| {
+            token.contains(',') && token.chars().filter(char::is_ascii_digit).count() >= 4
+        })
+        .collect::<Vec<_>>();
+    if figures.len() != 1 {
+        return None;
+    }
+    let lower = claim.to_ascii_lowercase();
+    let figure_position = lower.find(figures[0])?;
+    let population_position = lower[..figure_position].rfind("population")?;
+    let relation = &lower[population_position + "population".len()..figure_position];
+    if ![" is ", " was ", " stood at ", " reached ", " estimate for "]
+        .iter()
+        .any(|marker| format!(" {relation} ").contains(marker))
+    {
+        return None;
+    }
+    let years = numeric_tokens
+        .iter()
+        .filter_map(|token| token.replace(',', "").parse::<u16>().ok())
+        .filter(|year| (1900..=2100).contains(year))
+        .collect::<Vec<_>>();
+    if years.len() > 1 {
+        return None;
+    }
+    let population_definition = [
+        ("urban-area", "urban area"),
+        ("urban area", "urban area"),
+        ("metropolitan", "metropolitan area"),
+        ("city proper", "city proper"),
+        ("municipality", "municipality"),
+        ("administrative", "administrative area"),
+    ]
+    .iter()
+    .find_map(|(marker, definition)| {
+        lower[..population_position]
+            .rfind(marker)
+            .filter(|position| population_position.saturating_sub(*position) <= marker.len() + 2)
+            .map(|_| (*definition).to_string())
+    });
+    let reference_date = years.first().and_then(|year| {
+        let year = year.to_string();
+        let year_position = lower[figure_position + figures[0].len()..]
+            .find(&year)
+            .map(|position| position + figure_position + figures[0].len())?;
+        let between = lower[figure_position + figures[0].len()..year_position].trim();
+        if between.ends_with("at the end of") || between.ends_with("end of") {
+            Some(format!("end of {year}"))
+        } else if between.ends_with("in") || between.ends_with("as of") || between.ends_with("for")
+        {
+            Some(year)
+        } else {
+            None
+        }
+    });
+    if reference_date.is_none() && population_definition.is_none() {
+        return None;
+    }
+    Some(DeterministicConflictClaim {
+        reported_figure: figures[0].to_string(),
+        reference_date,
+        population_definition,
+    })
+}
+
+fn structurally_supported_fact_claim(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if [
+        "navigation",
+        "menu",
+        "cookie settings",
+        "privacy policy",
+        "skip to content",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+
+    let words = trimmed.split_whitespace().collect::<Vec<_>>();
+    let numeric_words = words
+        .iter()
+        .filter(|word| word.chars().any(|character| character.is_ascii_digit()))
+        .count();
+    let lexical_words = words
+        .iter()
+        .filter(|word| word.chars().any(|character| character.is_alphabetic()))
+        .count();
+    let has_sentence_punctuation = trimmed.ends_with(['.', '!', '?']);
+    let has_factual_relation = [
+        " is ",
+        " are ",
+        " was ",
+        " were ",
+        " has ",
+        " have ",
+        " reports ",
+        " reported ",
+        " estimates ",
+        " estimated ",
+        " reached ",
+        " stood at ",
+    ]
+    .iter()
+    .any(|relation| format!(" {lower} ").contains(relation));
+
+    // Flattened tables and title/navigation concatenations can contain relevant
+    // terms and many values, but do not preserve which date or definition owns
+    // each value. Only sentence-like prose with an explicit factual relation is
+    // eligible for deterministic rendering.
+    if numeric_words >= 2 && lexical_words <= numeric_words {
+        return false;
+    }
+    has_sentence_punctuation && has_factual_relation
 }
 
 fn sentence_like_chunks(value: &str) -> Vec<&str> {
@@ -2846,6 +3009,7 @@ async fn run_shared_synthesis(
     approvals_denied: usize,
     terminal_outcome: crate::evidence::EvidenceOutcomeEvent,
 ) -> Result<ExecOutcome, ExecError> {
+    let terminal_outcome = terminal_outcome.with_canonical_answer(&contract.canonical_answer());
     let observer = EventSinkSynthesisObserver { sink: sink.clone() };
     let outcome = service.synthesize(contract, &observer).await;
     let _ = sink
@@ -6016,9 +6180,76 @@ mod tests {
 
         assert!(rendered.contains("475,503"));
         assert!(rendered.contains("440,948"));
-        assert!(rendered.contains("different dates or definitions"));
-        assert!(rendered.contains("475,503 at the end of 2024 [Source]("));
+        assert!(rendered.contains("unresolved conflicting figures"));
+        assert!(rendered.contains(
+            "- source: publisher-example; reported figure: 475,503; reference date: end of 2024."
+        ));
+        assert!(rendered.contains("- source: publisher-authority; reported figure: 440,948; reference date: 2025; population definition: urban area."));
+        assert!(rendered.contains("[Source](https://example.com/final)"));
         assert!(!rendered.contains("Verification Shortfall"));
+    }
+
+    #[test]
+    fn deterministic_fact_claim_rejects_navigation_and_title_concatenation() {
+        assert!(!structurally_supported_fact_claim(
+            "Bratislava Population City statistics Navigation Menu Privacy Policy 475,503"
+        ));
+        assert!(!structurally_supported_fact_claim(
+            "Bratislava 442,197 428,672 411,228 475,503 480,902"
+        ));
+        assert!(structurally_supported_fact_claim(
+            "The population of Bratislava was 475,503 at the end of 2024."
+        ));
+        assert!(structurally_supported_fact_claim(
+            "The urban-area population estimate for Bratislava was 440,948 in 2025."
+        ));
+    }
+
+    #[test]
+    fn deterministic_web_fallback_rejects_flattened_population_table_as_conflict_claim() {
+        use crate::evidence::{
+            fixtures, EvidenceConflict, EvidenceId, EvidenceValidator, VerificationLevel,
+        };
+
+        let mut results = fixtures::two_independent_readable_pages();
+        results.web_fetches[0].value.as_mut().unwrap().passages[0].text =
+            "Bratislava 442,197 428,672 411,228 475,503 480,902".into();
+        results.web_fetches[1].value.as_mut().unwrap().passages[0].text =
+            "The population of Bratislava was 475,503 at the end of 2024.".into();
+        results.conflicts.push(EvidenceConflict {
+            evidence_ids: vec![
+                EvidenceId::new("web-1").unwrap(),
+                EvidenceId::new("web-2").unwrap(),
+            ],
+            description: "Population figures differ by reference date or definition.".into(),
+        });
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava? Verify it using two independent sources.".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        let ValidationOutcome::Bundle(bundle) =
+            EvidenceValidator::validate("turn-web-flattened-table", &plan, results)
+        else {
+            panic!("two fetched sources should remain eligible");
+        };
+
+        let rendered = render_deterministic_web_result(&bundle);
+        let canonical = canonical_web_answer(&bundle);
+
+        assert!(rendered.starts_with("Verification Shortfall:"));
+        assert!(rendered.contains("fewer than two independent answer-quality claims"));
+        assert!(!rendered.contains("442,197 428,672 411,228 475,503 480,902"));
+        assert_eq!(
+            canonical.outcome_status,
+            crate::evidence::CanonicalOutcomeStatus::VerificationShortfall
+        );
+
+        let mut misleading_bundle = bundle.clone();
+        misleading_bundle.web[0].evidence.passages[0].text =
+            "Copyright 2024; the municipality reports Bratislava's population was 475,503.".into();
+        let misleading = render_deterministic_web_result(&misleading_bundle);
+        assert!(misleading.starts_with("Verification Shortfall:"));
+        assert!(!misleading.contains("reference date: 2024"));
     }
 
     #[tokio::test]

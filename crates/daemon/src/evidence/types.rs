@@ -536,6 +536,7 @@ pub(crate) struct CanonicalGroundedAnswer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CanonicalOutcomeStatus {
     Verified,
+    Conflict,
     Partial,
     VerificationShortfall,
 }

@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    BodyOrigin, Completeness, EvidenceBundle, EvidenceContribution, EvidenceCounts, EvidenceIntent,
-    EvidenceOperation, ExecutionStatus, FailureCode, RecoveryKind, ValidationOutcome,
+    BodyOrigin, CanonicalGroundedAnswer, CanonicalOutcomeStatus, Completeness, EvidenceBundle,
+    EvidenceContribution, EvidenceCounts, EvidenceIntent, EvidenceOperation, ExecutionStatus,
+    FailureCode, RecoveryKind, ValidationOutcome,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +167,7 @@ pub(crate) struct LogicalActivityCompletion {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EvidenceOutcomeState {
     Verified,
+    Conflict,
     Partial,
     Empty,
     Unavailable,
@@ -249,6 +251,25 @@ impl EvidenceOutcomeEvent {
         self
     }
 
+    pub(crate) fn with_canonical_answer(mut self, canonical: &CanonicalGroundedAnswer) -> Self {
+        self.state = match canonical.outcome_status {
+            CanonicalOutcomeStatus::Verified => EvidenceOutcomeState::Verified,
+            CanonicalOutcomeStatus::Conflict => EvidenceOutcomeState::Conflict,
+            CanonicalOutcomeStatus::Partial => EvidenceOutcomeState::Partial,
+            CanonicalOutcomeStatus::VerificationShortfall => {
+                EvidenceOutcomeState::VerificationShortfall
+            }
+        };
+        self.message = outcome_message(
+            self.state,
+            self.kind,
+            self.acquired,
+            self.requested,
+            self.source_count,
+        );
+        self
+    }
+
     fn new(
         turn_id: &str,
         state: EvidenceOutcomeState,
@@ -277,7 +298,9 @@ fn outcome_from_bundle(bundle: &EvidenceBundle) -> EvidenceOutcomeEvent {
         EvidenceOutcomeKind::Mail
     };
     let (acquired, requested) = relevant_counts(kind, &bundle.acquired, &bundle.requested);
-    let state = if bundle.completeness == Completeness::Complete {
+    let state = if kind == EvidenceOutcomeKind::Web && !bundle.conflicts.is_empty() {
+        EvidenceOutcomeState::Conflict
+    } else if bundle.completeness == Completeness::Complete {
         EvidenceOutcomeState::Verified
     } else {
         EvidenceOutcomeState::Partial
@@ -353,6 +376,9 @@ fn outcome_message(
         (EvidenceOutcomeKind::Web, EvidenceOutcomeState::Verified) => {
             format!("Web verified · {source_count} sources")
         }
+        (EvidenceOutcomeKind::Web, EvidenceOutcomeState::Conflict) => {
+            format!("Web verified · {source_count} sources · conflict")
+        }
         (EvidenceOutcomeKind::Web, EvidenceOutcomeState::Partial) => {
             format!("Web partially verified · {source_count} sources")
         }
@@ -363,6 +389,9 @@ fn outcome_message(
             "Web unavailable".to_string()
         }
         (EvidenceOutcomeKind::Web, EvidenceOutcomeState::Denied) => "Web access denied".to_string(),
+        (EvidenceOutcomeKind::Mail, EvidenceOutcomeState::Conflict) => {
+            "Mail evidence conflict".to_string()
+        }
     }
 }
 
@@ -565,6 +594,40 @@ mod tests {
             EvidenceOutcomeEvent::from_validation(&make_bundle(Completeness::Partial)).state,
             EvidenceOutcomeState::Partial
         );
+
+        let ValidationOutcome::Bundle(mut conflict_bundle) = make_bundle(Completeness::Complete)
+        else {
+            unreachable!();
+        };
+        conflict_bundle
+            .conflicts
+            .push(super::super::EvidenceConflict {
+                evidence_ids: vec![
+                    super::super::EvidenceId::new("web-1").unwrap(),
+                    super::super::EvidenceId::new("web-2").unwrap(),
+                ],
+                description: "Figures differ".to_string(),
+            });
+        let conflict =
+            EvidenceOutcomeEvent::from_validation(&ValidationOutcome::Bundle(conflict_bundle));
+        assert_eq!(conflict.state, EvidenceOutcomeState::Conflict);
+        assert_eq!(conflict.message, "Web verified · 2 sources · conflict");
+        let canonical_shortfall = CanonicalGroundedAnswer {
+            text: "Verification Shortfall: fewer than two claims.".to_string(),
+            completeness: Completeness::Complete,
+            outcome_status: CanonicalOutcomeStatus::VerificationShortfall,
+            covered_evidence_ids: Vec::new(),
+            citation_targets: Vec::new(),
+            conflicts: Vec::new(),
+            shortfalls: Vec::new(),
+            source_identities: Vec::new(),
+        };
+        let canonical_outcome = conflict.with_canonical_answer(&canonical_shortfall);
+        assert_eq!(
+            canonical_outcome.state,
+            EvidenceOutcomeState::VerificationShortfall
+        );
+        assert_eq!(canonical_outcome.message, "Couldn't verify sources");
 
         let shortfall = ValidationOutcome::Recovery(RecoveryOutcome {
             kind: RecoveryKind::VerificationShortfall,

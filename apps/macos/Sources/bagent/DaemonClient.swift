@@ -313,6 +313,7 @@ struct DaemonClient: Sendable {
 
     enum EvidenceOutcomeState: String, Sendable, Equatable {
         case verified
+        case conflict
         case partial
         case empty
         case unavailable

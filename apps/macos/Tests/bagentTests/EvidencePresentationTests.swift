@@ -79,6 +79,8 @@ final class EvidencePresentationTests: XCTestCase {
             message = "Read \(acquired) of \(requested) emails · partial"
         case (.verified, .web):
             message = "Web verified · \(sources) sources"
+        case (.conflict, .web):
+            message = "Web verified · \(sources) sources · conflict"
         case (.denied, .mail):
             message = "Mail access denied"
         case (.verificationShortfall, .web):
@@ -119,6 +121,12 @@ final class EvidencePresentationTests: XCTestCase {
                 state: .verified, kind: .web, acquired: 2, requested: 2, sources: 2
             )),
             "Web verified · 2 sources"
+        )
+        XCTAssertEqual(
+            EvidencePresentation.outcomeLabel(outcome(
+                state: .conflict, kind: .web, acquired: 2, requested: 2, sources: 2
+            )),
+            "Web verified · 2 sources · conflict"
         )
         XCTAssertEqual(
             EvidencePresentation.outcomeLabel(outcome(state: .denied, kind: .mail)),
