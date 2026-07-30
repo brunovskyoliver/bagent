@@ -1211,7 +1211,9 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "flag"
             | "forward"
             | "install"
+            | "inspect"
             | "launch"
+            | "list"
             | "mark"
             | "message"
             | "move"
@@ -1220,6 +1222,7 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "post"
             | "print"
             | "quit"
+            | "read"
             | "remove"
             | "reply"
             | "resend"
@@ -1231,12 +1234,14 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "search"
             | "send"
             | "share"
+            | "show"
             | "start"
             | "stop"
             | "switch"
             | "uninstall"
             | "update"
             | "upload"
+            | "view"
             | "write"
     ) || [
         "archiv",
@@ -5723,6 +5728,9 @@ mod tests {
             "what is the current price of Nintendo Switch restart server?",
             "what is the current price of Nintendo open weather app?",
             "what is the current weather switch account?",
+            "what is the current weather read my project file?",
+            "what is the current weather show files?",
+            "what is the current weather inspect notes?",
             "what is the population of France and Germany delete file?",
             "compare prices of Apple and Microsoft and browse website",
             "compare prices of Apple and Microsoft browse website",
