@@ -982,6 +982,20 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
     while index < tokens.len() {
         let token = tokens[index];
         let lower = token.to_lowercase();
+        if !entity_context
+            && is_known_agentic_command_word(&lower)
+            && !is_supported_web_fact_topic_word(&lower)
+            && !is_supported_command_noun_at(tokens, index)
+            && !(is_supported_fact_request_verb(&lower)
+                && !tokens[..index].iter().any(|prior| {
+                    let prior = prior.to_lowercase();
+                    is_supported_web_fact_topic_word(&prior)
+                        || (!is_supported_web_fact_query_word(&prior)
+                            && !prior.chars().all(|character| character.is_ascii_digit()))
+                }))
+        {
+            return false;
+        }
         if lower == "and" {
             let remainder = &tokens[index + 1..];
             if entity_context {
@@ -1024,12 +1038,9 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
         } else if !is_supported_web_fact_query_word(&lower)
             && !lower.chars().all(|character| character.is_ascii_digit())
         {
-            if (is_known_agentic_command_word(&lower)
-                && !is_supported_web_fact_topic_word(&lower)
-                && !is_supported_command_noun_at(tokens, index))
-                || !token
-                    .chars()
-                    .all(|character| character.is_alphanumeric() || character == '-')
+            if !token
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '-')
             {
                 return false;
             }
@@ -1129,6 +1140,7 @@ fn is_supported_command_noun_at(tokens: &[&str], index: usize) -> bool {
         "download" => next.as_deref() == Some("speed"),
         "export" => matches!(next.as_deref(), Some("price" | "prices")),
         "install" => next.as_deref() == Some("size"),
+        "list" => matches!(next.as_deref(), Some("price" | "prices")),
         "open" => next.as_deref() == Some("source") && next_next.as_deref() == Some("license"),
         "restart" => next.as_deref() == Some("policy"),
         "run" => next.as_deref() == Some("time"),
@@ -1139,6 +1151,10 @@ fn is_supported_command_noun_at(tokens: &[&str], index: usize) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_supported_fact_request_verb(token: &str) -> bool {
+    matches!(token, "check" | "find" | "tell" | "verify")
 }
 
 fn entity_conjunction_phrase_is_supported(tokens: &[&str]) -> bool {
@@ -1197,6 +1213,7 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "attach"
             | "automate"
             | "browse"
+            | "check"
             | "compose"
             | "convert"
             | "copy"
@@ -1209,6 +1226,7 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "execute"
             | "export"
             | "flag"
+            | "find"
             | "forward"
             | "install"
             | "inspect"
@@ -1238,10 +1256,12 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "start"
             | "stop"
             | "switch"
+            | "tell"
             | "uninstall"
             | "update"
             | "upload"
             | "view"
+            | "verify"
             | "write"
     ) || [
         "archiv",
@@ -5634,6 +5654,7 @@ mod tests {
             "what is the current install size of X?",
             "what is the current archive format?",
             "what is the current run time online?",
+            "what is the current list price of the iPhone 17 online?",
             "what is the current price of Nintendo Switch?",
             "what is the current price of nintendo switch?",
             "what is the current weather",
@@ -5731,6 +5752,9 @@ mod tests {
             "what is the current weather read my project file?",
             "what is the current weather show files?",
             "what is the current weather inspect notes?",
+            "what is the current weather check my project file?",
+            "what is the current weather find my notes?",
+            "what is the current weather tell me what is in my file?",
             "what is the population of France and Germany delete file?",
             "compare prices of Apple and Microsoft and browse website",
             "compare prices of Apple and Microsoft browse website",
