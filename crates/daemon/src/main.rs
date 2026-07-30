@@ -55,6 +55,12 @@ mod embedded {
     refinery::embed_migrations!("migrations");
 }
 
+const STAGE8_ACCEPTANCE_PROVIDER_FAULTS_ENV: &str = "BAGENT_STAGE8_ACCEPTANCE_PROVIDER_FAULTS";
+
+fn stage8_acceptance_provider_faults_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Connection>>,
@@ -91,6 +97,9 @@ struct AppState {
     /// Tavily key is supplied ephemerally by the signed app from Keychain.
     /// It is never persisted by the daemon or included in diagnostics.
     tavily_api_key: Arc<RwLock<Option<String>>>,
+    /// Present only when the explicit Stage 8 acceptance environment flag was
+    /// set at daemon startup. The route controlling it is otherwise absent.
+    tavily_acceptance_fault: Option<Arc<RwLock<Option<evidence::TavilyAcceptanceFault>>>>,
     /// WhatsApp Web bridge connector. Always present; owns the bridge subprocess.
     /// Bridge can autostart when a prior LocalAuth session exists, and is also
     /// controlled explicitly via `/whatsapp/start` and `/whatsapp/stop`.
@@ -650,6 +659,10 @@ async fn main() -> Result<()> {
     // Odoo connector — starts unconfigured; Swift configures it lazily via POST /odoo/config.
     let odoo: Arc<RwLock<Option<OdooConnector>>> = Arc::new(RwLock::new(None));
     let tavily_api_key: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    let acceptance_faults_env = std::env::var(STAGE8_ACCEPTANCE_PROVIDER_FAULTS_ENV).ok();
+    let tavily_acceptance_fault =
+        stage8_acceptance_provider_faults_enabled(acceptance_faults_env.as_deref())
+            .then(|| Arc::new(RwLock::new(None)));
 
     // WhatsApp connector — always present; autostarts only for prior paired sessions.
     let whatsapp = Arc::new(WhatsappConnector::new(WhatsappConfig::default()));
@@ -687,6 +700,7 @@ async fn main() -> Result<()> {
         codex,
         odoo,
         tavily_api_key,
+        tavily_acceptance_fault,
         whatsapp,
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
@@ -702,7 +716,7 @@ async fn main() -> Result<()> {
     tokio::spawn(scheduler::run_scheduler(state.clone()));
 
     let shutdown_state = state.clone();
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/events", get(events_stream))
         .route("/models", get(models))
@@ -816,7 +830,14 @@ async fn main() -> Result<()> {
             "/whatsapp/chats/:id/messages",
             get(whatsapp_chat_messages_handler),
         )
-        .route("/whatsapp/send", post(whatsapp_send_handler))
+        .route("/whatsapp/send", post(whatsapp_send_handler));
+    if state.tavily_acceptance_fault.is_some() {
+        app = app.route(
+            "/web/tavily/acceptance-fault",
+            post(tavily_acceptance_fault_handler),
+        );
+    }
+    let app = app
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
@@ -3472,6 +3493,28 @@ struct TavilyConfigRequest {
     api_key: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct TavilyAcceptanceFaultRequest {
+    fault: Option<evidence::TavilyAcceptanceFault>,
+}
+
+/// Acceptance-only authenticated control. The router does not register this
+/// handler unless `BAGENT_STAGE8_ACCEPTANCE_PROVIDER_FAULTS=1` was present at
+/// daemon startup.
+async fn tavily_acceptance_fault_handler(
+    State(state): State<AppState>,
+    Json(body): Json<TavilyAcceptanceFaultRequest>,
+) -> impl IntoResponse {
+    let Some(slot) = state.tavily_acceptance_fault.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "not_found" })),
+        );
+    };
+    *slot.write().await = body.fault;
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
 /// Receives the Tavily credential from the signed app's Keychain and keeps it
 /// only for this daemon process lifetime.
 async fn tavily_config_handler(
@@ -3993,6 +4036,14 @@ mod tests {
         assert!(!attachment_mime_is_supported("image/jpeg"));
         assert!(attachment_mime_is_supported("application/pdf"));
         assert!(attachment_mime_is_supported("text/plain"));
+    }
+
+    #[test]
+    fn provider_fault_control_requires_the_exact_acceptance_flag() {
+        assert!(stage8_acceptance_provider_faults_enabled(Some("1")));
+        for value in [None, Some(""), Some("0"), Some("true"), Some("stage8")] {
+            assert!(!stage8_acceptance_provider_faults_enabled(value));
+        }
     }
 
     #[test]

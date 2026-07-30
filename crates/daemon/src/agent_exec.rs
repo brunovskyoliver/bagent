@@ -1971,10 +1971,7 @@ fn first_web_sentence_matching(response: &str, predicate: impl Fn(&str) -> bool)
 }
 
 fn sentence_ends_with_citation(segment: &str, citations: &[Url]) -> bool {
-    let trimmed = segment
-        .trim()
-        .trim_end_matches(|character: char| matches!(character, '.' | '?' | '!'))
-        .trim_end();
+    let trimmed = segment.trim().trim_end_matches(['.', '?', '!']).trim_end();
     citations.iter().any(|url| {
         trimmed.ends_with(&format!("]({url})")) || trimmed.ends_with(&format!("](<{url}>)"))
     })
@@ -2580,36 +2577,34 @@ fn render_canonical_web_text(bundle: &EvidenceBundle) -> String {
     }
     if !bundle.conflicts.is_empty() {
         if let Some(query) = web_fact_query(&bundle.intent) {
-            let claims = bundle
+            let candidates = bundle
                 .web
                 .iter()
-                .filter_map(|item| {
-                    deterministic_conflict_claim(query, item).map(|claim| {
-                        let reference_date = claim
-                            .reference_date
-                            .as_deref()
-                            .map(|date| format!("; reference date: {date}"))
-                            .unwrap_or_default();
-                        let definition = claim
-                            .population_definition
-                            .as_deref()
-                            .map(|definition| format!("; population definition: {definition}"))
-                            .unwrap_or_default();
-                        format!(
-                            "- source: {}; reported figure: {}{}{}. [Source]({}).",
-                            item.evidence.source_identity.as_str(),
-                            claim.reported_figure,
-                            reference_date,
-                            definition,
-                            item.evidence.final_url
-                        )
-                    })
-                })
+                .map(|item| (item, deterministic_conflict_claims(query, item)))
                 .collect::<Vec<_>>();
-            if claims.len() >= 2 {
+            let mut rendered = None;
+            'source_pairs: for (left_index, (left_item, left_claims)) in
+                candidates.iter().enumerate()
+            {
+                for (right_item, right_claims) in candidates.iter().skip(left_index + 1) {
+                    for left_claim in left_claims {
+                        for right_claim in right_claims {
+                            if left_claim.reported_figure == right_claim.reported_figure {
+                                continue;
+                            }
+                            rendered = Some(vec![
+                                render_deterministic_conflict_bullet(left_item, left_claim),
+                                render_deterministic_conflict_bullet(right_item, right_claim),
+                            ]);
+                            break 'source_pairs;
+                        }
+                    }
+                }
+            }
+            if let Some(rendered) = rendered {
                 return format!(
                     "Fetched sources report unresolved conflicting figures; no source was selected as the winner:\n{}",
-                    claims.join("\n")
+                    rendered.join("\n")
                 );
             }
         }
@@ -2677,6 +2672,30 @@ fn render_canonical_web_text(bundle: &EvidenceBundle) -> String {
     )
 }
 
+fn render_deterministic_conflict_bullet(
+    item: &crate::evidence::WebBundleItem,
+    claim: &DeterministicConflictClaim,
+) -> String {
+    let reference_date = claim
+        .reference_date
+        .as_deref()
+        .map(|date| format!("; reference date: {date}"))
+        .unwrap_or_default();
+    let definition = claim
+        .definition
+        .as_deref()
+        .map(|definition| format!("; {}: {definition}", claim.definition_label))
+        .unwrap_or_default();
+    format!(
+        "- source: {}; reported figure: {}{}{}. [Source]({}).",
+        item.evidence.source_identity.as_str(),
+        claim.reported_figure,
+        reference_date,
+        definition,
+        item.evidence.final_url
+    )
+}
+
 #[cfg(test)]
 fn render_deterministic_web_result(bundle: &EvidenceBundle) -> String {
     canonical_web_answer(bundle).text
@@ -2738,14 +2757,24 @@ fn deterministic_fact_claim(query: &str, item: &crate::evidence::WebBundleItem) 
 struct DeterministicConflictClaim {
     reported_figure: String,
     reference_date: Option<String>,
-    population_definition: Option<String>,
+    definition: Option<String>,
+    definition_label: &'static str,
 }
 
-fn deterministic_conflict_claim(
+fn deterministic_conflict_claims(
     query: &str,
     item: &crate::evidence::WebBundleItem,
-) -> Option<DeterministicConflictClaim> {
-    let claim = deterministic_fact_claim(query, item)?;
+) -> Vec<DeterministicConflictClaim> {
+    item.evidence
+        .passages
+        .iter()
+        .flat_map(|passage| sentence_like_chunks(&passage.text))
+        .filter(|claim| assess_claim_relevance(query, claim).eligible)
+        .filter_map(parse_deterministic_conflict_claim)
+        .collect()
+}
+
+fn parse_deterministic_conflict_claim(claim: &str) -> Option<DeterministicConflictClaim> {
     let numeric_tokens = claim
         .split_whitespace()
         .map(|token| {
@@ -2757,67 +2786,154 @@ fn deterministic_conflict_claim(
         .iter()
         .copied()
         .filter(|token| {
-            token.contains(',') && token.chars().filter(char::is_ascii_digit).count() >= 4
+            let digits = token
+                .chars()
+                .filter(char::is_ascii_digit)
+                .collect::<String>();
+            let year_only = digits.len() == 4
+                && digits
+                    .parse::<u16>()
+                    .is_ok_and(|year| (1900..=2100).contains(&year));
+            !year_only && digits.len() >= 3 && (token.contains(',') || token.contains('.'))
         })
         .collect::<Vec<_>>();
-    if figures.len() != 1 {
-        return None;
-    }
     let lower = claim.to_ascii_lowercase();
-    let figure_position = lower.find(figures[0])?;
-    let population_position = lower[..figure_position].rfind("population")?;
-    let relation = &lower[population_position + "population".len()..figure_position];
-    if ![" is ", " was ", " stood at ", " reached ", " estimate for "]
+    let linked = figures
         .iter()
-        .any(|marker| format!(" {relation} ").contains(marker))
-    {
+        .filter_map(|figure| {
+            let figure_position = lower.find(*figure)?;
+            let (measure, measure_position) = ["population", "height", "elevation"]
+                .iter()
+                .filter_map(|measure| {
+                    lower[..figure_position]
+                        .rfind(measure)
+                        .map(|position| (*measure, position))
+                })
+                .max_by_key(|(_, position)| *position)?;
+            let relation = &lower[measure_position + measure.len()..figure_position];
+            let supported_relation = [
+                " is ",
+                " as ",
+                " was ",
+                " stood at ",
+                " stands at ",
+                " reached ",
+                " reference ",
+                " references ",
+                " estimate for ",
+                " measured at ",
+                " reported as ",
+            ]
+            .iter()
+            .any(|marker| format!(" {relation} ").contains(marker));
+            (supported_relation && !contains_non_year_number(relation)).then_some((
+                *figure,
+                figure_position,
+                measure,
+            ))
+        })
+        .collect::<Vec<_>>();
+    if linked.len() != 1 {
         return None;
     }
+    let (figure, figure_position, measure) = linked[0];
     let years = numeric_tokens
         .iter()
         .filter_map(|token| token.replace(',', "").parse::<u16>().ok())
         .filter(|year| (1900..=2100).contains(year))
         .collect::<Vec<_>>();
-    if years.len() > 1 {
-        return None;
-    }
-    let population_definition = [
+    let definition = [
         ("urban-area", "urban area"),
         ("urban area", "urban area"),
         ("metropolitan", "metropolitan area"),
         ("city proper", "city proper"),
         ("municipality", "municipality"),
         ("administrative", "administrative area"),
+        ("snow height", "snow height"),
+        ("including snow", "including snow and ice"),
+        ("snow and ice", "snow and ice"),
+        ("snow cap", "snow cap"),
+        ("rock height", "rock height"),
+        ("rock summit", "rock summit"),
+        ("without snow", "rock height without snow"),
+        ("geoid", "geoid-based elevation"),
     ]
     .iter()
-    .find_map(|(marker, definition)| {
-        lower[..population_position]
-            .rfind(marker)
-            .filter(|position| population_position.saturating_sub(*position) <= marker.len() + 2)
-            .map(|_| (*definition).to_string())
-    });
-    let reference_date = years.first().and_then(|year| {
-        let year = year.to_string();
-        let year_position = lower[figure_position + figures[0].len()..]
-            .find(&year)
-            .map(|position| position + figure_position + figures[0].len())?;
-        let between = lower[figure_position + figures[0].len()..year_position].trim();
-        if between.ends_with("at the end of") || between.ends_with("end of") {
-            Some(format!("end of {year}"))
-        } else if between.ends_with("in") || between.ends_with("as of") || between.ends_with("for")
-        {
-            Some(year)
-        } else {
-            None
-        }
-    });
-    if reference_date.is_none() && population_definition.is_none() {
+    .find_map(|(marker, definition)| lower.contains(marker).then(|| (*definition).to_string()));
+    let reference_date = years
+        .iter()
+        .filter_map(|year| {
+            let year = year.to_string();
+            let year_position = lower.find(&year)?;
+            let distance = figure_position.abs_diff(year_position);
+            let explicitly_associated = if year_position > figure_position {
+                let between = lower[figure_position + figure.len()..year_position].trim();
+                between.ends_with("at the end of")
+                    || between.ends_with("end of")
+                    || between.ends_with("in")
+                    || between.ends_with("as of")
+                    || between.ends_with("for")
+            } else {
+                let between = lower[year_position + year.len()..figure_position].trim();
+                distance <= 240
+                    && [
+                        "agreement",
+                        "announced",
+                        "measurement",
+                        "measured",
+                        "refined",
+                        "reported",
+                        "survey",
+                    ]
+                    .iter()
+                    .any(|marker| between.contains(marker))
+            } || lower.contains(&format!("in {year}"))
+                || lower.contains(&format!("{year} survey"))
+                || lower.contains(&format!("{year} agreement"))
+                || lower.contains(&format!("as of {year}"))
+                || lower.contains(&format!("end of {year}"));
+            explicitly_associated.then_some((distance, year))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, year)| {
+            let year_position = lower.find(&year).unwrap_or_default();
+            if year_position > figure_position {
+                let between = lower[figure_position + figure.len()..year_position].trim();
+                if between.ends_with("at the end of") || between.ends_with("end of") {
+                    return format!("end of {year}");
+                }
+            }
+            year
+        });
+    if reference_date.is_none() && definition.is_none() {
         return None;
     }
     Some(DeterministicConflictClaim {
-        reported_figure: figures[0].to_string(),
+        reported_figure: figure.to_string(),
         reference_date,
-        population_definition,
+        definition,
+        definition_label: if measure == "population" {
+            "population definition"
+        } else {
+            "measurement definition"
+        },
+    })
+}
+
+fn contains_non_year_number(value: &str) -> bool {
+    value.split_whitespace().any(|token| {
+        let digits = token
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect::<String>();
+        if digits.is_empty() {
+            false
+        } else {
+            !(digits.len() == 4
+                && digits
+                    .parse::<u16>()
+                    .is_ok_and(|year| (1900..=2100).contains(&year)))
+        }
     })
 }
 
@@ -2863,6 +2979,12 @@ fn structurally_supported_fact_claim(value: &str) -> bool {
         " estimated ",
         " reached ",
         " stood at ",
+        " serves as ",
+        " was elected ",
+        " elected president ",
+        " assumed office ",
+        " took office ",
+        " became president ",
     ]
     .iter()
     .any(|relation| format!(" {lower} ").contains(relation));
@@ -2874,7 +2996,7 @@ fn structurally_supported_fact_claim(value: &str) -> bool {
     if numeric_words >= 2 && lexical_words <= numeric_words {
         return false;
     }
-    has_sentence_punctuation && has_factual_relation
+    has_factual_relation && (has_sentence_punctuation || lexical_words >= 5)
 }
 
 fn sentence_like_chunks(value: &str) -> Vec<&str> {
@@ -6190,6 +6312,91 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_height_conflict_keeps_each_figure_and_reference_date_with_its_citation() {
+        use crate::evidence::{
+            fixtures, EvidenceConflict, EvidenceId, EvidenceValidator, VerificationLevel,
+        };
+
+        let mut results = fixtures::two_independent_readable_pages();
+        results.web_fetches[0].value.as_mut().unwrap().passages[0].text =
+            "The height of Mount Everest was reported as 8,848.86 metres in 2020.".into();
+        results.web_fetches[0]
+            .value
+            .as_mut()
+            .unwrap()
+            .passages
+            .push(crate::evidence::EvidencePassage {
+                passage_id: EvidenceId::new("web-passage-rock").unwrap(),
+                text:
+                    "In the 2005 survey, Mount Everest rock height was reported as 8,844.43 metres."
+                        .into(),
+                truncated: false,
+            });
+        results.web_fetches[1].value.as_mut().unwrap().passages[0].text =
+            "The height of Mount Everest was measured at 8,848.86 metres in 2020".into();
+        results.conflicts.push(EvidenceConflict {
+            evidence_ids: vec![
+                EvidenceId::new("web-1").unwrap(),
+                EvidenceId::new("web-2").unwrap(),
+            ],
+            description: "Height measurements differ by reference date.".into(),
+        });
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the height of Mount Everest? Compare two independent publishers with explicit figures and dates.".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        let ValidationOutcome::Bundle(bundle) =
+            EvidenceValidator::validate("turn-height-conflict", &plan, results)
+        else {
+            panic!("two associated claims should validate");
+        };
+
+        let canonical = canonical_web_answer(&bundle);
+
+        assert!(canonical.text.contains("8,848.86; reference date: 2020"));
+        assert!(canonical.text.contains("8,844.43; reference date: 2005"));
+        assert_eq!(canonical.citation_targets.len(), 2);
+        assert_eq!(
+            canonical.outcome_status,
+            crate::evidence::CanonicalOutcomeStatus::Conflict
+        );
+    }
+
+    #[test]
+    fn height_conflict_parser_keeps_preceding_date_and_measurement_definition() {
+        let snow = parse_deterministic_conflict_claim(
+            "In the 2020 agreement, Mount Everest snow height was reported as 8,848.86 metres.",
+        )
+        .expect("associated snow-height claim");
+        let rock = parse_deterministic_conflict_claim(
+            "The 2005 survey reported Mount Everest rock height as 8,844.43 metres.",
+        )
+        .expect("associated rock-height claim");
+
+        assert_eq!(snow.reported_figure, "8,848.86");
+        assert_eq!(snow.reference_date.as_deref(), Some("2020"));
+        assert_eq!(snow.definition.as_deref(), Some("snow height"));
+        assert_eq!(rock.reported_figure, "8,844.43");
+        assert_eq!(rock.reference_date.as_deref(), Some("2005"));
+        assert_eq!(rock.definition.as_deref(), Some("rock height"));
+
+        let converted = parse_deterministic_conflict_claim(
+            "In the 2005 survey, the height of Everest was reported as 8,844.43 m (29,017.16 ft) based on the rock summit.",
+        )
+        .expect("primary metric figure must remain distinct from its unit conversion");
+        assert_eq!(converted.reported_figure, "8,844.43");
+        assert_eq!(converted.reference_date.as_deref(), Some("2005"));
+        assert_eq!(converted.definition.as_deref(), Some("rock summit"));
+
+        let refined = parse_deterministic_conflict_claim(
+            "Later surveys by China (2005) and a joint survey (2020) refined the official height as 8,848.86 metres.",
+        )
+        .expect("nearest explicit survey date must own the refined figure");
+        assert_eq!(refined.reported_figure, "8,848.86");
+        assert_eq!(refined.reference_date.as_deref(), Some("2020"));
+    }
+
+    #[test]
     fn deterministic_fact_claim_rejects_navigation_and_title_concatenation() {
         assert!(!structurally_supported_fact_claim(
             "Bratislava Population City statistics Navigation Menu Privacy Policy 475,503"
@@ -6202,6 +6409,12 @@ mod tests {
         ));
         assert!(structurally_supported_fact_claim(
             "The urban-area population estimate for Bratislava was 440,948 in 2025."
+        ));
+        assert!(structurally_supported_fact_claim(
+            "President of the Slovak Republic: Peter Pellegrini: Assumed office on 15 June 2024."
+        ));
+        assert!(structurally_supported_fact_claim(
+            "Peter Pellegrini is the President of Slovakia"
         ));
     }
 

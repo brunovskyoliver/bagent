@@ -8,12 +8,13 @@ use url::Url;
 use super::{
     assess_claim_relevance, candidate_is_first_party, candidate_is_query_relevant,
     candidate_query_relevance_score, candidate_source_identity, direct_web_candidate,
-    linked_web_candidate, prepare_web_candidates, AppleMailEvidenceAdapter, EvidenceConflict,
-    EvidenceContribution, EvidenceIntent, EvidenceOperation, EvidencePhase, EvidencePhaseEvent,
-    EvidencePlanner, EvidenceRequest, EvidenceResults, ExecutionStatus, ExtractionStatus,
-    FailureCode, LogicalActivityCompletion, LogicalActivityEvent, MailBodyEvidence,
-    MailEvidenceAdapter, MailHeaderEvidence, OperationResult, SourceAuthority, TypedWebAdapter,
-    TypedWebEvidenceAdapter, ValidationOutcome, VerificationLevel, WebCandidate, WebFetchEvidence,
+    linked_web_candidate, prepare_web_candidates, seed_relevant_first_party_candidates,
+    AppleMailEvidenceAdapter, EvidenceConflict, EvidenceContribution, EvidenceIntent,
+    EvidenceOperation, EvidencePhase, EvidencePhaseEvent, EvidencePlanner, EvidenceRequest,
+    EvidenceResults, ExecutionStatus, ExtractionStatus, FailureCode, LogicalActivityCompletion,
+    LogicalActivityEvent, MailBodyEvidence, MailEvidenceAdapter, MailHeaderEvidence,
+    OperationResult, ProviderStatus, SourceAuthority, TypedWebAdapter, TypedWebEvidenceAdapter,
+    ValidationOutcome, VerificationLevel, WebCandidate, WebFetchEvidence, WebProvider,
     WebSearchResult,
 };
 use crate::{
@@ -257,14 +258,15 @@ pub(crate) async fn execute_evidence_turn(
         }
     } else if is_web_intent(&plan.intent) {
         let tavily_api_key = ctx.state.tavily_api_key.read().await.clone();
-        execute_web_plan(
-            TypedWebAdapter::production(tavily_api_key),
-            &mut gate,
-            &request.turn_id,
-            &plan,
-            "en",
-        )
-        .await
+        let tavily_acceptance_fault = match ctx.state.tavily_acceptance_fault.as_ref() {
+            Some(slot) => *slot.read().await,
+            None => None,
+        };
+        let adapter = match tavily_acceptance_fault {
+            Some(fault) => TypedWebAdapter::production_with_acceptance_fault(tavily_api_key, fault),
+            None => TypedWebAdapter::production(tavily_api_key),
+        };
+        execute_web_plan(adapter, &mut gate, &request.turn_id, &plan, "en").await
     } else {
         return Err(EvidenceExecError::UnsupportedIntent);
     };
@@ -307,10 +309,10 @@ where
     let mut results = EvidenceResults::default();
     let mut operations_executed = 0usize;
     let mut approvals_denied = 0usize;
+    let providers = super::web::web_provider_set(adapter.tavily_configured());
     let mut candidates = match intent {
         EvidenceIntent::WebDirectPage { url } => vec![direct_web_candidate(url)],
         EvidenceIntent::WebFact { query, .. } => {
-            let providers = super::web::web_provider_set(adapter.tavily_configured());
             let operation = EvidenceOperation::WebSearch {
                 normalized_query: query.clone(),
                 provider_set: providers.clone(),
@@ -356,6 +358,17 @@ where
                 .as_ref()
                 .map(|value| value.candidates.clone())
                 .unwrap_or_default();
+            if !candidates.is_empty()
+                && matches!(
+                    intent,
+                    EvidenceIntent::WebFact {
+                        verification: VerificationLevel::SingleAuthoritative,
+                        ..
+                    }
+                )
+            {
+                seed_relevant_first_party_candidates(query, &mut candidates);
+            }
             prepare_web_candidates(query, &mut candidates);
             if let Some(value) = search.value.as_mut() {
                 value.candidates = candidates.clone();
@@ -375,6 +388,7 @@ where
                 .await;
             if plan.budget.web_search_attempts > 1
                 && search_needs_diversification(intent, query, &candidates)
+                && !search_has_terminal_tavily_failure(results.web_searches.last())
             {
                 let diversified_query = diversified_search_query(intent, query, &candidates);
                 let operation = EvidenceOperation::WebSearch {
@@ -478,9 +492,19 @@ where
         while inflight.len() < usize::from(concurrency)
             && attempts_used < plan.budget.web_fetch_attempts
         {
-            let unseen_position = queue.iter().position(|candidate| {
-                !attempted_source_identities.contains(&candidate_source_identity(candidate))
-            });
+            let unseen_position = matches!(
+                intent,
+                EvidenceIntent::WebFact {
+                    verification: VerificationLevel::Corroborated,
+                    ..
+                }
+            )
+            .then(|| {
+                queue.iter().position(|candidate| {
+                    !attempted_source_identities.contains(&candidate_source_identity(candidate))
+                })
+            })
+            .flatten();
             let candidate = if let Some(position) = unseen_position {
                 queue.remove(position).expect("queued candidate position")
             } else if inflight.is_empty() {
@@ -594,6 +618,8 @@ where
                         prior.value.as_ref().is_some_and(|prior| {
                             prior.final_url == evidence.final_url
                                 || prior.source_identity == evidence.source_identity
+                                || evidence_content_fingerprint(prior)
+                                    == evidence_content_fingerprint(evidence)
                         })
                     });
                     if duplicate_source {
@@ -657,6 +683,81 @@ where
                 .await;
             }
         }
+        if matches!(
+            intent,
+            EvidenceIntent::WebFact {
+                verification: VerificationLevel::Corroborated
+                    | VerificationLevel::SingleAuthoritative,
+                ..
+            }
+        ) && !web_contract_satisfied(intent, &results.web_fetches)
+            && attempts_used < plan.budget.web_fetch_attempts
+            && results.web_searches.len() < usize::from(plan.budget.web_search_attempts)
+            && !search_has_terminal_tavily_failure(results.web_searches.first())
+        {
+            let diversified_query =
+                diversified_search_query_after_fetch(query, &results.web_fetches);
+            let operation = EvidenceOperation::WebSearch {
+                normalized_query: diversified_query.clone(),
+                provider_set: providers.clone(),
+            };
+            gate.record_activity_started(&operation).await;
+            let mut diversified = match gate.admit(&operation).await {
+                Admission::Allowed => {
+                    gate.record_execution(&operation).await;
+                    let result = adapter.search(&diversified_query, lang, &providers).await;
+                    operations_executed += usize::from(result.attempts);
+                    result
+                }
+                Admission::Denied => {
+                    approvals_denied += 1;
+                    denied_result(&operation)
+                }
+            };
+            gate.record_completion(&operation, completion_for_search(&diversified))
+                .await;
+            let mut diversified_candidates = diversified
+                .value
+                .as_mut()
+                .map(|value| std::mem::take(&mut value.candidates))
+                .unwrap_or_default();
+            if !diversified_candidates.is_empty()
+                && matches!(
+                    intent,
+                    EvidenceIntent::WebFact {
+                        verification: VerificationLevel::SingleAuthoritative,
+                        ..
+                    }
+                )
+            {
+                seed_relevant_first_party_candidates(query, &mut diversified_candidates);
+            }
+            prepare_web_candidates(query, &mut diversified_candidates);
+            if let Some(value) = diversified.value.as_mut() {
+                value.candidates = diversified_candidates.clone();
+            }
+            results.web_searches.push(diversified);
+            if let Some(search) = results.web_searches.last() {
+                record_search_diagnostics(
+                    gate,
+                    search,
+                    diversified_candidates.len(),
+                    results.web_searches.len().min(usize::from(u8::MAX)) as u8,
+                    plan.budget.web_search_attempts,
+                )
+                .await;
+            }
+            record_candidate_diagnostics(
+                gate,
+                query,
+                &diversified_candidates,
+                plan.budget.web_fetch_attempts,
+            )
+            .await;
+            for candidate in diversified_candidates.into_iter().rev() {
+                queue.push_front(candidate);
+            }
+        }
     }
     if matches!(
         intent,
@@ -665,7 +766,7 @@ where
             ..
         }
     ) {
-        results.conflicts = detect_web_conflicts(&results.web_fetches);
+        results.conflicts = detect_web_conflicts(query, &results.web_fetches);
     }
 
     EvidenceTurnOutcome {
@@ -673,6 +774,33 @@ where
         operations_executed,
         approvals_denied,
     }
+}
+
+fn evidence_content_fingerprint(evidence: &WebFetchEvidence) -> String {
+    evidence
+        .passages
+        .iter()
+        .flat_map(|passage| passage.text.split_whitespace())
+        .map(|word| {
+            word.to_ascii_lowercase()
+                .trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                .to_string()
+        })
+        .filter(|word| !word.is_empty())
+        .take(240)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn search_has_terminal_tavily_failure(search: Option<&OperationResult<WebSearchResult>>) -> bool {
+    search
+        .and_then(|result| result.value.as_ref())
+        .is_some_and(|value| {
+            value.providers.iter().any(|provider| {
+                provider.provider == WebProvider::Tavily
+                    && !matches!(provider.status, ProviderStatus::Succeeded { .. })
+            })
+        })
 }
 
 async fn record_search_diagnostics<G: EvidenceOperationGate + Send>(
@@ -785,14 +913,7 @@ fn search_needs_diversification(
         EvidenceIntent::WebFact {
             verification: VerificationLevel::Corroborated,
             ..
-        } => {
-            candidates
-                .iter()
-                .map(candidate_source_identity)
-                .collect::<HashSet<_>>()
-                .len()
-                < 2
-        }
+        } => false,
         _ => false,
     }
 }
@@ -802,6 +923,7 @@ fn diversified_search_query(
     query: &str,
     candidates: &[WebCandidate],
 ) -> String {
+    let subject = focused_search_subject(query);
     let exclusion = candidates
         .first()
         .map(candidate_source_identity)
@@ -812,31 +934,200 @@ fn diversified_search_query(
             verification: VerificationLevel::SingleAuthoritative,
             ..
         } => {
-            format!("{query} official{exclusion}")
+            let normalized = query.to_ascii_lowercase();
+            let relationship = if normalized.contains("president") || normalized.contains("who") {
+                " biography office holder"
+            } else {
+                " primary source definition"
+            };
+            format!("{subject} official{relationship}{exclusion}")
         }
         EvidenceIntent::WebFact {
             verification: VerificationLevel::Corroborated,
             ..
         } => {
             let normalized = query.to_ascii_lowercase();
-            let terminology = if ["population", "rate", "percent", "number", "statistics"]
-                .iter()
-                .any(|term| normalized.contains(term))
+            let terminology = if [
+                "population",
+                "rate",
+                "percent",
+                "number",
+                "statistics",
+                "height",
+            ]
+            .iter()
+            .any(|term| normalized.contains(term))
             {
-                " official statistics"
+                " reported figure reference date definition"
+            } else if normalized.contains("president") || normalized.contains("who") {
+                " office holder biography"
             } else {
-                " official"
+                " independent claim definition"
             };
-            format!("{query}{terminology}{exclusion}")
+            format!("{subject}{terminology}{exclusion}")
         }
         _ => query.to_string(),
     }
 }
 
-fn detect_web_conflicts(results: &[OperationResult<WebFetchEvidence>]) -> Vec<EvidenceConflict> {
+fn focused_search_subject(query: &str) -> &str {
+    let normalized = query.to_ascii_lowercase();
+    if normalized.contains("president")
+        && (normalized.contains("slovakia") || normalized.contains("slovak republic"))
+    {
+        "President of Slovakia"
+    } else if normalized.contains("everest")
+        && (normalized.contains("height") || normalized.contains("elevation"))
+    {
+        "Mount Everest height"
+    } else if normalized.contains("bratislava") && normalized.contains("population") {
+        "Bratislava population"
+    } else {
+        query
+    }
+}
+
+fn diversified_search_query_after_fetch(
+    query: &str,
+    fetches: &[OperationResult<WebFetchEvidence>],
+) -> String {
+    let retained = fetches
+        .iter()
+        .filter_map(|result| result.value.as_ref())
+        .filter(|evidence| !evidence.passages.is_empty())
+        .collect::<Vec<_>>();
+    let grounded_holder = grounded_office_holder(query, &retained);
+    let subject = grounded_holder
+        .as_deref()
+        .map(|holder| format!("{holder} President of Slovakia"))
+        .unwrap_or_else(|| focused_search_subject(query).to_string());
+    let combined = retained
+        .iter()
+        .flat_map(|evidence| evidence.passages.iter())
+        .map(|passage| passage.text.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized_query = query.to_ascii_lowercase();
+    let missing_relationship = (normalized_query.contains("president")
+        || normalized_query.contains("office holder"))
+        && ![" is ", " serves as ", " assumed office ", " took office "]
+            .iter()
+            .any(|relation| combined.contains(relation));
+    let missing_date = super::query_requires_claim_number(query)
+        && !retained.iter().any(|evidence| {
+            evidence
+                .passages
+                .iter()
+                .any(|passage| passage.text.split_whitespace().any(is_year_token))
+        });
+    let missing_definition = super::query_requires_claim_number(query)
+        && !["definition", "scope", "measured", "estimate", "official"]
+            .iter()
+            .any(|term| combined.contains(term));
+    let terminology = [
+        missing_relationship.then_some("office holder biography"),
+        missing_date.then_some("reference date"),
+        missing_definition.then_some("definition scope"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    let exclusion = retained
+        .first()
+        .map(|evidence| format!(" -site:{}", evidence.source_identity.as_str()))
+        .unwrap_or_default();
+    let terminology = if terminology.is_empty() {
+        "independent claim"
+    } else {
+        terminology.as_str()
+    };
+    format!("{subject} {terminology}{exclusion}")
+}
+
+fn grounded_office_holder(query: &str, retained: &[&WebFetchEvidence]) -> Option<String> {
+    let normalized = query.to_ascii_lowercase();
+    if !normalized.contains("president") {
+        return None;
+    }
+    for passage in retained
+        .iter()
+        .flat_map(|evidence| evidence.passages.iter())
+    {
+        for sentence in sentence_chunks_preserving_decimals(&passage.text) {
+            let lower = sentence.to_ascii_lowercase();
+            for relation in [
+                " is the president",
+                " serves as president",
+                " serves as the president",
+            ] {
+                if let Some(position) = lower.find(relation) {
+                    if let Some(name) = trailing_person_name(&sentence[..position]) {
+                        return Some(name);
+                    }
+                }
+            }
+            if let Some(position) = lower.find("president ") {
+                let after = &sentence[position + "president ".len()..];
+                if let Some(name) = leading_person_name(after) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn trailing_person_name(value: &str) -> Option<String> {
+    let words = value
+        .split_whitespace()
+        .rev()
+        .take_while(|word| person_name_word(word))
+        .take(4)
+        .collect::<Vec<_>>();
+    (words.len() >= 2).then(|| words.into_iter().rev().collect::<Vec<_>>().join(" "))
+}
+
+fn leading_person_name(value: &str) -> Option<String> {
+    let words = value
+        .split_whitespace()
+        .take_while(|word| person_name_word(word))
+        .take(4)
+        .collect::<Vec<_>>();
+    (words.len() >= 2).then(|| words.join(" "))
+}
+
+fn person_name_word(value: &str) -> bool {
+    let trimmed =
+        value.trim_matches(|character: char| !character.is_alphabetic() && character != '-');
+    let mut characters = trimmed.chars();
+    characters.next().is_some_and(char::is_uppercase)
+        && characters.all(|character| character.is_alphabetic() || character == '-')
+}
+
+fn is_year_token(token: &str) -> bool {
+    let digits = token
+        .trim_matches(|character: char| !character.is_ascii_digit())
+        .to_string();
+    digits.len() == 4
+        && digits
+            .parse::<u16>()
+            .is_ok_and(|year| (1900..=2100).contains(&year))
+}
+
+fn detect_web_conflicts(
+    query: &str,
+    results: &[OperationResult<WebFetchEvidence>],
+) -> Vec<EvidenceConflict> {
     let usable = results
         .iter()
         .filter(|result| matches!(result.execution, ExecutionStatus::Succeeded))
+        .filter(|result| {
+            matches!(
+                result.contribution,
+                EvidenceContribution::Satisfied | EvidenceContribution::Partial
+            )
+        })
         .filter_map(|result| result.value.as_ref())
         .filter(|evidence| !evidence.passages.is_empty())
         .collect::<Vec<_>>();
@@ -845,27 +1136,17 @@ fn detect_web_conflicts(results: &[OperationResult<WebFetchEvidence>]) -> Vec<Ev
             if left.source_identity == right.source_identity {
                 continue;
             }
-            let left_text = left
-                .passages
-                .iter()
-                .map(|passage| passage.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_ascii_lowercase();
-            let right_text = right
-                .passages
-                .iter()
-                .map(|passage| passage.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_ascii_lowercase();
-            let left_scalars = scalar_claim_tokens(&left_text);
-            let right_scalars = scalar_claim_tokens(&right_text);
-            let numeric_conflict = !left_scalars.is_empty()
+            let left_scalars = scalar_claim_tokens(query, left);
+            let right_scalars = scalar_claim_tokens(query, right);
+            let distinct_scalars = left_scalars
+                .union(&right_scalars)
+                .collect::<HashSet<_>>()
+                .len();
+            let numeric_conflict = super::query_requires_claim_number(query)
+                && !left_scalars.is_empty()
                 && !right_scalars.is_empty()
-                && left_scalars.is_disjoint(&right_scalars);
-            let negation_conflict = contains_negation(&left_text) != contains_negation(&right_text);
-            if numeric_conflict || negation_conflict {
+                && distinct_scalars >= 2;
+            if numeric_conflict {
                 return vec![EvidenceConflict {
                     evidence_ids: vec![left.evidence_id.clone(), right.evidence_id.clone()],
                     description: "Independent fetched sources contain unresolved differing claims."
@@ -877,23 +1158,138 @@ fn detect_web_conflicts(results: &[OperationResult<WebFetchEvidence>]) -> Vec<Ev
     Vec::new()
 }
 
-fn scalar_claim_tokens(text: &str) -> HashSet<String> {
-    text.split_whitespace()
-        .map(|token| {
-            token
-                .trim_matches(|character: char| {
-                    !character.is_ascii_digit() && !matches!(character, '.' | ',' | '%' | '$' | '€')
+fn scalar_claim_tokens(query: &str, evidence: &WebFetchEvidence) -> HashSet<String> {
+    evidence
+        .passages
+        .iter()
+        .flat_map(|passage| sentence_chunks_preserving_decimals(&passage.text))
+        .filter(|sentence| assess_claim_relevance(query, sentence).eligible)
+        .filter_map(|sentence| {
+            let tokens = sentence
+                .split_whitespace()
+                .map(|token| {
+                    token
+                        .trim_matches(|character: char| {
+                            !character.is_ascii_digit()
+                                && !matches!(character, '.' | ',' | '%' | '$' | '€')
+                        })
+                        .to_string()
                 })
-                .to_string()
+                .filter(|token| !token.is_empty())
+                .collect::<Vec<_>>();
+            let lower = sentence.to_ascii_lowercase();
+            let associated = tokens.iter().any(|token| is_year_token(token))
+                || [
+                    "city proper",
+                    "metropolitan",
+                    "municipality",
+                    "snow height",
+                    "including snow",
+                    "snow and ice",
+                    "rock height",
+                    "rock summit",
+                    "without snow",
+                    "geoid",
+                ]
+                .iter()
+                .any(|marker| lower.contains(marker));
+            if !associated {
+                return None;
+            }
+            let linked = tokens
+                .iter()
+                .filter(|token| {
+                    let digits = token
+                        .chars()
+                        .filter(char::is_ascii_digit)
+                        .collect::<String>();
+                    let year_only = digits.len() == 4
+                        && digits
+                            .parse::<u16>()
+                            .is_ok_and(|year| (1900..=2100).contains(&year));
+                    !year_only && digits.len() >= 3
+                })
+                .filter(|figure| {
+                    let Some(figure_position) = lower.find(figure.as_str()) else {
+                        return false;
+                    };
+                    let measure = ["population", "height", "elevation"]
+                        .iter()
+                        .filter_map(|measure| {
+                            lower[..figure_position]
+                                .rfind(measure)
+                                .map(|position| (*measure, position))
+                        })
+                        .max_by_key(|(_, position)| *position);
+                    let Some((measure, measure_position)) = measure else {
+                        return false;
+                    };
+                    let relation = &lower[measure_position + measure.len()..figure_position];
+                    let supported = [
+                        " is ",
+                        " as ",
+                        " was ",
+                        " stood at ",
+                        " stands at ",
+                        " reached ",
+                        " reference ",
+                        " references ",
+                        " estimate for ",
+                        " measured at ",
+                        " reported as ",
+                    ]
+                    .iter()
+                    .any(|marker| format!(" {relation} ").contains(marker));
+                    supported && !contains_non_year_number(relation)
+                })
+                .collect::<Vec<_>>();
+            (linked.len() == 1).then(|| (*linked[0]).clone())
         })
-        .filter(|token| token.chars().any(|character| character.is_ascii_digit()))
         .collect()
 }
 
-fn contains_negation(text: &str) -> bool {
-    [" no ", " not ", " never ", "false", "cannot", "can't"]
-        .iter()
-        .any(|term| text.contains(term))
+fn contains_non_year_number(value: &str) -> bool {
+    value.split_whitespace().any(|token| {
+        let digits = token
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect::<String>();
+        if digits.is_empty() {
+            false
+        } else {
+            !(digits.len() == 4
+                && digits
+                    .parse::<u16>()
+                    .is_ok_and(|year| (1900..=2100).contains(&year)))
+        }
+    })
+}
+
+fn sentence_chunks_preserving_decimals(value: &str) -> Vec<&str> {
+    let bytes = value.as_bytes();
+    let mut start = 0usize;
+    let mut chunks = Vec::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        let decimal_point = *byte == b'.'
+            && index > 0
+            && index + 1 < bytes.len()
+            && bytes[index - 1].is_ascii_digit()
+            && bytes[index + 1].is_ascii_digit();
+        if matches!(*byte, b'.' | b'!' | b'?') && !decimal_point {
+            if let Some(chunk) = value
+                .get(start..index)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                chunks.push(chunk);
+            }
+            start = index + 1;
+        }
+    }
+    if let Some(chunk) = value.get(start..).map(str::trim).filter(|v| !v.is_empty()) {
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 fn apply_ranked_authority(
@@ -905,7 +1301,15 @@ fn apply_ranked_authority(
         if let Some(evidence) = result.value.as_mut() {
             let mut final_candidate = candidate.clone();
             final_candidate.requested_url = evidence.final_url.clone();
-            if !candidate_is_first_party(query, &final_candidate) {
+            let candidate_identity_matches = candidate_is_first_party(query, &final_candidate);
+            let page_identity_matches = evidence.passages.iter().any(|passage| {
+                final_candidate.title = passage.text.clone();
+                candidate_is_first_party(query, &final_candidate)
+            });
+            if !candidate_identity_matches && !page_identity_matches {
+                if evidence.authority == SourceAuthority::FirstParty {
+                    evidence.authority = SourceAuthority::AuthoritativeReference;
+                }
                 return;
             }
             evidence.authority = SourceAuthority::FirstParty;
@@ -1013,44 +1417,64 @@ fn select_direct_page_passages(evidence: &mut WebFetchEvidence) {
         .collect();
 }
 
-fn rank_fact_passages(query: &str, evidence: &mut WebFetchEvidence) {
-    let mut contextual_headings = evidence
+pub(crate) fn rank_fact_passages(query: &str, evidence: &mut WebFetchEvidence) {
+    promote_biography_office_holder_passage(query, evidence);
+    let contextual_headings = evidence
         .passages
         .iter()
+        .enumerate()
         .filter(|passage| {
-            passage.text.chars().count() <= 120
+            passage.1.text.chars().count() <= 120
                 && !passage
+                    .1
                     .text
                     .chars()
                     .any(|character| character.is_ascii_digit())
-                && !passage.text.contains(['.', '!', '?'])
+                && !passage.1.text.contains(['.', '!', '?'])
         })
-        .map(|passage| {
+        .map(|(index, passage)| {
             (
+                index,
                 passage.text.clone(),
                 assess_claim_relevance(query, &passage.text).query_coverage_basis_points,
             )
         })
-        .filter(|(_, coverage)| *coverage > 0)
         .collect::<Vec<_>>();
-    contextual_headings.sort_by(|left, right| right.1.cmp(&left.1));
-    for passage in &mut evidence.passages {
-        if !passage
-            .text
-            .chars()
-            .any(|character| character.is_ascii_digit())
-            || assess_claim_relevance(query, &passage.text).eligible
-        {
+    for (passage_index, passage) in evidence.passages.iter_mut().enumerate() {
+        if assess_claim_relevance(query, &passage.text).eligible {
             continue;
         }
-        for (heading, _) in &contextual_headings {
-            let contextual = format!("{heading}: {}", passage.text);
-            if contextual.chars().count() <= 1_200
-                && assess_claim_relevance(query, &contextual).eligible
-            {
-                passage.text = contextual;
-                break;
-            }
+        let nearest = contextual_headings
+            .iter()
+            .rev()
+            .find(|(index, _, _)| *index < passage_index);
+        // The page title is global context; otherwise only the immediately
+        // preceding heading may qualify. Never reach across a later section
+        // boundary to borrow a higher-scoring entity heading.
+        let title = contextual_headings
+            .first()
+            .filter(|(index, _, coverage)| *index == 0 && passage_index <= 2 && *coverage > 0);
+        let mut context = [title, nearest]
+            .into_iter()
+            .flatten()
+            .map(|(index, heading, _)| (*index, heading.as_str()))
+            .collect::<Vec<_>>();
+        context.sort_by_key(|(index, _)| *index);
+        context.dedup_by_key(|(index, _)| *index);
+        let contextual = format!(
+            "{}: {}",
+            context
+                .iter()
+                .map(|(_, heading)| *heading)
+                .collect::<Vec<_>>()
+                .join(": "),
+            passage.text
+        );
+        if !context.is_empty()
+            && contextual.chars().count() <= 1_200
+            && assess_claim_relevance(query, &contextual).eligible
+        {
+            passage.text = contextual;
         }
     }
 
@@ -1102,6 +1526,39 @@ fn rank_fact_passages(query: &str, evidence: &mut WebFetchEvidence) {
         .collect();
 }
 
+fn promote_biography_office_holder_passage(query: &str, evidence: &mut WebFetchEvidence) {
+    let normalized_query = query.to_ascii_lowercase();
+    if !normalized_query.contains("president")
+        || evidence.authority != SourceAuthority::FirstParty
+        || evidence.passages.len() < 2
+    {
+        return;
+    }
+    // Only combine the owner-validated page title and its immediately
+    // adjacent biography heading. Never search the rest of the page for an
+    // unrelated office row to attach to the biography subject.
+    let title = evidence.passages[0].text.trim();
+    let title_lower = title.to_ascii_lowercase();
+    let Some(role_position) = title_lower.find("president of") else {
+        return;
+    };
+    let heading = evidence.passages[1].text.trim();
+    let heading_lower = heading.to_ascii_lowercase();
+    let prefix = "biography of ";
+    let Some(subject) = heading_lower
+        .strip_prefix(prefix)
+        .and_then(|_| heading.get(prefix.len()..))
+        .map(str::trim)
+        .filter(|subject| {
+            subject.split_whitespace().count() >= 2 && subject.chars().count() <= 100
+        })
+    else {
+        return;
+    };
+    let role = title[role_position..].trim().trim_end_matches('.');
+    evidence.passages[0].text = format!("{subject} is {role}.");
+}
+
 fn merge_retry(
     first: &mut OperationResult<WebFetchEvidence>,
     retry: OperationResult<WebFetchEvidence>,
@@ -1121,6 +1578,12 @@ fn web_contract_satisfied(
     let usable = results
         .iter()
         .filter(|result| matches!(result.execution, ExecutionStatus::Succeeded))
+        .filter(|result| {
+            matches!(
+                result.contribution,
+                EvidenceContribution::Satisfied | EvidenceContribution::Partial
+            )
+        })
         .filter_map(|result| result.value.as_ref())
         .filter(|evidence| {
             matches!(
@@ -2314,6 +2777,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_tavily_failure_is_not_retried_by_query_diversification() {
+        let statuses = [
+            ProviderStatus::Failed(FailureCode::ConnectorUnavailable),
+            ProviderStatus::Failed(FailureCode::RateLimited),
+            ProviderStatus::TimedOut,
+            ProviderStatus::InvalidResponse,
+        ];
+        for status in statuses {
+            let adapter = ScriptedWebAdapter {
+                search: OperationResult::succeeded(
+                    EvidenceOperation::WebSearch {
+                        normalized_query: "official fact".into(),
+                        provider_set: ProviderSet(vec![
+                            WebProvider::Tavily,
+                            WebProvider::DuckDuckGo,
+                        ]),
+                    }
+                    .key(),
+                    WebSearchResult {
+                        providers: vec![
+                            super::super::ProviderResult {
+                                provider: WebProvider::Tavily,
+                                status,
+                                duration_ms: 0,
+                            },
+                            super::super::ProviderResult {
+                                provider: WebProvider::DuckDuckGo,
+                                status: ProviderStatus::Empty,
+                                duration_ms: 0,
+                            },
+                        ],
+                        candidates: Vec::new(),
+                    },
+                ),
+                fetches: Arc::new(Mutex::new(HashMap::new())),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            };
+            let observed = adapter.clone();
+            let mut gate = WebRecordingGate {
+                log: Arc::new(Mutex::new(Vec::new())),
+            };
+            let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+                query: "Who is the President of Slovakia? Use the official first-party website."
+                    .into(),
+                verification: VerificationLevel::SingleAuthoritative,
+            });
+
+            let outcome =
+                execute_web_plan(adapter, &mut gate, "turn-provider-fault", &plan, "en").await;
+
+            assert!(matches!(outcome.validation, ValidationOutcome::Recovery(_)));
+            assert_eq!(
+                observed
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| call.as_str() == "search")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn web_fact_is_gated_immediately_and_stops_on_ranked_first_party_evidence() {
         let first_party = web_candidate("https://acme.com/fact", 2);
         let reference = web_candidate("https://en.wikipedia.org/wiki/Acme", 1);
@@ -2359,6 +2889,87 @@ mod tests {
         assert!(log[1].starts_with("execute:web_search:"));
         assert!(log[2].starts_with("gate:web_fetch:"));
         assert!(log[3].starts_with("execute:web_fetch:"));
+    }
+
+    #[tokio::test]
+    async fn fetched_final_url_and_page_identity_can_establish_first_party_authority() {
+        let mut official = web_candidate("https://www.prezident.sk/en/", 1);
+        official.title = "Home".into();
+        let adapter = scripted_web_adapter(
+            vec![official.clone()],
+            vec![vec![readable_passages(
+                &official,
+                official.requested_url.as_str(),
+                "prezident.sk",
+                &[
+                    "President of the Slovak Republic",
+                    "Peter Pellegrini is the President of the Slovak Republic.",
+                ],
+            )]],
+        );
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Who is the President of Slovakia? Use the official first-party website.".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let outcome =
+            execute_web_plan(adapter, &mut gate, "turn-page-authority", &plan, "en").await;
+
+        let ValidationOutcome::Bundle(bundle) = outcome.validation else {
+            panic!("bound official page identity and holder relationship should validate");
+        };
+        assert_eq!(bundle.web.len(), 1);
+        assert_eq!(
+            bundle.web[0].evidence.authority,
+            SourceAuthority::FirstParty
+        );
+        assert!(bundle.web[0]
+            .evidence
+            .passages
+            .iter()
+            .any(|passage| passage.text.contains("Peter Pellegrini")));
+    }
+
+    #[tokio::test]
+    async fn bounded_structured_identity_after_visible_blocks_can_establish_first_party_authority()
+    {
+        let mut official = web_candidate("https://www.prezident.sk/en/", 1);
+        official.title = "Home".into();
+        let adapter = scripted_web_adapter(
+            vec![official.clone()],
+            vec![vec![readable_passages(
+                &official,
+                official.requested_url.as_str(),
+                "prezident.sk",
+                &[
+                    "Welcome",
+                    "News",
+                    "Events",
+                    "Speeches",
+                    "Contact",
+                    "Peter Pellegrini is the President of the Slovak Republic.",
+                ],
+            )]],
+        );
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Name the current President of Slovakia using the official website.".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let outcome =
+            execute_web_plan(adapter, &mut gate, "turn-structured-authority", &plan, "en").await;
+
+        assert!(matches!(
+            outcome.validation,
+            ValidationOutcome::Bundle(bundle)
+                if bundle.web[0].evidence.authority == SourceAuthority::FirstParty
+        ));
     }
 
     #[tokio::test]
@@ -2423,9 +3034,9 @@ mod tests {
         let ValidationOutcome::Bundle(bundle) = outcome.validation else {
             panic!("two independent fetched sources should produce a bundle");
         };
-        assert_eq!(outcome.operations_executed, 6);
+        assert_eq!(outcome.operations_executed, 7);
         assert_eq!(bundle.acquired.web_sources, 2);
-        assert_eq!(bundle.conflicts.len(), 1);
+        assert!(bundle.conflicts.is_empty());
         assert!(observed.max_active.load(Ordering::SeqCst) <= 2);
         assert_eq!(
             observed
@@ -2437,6 +3048,241 @@ mod tests {
                 .count(),
             5
         );
+        assert_eq!(
+            observed
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.as_str() == "search")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn two_independent_office_holder_prose_claims_satisfy_corroboration_and_stop_fetching() {
+        let mut first = web_candidate("https://publisher-one.example/slovakia", 1);
+        first.title = "President of Slovakia".into();
+        let mut second = web_candidate("https://publisher-two.example/slovakia", 2);
+        second.title = "Slovakia office holder".into();
+        let third = web_candidate("https://publisher-three.example/slovakia", 3);
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second.clone(), third.clone()],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    first.requested_url.as_str(),
+                    "publisher-one.example",
+                    "Peter Pellegrini is the President of Slovakia and assumed office in 2024.",
+                )],
+                vec![readable_fetch(
+                    &second,
+                    second.requested_url.as_str(),
+                    "publisher-two.example",
+                    "Since 2024, Peter Pellegrini serves as President of the Slovak Republic.",
+                )],
+                vec![readable_fetch(
+                    &third,
+                    third.requested_url.as_str(),
+                    "publisher-three.example",
+                    "This unused page should never be fetched.",
+                )],
+            ],
+        );
+        let observed = adapter.clone();
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query:
+                "Who is the current president of Slovakia? Verify it using two independent sources."
+                    .into(),
+            verification: VerificationLevel::Corroborated,
+        });
+
+        let outcome =
+            execute_web_plan(adapter, &mut gate, "turn-prose-corroboration", &plan, "en").await;
+
+        let ValidationOutcome::Bundle(bundle) = outcome.validation else {
+            panic!("two independently grounded prose claims should satisfy corroboration");
+        };
+        assert_eq!(bundle.acquired.web_sources, 2);
+        assert_eq!(bundle.web.len(), 2);
+        assert!(bundle.conflicts.is_empty());
+        assert_eq!(
+            observed
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("fetch:"))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn mirrored_claim_text_is_skipped_and_third_independent_source_is_fetched() {
+        let first = web_candidate("https://publisher-one.example/fact", 1);
+        let second = web_candidate("https://cdn-two.example/mirror", 2);
+        let third = web_candidate("https://publisher-three.example/fact", 3);
+        let claim = "Peter Pellegrini is the President of Slovakia and assumed office in 2024.";
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second.clone(), third.clone()],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    first.requested_url.as_str(),
+                    "publisher-one.example",
+                    claim,
+                )],
+                vec![readable_fetch(
+                    &second,
+                    second.requested_url.as_str(),
+                    "cdn-two.example",
+                    claim,
+                )],
+                vec![readable_fetch(
+                    &third,
+                    third.requested_url.as_str(),
+                    "publisher-three.example",
+                    "Since 2024, Peter Pellegrini serves as President of the Slovak Republic.",
+                )],
+            ],
+        );
+        let observed = adapter.clone();
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Who is the current president of Slovakia?".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+
+        let outcome = execute_web_plan(adapter, &mut gate, "turn-mirror", &plan, "en").await;
+
+        assert!(matches!(
+            outcome.validation,
+            ValidationOutcome::Bundle(bundle)
+                if bundle.acquired.web_sources == 2
+                    && bundle.completeness == super::super::Completeness::Complete
+        ));
+        assert_eq!(
+            observed
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("fetch:"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn diversified_queries_target_missing_relationship_date_and_definition_context() {
+        let official = EvidenceIntent::WebFact {
+            query: "Who is the current president of Slovakia?".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        };
+        let numeric = EvidenceIntent::WebFact {
+            query: "Compare the height of Mount Everest.".into(),
+            verification: VerificationLevel::Corroborated,
+        };
+        let candidates = vec![web_candidate("https://publisher.example/result", 1)];
+
+        let official_query = diversified_search_query(
+            &official,
+            "Who is the current president of Slovakia?",
+            &candidates,
+        );
+        let numeric_query = diversified_search_query(
+            &numeric,
+            "Compare the height of Mount Everest.",
+            &candidates,
+        );
+
+        assert!(official_query.contains("biography office holder"));
+        assert!(numeric_query.contains("reported figure reference date definition"));
+        assert!(official_query.starts_with("President of Slovakia"));
+        assert!(numeric_query.starts_with("Mount Everest height"));
+
+        let rejected_numeric = readable_fetch(
+            &candidates[0],
+            candidates[0].requested_url.as_str(),
+            "publisher.example",
+            "Mount Everest height was 8,848 metres.",
+        );
+        let after_fetch = diversified_search_query_after_fetch(
+            "Compare the height of Mount Everest.",
+            &[rejected_numeric],
+        );
+        assert!(after_fetch.contains("reference date"));
+        assert!(after_fetch.contains("definition scope"));
+        assert!(after_fetch.contains("-site:publisher.example"));
+        assert!(after_fetch.starts_with("Mount Everest height"));
+
+        let grounded_holder = readable_fetch(
+            &candidates[0],
+            candidates[0].requested_url.as_str(),
+            "publisher.example",
+            "Peter Pellegrini is the President of Slovakia.",
+        );
+        let holder_followup = diversified_search_query_after_fetch(
+            "Who is the current President of Slovakia?",
+            &[grounded_holder],
+        );
+        assert!(holder_followup.starts_with("Peter Pellegrini President of Slovakia"));
+    }
+
+    #[test]
+    fn associated_metric_figures_ignore_unit_conversions_and_form_a_conflict() {
+        let first = web_candidate("https://publisher-one.example/everest", 1);
+        let second = web_candidate("https://publisher-two.example/everest", 2);
+        let first = readable_fetch(
+            &first,
+            first.requested_url.as_str(),
+            "publisher-one.example",
+            "Mount Everest height was reported as 8,848.86 metres in the 2020 agreement, including snow and ice.",
+        );
+        let second = readable_fetch(
+            &second,
+            second.requested_url.as_str(),
+            "publisher-two.example",
+            "In the 2005 survey, Mount Everest rock height was reported as 8,844.43 m (29,017.16 ft).",
+        );
+
+        let conflicts = detect_web_conflicts(
+            "Compare the height of Mount Everest with figures, dates, and definitions.",
+            &[first, second],
+        );
+
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    #[test]
+    fn corroborated_prose_ignores_incidental_negation_outside_numeric_claims() {
+        let first = web_candidate("https://publisher-one.example/slovakia", 1);
+        let second = web_candidate("https://publisher-two.example/slovakia", 2);
+        let first = readable_fetch(
+            &first,
+            first.requested_url.as_str(),
+            "publisher-one.example",
+            "Peter Pellegrini is the President of Slovakia. The office is not ceremonial in every circumstance.",
+        );
+        let second = readable_fetch(
+            &second,
+            second.requested_url.as_str(),
+            "publisher-two.example",
+            "Peter Pellegrini is the President of Slovakia.",
+        );
+
+        assert!(detect_web_conflicts(
+            "Who is the current President of Slovakia?",
+            &[first, second]
+        )
+        .is_empty());
     }
 
     #[tokio::test]

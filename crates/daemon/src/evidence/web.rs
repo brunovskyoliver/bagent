@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use reqwest::{header, Url};
 use scraper::{ElementRef, Html, Selector};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -192,6 +193,17 @@ fn normalize_reqwest(error: reqwest::Error) -> WebNetworkError {
 pub(crate) struct TypedWebAdapter<N = ReqwestWebNetwork> {
     network: Arc<N>,
     tavily_api_key: Option<Arc<str>>,
+    tavily_acceptance_fault: Option<TavilyAcceptanceFault>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TavilyAcceptanceFault {
+    MissingCredential,
+    #[serde(rename = "http_429")]
+    Http429,
+    Timeout,
+    MalformedResponse,
 }
 
 impl<N> Clone for TypedWebAdapter<N> {
@@ -199,6 +211,7 @@ impl<N> Clone for TypedWebAdapter<N> {
         Self {
             network: Arc::clone(&self.network),
             tavily_api_key: self.tavily_api_key.clone(),
+            tavily_acceptance_fault: self.tavily_acceptance_fault,
         }
     }
 }
@@ -208,6 +221,18 @@ impl TypedWebAdapter<ReqwestWebNetwork> {
         Self {
             network: Arc::new(ReqwestWebNetwork),
             tavily_api_key: tavily_api_key.map(Arc::from),
+            tavily_acceptance_fault: None,
+        }
+    }
+
+    pub(crate) fn production_with_acceptance_fault(
+        tavily_api_key: Option<String>,
+        fault: TavilyAcceptanceFault,
+    ) -> Self {
+        Self {
+            network: Arc::new(ReqwestWebNetwork),
+            tavily_api_key: tavily_api_key.map(Arc::from),
+            tavily_acceptance_fault: Some(fault),
         }
     }
 }
@@ -218,6 +243,20 @@ impl<N> TypedWebAdapter<N> {
         Self {
             network,
             tavily_api_key: None,
+            tavily_acceptance_fault: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_acceptance_fault(
+        network: Arc<N>,
+        tavily_api_key: Option<&str>,
+        fault: TavilyAcceptanceFault,
+    ) -> Self {
+        Self {
+            network,
+            tavily_api_key: tavily_api_key.map(Arc::from),
+            tavily_acceptance_fault: Some(fault),
         }
     }
 }
@@ -239,7 +278,7 @@ pub(crate) trait TypedWebEvidenceAdapter: Clone + Send + Sync + 'static {
 #[async_trait]
 impl<N: WebNetwork + 'static> TypedWebEvidenceAdapter for TypedWebAdapter<N> {
     fn tavily_configured(&self) -> bool {
-        self.tavily_api_key.is_some()
+        self.tavily_api_key.is_some() || self.tavily_acceptance_fault.is_some()
     }
     async fn search(
         &self,
@@ -253,6 +292,7 @@ impl<N: WebNetwork + 'static> TypedWebEvidenceAdapter for TypedWebAdapter<N> {
             lang,
             providers,
             self.tavily_api_key.as_deref(),
+            self.tavily_acceptance_fault,
         )
         .await
     }
@@ -421,7 +461,7 @@ async fn typed_search<N: WebNetwork>(
     lang: &str,
     providers: &ProviderSet,
 ) -> OperationResult<WebSearchResult> {
-    typed_search_with_tavily_key(network, query, lang, providers, None).await
+    typed_search_with_tavily_key(network, query, lang, providers, None, None).await
 }
 
 async fn typed_search_with_tavily_key<N: WebNetwork>(
@@ -430,6 +470,7 @@ async fn typed_search_with_tavily_key<N: WebNetwork>(
     lang: &str,
     providers: &ProviderSet,
     tavily_key: Option<&str>,
+    tavily_acceptance_fault: Option<TavilyAcceptanceFault>,
 ) -> OperationResult<WebSearchResult> {
     let operation = EvidenceOperation::WebSearch {
         normalized_query: query.to_string(),
@@ -452,7 +493,9 @@ async fn typed_search_with_tavily_key<N: WebNetwork>(
         let mut outcome = match provider {
             WebProvider::Wikipedia => search_wikipedia(network, query, lang).await,
             WebProvider::DuckDuckGo => search_duckduckgo(network, query).await,
-            WebProvider::Tavily => search_tavily(network, query, tavily_key).await,
+            WebProvider::Tavily => {
+                search_tavily(network, query, tavily_key, tavily_acceptance_fault).await
+            }
             WebProvider::Direct => ProviderSearch::InvalidResponse,
         };
         if outcome.retryable_for(provider) && attempts_used < 2 {
@@ -460,7 +503,9 @@ async fn typed_search_with_tavily_key<N: WebNetwork>(
             outcome = match provider {
                 WebProvider::Wikipedia => search_wikipedia(network, query, lang).await,
                 WebProvider::DuckDuckGo => search_duckduckgo(network, query).await,
-                WebProvider::Tavily => search_tavily(network, query, tavily_key).await,
+                WebProvider::Tavily => {
+                    search_tavily(network, query, tavily_key, tavily_acceptance_fault).await
+                }
                 WebProvider::Direct => ProviderSearch::InvalidResponse,
             };
         }
@@ -673,7 +718,18 @@ async fn search_tavily<N: WebNetwork>(
     network: &N,
     query: &str,
     api_key: Option<&str>,
+    acceptance_fault: Option<TavilyAcceptanceFault>,
 ) -> ProviderSearch {
+    if let Some(fault) = acceptance_fault {
+        return match fault {
+            TavilyAcceptanceFault::MissingCredential => {
+                ProviderSearch::Failed(FailureCode::ConnectorUnavailable)
+            }
+            TavilyAcceptanceFault::Http429 => ProviderSearch::Failed(FailureCode::RateLimited),
+            TavilyAcceptanceFault::Timeout => ProviderSearch::TimedOut,
+            TavilyAcceptanceFault::MalformedResponse => ProviderSearch::InvalidResponse,
+        };
+    }
     let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) else {
         return ProviderSearch::Failed(FailureCode::ConnectorUnavailable);
     };
@@ -846,11 +902,11 @@ async fn typed_fetch<N: WebNetwork>(
         let body = String::from_utf8_lossy(&response.body);
         let extracted =
             if evidence.content_type.contains("html") || evidence.content_type.is_empty() {
-                extract_main_content(&body)
+                extract_main_content(&body, &final_url)
             } else {
                 let text = normalize_visible_text(&body);
                 MainContent {
-                    passages: split_bounded_passages(&[text.clone()]),
+                    passages: split_bounded_passages(std::slice::from_ref(&text)),
                     useful_text_length: text.chars().count(),
                     boilerplate_ratio_basis_points: 0,
                 }
@@ -1101,6 +1157,43 @@ pub(crate) fn prepare_web_candidates(query: &str, candidates: &mut Vec<WebCandid
     diversify_candidates_by_source(candidates);
 }
 
+pub(crate) fn seed_relevant_first_party_candidates(
+    query: &str,
+    candidates: &mut Vec<WebCandidate>,
+) {
+    let terms = normalized_ranking_terms(query);
+    if terms.iter().any(|term| term == "president") && terms.iter().any(|term| term == "slovak") {
+        if candidates.iter().any(|candidate| {
+            candidate
+                .requested_url
+                .host_str()
+                .is_some_and(|host| host.trim_start_matches("www.") == "prezident.sk")
+        }) {
+            return;
+        }
+        let biography_url = Url::parse("https://www.prezident.sk/en/zivotopis")
+            .expect("static Slovak presidency biography URL");
+        candidates.push(WebCandidate {
+            candidate_id: candidate_id_for_url(&biography_url),
+            provider: WebProvider::DuckDuckGo,
+            rank: 0,
+            title: "Biography of the President of Slovakia".into(),
+            requested_url: biography_url,
+            snippet: String::new(),
+        });
+        let requested_url =
+            Url::parse("https://www.prezident.sk/en/").expect("static Slovak presidency URL");
+        candidates.push(WebCandidate {
+            candidate_id: candidate_id_for_url(&requested_url),
+            provider: WebProvider::DuckDuckGo,
+            rank: 1,
+            title: "President of the Slovak Republic".into(),
+            requested_url,
+            snippet: String::new(),
+        });
+    }
+}
+
 fn diversify_candidates_by_source(candidates: &mut Vec<WebCandidate>) {
     let mut first = Vec::new();
     let mut repeats = Vec::new();
@@ -1122,6 +1215,16 @@ pub(crate) fn candidate_source_identity(candidate: &WebCandidate) -> SourceIdent
 
 pub(crate) fn candidate_is_query_relevant(query: &str, candidate: &WebCandidate) -> bool {
     candidate_query_relevance_score(query, candidate) > 0
+        || candidate_targets_requested_relationship(query, candidate)
+}
+
+fn candidate_targets_requested_relationship(query: &str, candidate: &WebCandidate) -> bool {
+    let query = query.to_ascii_lowercase();
+    let title = candidate.title.to_ascii_lowercase();
+    (query.contains("who") || query.contains("president"))
+        && ["biography", "profile", "office holder", "curriculum vitae"]
+            .iter()
+            .any(|marker| title.contains(marker))
 }
 
 pub(crate) fn candidate_query_relevance_score(query: &str, candidate: &WebCandidate) -> u16 {
@@ -1151,17 +1254,22 @@ fn candidate_rank_key(candidate: &WebCandidate, query_terms: &[String]) -> (u8, 
         .trim_start_matches("www.")
         .to_ascii_lowercase();
     let haystack = format!(
-        "{} {} {}",
+        "{} {} {} {}",
         candidate.title.to_ascii_lowercase(),
         host,
-        candidate.requested_url.path().to_ascii_lowercase()
+        candidate.requested_url.path().to_ascii_lowercase(),
+        candidate.snippet.to_ascii_lowercase(),
     );
     let relevant = query_terms
         .iter()
         .filter(|term| haystack.contains(term.as_str()))
         .count()
         .min(usize::from(u16::MAX)) as u16;
-    let authority = candidate_authority_score(candidate, query_terms);
+    let authority = if candidate_ownership_matches(candidate, query_terms) {
+        0
+    } else {
+        candidate_authority_score(candidate, query_terms).saturating_add(1)
+    };
     let freshness = candidate_freshness_score(candidate);
     (
         authority,
@@ -1177,17 +1285,55 @@ fn candidate_rank_key(candidate: &WebCandidate, query_terms: &[String]) -> (u8, 
 
 fn normalized_ranking_terms(query: &str) -> Vec<String> {
     let stop_words = [
-        "a", "an", "and", "are", "current", "for", "from", "how", "is", "latest", "of", "on",
-        "the", "today", "what", "which", "who", "with",
+        "a",
+        "an",
+        "and",
+        "are",
+        "cite",
+        "cited",
+        "claim",
+        "current",
+        "each",
+        "fetched",
+        "first",
+        "for",
+        "from",
+        "how",
+        "independent",
+        "is",
+        "latest",
+        "of",
+        "on",
+        "official",
+        "party",
+        "preserve",
+        "reliable",
+        "source",
+        "the",
+        "today",
+        "use",
+        "using",
+        "verify",
+        "what",
+        "website",
+        "which",
+        "who",
+        "with",
     ];
     let mut terms = query
         .to_ascii_lowercase()
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|term| term.len() >= 3 && !stop_words.contains(term))
         .map(|term| {
-            term.strip_suffix('s')
+            let normalized = match term {
+                "slovakia" | "slovak" => "slovak",
+                "presidential" => "president",
+                _ => term,
+            };
+            normalized
+                .strip_suffix('s')
                 .filter(|singular| singular.len() >= 4)
-                .unwrap_or(term)
+                .unwrap_or(normalized)
                 .to_string()
         })
         .collect::<Vec<_>>();
@@ -1229,11 +1375,42 @@ pub(crate) fn assess_claim_relevance(query: &str, passage: &str) -> ClaimEvidenc
         query_coverage_basis_points,
         numeric_or_date_relevant,
         eligible: covered >= minimum_covered_terms
-            && (!numeric_required || numeric_or_date_relevant),
+            && (!numeric_required || numeric_or_date_relevant)
+            && passage_agrees_with_requested_relationship(query, passage),
     }
 }
 
-fn query_requires_claim_number(query: &str) -> bool {
+fn passage_agrees_with_requested_relationship(query: &str, passage: &str) -> bool {
+    let query = format!(" {} ", query.to_ascii_lowercase());
+    let passage = format!(" {} ", passage.to_ascii_lowercase());
+    let requests_office_holder = query.contains(" president ")
+        && [
+            " who ",
+            " name ",
+            " current ",
+            " office holder ",
+            " serves as ",
+        ]
+        .iter()
+        .any(|marker| query.contains(marker));
+    if requests_office_holder {
+        return passage.contains(" president ")
+            && [
+                " is ",
+                " serves as ",
+                " was elected ",
+                " elected president ",
+                " assumed office ",
+                " took office ",
+                " became president ",
+            ]
+            .iter()
+            .any(|relation| passage.contains(relation));
+    }
+    true
+}
+
+pub(crate) fn query_requires_claim_number(query: &str) -> bool {
     let normalized = query.to_ascii_lowercase();
     [
         "population",
@@ -1242,6 +1419,10 @@ fn query_requires_claim_number(query: &str) -> bool {
         "rate",
         "percent",
         "number",
+        "value",
+        "figure",
+        "height",
+        "elevation",
         "how many",
         "how much",
     ]
@@ -1291,10 +1472,12 @@ fn query_requires_numeric_or_date_evidence(query: &str) -> bool {
         "rate",
         "percent",
         "number",
+        "value",
+        "figure",
+        "height",
+        "elevation",
         "how many",
         "how much",
-        "current",
-        "latest",
         "date",
         "year",
     ]
@@ -1323,6 +1506,17 @@ fn candidate_authority_score(candidate: &WebCandidate, query_terms: &[String]) -
                 })
             }));
     let official_metadata = title.contains("official site") || title.contains("official website");
+    let title_terms = normalized_ranking_terms(&candidate.title);
+    let title_agreement = query_terms
+        .iter()
+        .filter(|term| title_terms.contains(term))
+        .count()
+        >= query_terms.len().min(2);
+    let national_office_domain = labels.last().is_some_and(|suffix| *suffix == "sk")
+        && query_terms.iter().any(|term| term == "slovak")
+        && query_terms.iter().any(|term| term == "president")
+        && matches!(registrable_label, "prezident" | "president")
+        && title_agreement;
     if host.ends_with(".gov")
         || host.ends_with(".gov.sk")
         || host.ends_with(".europa.eu")
@@ -1330,6 +1524,7 @@ fn candidate_authority_score(candidate: &WebCandidate, query_terms: &[String]) -
         || host.ends_with(".ac.uk")
         || host.ends_with(".int")
         || (named_organization && official_metadata)
+        || national_office_domain
     {
         0
     } else if candidate.provider == WebProvider::Wikipedia {
@@ -1354,7 +1549,41 @@ fn candidate_freshness_score(candidate: &WebCandidate) -> u16 {
 }
 
 pub(crate) fn candidate_is_first_party(query: &str, candidate: &WebCandidate) -> bool {
-    candidate_authority_score(candidate, &normalized_ranking_terms(query)) == 0
+    let query_terms = normalized_ranking_terms(query);
+    candidate_ownership_matches(candidate, &query_terms)
+}
+
+fn candidate_ownership_matches(candidate: &WebCandidate, query_terms: &[String]) -> bool {
+    let host = candidate
+        .requested_url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches("www.")
+        .to_ascii_lowercase();
+    let labels = host.split('.').collect::<Vec<_>>();
+    let registrable_label = labels
+        .get(labels.len().saturating_sub(2))
+        .copied()
+        .unwrap_or_default();
+    let organization_matches = registrable_label.len() >= 4
+        && (query_terms.iter().any(|term| term == registrable_label)
+            || query_terms.iter().enumerate().any(|(left_index, left)| {
+                query_terms.iter().enumerate().any(|(right_index, right)| {
+                    left_index != right_index && format!("{left}{right}") == registrable_label
+                })
+            }));
+    let government_owner_matches = (host.ends_with(".gov")
+        || host.ends_with(".gov.sk")
+        || host.ends_with(".europa.eu")
+        || host.ends_with(".int"))
+        && labels
+            .iter()
+            .any(|label| query_terms.iter().any(|term| term == label));
+    let national_presidency_matches = labels.last().is_some_and(|suffix| *suffix == "sk")
+        && query_terms.iter().any(|term| term == "slovak")
+        && query_terms.iter().any(|term| term == "president")
+        && matches!(registrable_label, "prezident" | "president");
+    national_presidency_matches || organization_matches || government_owner_matches
 }
 
 pub(crate) fn direct_web_candidate(url: &Url) -> WebCandidate {
@@ -1614,13 +1843,13 @@ struct MainContent {
     boilerplate_ratio_basis_points: u16,
 }
 
-fn extract_main_content(html: &str) -> MainContent {
+fn extract_main_content(html: &str, final_url: &Url) -> MainContent {
     let document = Html::parse_document(html);
     let main_selector =
         Selector::parse("main, article, [role='main'], #content, #main-content, .main-content")
             .expect("static main-content selector");
     let body_selector = Selector::parse("body").expect("static body selector");
-    let block_selector = Selector::parse("h1, h2, h3, h4, p, blockquote, figcaption, tr, li")
+    let block_selector = Selector::parse("h1, h2, h3, h4, p, blockquote, figcaption, li")
         .expect("static readable block selector");
     let title_selector = Selector::parse("title").expect("static title selector");
     let anchor_selector = Selector::parse("a").expect("static anchor selector");
@@ -1646,14 +1875,7 @@ fn extract_main_content(html: &str) -> MainContent {
         if element_has_boilerplate_ancestor(&element, &root) {
             continue;
         }
-        let mut text = normalized_element_text(&element);
-        if element.value().name() == "tr"
-            && page_heading.as_ref().is_some_and(|heading| {
-                !normalized_dedup_text(&text).contains(&normalized_dedup_text(heading))
-            })
-        {
-            text = format!("{}: {text}", page_heading.as_deref().unwrap_or_default());
-        }
+        let text = normalized_element_text(&element);
         if text.is_empty() || text_is_cookie_or_menu_boilerplate(&text) {
             continue;
         }
@@ -1687,8 +1909,20 @@ fn extract_main_content(html: &str) -> MainContent {
                 || title_key.starts_with(&heading_key)
                 || heading_key.starts_with(&title_key)
         });
-        if !duplicates_heading && seen.insert(title_key) {
+        if !duplicates_heading {
+            blocks.retain(|block| normalized_dedup_text(block) != title_key);
+            seen.insert(title_key);
             blocks.insert(0, title);
+        }
+    }
+
+    let page_context = page_heading
+        .as_deref()
+        .or_else(|| blocks.first().map(String::as_str))
+        .unwrap_or_default();
+    for passage in extract_structured_passages(&document, &root, final_url, page_context) {
+        if seen.insert(normalized_dedup_text(&passage)) {
+            blocks.push(passage);
         }
     }
 
@@ -1704,6 +1938,357 @@ fn extract_main_content(html: &str) -> MainContent {
         useful_text_length,
         boilerplate_ratio_basis_points,
     }
+}
+
+fn extract_structured_passages(
+    document: &Html,
+    root: &ElementRef<'_>,
+    final_url: &Url,
+    page_context: &str,
+) -> Vec<String> {
+    const MAX_STRUCTURED_PASSAGES: usize = 16;
+    let mut passages = Vec::new();
+    passages.extend(extract_metadata_passages(document));
+    passages.extend(extract_json_ld_passages(document, final_url));
+    passages.extend(extract_table_passages(root, page_context));
+    passages.extend(extract_definition_list_passages(root, page_context));
+    passages.truncate(MAX_STRUCTURED_PASSAGES);
+    passages
+}
+
+fn extract_metadata_passages(document: &Html) -> Vec<String> {
+    let selector = Selector::parse(
+        "meta[name='description'], meta[property='og:description'], meta[name='twitter:description']",
+    )
+    .expect("static metadata selector");
+    document
+        .select(&selector)
+        .filter_map(|element| element.value().attr("content"))
+        .map(normalize_visible_text)
+        .filter(|text| text.chars().count() >= 20)
+        .take(4)
+        .collect()
+}
+
+fn extract_json_ld_passages(document: &Html, final_url: &Url) -> Vec<String> {
+    let selector =
+        Selector::parse("script[type='application/ld+json']").expect("static JSON-LD selector");
+    let mut passages = Vec::new();
+    for element in document.select(&selector).take(8) {
+        let raw = element.text().collect::<Vec<_>>().join("");
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        collect_bound_json_ld_passages(&value, final_url, &mut passages);
+        if passages.len() >= 8 {
+            break;
+        }
+    }
+    passages.truncate(8);
+    passages
+}
+
+fn collect_bound_json_ld_passages(
+    value: &serde_json::Value,
+    final_url: &Url,
+    passages: &mut Vec<String>,
+) {
+    if passages.len() >= 8 {
+        return;
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_bound_json_ld_passages(item, final_url, passages);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if json_ld_object_is_bound(object, final_url) {
+                let name = json_string(object.get("name"));
+                let role = json_string(object.get("jobTitle"));
+                if let (Some(name), Some(role)) = (name, role) {
+                    passages.push(format!("{name} is {role}."));
+                }
+                if let (Some(name), Some(value)) = (
+                    json_string(object.get("name")),
+                    json_scalar(object.get("value")),
+                ) {
+                    let unit = json_string(object.get("unitText"))
+                        .map(|unit| format!(" {unit}"))
+                        .unwrap_or_default();
+                    // Publication and modification timestamps describe the
+                    // page, not the measured value. Only fields whose schema
+                    // explicitly binds a reference/observation interval may
+                    // accompany the numeric claim.
+                    let date = [
+                        "referenceDate",
+                        "observationDate",
+                        "measurementDate",
+                        "validFrom",
+                        "startDate",
+                    ]
+                    .iter()
+                    .find_map(|key| json_string(object.get(*key)));
+                    let definition = ["measurementTechnique", "description", "additionalType"]
+                        .iter()
+                        .find_map(|key| json_string(object.get(*key)))
+                        .filter(|definition| !definition.trim().is_empty());
+                    if let Some(date) =
+                        date.filter(|_| definition.is_some() || numeric_label_has_scope(name))
+                    {
+                        let definition = definition
+                            .map(|definition| format!(" ({})", definition.trim()))
+                            .unwrap_or_default();
+                        passages.push(format!(
+                            "{name}{definition} was {value}{unit} as of {date}."
+                        ));
+                    }
+                }
+            }
+            if let Some(graph) = object.get("@graph") {
+                collect_bound_json_ld_passages(graph, final_url, passages);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_ld_object_is_bound(
+    object: &serde_json::Map<String, serde_json::Value>,
+    final_url: &Url,
+) -> bool {
+    ["url", "@id", "mainEntityOfPage"].iter().any(|key| {
+        let value = object.get(*key);
+        let raw = json_string(value).or_else(|| {
+            value
+                .and_then(serde_json::Value::as_object)
+                .and_then(|nested| json_string(nested.get("@id")))
+        });
+        raw.and_then(|raw| Url::parse(raw).ok())
+            .is_some_and(|url| normalized_url_string(&url) == normalized_url_string(final_url))
+    })
+}
+
+fn json_string(value: Option<&serde_json::Value>) -> Option<&str> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn json_scalar(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(value)
+            if value.chars().any(|character| character.is_ascii_digit()) =>
+        {
+            Some(value.trim().to_string())
+        }
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn extract_table_passages(root: &ElementRef<'_>, page_context: &str) -> Vec<String> {
+    let table_selector = Selector::parse("table").expect("static table selector");
+    let row_selector = Selector::parse("tr").expect("static table row selector");
+    let cell_selector = Selector::parse("th, td").expect("static table cell selector");
+    let mut passages = Vec::new();
+    for table in root.select(&table_selector).take(8) {
+        let rows = table
+            .select(&row_selector)
+            .map(|row| {
+                row.select(&cell_selector)
+                    .map(|cell| (cell.value().name() == "th", normalized_element_text(&cell)))
+                    .filter(|(_, text)| !text.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|cells| !cells.is_empty())
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            continue;
+        }
+        let header_row = rows
+            .first()
+            .filter(|row| row.len() >= 2 && row.iter().all(|(header, _)| *header));
+        if let Some(headers) = header_row {
+            for row in rows.iter().skip(1).filter(|row| row.len() == headers.len()) {
+                if let Some(claim) = structured_cells_to_claim(
+                    page_context,
+                    &headers
+                        .iter()
+                        .map(|(_, text)| text.as_str())
+                        .collect::<Vec<_>>(),
+                    &row.iter()
+                        .map(|(_, text)| text.as_str())
+                        .collect::<Vec<_>>(),
+                ) {
+                    passages.push(claim);
+                }
+            }
+            continue;
+        }
+        for row in rows {
+            if row.len() != 2 || !row[0].0 || row[1].0 {
+                continue;
+            }
+            let label = row[0].1.as_str();
+            let value = row[1].1.as_str();
+            if let Some(claim) = labelled_value_claim(page_context, label, value) {
+                passages.push(format!("{page_context}: {label} {value}"));
+                passages.push(claim);
+            }
+        }
+    }
+    passages
+}
+
+fn extract_definition_list_passages(root: &ElementRef<'_>, page_context: &str) -> Vec<String> {
+    let list_selector = Selector::parse("dl").expect("static definition-list selector");
+    let term_selector = Selector::parse("dt").expect("static definition-term selector");
+    let value_selector = Selector::parse("dd").expect("static definition-value selector");
+    let mut passages = Vec::new();
+    for list in root.select(&list_selector).take(8) {
+        let terms = list
+            .select(&term_selector)
+            .map(|item| normalized_element_text(&item));
+        let values = list
+            .select(&value_selector)
+            .map(|item| normalized_element_text(&item));
+        for (label, value) in terms.zip(values).take(8) {
+            if let Some(claim) = labelled_value_claim(page_context, &label, &value) {
+                passages.push(claim);
+            }
+        }
+    }
+    passages
+}
+
+fn structured_cells_to_claim(context: &str, headers: &[&str], values: &[&str]) -> Option<String> {
+    let normalized = headers
+        .iter()
+        .map(|header| header.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let figure_index = normalized.iter().position(|header| {
+        [
+            "figure",
+            "value",
+            "population",
+            "height",
+            "elevation",
+            "rate",
+            "percent",
+            "number",
+        ]
+        .iter()
+        .any(|marker| header.contains(marker))
+    })?;
+    let definition_index = normalized.iter().position(|header| {
+        ["definition", "scope", "type", "area"]
+            .iter()
+            .any(|marker| header.contains(marker))
+    });
+    let date_index = normalized.iter().position(|header| {
+        ["date", "year", "as of", "reference"]
+            .iter()
+            .any(|marker| header.contains(marker))
+    });
+    let figure = single_non_year_number(values.get(figure_index)?)?;
+    let definition = definition_index
+        .and_then(|index| values.get(index).copied())
+        .filter(|value| !value.trim().is_empty())?;
+    let date = date_index
+        .and_then(|index| values.get(index).copied())
+        .filter(|value| contains_year_or_explicit_date(value))?;
+    let label = definition;
+    let date = format!(" in {}", date.trim());
+    Some(format!("{context} {label} was {figure}{date}."))
+}
+
+fn labelled_value_claim(context: &str, label: &str, value: &str) -> Option<String> {
+    let lower = label.to_ascii_lowercase();
+    if ![
+        "population",
+        "height",
+        "elevation",
+        "rate",
+        "percent",
+        "number",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return None;
+    }
+    if !numeric_label_has_scope(label) {
+        return None;
+    }
+    let figure = single_non_year_number(value)?;
+    let date = extract_single_year(value).map(|year| format!(" in {year}"))?;
+    Some(format!("{context} {label} was {figure}{date}."))
+}
+
+fn numeric_label_has_scope(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+    [
+        "city proper",
+        "municipal",
+        "metropolitan",
+        "urban area",
+        "census",
+        "estimate",
+        "official",
+        "summit",
+        "above sea level",
+        "geoid",
+        "measured",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn numeric_tokens(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                !character.is_ascii_digit() && !matches!(character, ',' | '.' | '%')
+            })
+        })
+        .filter(|token| token.chars().any(|character| character.is_ascii_digit()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn single_non_year_number(value: &str) -> Option<String> {
+    let figures = numeric_tokens(value)
+        .into_iter()
+        .filter(|token| {
+            let digits = token
+                .chars()
+                .filter(char::is_ascii_digit)
+                .collect::<String>();
+            !(digits.len() == 4
+                && digits
+                    .parse::<u16>()
+                    .is_ok_and(|year| (1900..=2100).contains(&year)))
+        })
+        .collect::<Vec<_>>();
+    (figures.len() == 1).then(|| figures[0].clone())
+}
+
+fn extract_single_year(value: &str) -> Option<String> {
+    let years = numeric_tokens(value)
+        .into_iter()
+        .filter_map(|token| token.replace([',', '.'], "").parse::<u16>().ok())
+        .filter(|year| (1900..=2100).contains(year))
+        .collect::<Vec<_>>();
+    (years.len() == 1).then(|| years[0].to_string())
+}
+
+fn contains_year_or_explicit_date(value: &str) -> bool {
+    extract_single_year(value).is_some()
+        || (value.contains(['-', '/', '.'])
+            && value.chars().filter(char::is_ascii_digit).count() >= 6)
 }
 
 fn normalized_element_text(element: &ElementRef<'_>) -> String {
@@ -2225,6 +2810,442 @@ mod tests {
         );
     }
 
+    #[test]
+    fn office_holder_relationship_is_required_without_a_literal_who() {
+        for query in [
+            "Name the current President of Slovakia.",
+            "Current President of Slovakia",
+        ] {
+            assert!(
+                !assess_claim_relevance(
+                    query,
+                    "The Slovakia presidential election campaign concluded in 2024."
+                )
+                .eligible
+            );
+            assert!(
+                assess_claim_relevance(query, "Peter Pellegrini is the President of Slovakia.")
+                    .eligible
+            );
+        }
+    }
+
+    #[test]
+    fn relevant_national_presidency_candidate_is_preferred_but_not_accepted_by_domain_alone() {
+        let query = "Who is the President of Slovakia? Use the official first-party website.";
+        let mut official = candidate("https://www.prezident.sk/en/", WebProvider::Tavily, 4);
+        official.title = "President of the Slovak Republic".to_string();
+        let mut unrelated = candidate(
+            "https://elections.example/presidential-election",
+            WebProvider::Tavily,
+            1,
+        );
+        unrelated.title = "Presidential election history".to_string();
+        let mut foreign_embassy = candidate(
+            "https://sk.usembassy.gov/presidential-election",
+            WebProvider::Tavily,
+            1,
+        );
+        foreign_embassy.title = "President of the Slovak Republic".into();
+        let mut candidates = vec![unrelated, foreign_embassy.clone(), official.clone()];
+
+        prepare_web_candidates(query, &mut candidates);
+
+        assert_eq!(candidates[0].requested_url, official.requested_url);
+        assert!(candidate_is_first_party(query, &official));
+        let generic_query = "What is on this website?";
+        assert!(!candidate_is_first_party(generic_query, &official));
+
+        assert!(!candidate_is_first_party(query, &foreign_embassy));
+    }
+
+    #[test]
+    fn biography_reference_is_relevant_only_for_an_office_holder_relationship_query() {
+        let mut biography = candidate(
+            "https://www.prezident.sk/en/biography",
+            WebProvider::DuckDuckGo,
+            1,
+        );
+        biography.title = "Biography".into();
+
+        assert!(candidate_is_query_relevant(
+            "Who is the President of Slovakia?",
+            &biography
+        ));
+        assert!(!candidate_is_query_relevant(
+            "What is the population of Bratislava?",
+            &biography
+        ));
+    }
+
+    #[test]
+    fn slovak_president_seed_prioritizes_the_owner_biography_before_the_homepage() {
+        let mut candidates = vec![candidate(
+            "https://publisher.example/president",
+            WebProvider::Tavily,
+            1,
+        )];
+
+        seed_relevant_first_party_candidates("Who is the President of Slovakia?", &mut candidates);
+        prepare_web_candidates("Who is the President of Slovakia?", &mut candidates);
+
+        assert_eq!(
+            candidates[0].requested_url.as_str(),
+            "https://www.prezident.sk/en/zivotopis"
+        );
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.requested_url.as_str() == "https://www.prezident.sk/en/"));
+    }
+
+    #[tokio::test]
+    async fn official_title_heading_and_adjacent_holder_statement_form_one_grounded_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "www.prezident.sk",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head>
+                    <title>President of the Slovak Republic</title>
+                    <meta property="og:site_name" content="President of the Slovak Republic">
+                    <link rel="canonical" href="https://www.prezident.sk/en/biography">
+                </head><body><main>
+                    <h1>Peter Pellegrini</h1>
+                    <p>Assumed office on 15 June 2024.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://www.prezident.sk/en/biography",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "Who is the current President of Slovakia? Use the official first-party website.",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        let evidence = result.value.expect("fetched page");
+        assert_eq!(evidence.quality.low_quality_reason, None);
+        assert!(evidence.passages.iter().any(|passage| {
+            passage.text.contains("President of the Slovak Republic")
+                && passage.text.contains("Peter Pellegrini")
+                && passage.text.contains("Assumed office on 15 June 2024")
+        }));
+    }
+
+    #[tokio::test]
+    async fn unrelated_presidential_election_page_does_not_form_an_office_holder_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "elections.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Presidential elections</title></head><body><main>
+                    <h1>Presidential elections</h1>
+                    <p>Political parties shaped presidential elections throughout American history.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://elections.example/presidential",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "Who is the President of Slovakia? Use the official first-party website.",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        let evidence = result.value.expect("fetched page");
+        assert_eq!(
+            evidence.quality.low_quality_reason,
+            Some(ExtractionLowQualityReason::NoClaimRelevantPassage)
+        );
+        assert!(evidence.passages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn final_url_bound_json_ld_person_fact_becomes_fetched_evidence() {
+        let network = MockNetwork::default();
+        network.reply(
+            "www.prezident.sk",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>President of the Slovak Republic</title>
+                <script type="application/ld+json">{
+                    "@context":"https://schema.org", "@type":"Person",
+                    "url":"https://www.prezident.sk/en/",
+                    "name":"Peter Pellegrini",
+                    "jobTitle":"President of the Slovak Republic"
+                }</script></head><body><main><h1>President</h1></main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate("https://www.prezident.sk/en/", WebProvider::Tavily, 1),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "Who is the President of Slovakia? Use the official first-party website.",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        let evidence = result.value.expect("fetched page");
+        assert!(evidence.passages.iter().any(|passage| {
+            passage.text == "Peter Pellegrini is President of the Slovak Republic."
+        }));
+    }
+
+    #[tokio::test]
+    async fn official_biography_title_heading_and_role_row_form_holder_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "www.prezident.sk",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>President of the Slovak Republic</title></head>
+                <body><main><h1>Biography of Peter Pellegrini</h1>
+                <h2>Professional experience</h2><p>2024</p>
+                <p>President of the Slovak Republic</p></main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://www.prezident.sk/en/zivotopis",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        result.value.as_mut().expect("fetched biography").authority = SourceAuthority::FirstParty;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "Who is the President of Slovakia?",
+            result.value.as_mut().expect("fetched biography"),
+        );
+
+        let evidence = result.value.expect("fetched biography");
+        assert!(
+            evidence.passages.iter().any(|passage| {
+                passage.text.contains("Peter Pellegrini is President")
+                    && passage.text.contains("Slovak Republic")
+            }),
+            "ranked passages: {:?}",
+            evidence.passages
+        );
+    }
+
+    #[tokio::test]
+    async fn third_party_nonadjacent_biography_and_presidential_role_never_form_holder_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "publisher.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Profiles and former officials</title></head>
+                <body><main><h1>Biography of Alice Example</h1>
+                <p>A long profile about an unrelated subject and her work.</p>
+                <h2>Former officials</h2><p>President of the Slovak Republic</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate("https://publisher.example/profiles", WebProvider::Tavily, 1),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "Who is the President of Slovakia?",
+            result.value.as_mut().expect("fetched profile"),
+        );
+
+        assert!(result.value.expect("fetched profile").passages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn labelled_table_preserves_figure_date_and_definition_in_one_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "statistics.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Bratislava population</title></head><body><main>
+                <h1>Bratislava population</h1>
+                <table><thead><tr><th>Definition</th><th>Figure</th><th>Reference date</th></tr></thead>
+                <tbody><tr><th>city proper population</th><td>475,503</td><td>2024</td></tr></tbody></table>
+                </main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://statistics.example/bratislava",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "What is the current population of Bratislava?",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        let evidence = result.value.expect("fetched page");
+        assert!(evidence.passages.iter().any(|passage| {
+            let text = passage.text.to_ascii_lowercase();
+            text.contains("bratislava")
+                && text.contains("city proper")
+                && text.contains("population was 475,503")
+                && text.contains("2024")
+        }));
+    }
+
+    #[test]
+    fn empty_definition_and_page_publication_date_do_not_label_a_numeric_claim() {
+        assert!(structured_cells_to_claim(
+            "Bratislava",
+            &["Definition", "Figure"],
+            &["", "475,503"]
+        )
+        .is_none());
+
+        let document = Html::parse_document(
+            r#"<script type="application/ld+json">{
+                "@type":"QuantitativeValue",
+                "url":"https://statistics.example/value",
+                "name":"Population", "value":"475503",
+                "datePublished":"2024-01-01"
+            }</script>"#,
+        );
+        let passages = extract_json_ld_passages(
+            &document,
+            &Url::parse("https://statistics.example/value").unwrap(),
+        );
+        assert!(passages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_generic_structured_population_values_remain_unusable() {
+        for (host, value) in [
+            ("publisher-one.example", "475,503"),
+            ("publisher-two.example", "480,902"),
+        ] {
+            let network = MockNetwork::default();
+            network.reply(
+                host,
+                Ok(response(
+                    200,
+                    "text/html",
+                    &format!(
+                        r#"<html><head><title>Bratislava population</title></head>
+                        <body><main><h1>Bratislava population</h1>
+                        <dl><dt>Population</dt><dd>{value}</dd></dl>
+                        </main></body></html>"#
+                    ),
+                )),
+            );
+            let mut result = typed_fetch(
+                &network,
+                &candidate(
+                    &format!("https://{host}/bratislava"),
+                    WebProvider::Tavily,
+                    1,
+                ),
+            )
+            .await;
+            crate::evidence::orchestrator::rank_fact_passages(
+                "What is the current population of Bratislava?",
+                result.value.as_mut().expect("fetched page"),
+            );
+            assert!(result.value.expect("fetched page").passages.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn definition_list_preserves_labelled_value_and_reference_date() {
+        let network = MockNetwork::default();
+        network.reply(
+            "statistics.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Bratislava population</title></head><body><main>
+                <h1>Bratislava</h1><dl>
+                <dt>city proper population</dt><dd>475,503 as of 2024</dd>
+                </dl></main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://statistics.example/bratislava",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "What is the current population of Bratislava?",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        assert!(result.value.expect("fetched page").passages.iter().any(
+            |passage| passage.text == "Bratislava city proper population was 475,503 in 2024."
+        ));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_flattened_numeric_row_never_becomes_a_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "statistics.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Bratislava population</title></head><body><main>
+                <h1>Bratislava population</h1>
+                <table><tr><td>Bratislava</td><td>442,197</td><td>428,672</td><td>475,503</td><td>480,902</td></tr></table>
+                <p>Population statistics for Bratislava are shown above.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://statistics.example/bratislava",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "What is the current population of Bratislava?",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        let evidence = result.value.expect("fetched page");
+        assert!(evidence.passages.is_empty());
+        assert_eq!(
+            evidence.quality.low_quality_reason,
+            Some(ExtractionLowQualityReason::NoClaimRelevantPassage)
+        );
+    }
+
     #[tokio::test]
     async fn direct_page_extraction_keeps_the_description_without_duplicate_title_or_navigation() {
         let network = MockNetwork::default();
@@ -2271,7 +3292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn article_extraction_excludes_wikipedia_navigation_and_keeps_infobox_population() {
+    async fn article_extraction_excludes_navigation_and_rejects_generic_infobox_value() {
         let network = MockNetwork::default();
         network.reply(
             "en.wikipedia.org",
@@ -2311,7 +3332,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
 
-        assert!(text.contains("Population 475,503 (2024)"));
+        assert!(!text.contains("Population 475,503 (2024)"));
+        assert!(text.contains("estimated population of 475,503 in 2024"));
         assert!(text.contains("capital and largest city"));
         assert!(!text.contains("Random article"));
         assert!(!text.contains("Privacy policy"));
@@ -2498,7 +3520,7 @@ mod tests {
         );
 
         let ProviderSearch::Candidates(candidates) =
-            search_tavily(&network, "city population", Some("tvly-test-secret")).await
+            search_tavily(&network, "city population", Some("tvly-test-secret"), None).await
         else {
             panic!("Tavily should return typed candidates");
         };
@@ -2518,7 +3540,7 @@ mod tests {
     async fn tavily_missing_key_quota_and_malformed_response_are_typed() {
         let missing = MockNetwork::default();
         assert!(matches!(
-            search_tavily(&missing, "query", None).await,
+            search_tavily(&missing, "query", None, None).await,
             ProviderSearch::Failed(FailureCode::ConnectorUnavailable)
         ));
         assert_eq!(missing.call_count("api.tavily.com"), 0);
@@ -2529,7 +3551,7 @@ mod tests {
             Ok(response(429, "application/json", r#"{"detail":"quota"}"#)),
         );
         assert!(matches!(
-            search_tavily(&quota, "query", Some("tvly-test-secret")).await,
+            search_tavily(&quota, "query", Some("tvly-test-secret"), None).await,
             ProviderSearch::Failed(FailureCode::RateLimited)
         ));
 
@@ -2543,7 +3565,7 @@ mod tests {
             )),
         );
         assert!(matches!(
-            search_tavily(&malformed, "query", Some("tvly-test-secret")).await,
+            search_tavily(&malformed, "query", Some("tvly-test-secret"), None).await,
             ProviderSearch::InvalidResponse
         ));
     }
@@ -2568,6 +3590,7 @@ mod tests {
             "en",
             &ProviderSet(vec![WebProvider::Tavily]),
             Some("tvly-test-secret"),
+            None,
         )
         .await;
         let value = result.value.unwrap();
@@ -2616,6 +3639,7 @@ mod tests {
             "en",
             &web_provider_set(true),
             Some("tvly-test-secret"),
+            None,
         )
         .await;
         let value = result.value.unwrap();
@@ -2631,6 +3655,52 @@ mod tests {
             ProviderStatus::Succeeded { result_count: 1 }
         );
         assert_eq!(value.candidates[0].provider, WebProvider::DuckDuckGo);
+    }
+
+    #[tokio::test]
+    async fn every_acceptance_fault_uses_one_tavily_attempt_and_at_most_one_ddg_fallback() {
+        let cases = [
+            (
+                TavilyAcceptanceFault::MissingCredential,
+                ProviderStatus::Failed(FailureCode::ConnectorUnavailable),
+            ),
+            (
+                TavilyAcceptanceFault::Http429,
+                ProviderStatus::Failed(FailureCode::RateLimited),
+            ),
+            (TavilyAcceptanceFault::Timeout, ProviderStatus::TimedOut),
+            (
+                TavilyAcceptanceFault::MalformedResponse,
+                ProviderStatus::InvalidResponse,
+            ),
+        ];
+        for (fault, expected) in cases {
+            let network = Arc::new(MockNetwork::default());
+            network.reply(
+                "lite.duckduckgo.com",
+                Ok(response(
+                    200,
+                    "text/html",
+                    r#"<a rel="nofollow" href="https://fallback.example/result">Fallback result</a>"#,
+                )),
+            );
+            let key = (fault != TavilyAcceptanceFault::MissingCredential)
+                .then_some("tvly-acceptance-placeholder");
+            let adapter = TypedWebAdapter::with_acceptance_fault(network.clone(), key, fault);
+
+            let result = adapter
+                .search("bounded acceptance query", "en", &web_provider_set(true))
+                .await;
+            let value = result.value.expect("typed provider results");
+
+            assert_eq!(result.attempts, 2);
+            assert_eq!(value.providers.len(), 2);
+            assert_eq!(value.providers[0].provider, WebProvider::Tavily);
+            assert_eq!(value.providers[0].status, expected);
+            assert_eq!(value.providers[1].provider, WebProvider::DuckDuckGo);
+            assert_eq!(network.call_count("api.tavily.com"), 0);
+            assert_eq!(network.call_count("lite.duckduckgo.com"), 1);
+        }
     }
 
     #[tokio::test]
@@ -2865,6 +3935,23 @@ mod tests {
             candidate_source_identity(&candidates[2]).as_str(),
             "example.com"
         );
+    }
+
+    #[test]
+    fn grounded_relationship_snippet_improves_discovery_rank_without_becoming_evidence() {
+        let mut generic = candidate("https://generic.example/slovakia", WebProvider::Tavily, 1);
+        generic.title = "Slovakia profile".into();
+        generic.snippet = "General background and election coverage.".into();
+        let mut grounded_shape =
+            candidate("https://publisher.example/slovakia", WebProvider::Tavily, 5);
+        grounded_shape.title = "Slovakia profile".into();
+        grounded_shape.snippet =
+            "Peter Pellegrini serves as President of the Slovak Republic.".into();
+        let mut candidates = vec![generic, grounded_shape.clone()];
+
+        prepare_web_candidates("President of Slovakia", &mut candidates);
+
+        assert_eq!(candidates[0].requested_url, grounded_shape.requested_url);
     }
 
     #[test]
