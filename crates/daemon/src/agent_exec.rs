@@ -1029,9 +1029,10 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
         {
             if (is_known_agentic_command_word(&lower)
                 && !is_supported_web_fact_topic_word(&lower)
+                && !is_supported_command_homonym_noun(&lower)
                 && ((index + 1 < tokens.len()
                     && last_fact_topic.is_none_or(|topic| index > topic))
-                    || (index + 1 == tokens.len() && token == lower)))
+                    || index + 1 == tokens.len()))
                 || !token
                     .chars()
                     .all(|character| character.is_alphanumeric() || character == '-')
@@ -1121,37 +1122,15 @@ fn entity_phrase_is_supported(tokens: &[&str]) -> bool {
         if !is_known_agentic_command_word(&lower) || is_supported_web_fact_topic_word(&lower) {
             return false;
         }
-        let is_terminal_lowercase = index + 1 == tokens.len() && *token == lower;
-        let starts_action_object = tokens[index + 1..].iter().any(|next| {
-            is_agentic_command_object_word(&next.to_lowercase())
-                || is_web_scope_token(&next.to_lowercase())
-        });
-        is_terminal_lowercase || starts_action_object
+        !is_supported_command_homonym_noun(&lower)
+            && !tokens[index + 1..]
+                .iter()
+                .any(|next| is_supported_web_fact_topic_word(&next.to_lowercase()))
     })
 }
 
-fn is_agentic_command_object_word(token: &str) -> bool {
-    matches!(
-        token,
-        "app"
-            | "application"
-            | "basert"
-            | "clipboard"
-            | "data"
-            | "database"
-            | "email"
-            | "file"
-            | "files"
-            | "folder"
-            | "mail"
-            | "message"
-            | "note"
-            | "notes"
-            | "record"
-            | "reply"
-            | "website"
-            | "window"
-    )
+fn is_supported_command_homonym_noun(token: &str) -> bool {
+    matches!(token, "switch")
 }
 
 fn entity_conjunction_phrase_is_supported(tokens: &[&str]) -> bool {
@@ -5640,6 +5619,7 @@ mod tests {
             "what is the current download speed online?",
             "what is the current restart policy?",
             "what is the current price of Nintendo Switch?",
+            "what is the current price of nintendo switch?",
             "what is the current weather",
             "who is the current president of France",
             "compare the current prices of service A and service B",
@@ -5727,11 +5707,17 @@ mod tests {
             "what is the current GDP restart BaseRT?",
             "what is the current mayor browse website?",
             "what is the current GDP restart?",
+            "what is the current GDP Restart?",
             "what is the current price of Nintendo Switch restart?",
+            "what is the current price of Nintendo Switch restart server?",
             "what is the population of France and Germany delete file?",
             "compare prices of Apple and Microsoft and browse website",
             "compare prices of Apple and Microsoft browse website",
             "compare prices of Apple and Microsoft browse",
+            "compare prices of Apple and Microsoft Browse",
+            "compare prices of Apple and Microsoft browse Google",
+            "compare prices of Apple and Microsoft browse browser",
+            "compare prices of Apple and Microsoft delete account",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
