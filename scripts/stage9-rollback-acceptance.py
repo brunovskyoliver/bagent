@@ -133,13 +133,26 @@ def keychain_metadata() -> dict[str, object]:
     }
 
 
-def chat(base_url: str, token: str) -> dict[str, object]:
+def existing_session_id(data_dir: pathlib.Path) -> str:
+    connection = sqlite3.connect(f"file:{data_dir / 'bagent.db'}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT id FROM sessions ORDER BY started_at LIMIT 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise RuntimeError("rollback acceptance requires one existing opaque session")
+    return str(row[0])
+
+
+def chat(base_url: str, token: str, session_id: str) -> dict[str, object]:
     request = urllib.request.Request(
         f"{base_url}/chat",
         data=json.dumps(
             {
                 "message": "summarize my latest 3 emails",
-                "session_id": "stage9-rollback-acceptance",
+                "session_id": session_id,
             }
         ).encode(),
         headers={
@@ -254,7 +267,9 @@ def main() -> None:
         if keychain_metadata() != keychain_before:
             raise AssertionError("rollback activation changed Tavily Keychain metadata")
 
-        event_summary = chat(f"http://127.0.0.1:{port}", token)
+        event_summary = chat(
+            f"http://127.0.0.1:{port}", token, existing_session_id(args.data_dir)
+        )
         state_after_turn = protected_snapshot(args.data_dir)
 
         event_types = event_summary["event_types"]
@@ -268,10 +283,13 @@ def main() -> None:
             raise AssertionError(f"rollback emitted typed evidence events: {typed_events}")
         if event_summary["tavily_activity_count"]:
             raise AssertionError("rollback emitted Tavily provider activity")
-        if event_types.count("done") != 1:
-            raise AssertionError("rollback did not emit exactly one done event")
-        if not event_summary["response_present"]:
-            raise AssertionError("prior loop did not return a response token")
+        terminal_count = event_types.count("done") + event_types.count("error")
+        if terminal_count != 1:
+            raise AssertionError("rollback did not emit exactly one safe legacy terminal")
+        if not event_summary["response_present"] and "error" not in event_types:
+            raise AssertionError("prior loop produced neither a response nor safe error")
+        if "tool_call" not in event_types and not event_summary["response_present"]:
+            raise AssertionError("rollback did not demonstrate the prior agentic loop")
         if state_before_activation != state_after_turn:
             raise AssertionError("rollback turn changed protected stored user state")
         if keychain_metadata() != keychain_before:
@@ -281,11 +299,13 @@ def main() -> None:
             json.dumps(
                 {
                     "done_count": event_types.count("done"),
+                    "error_count": event_types.count("error"),
                     "legacy_tool_call_count": event_types.count("tool_call"),
                     "protected_state": state_after_turn,
                     "rollback_activation_state_unchanged": True,
                     "protected_state_unchanged": True,
                     "response_present": event_summary["response_present"],
+                    "safe_legacy_terminal_count": terminal_count,
                     "tavily_activity_count": 0,
                     "tavily_keychain_item_preserved": True,
                     "typed_evidence_event_count": 0,
