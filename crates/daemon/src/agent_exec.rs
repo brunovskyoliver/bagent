@@ -4403,9 +4403,8 @@ pub(crate) async fn run_agent_loop(
                     }
                 }
                 Err(e) => {
-                    let error_code = normalized_legacy_model_error_code(&e.to_string());
                     let _ = sink
-                        .emit(json!({"type":"error","code":error_code,"message": e.to_string()}))
+                        .emit(normalized_legacy_model_error_event(&e.to_string()))
                         .await;
                     return Err(ExecError::Model(e.to_string()));
                 }
@@ -4443,9 +4442,8 @@ pub(crate) async fn run_agent_loop(
                 }
                 Ok(ChatStreamEvent::ToolCalls(calls)) => round_calls.extend(calls),
                 Err(e) => {
-                    let error_code = normalized_legacy_model_error_code(&e.to_string());
                     let _ = sink
-                        .emit(json!({"type":"error","code":error_code,"message": e.to_string()}))
+                        .emit(normalized_legacy_model_error_event(&e.to_string()))
                         .await;
                     return Err(ExecError::Model(e.to_string()));
                 }
@@ -5123,6 +5121,16 @@ fn normalized_legacy_model_error_code(error: &str) -> &'static str {
     }
 }
 
+fn normalized_legacy_model_error_event(error: &str) -> serde_json::Value {
+    let code = normalized_legacy_model_error_code(error);
+    let message = if code.starts_with("model_unavailable_") {
+        "The local model is temporarily unavailable."
+    } else {
+        "The local model request failed."
+    };
+    json!({"type":"error","code":code,"message":message})
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TranscriptSource {
     id: String,
@@ -5232,6 +5240,10 @@ mod tests {
             normalized_legacy_model_error_code("unexpected private provider detail"),
             "model_error"
         );
+        let event = normalized_legacy_model_error_event("unexpected private provider detail");
+        assert_eq!(event["code"], "model_error");
+        assert_eq!(event["message"], "The local model request failed.");
+        assert!(!event.to_string().contains("private provider detail"));
     }
     use crate::evidence::{
         execute_mail_plan, execute_unavailable_mail_plan, Admission, EvidenceOperation,
