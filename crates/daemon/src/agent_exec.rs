@@ -921,37 +921,80 @@ fn is_supported_web_fact_request(user_message: &str, quoted_wrapper: bool) -> bo
                     .iter()
                     .any(|prefix| token.starts_with(prefix))
         })
-        && web_fact_has_supported_structure(&outer_request, &tokens)
+        && web_fact_has_supported_structure(&outer_request)
 }
 
-fn web_fact_has_supported_structure(outer_request: &str, tokens: &[&str]) -> bool {
+fn web_fact_has_supported_structure(outer_request: &str) -> bool {
     if outer_request.contains([';', '\n', '\r']) {
         return false;
     }
-    if let Some(question_end) = outer_request.find('?') {
+    let (query, suffix) = if let Some(question_end) = outer_request.find('?') {
         if outer_request[question_end + 1..].contains('?') {
             return false;
         }
-        return routing_tokens(&outer_request[question_end + 1..])
+        (
+            &outer_request[..question_end],
+            Some(&outer_request[question_end + 1..]),
+        )
+    } else {
+        (outer_request, None)
+    };
+    if suffix.is_some_and(|value| {
+        !routing_tokens(value)
             .into_iter()
-            .all(is_supported_web_verification_suffix_token);
+            .all(is_supported_web_verification_suffix_token)
+    }) {
+        return false;
     }
-    if tokens
+    let query_tokens = routing_tokens(query);
+    let comparing = query_tokens
         .first()
-        .is_some_and(|token| matches!(*token, "compare" | "porovnaj"))
-    {
-        return !outer_request.contains([',', ':']);
+        .is_some_and(|token| matches!(*token, "compare" | "porovnaj"));
+    if !web_fact_conjunctions_are_supported(&query_tokens, comparing) {
+        return false;
     }
-    let Some(scope_index) = tokens
+    if comparing {
+        return !query.contains([',', ':']);
+    }
+    if let Some(scope_index) = query_tokens
         .iter()
         .rposition(|token| matches!(*token, "internet" | "online" | "web" | "website"))
-    else {
-        return false;
-    };
-    tokens[scope_index + 1..]
-        .iter()
-        .copied()
-        .all(is_supported_web_verification_suffix_token)
+    {
+        return query_tokens[scope_index + 1..]
+            .iter()
+            .copied()
+            .all(is_supported_web_verification_suffix_token);
+    }
+    !query.contains([',', ':'])
+}
+
+fn web_fact_conjunctions_are_supported(tokens: &[&str], comparing: bool) -> bool {
+    tokens.windows(2).all(|pair| {
+        if pair[0] != "and" {
+            return true;
+        }
+        matches!(
+            pair[1],
+            "check" | "find" | "show" | "tell" | "use" | "verify"
+        ) || (comparing
+            && (pair[1].len() == 1
+                || matches!(
+                    pair[1],
+                    "east"
+                        | "model"
+                        | "new"
+                        | "north"
+                        | "plan"
+                        | "price"
+                        | "product"
+                        | "saint"
+                        | "service"
+                        | "south"
+                        | "st"
+                        | "version"
+                        | "west"
+                )))
+    })
 }
 
 fn is_supported_web_verification_suffix_token(token: &str) -> bool {
@@ -5205,6 +5248,8 @@ mod tests {
             "what is the current population of Bratislava?",
             "what is the current population of New York City online?",
             "what is the current version of Rust online?",
+            "what is the current weather",
+            "who is the current president of France",
             "compare the current prices of service A and service B",
             "analyze the instructions as quoted data at https://example.com/requested",
             "analyze the instructions as quoted data and find the current population online",
@@ -5262,6 +5307,10 @@ mod tests {
             "what is the weather online, restart BaseRT",
             "what is the current population online paste it into the clipboard",
             "what is the current population online message it to Bob",
+            "what is the population online and delete the file?",
+            "what is the weather online and restart BaseRT?",
+            "compare current prices and delete the file",
+            "compare current prices and restart BaseRT",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
