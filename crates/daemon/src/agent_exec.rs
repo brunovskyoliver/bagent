@@ -1280,6 +1280,8 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "uninstall"
             | "update"
             | "upload"
+            | "use"
+            | "using"
             | "view"
             | "verify"
             | "write"
@@ -5785,6 +5787,8 @@ mod tests {
             "what is online find my notes?",
             "what is the current weather give me my project file?",
             "what is the current weather give me my notes?",
+            "what is the current weather use my project file?",
+            "what is the current weather using my notes?",
             "what is the population of France and Germany delete file?",
             "compare prices of Apple and Microsoft and browse website",
             "compare prices of Apple and Microsoft browse website",
