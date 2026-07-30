@@ -133,8 +133,32 @@ Evidence Content withheld from ordinary synthesis because it contains instructio
 _Avoid_: Hidden command, trusted instruction
 
 **Model Residency**:
-The period during which a synthesis model remains loaded and ready after use; it may end on an idle deadline or memory pressure without changing evidence correctness.
+The period during which a model's weights remain loaded and ready, distinct from availability of the model service itself. An active Conversation Turn or Automation Run protects residency; otherwise it may end after inactivity or memory pressure without changing task correctness.
 _Avoid_: Permanent model ownership, evidence cache
+
+**Automation Run**:
+One scheduled or manually triggered execution of an automation, isolated from every earlier and later execution of that automation.
+_Avoid_: Recurring conversation, shared run
+
+**Automation Session**:
+The immutable task context, observable activity, tool outcomes, and final response belonging to one Automation Run. It may seed a new chat but is never extended by that chat.
+_Avoid_: Result summary, current chat
+
+**Conversation Turn**:
+One user request and its resulting assistant work within the current chat session.
+_Avoid_: Automation Run, model request
+
+**Current Chat**:
+The user-controlled conversation that receives new Conversation Turns. Clearing it starts a fresh Current Chat without deleting Automation Sessions or saved long-term memory.
+_Avoid_: Automation Session, conversation archive
+
+**Activity Peek**:
+A transient, compact notch presentation of one privacy-safe current activity and its tool category while work continues in the background. It exposes neither hidden reasoning nor evidence content and does not take focus.
+_Avoid_: Chain of thought, activity transcript, notification window
+
+**Permission Grant Assist**:
+An in-notch guide that opens the relevant macOS privacy pane, presents bagent as a draggable application, rechecks the authoritative system grant, and offers a UI-only relaunch when the grant requires it.
+_Avoid_: Custom permission dialog, automatic grant, daemon restart
 
 **Synthesis Fallback**:
 One bounded attempt by the admitted backup model when the preferred synthesis model cannot load, is unavailable, or exceeds its deadline; it reuses the same validated Evidence Bundle.
