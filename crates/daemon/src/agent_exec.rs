@@ -973,9 +973,9 @@ fn web_fact_has_supported_structure(outer_request: &str) -> bool {
         .first()
         .is_some_and(|token| matches!(token.to_lowercase().as_str(), "compare" | "porovnaj"));
     if comparing {
-        return !query.contains([',', ':', '.']) && comparison_query_is_supported(&query_tokens);
+        return !query.contains([',', ':', '.']) && comparison_query_is_supported(query_tokens);
     }
-    !query.contains([',', ':', '.']) && fact_query_is_supported(&query_tokens)
+    !query.contains([',', ':', '.']) && fact_query_is_supported(query_tokens)
 }
 
 fn fact_query_is_supported(tokens: &[&str]) -> bool {
