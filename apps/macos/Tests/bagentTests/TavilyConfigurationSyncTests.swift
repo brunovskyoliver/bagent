@@ -214,4 +214,15 @@ final class TavilyConfigurationSyncTests: XCTestCase {
 
         XCTAssertTrue(reporter.shouldAttempt(processID: 202, status: .configurationFailed))
     }
+
+    func testUnavailableHealthDoesNotResetFailureReportBudgetForSamePID() {
+        let reporter = TavilyConfigurationFailureReporter(maxAttemptsPerDaemon: 2)
+
+        XCTAssertTrue(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+        reporter.didAttempt(accepted: false)
+        XCTAssertFalse(reporter.shouldAttempt(processID: nil, status: .pending))
+        XCTAssertTrue(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+        reporter.didAttempt(accepted: false)
+        XCTAssertFalse(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+    }
 }

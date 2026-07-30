@@ -75,6 +75,9 @@ final class TavilyConfigurationFailureReporter {
         processID currentProcessID: Int?,
         status: DaemonClient.TavilyConfigurationStatus
     ) -> Bool {
+        guard let currentProcessID else {
+            return false
+        }
         if processID != currentProcessID {
             processID = currentProcessID
             attempts = 0
@@ -85,7 +88,7 @@ final class TavilyConfigurationFailureReporter {
             delivered = false
             return false
         }
-        return currentProcessID != nil && !delivered && attempts < maxAttemptsPerDaemon
+        return !delivered && attempts < maxAttemptsPerDaemon
     }
 
     func didAttempt(accepted: Bool) {
