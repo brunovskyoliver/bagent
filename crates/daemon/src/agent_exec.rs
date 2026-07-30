@@ -5126,6 +5126,7 @@ fn normalized_legacy_model_error_code(error: &str) -> &'static str {
     } else if normalized.starts_with("basert error:")
         || normalized == "basert stream read"
         || normalized.starts_with("basert stream read:")
+        || normalized == "post /v1/chat/completions"
         || normalized.starts_with("post /v1/chat/completions:")
         || normalized == "basert returned an incomplete tool call"
         || normalized.starts_with("parse arguments for basert tool call ")
@@ -5287,6 +5288,10 @@ mod tests {
         );
         assert_eq!(
             normalized_legacy_model_error_code("POST /v1/chat/completions: HTTP 400 Bad Request"),
+            "model_unavailable_basert"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("POST /v1/chat/completions"),
             "model_unavailable_basert"
         );
         assert_eq!(
