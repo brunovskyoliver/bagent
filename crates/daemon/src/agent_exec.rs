@@ -1145,6 +1145,11 @@ fn is_supported_command_noun_at(tokens: &[&str], index: usize) -> bool {
                 && tokens[index - 1].eq_ignore_ascii_case("nintendo")
                 && index + 1 == tokens.len()
         }
+        "use" => {
+            index > 0
+                && tokens[index - 1].eq_ignore_ascii_case("land")
+                && next.as_deref() == Some("policy")
+        }
         "view" => matches!(next.as_deref(), Some("count" | "counts")),
         _ => false,
     }
@@ -5682,6 +5687,7 @@ mod tests {
             "can you find the current population of Bratislava online?",
             "tell me the current weather online?",
             "what are the current show times for Wicked online?",
+            "what is the current land use policy of France online?",
             "what is the current price of Nintendo Switch?",
             "what is the current price of nintendo switch?",
             "what is the current weather",
