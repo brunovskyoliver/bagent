@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[cfg(feature = "stage8-acceptance")]
+mod acceptance;
 mod adapters;
 mod classifier;
 mod diagnostics;
@@ -12,6 +14,8 @@ mod types;
 mod validator;
 mod web;
 
+#[cfg(feature = "stage8-acceptance")]
+pub(crate) use acceptance::*;
 pub(crate) use adapters::*;
 pub(crate) use classifier::*;
 pub(crate) use diagnostics::*;

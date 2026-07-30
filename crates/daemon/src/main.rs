@@ -55,12 +55,6 @@ mod embedded {
     refinery::embed_migrations!("migrations");
 }
 
-const STAGE8_ACCEPTANCE_PROVIDER_FAULTS_ENV: &str = "BAGENT_STAGE8_ACCEPTANCE_PROVIDER_FAULTS";
-
-fn stage8_acceptance_provider_faults_enabled(value: Option<&str>) -> bool {
-    value == Some("1")
-}
-
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Connection>>,
@@ -97,9 +91,9 @@ struct AppState {
     /// Tavily key is supplied ephemerally by the signed app from Keychain.
     /// It is never persisted by the daemon or included in diagnostics.
     tavily_api_key: Arc<RwLock<Option<String>>>,
-    /// Present only when the explicit Stage 8 acceptance environment flag was
-    /// set at daemon startup. The route controlling it is otherwise absent.
-    tavily_acceptance_fault: Option<Arc<RwLock<Option<evidence::TavilyAcceptanceFault>>>>,
+    /// Compiled and activated only for signed Stage 8 acceptance campaigns.
+    #[cfg(feature = "stage8-acceptance")]
+    acceptance: Option<evidence::AcceptanceControl>,
     /// WhatsApp Web bridge connector. Always present; owns the bridge subprocess.
     /// Bridge can autostart when a prior LocalAuth session exists, and is also
     /// controlled explicitly via `/whatsapp/start` and `/whatsapp/stop`.
@@ -462,8 +456,22 @@ async fn main() -> Result<()> {
     let basert_api_key =
         std::env::var("BAGENT_BASERT_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
     let inference = BaseRtClient::new(basert_base_url, basert_api_key);
+    #[cfg(feature = "stage8-acceptance")]
+    let acceptance = evidence::acceptance_runtime_enabled(
+        std::env::var(evidence::STAGE8_ACCEPTANCE_FIXTURES_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .then(evidence::AcceptanceControl::default);
+    #[cfg(feature = "stage8-acceptance")]
+    let synthesis_client: Arc<dyn evidence::SynthesisModelClient> = match &acceptance {
+        Some(control) => Arc::new(control.synthesis_client(inference.clone())),
+        None => Arc::new(inference.clone()),
+    };
+    #[cfg(not(feature = "stage8-acceptance"))]
+    let synthesis_client: Arc<dyn evidence::SynthesisModelClient> = Arc::new(inference.clone());
     let synthesis = evidence::SynthesisService::new(
-        Arc::new(inference.clone()),
+        synthesis_client,
         Arc::new(evidence::SystemSynthesisClock::default()),
         Arc::new(evidence::SystemMemoryPressureSignal::from_environment()),
         evidence::SynthesisConfig::from_environment(),
@@ -659,10 +667,6 @@ async fn main() -> Result<()> {
     // Odoo connector — starts unconfigured; Swift configures it lazily via POST /odoo/config.
     let odoo: Arc<RwLock<Option<OdooConnector>>> = Arc::new(RwLock::new(None));
     let tavily_api_key: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-    let acceptance_faults_env = std::env::var(STAGE8_ACCEPTANCE_PROVIDER_FAULTS_ENV).ok();
-    let tavily_acceptance_fault =
-        stage8_acceptance_provider_faults_enabled(acceptance_faults_env.as_deref())
-            .then(|| Arc::new(RwLock::new(None)));
 
     // WhatsApp connector — always present; autostarts only for prior paired sessions.
     let whatsapp = Arc::new(WhatsappConnector::new(WhatsappConfig::default()));
@@ -700,7 +704,8 @@ async fn main() -> Result<()> {
         codex,
         odoo,
         tavily_api_key,
-        tavily_acceptance_fault,
+        #[cfg(feature = "stage8-acceptance")]
+        acceptance,
         whatsapp,
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
@@ -716,6 +721,7 @@ async fn main() -> Result<()> {
     tokio::spawn(scheduler::run_scheduler(state.clone()));
 
     let shutdown_state = state.clone();
+    #[allow(unused_mut)]
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/events", get(events_stream))
@@ -831,10 +837,11 @@ async fn main() -> Result<()> {
             get(whatsapp_chat_messages_handler),
         )
         .route("/whatsapp/send", post(whatsapp_send_handler));
-    if state.tavily_acceptance_fault.is_some() {
+    #[cfg(feature = "stage8-acceptance")]
+    if state.acceptance.is_some() {
         app = app.route(
-            "/web/tavily/acceptance-fault",
-            post(tavily_acceptance_fault_handler),
+            "/acceptance/stage8/fixture",
+            post(stage8_acceptance_fixture_handler),
         );
     }
     let app = app
@@ -1959,6 +1966,10 @@ async fn chat(
     let skills = state.skills.clone();
     let task_rater = state.task_rater.clone();
     let runtime_refs = state.runtime_refs.clone();
+    #[cfg(feature = "stage8-acceptance")]
+    let acceptance_runtime_active = state.acceptance.is_some();
+    #[cfg(not(feature = "stage8-acceptance"))]
+    let acceptance_runtime_active = false;
 
     tokio::spawn(async move {
         let t0 = std::time::Instant::now();
@@ -2350,32 +2361,34 @@ async fn chat(
             );
         }
 
-        if let Some(trace) = prompt_trace {
-            let record = PromptDebugRecord {
-                prompt_trace_id: prompt_trace_id.clone(),
-                session_id: session_id.clone(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                user_message: redact_debug_text(&user_message),
-                model: effective_model.clone(),
-                language: lang.to_string(),
-                prompt_chars,
-                prompt_token_estimate: prompt_chars / 4,
-                message_count: prompt_messages_for_log.len(),
-                prompt_messages: prompt_messages_for_log
-                    .iter()
-                    .map(|m| PromptDebugMessage {
-                        role: m.role.clone(),
-                        content: redact_debug_text(&m.content),
-                        images_count: 0,
-                    })
-                    .collect(),
-                trace,
-                response_preview: redact_debug_text(&preview_text(&response_for_audit, 600)),
-                response_chars: response_for_audit.len(),
-                elapsed_ms: t0.elapsed().as_millis(),
-            };
-            if let Err(e) = append_prompt_debug_record(&debug_dir, &record) {
-                tracing::warn!("prompt debug log write failed: {e}");
+        if !acceptance_runtime_active {
+            if let Some(trace) = prompt_trace {
+                let record = PromptDebugRecord {
+                    prompt_trace_id: prompt_trace_id.clone(),
+                    session_id: session_id.clone(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    user_message: redact_debug_text(&user_message),
+                    model: effective_model.clone(),
+                    language: lang.to_string(),
+                    prompt_chars,
+                    prompt_token_estimate: prompt_chars / 4,
+                    message_count: prompt_messages_for_log.len(),
+                    prompt_messages: prompt_messages_for_log
+                        .iter()
+                        .map(|m| PromptDebugMessage {
+                            role: m.role.clone(),
+                            content: redact_debug_text(&m.content),
+                            images_count: 0,
+                        })
+                        .collect(),
+                    trace,
+                    response_preview: redact_debug_text(&preview_text(&response_for_audit, 600)),
+                    response_chars: response_for_audit.len(),
+                    elapsed_ms: t0.elapsed().as_millis(),
+                };
+                if let Err(e) = append_prompt_debug_record(&debug_dir, &record) {
+                    tracing::warn!("prompt debug log write failed: {e}");
+                }
             }
         }
 
@@ -3493,25 +3506,26 @@ struct TavilyConfigRequest {
     api_key: Option<String>,
 }
 
+#[cfg(feature = "stage8-acceptance")]
 #[derive(Deserialize)]
-struct TavilyAcceptanceFaultRequest {
-    fault: Option<evidence::TavilyAcceptanceFault>,
+struct Stage8AcceptanceFixtureRequest {
+    selection: Option<evidence::AcceptanceFixtureSelection>,
 }
 
-/// Acceptance-only authenticated control. The router does not register this
-/// handler unless `BAGENT_STAGE8_ACCEPTANCE_PROVIDER_FAULTS=1` was present at
-/// daemon startup.
-async fn tavily_acceptance_fault_handler(
+/// Acceptance-only authenticated control. Both the compile-time feature and
+/// exact runtime environment flag are required before the route is registered.
+#[cfg(feature = "stage8-acceptance")]
+async fn stage8_acceptance_fixture_handler(
     State(state): State<AppState>,
-    Json(body): Json<TavilyAcceptanceFaultRequest>,
+    Json(body): Json<Stage8AcceptanceFixtureRequest>,
 ) -> impl IntoResponse {
-    let Some(slot) = state.tavily_acceptance_fault.as_ref() else {
+    let Some(control) = state.acceptance.as_ref() else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "ok": false, "error": "not_found" })),
         );
     };
-    *slot.write().await = body.fault;
+    control.set(body.selection);
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
 
@@ -4036,14 +4050,6 @@ mod tests {
         assert!(!attachment_mime_is_supported("image/jpeg"));
         assert!(attachment_mime_is_supported("application/pdf"));
         assert!(attachment_mime_is_supported("text/plain"));
-    }
-
-    #[test]
-    fn provider_fault_control_requires_the_exact_acceptance_flag() {
-        assert!(stage8_acceptance_provider_faults_enabled(Some("1")));
-        for value in [None, Some(""), Some("0"), Some("true"), Some("stage8")] {
-            assert!(!stage8_acceptance_provider_faults_enabled(value));
-        }
     }
 
     #[test]

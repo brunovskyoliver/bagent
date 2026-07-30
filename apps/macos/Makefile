@@ -13,7 +13,7 @@ ifeq ($(SIGN_ID),)
 SIGN_ID   := -
 endif
 
-.PHONY: run build daemon bundle clean whatsapp-bridge-install
+.PHONY: run build daemon daemon-acceptance bundle bundle-acceptance assemble-bundle clean whatsapp-bridge-install
 
 # Dev run: builds daemon first, then the Swift app. The Info.plist is embedded in
 # the binary (see Package.swift) so screen-capture TCC works without bundling. Ad-hoc
@@ -41,12 +41,27 @@ daemon-dev:
 daemon:
 	cargo build --release --manifest-path $(REPO_ROOT)/Cargo.toml
 
+# Explicitly compiled Stage 8 acceptance daemon. The fixture routes still
+# require BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 at daemon startup.
+daemon-acceptance:
+	cargo build --release --manifest-path $(REPO_ROOT)/Cargo.toml -p bagentd --features stage8-acceptance
+
 # Release Swift build
 build:
 	swift build -c release
 
 # Bundle: Swift + daemon release binary
 bundle: build daemon
+	$(MAKE) assemble-bundle
+	@echo "✓  $(BUNDLE) ready — open $(BUNDLE) or drag to Applications"
+
+# Signed-app acceptance bundle. This is never used by the ordinary bundle
+# target, so production/default builds contain no fixture controls.
+bundle-acceptance: build daemon-acceptance
+	$(MAKE) assemble-bundle
+	@echo "✓  $(BUNDLE) Stage 8 acceptance build ready"
+
+assemble-bundle:
 	rm -rf $(BUNDLE)
 	mkdir -p "$(BUNDLE)/Contents/MacOS"
 	cp "$(BUILD_DIR)/$(APP_NAME)" "$(BUNDLE)/Contents/MacOS/"
@@ -62,9 +77,8 @@ bundle: build daemon
   <key>LSUIElement</key>         <true/>\n\
   <key>NSHighResolutionCapable</key> <true/>\n\
   <key>NSScreenCaptureUsageDescription</key> <string>bagent captures your screen on demand to answer questions about what is displayed. Screenshots are processed in memory and never saved to disk.</string>\n\
-</dict></plist>\n' > "$(BUNDLE)/Contents/Info.plist"
+  </dict></plist>\n' > "$(BUNDLE)/Contents/Info.plist"
 	codesign --force --sign $(SIGN_ID) "$(BUNDLE)"
-	@echo "✓  $(BUNDLE) ready — open $(BUNDLE) or drag to Applications"
 
 clean:
 	rm -rf .build $(BUNDLE)

@@ -2,6 +2,29 @@ import XCTest
 @testable import bagent
 
 final class EvidenceEventDecodingTests: XCTestCase {
+    func testDecodesCapturedSignedAcceptanceEventsWhenProvided() throws {
+        guard let path = ProcessInfo.processInfo.environment["BAGENT_STAGE8_ACCEPTANCE_SSE"],
+              !path.isEmpty
+        else {
+            throw XCTSkip("signed acceptance SSE capture not provided")
+        }
+        let contents = try String(contentsOfFile: path, encoding: .utf8)
+        let payloads = contents.split(separator: "\n").map(String.init)
+        XCTAssertFalse(payloads.isEmpty)
+
+        var outcomes = 0
+        var done = 0
+        for payload in payloads {
+            let decoded = try JSONDecoder().decode(SSEEvent.self, from: Data(payload.utf8))
+            if decoded.type == "done" { done += 1 }
+            if case .evidenceOutcome = DaemonClient.evidenceChatEvent(from: decoded) {
+                outcomes += 1
+            }
+        }
+        XCTAssertGreaterThan(outcomes, 0)
+        XCTAssertEqual(outcomes, done)
+    }
+
     func testDecodesEveryEvidenceEventShape() throws {
         let fixtures = [
             """

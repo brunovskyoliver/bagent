@@ -177,7 +177,7 @@ final class DaemonLauncher {
     // MARK: - launchd
 
     private func installAndStart(binary: URL) async {
-        let env = [
+        var env = [
             "BAGENT_BASERT_BASE_URL": "http://127.0.0.1:8082/v1",
             "BAGENT_BASERT_API_KEY": BaseRTLaunchAgent.apiKey,
             "BAGENT_BASERT_LOG_PATH": BaseRTLaunchAgent.logURL.path,
@@ -188,6 +188,14 @@ final class DaemonLauncher {
             "BAGENT_SYNTHESIS_FALLBACK_MODEL_PATH":
                 BaseRTLaunchAgent.cachedModelURL(BaseRTLaunchAgent.model).path,
         ]
+        // Acceptance flags are never synthesized by the app. A deliberately
+        // launched acceptance build may pass the exact values through to its
+        // signed daemon; ordinary launches omit both keys.
+        let processEnvironment = ProcessInfo.processInfo.environment
+        for key in ["BAGENT_EVIDENCE_ORCHESTRATOR", "BAGENT_STAGE8_ACCEPTANCE_FIXTURES"]
+        where processEnvironment[key] == "1" {
+            env[key] = "1"
+        }
         let plist = DaemonLaunchAgent.plistContent(binaryPath: binary.path, environment: env)
         let plistURL = DaemonLaunchAgent.plistURL
         do {

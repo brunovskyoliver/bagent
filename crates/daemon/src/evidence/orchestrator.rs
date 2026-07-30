@@ -5,6 +5,8 @@ use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde_json::json;
 use url::Url;
 
+#[cfg(feature = "stage8-acceptance")]
+use super::AcceptanceControl;
 use super::{
     assess_claim_relevance, candidate_discovery_identity_matches, candidate_is_first_party,
     candidate_is_query_relevant, candidate_query_relevance_score, candidate_source_identity,
@@ -250,6 +252,15 @@ pub(crate) async fn execute_evidence_turn(
         duplicate_suppressions: HashMap::new(),
     };
     let outcome = if is_mail_intent(&plan.intent) {
+        #[cfg(feature = "stage8-acceptance")]
+        if let Some(mut adapter) = ctx
+            .state
+            .acceptance
+            .as_ref()
+            .and_then(AcceptanceControl::mail_adapter)
+        {
+            return Ok(execute_mail_plan(&mut adapter, &mut gate, &request.turn_id, &plan).await);
+        }
         if let Some(connector) = ctx.state.mail.clone() {
             let mut adapter = AppleMailEvidenceAdapter::new(connector);
             execute_mail_plan(&mut adapter, &mut gate, &request.turn_id, &plan).await
@@ -257,15 +268,17 @@ pub(crate) async fn execute_evidence_turn(
             execute_unavailable_mail_plan(&mut gate, &request.turn_id, &plan).await
         }
     } else if is_web_intent(&plan.intent) {
+        #[cfg(feature = "stage8-acceptance")]
+        if let Some(adapter) = ctx
+            .state
+            .acceptance
+            .as_ref()
+            .and_then(AcceptanceControl::web_adapter)
+        {
+            return Ok(execute_web_plan(adapter, &mut gate, &request.turn_id, &plan, "en").await);
+        }
         let tavily_api_key = ctx.state.tavily_api_key.read().await.clone();
-        let tavily_acceptance_fault = match ctx.state.tavily_acceptance_fault.as_ref() {
-            Some(slot) => *slot.read().await,
-            None => None,
-        };
-        let adapter = match tavily_acceptance_fault {
-            Some(fault) => TypedWebAdapter::production_with_acceptance_fault(tavily_api_key, fault),
-            None => TypedWebAdapter::production(tavily_api_key),
-        };
+        let adapter = TypedWebAdapter::production(tavily_api_key);
         execute_web_plan(adapter, &mut gate, &request.turn_id, &plan, "en").await
     } else {
         return Err(EvidenceExecError::UnsupportedIntent);

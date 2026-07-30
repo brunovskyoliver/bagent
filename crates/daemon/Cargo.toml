@@ -3,6 +3,10 @@ name = "bagentd"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+stage8-acceptance = []
+
 [[bin]]
 name = "bagentd"
 path = "src/main.rs"
