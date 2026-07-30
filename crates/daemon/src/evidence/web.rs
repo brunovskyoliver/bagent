@@ -1157,43 +1157,6 @@ pub(crate) fn prepare_web_candidates(query: &str, candidates: &mut Vec<WebCandid
     diversify_candidates_by_source(candidates);
 }
 
-pub(crate) fn seed_relevant_first_party_candidates(
-    query: &str,
-    candidates: &mut Vec<WebCandidate>,
-) {
-    let terms = normalized_ranking_terms(query);
-    if terms.iter().any(|term| term == "president") && terms.iter().any(|term| term == "slovak") {
-        if candidates.iter().any(|candidate| {
-            candidate
-                .requested_url
-                .host_str()
-                .is_some_and(|host| host.trim_start_matches("www.") == "prezident.sk")
-        }) {
-            return;
-        }
-        let biography_url = Url::parse("https://www.prezident.sk/en/zivotopis")
-            .expect("static Slovak presidency biography URL");
-        candidates.push(WebCandidate {
-            candidate_id: candidate_id_for_url(&biography_url),
-            provider: WebProvider::DuckDuckGo,
-            rank: 0,
-            title: "Biography of the President of Slovakia".into(),
-            requested_url: biography_url,
-            snippet: String::new(),
-        });
-        let requested_url =
-            Url::parse("https://www.prezident.sk/en/").expect("static Slovak presidency URL");
-        candidates.push(WebCandidate {
-            candidate_id: candidate_id_for_url(&requested_url),
-            provider: WebProvider::DuckDuckGo,
-            rank: 1,
-            title: "President of the Slovak Republic".into(),
-            requested_url,
-            snippet: String::new(),
-        });
-    }
-}
-
 fn diversify_candidates_by_source(candidates: &mut Vec<WebCandidate>) {
     let mut first = Vec::new();
     let mut repeats = Vec::new();
@@ -1428,6 +1391,20 @@ pub(crate) fn query_requires_claim_number(query: &str) -> bool {
     ]
     .iter()
     .any(|term| normalized.contains(term))
+}
+
+pub(crate) fn normalize_numeric_claim(value: &str) -> String {
+    let normalized = value.replace(',', "");
+    let (integer, fraction) = normalized
+        .split_once('.')
+        .map(|(integer, fraction)| (integer, Some(fraction)))
+        .unwrap_or((normalized.as_str(), None));
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    match fraction.map(|fraction| fraction.trim_end_matches('0')) {
+        Some("") | None => integer.to_string(),
+        Some(fraction) => format!("{integer}.{fraction}"),
+    }
 }
 
 fn passage_contains_claim_number(query: &str, passage: &str) -> bool {
@@ -2876,26 +2853,6 @@ mod tests {
             "What is the population of Bratislava?",
             &biography
         ));
-    }
-
-    #[test]
-    fn slovak_president_seed_prioritizes_the_owner_biography_before_the_homepage() {
-        let mut candidates = vec![candidate(
-            "https://publisher.example/president",
-            WebProvider::Tavily,
-            1,
-        )];
-
-        seed_relevant_first_party_candidates("Who is the President of Slovakia?", &mut candidates);
-        prepare_web_candidates("Who is the President of Slovakia?", &mut candidates);
-
-        assert_eq!(
-            candidates[0].requested_url.as_str(),
-            "https://www.prezident.sk/en/zivotopis"
-        );
-        assert!(candidates
-            .iter()
-            .any(|candidate| candidate.requested_url.as_str() == "https://www.prezident.sk/en/"));
     }
 
     #[tokio::test]

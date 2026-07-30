@@ -30,10 +30,10 @@ use filesystem_connector::{
 use whatsapp_connector::WhatsappSendTarget;
 
 use crate::evidence::{
-    assess_claim_relevance, execute_evidence_turn, Classification, Completeness, EvidenceBundle,
-    EvidenceContext, EvidenceIntent, EvidenceIntentClassifier, EvidenceOrigin, EvidenceRequest,
-    SynthesisContract, SynthesisObserver, SynthesisPhaseEvent, SynthesisService, ValidationOutcome,
-    EVIDENCE_SCHEMA_VERSION,
+    assess_claim_relevance, execute_evidence_turn, normalize_numeric_claim, Classification,
+    Completeness, EvidenceBundle, EvidenceContext, EvidenceIntent, EvidenceIntentClassifier,
+    EvidenceOrigin, EvidenceRequest, SynthesisContract, SynthesisObserver, SynthesisPhaseEvent,
+    SynthesisService, ValidationOutcome, EVIDENCE_SCHEMA_VERSION,
 };
 use crate::{
     audit_fs, json_str_arg, request_tool_approval, run_aerospace, save_last_file_ref,
@@ -2589,7 +2589,9 @@ fn render_canonical_web_text(bundle: &EvidenceBundle) -> String {
                 for (right_item, right_claims) in candidates.iter().skip(left_index + 1) {
                     for left_claim in left_claims {
                         for right_claim in right_claims {
-                            if left_claim.reported_figure == right_claim.reported_figure {
+                            if normalize_numeric_claim(&left_claim.reported_figure)
+                                == normalize_numeric_claim(&right_claim.reported_figure)
+                            {
                                 continue;
                             }
                             rendered = Some(vec![
@@ -6360,6 +6362,43 @@ mod tests {
             canonical.outcome_status,
             crate::evidence::CanonicalOutcomeStatus::Conflict
         );
+    }
+
+    #[test]
+    fn deterministic_conflict_renderer_does_not_split_equivalent_numeric_formats() {
+        use crate::evidence::{
+            fixtures, EvidenceConflict, EvidenceId, EvidenceValidator, VerificationLevel,
+        };
+
+        let mut results = fixtures::two_independent_readable_pages();
+        results.web_fetches[0].value.as_mut().unwrap().passages[0].text =
+            "Mount Everest snow height was reported as 8,848.86 metres in 2020.".into();
+        results.web_fetches[1].value.as_mut().unwrap().passages[0].text =
+            "Mount Everest snow height was reported as 8848.86 metres in 2020.".into();
+        results.conflicts.push(EvidenceConflict {
+            evidence_ids: vec![
+                EvidenceId::new("web-1").unwrap(),
+                EvidenceId::new("web-2").unwrap(),
+            ],
+            description: "Formatting-only numeric difference.".into(),
+        });
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Compare the height of Mount Everest with two independent sources.".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        let ValidationOutcome::Bundle(bundle) =
+            EvidenceValidator::validate("turn-equivalent-format", &plan, results)
+        else {
+            panic!("two readable sources should validate");
+        };
+
+        let canonical = canonical_web_answer(&bundle);
+
+        assert_eq!(
+            canonical.outcome_status,
+            crate::evidence::CanonicalOutcomeStatus::VerificationShortfall
+        );
+        assert!(!canonical.text.contains("unresolved conflicting figures"));
     }
 
     #[test]

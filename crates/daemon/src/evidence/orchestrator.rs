@@ -8,7 +8,7 @@ use url::Url;
 use super::{
     assess_claim_relevance, candidate_is_first_party, candidate_is_query_relevant,
     candidate_query_relevance_score, candidate_source_identity, direct_web_candidate,
-    linked_web_candidate, prepare_web_candidates, seed_relevant_first_party_candidates,
+    linked_web_candidate, normalize_numeric_claim, prepare_web_candidates,
     AppleMailEvidenceAdapter, EvidenceConflict, EvidenceContribution, EvidenceIntent,
     EvidenceOperation, EvidencePhase, EvidencePhaseEvent, EvidencePlanner, EvidenceRequest,
     EvidenceResults, ExecutionStatus, ExtractionStatus, FailureCode, LogicalActivityCompletion,
@@ -358,17 +358,6 @@ where
                 .as_ref()
                 .map(|value| value.candidates.clone())
                 .unwrap_or_default();
-            if !candidates.is_empty()
-                && matches!(
-                    intent,
-                    EvidenceIntent::WebFact {
-                        verification: VerificationLevel::SingleAuthoritative,
-                        ..
-                    }
-                )
-            {
-                seed_relevant_first_party_candidates(query, &mut candidates);
-            }
             prepare_web_candidates(query, &mut candidates);
             if let Some(value) = search.value.as_mut() {
                 value.candidates = candidates.clone();
@@ -721,17 +710,6 @@ where
                 .as_mut()
                 .map(|value| std::mem::take(&mut value.candidates))
                 .unwrap_or_default();
-            if !diversified_candidates.is_empty()
-                && matches!(
-                    intent,
-                    EvidenceIntent::WebFact {
-                        verification: VerificationLevel::SingleAuthoritative,
-                        ..
-                    }
-                )
-            {
-                seed_relevant_first_party_candidates(query, &mut diversified_candidates);
-            }
             prepare_web_candidates(query, &mut diversified_candidates);
             if let Some(value) = diversified.value.as_mut() {
                 value.candidates = diversified_candidates.clone();
@@ -1136,6 +1114,21 @@ fn detect_web_conflicts(
             if left.source_identity == right.source_identity {
                 continue;
             }
+            let left_holder = grounded_office_holder(query, &[*left]);
+            let right_holder = grounded_office_holder(query, &[*right]);
+            let left_holder = left_holder.map(|holder| normalize_office_holder(&holder));
+            let right_holder = right_holder.map(|holder| normalize_office_holder(&holder));
+            let left_negated = negated_office_holders(query, left);
+            let right_negated = negated_office_holders(query, right);
+            let office_holder_conflict = match (&left_holder, &right_holder) {
+                (Some(left_holder), Some(right_holder)) => left_holder != right_holder,
+                _ => false,
+            } || left_holder
+                .as_ref()
+                .is_some_and(|holder| right_negated.contains(holder))
+                || right_holder
+                    .as_ref()
+                    .is_some_and(|holder| left_negated.contains(holder));
             let left_scalars = scalar_claim_tokens(query, left);
             let right_scalars = scalar_claim_tokens(query, right);
             let distinct_scalars = left_scalars
@@ -1146,7 +1139,7 @@ fn detect_web_conflicts(
                 && !left_scalars.is_empty()
                 && !right_scalars.is_empty()
                 && distinct_scalars >= 2;
-            if numeric_conflict {
+            if office_holder_conflict || numeric_conflict {
                 return vec![EvidenceConflict {
                     evidence_ids: vec![left.evidence_id.clone(), right.evidence_id.clone()],
                     description: "Independent fetched sources contain unresolved differing claims."
@@ -1156,6 +1149,42 @@ fn detect_web_conflicts(
         }
     }
     Vec::new()
+}
+
+fn normalize_office_holder(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphabetic() && character != '-')
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn negated_office_holders(query: &str, evidence: &WebFetchEvidence) -> HashSet<String> {
+    if !query.to_ascii_lowercase().contains("president") {
+        return HashSet::new();
+    }
+    evidence
+        .passages
+        .iter()
+        .flat_map(|passage| sentence_chunks_preserving_decimals(&passage.text))
+        .filter_map(|sentence| {
+            let lower = sentence.to_ascii_lowercase();
+            [
+                " is not the president",
+                " is no longer the president",
+                " does not serve as president",
+                " does not serve as the president",
+            ]
+            .iter()
+            .find_map(|relation| lower.find(relation))
+            .and_then(|position| trailing_person_name(&sentence[..position]))
+            .map(|holder| normalize_office_holder(&holder))
+        })
+        .collect()
 }
 
 fn scalar_claim_tokens(query: &str, evidence: &WebFetchEvidence) -> HashSet<String> {
@@ -1243,7 +1272,7 @@ fn scalar_claim_tokens(query: &str, evidence: &WebFetchEvidence) -> HashSet<Stri
                     supported && !contains_non_year_number(relation)
                 })
                 .collect::<Vec<_>>();
-            (linked.len() == 1).then(|| (*linked[0]).clone())
+            (linked.len() == 1).then(|| normalize_numeric_claim(linked[0]))
         })
         .collect()
 }
@@ -2934,6 +2963,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authoritative_search_fetches_only_candidates_returned_by_typed_discovery() {
+        let discovered = web_candidate("https://publisher.example/slovakia-president", 1);
+        let adapter = scripted_web_adapter(
+            vec![discovered.clone()],
+            vec![vec![readable_fetch(
+                &discovered,
+                discovered.requested_url.as_str(),
+                "publisher.example",
+                "Peter Pellegrini is the President of Slovakia.",
+            )]],
+        );
+        let observed = adapter.clone();
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Who is the President of Slovakia? Use an authoritative source.".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let _ =
+            execute_web_plan(adapter, &mut gate, "turn-discovery-provenance", &plan, "en").await;
+
+        let expected = format!("fetch:{}", discovered.candidate_id.as_str());
+        assert!(observed
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("fetch:"))
+            .all(|call| call == &expected));
+    }
+
+    #[tokio::test]
     async fn bounded_structured_identity_after_visible_blocks_can_establish_first_party_authority()
     {
         let mut official = web_candidate("https://www.prezident.sk/en/", 1);
@@ -3262,6 +3325,31 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_numeric_figures_with_different_grouping_are_not_a_conflict() {
+        let first = web_candidate("https://publisher-one.example/everest", 1);
+        let second = web_candidate("https://publisher-two.example/everest", 2);
+        let first = readable_fetch(
+            &first,
+            first.requested_url.as_str(),
+            "publisher-one.example",
+            "Mount Everest snow height was reported as 8,848.86 metres in 2020.",
+        );
+        let second = readable_fetch(
+            &second,
+            second.requested_url.as_str(),
+            "publisher-two.example",
+            "Mount Everest snow height was reported as 8848.86 metres in 2020.",
+        );
+
+        let conflicts = detect_web_conflicts(
+            "Compare the height of Mount Everest with figures and dates.",
+            &[first, second],
+        );
+
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
     fn corroborated_prose_ignores_incidental_negation_outside_numeric_claims() {
         let first = web_candidate("https://publisher-one.example/slovakia", 1);
         let second = web_candidate("https://publisher-two.example/slovakia", 2);
@@ -3283,6 +3371,56 @@ mod tests {
             &[first, second]
         )
         .is_empty());
+    }
+
+    #[test]
+    fn contradictory_office_holders_are_preserved_as_an_evidence_conflict() {
+        let first = web_candidate("https://publisher-one.example/slovakia", 1);
+        let second = web_candidate("https://publisher-two.example/slovakia", 2);
+        let first = readable_fetch(
+            &first,
+            first.requested_url.as_str(),
+            "publisher-one.example",
+            "Peter Pellegrini is the President of Slovakia.",
+        );
+        let second = readable_fetch(
+            &second,
+            second.requested_url.as_str(),
+            "publisher-two.example",
+            "Zuzana Caputova is the President of Slovakia.",
+        );
+
+        let conflicts = detect_web_conflicts(
+            "Who is the current President of Slovakia?",
+            &[first, second],
+        );
+
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    #[test]
+    fn explicit_office_holder_negation_is_preserved_as_an_evidence_conflict() {
+        let first = web_candidate("https://publisher-one.example/slovakia", 1);
+        let second = web_candidate("https://publisher-two.example/slovakia", 2);
+        let first = readable_fetch(
+            &first,
+            first.requested_url.as_str(),
+            "publisher-one.example",
+            "Peter Pellegrini is the President of Slovakia.",
+        );
+        let second = readable_fetch(
+            &second,
+            second.requested_url.as_str(),
+            "publisher-two.example",
+            "Peter Pellegrini is not the President of Slovakia.",
+        );
+
+        let conflicts = detect_web_conflicts(
+            "Who is the current President of Slovakia?",
+            &[first, second],
+        );
+
+        assert_eq!(conflicts.len(), 1);
     }
 
     #[tokio::test]
