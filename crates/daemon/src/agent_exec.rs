@@ -5108,11 +5108,21 @@ pub(crate) async fn run_agent_loop(
 
 fn normalized_legacy_model_error_code(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
-    if normalized.contains("basert runtime poisoned: metal_oom") {
+    if normalized.contains("basert runtime poisoned: metal_oom")
+        || normalized.contains("kiogpucommandbuffercallbackerroroutofmemory")
+        || normalized.contains("insufficient memory")
+        || normalized.contains("out of memory")
+    {
         "model_unavailable_metal_oom"
-    } else if normalized.contains("basert runtime poisoned: metal_device") {
+    } else if normalized.contains("basert runtime poisoned: metal_device")
+        || normalized.contains("device lost")
+        || normalized.contains("device was lost")
+        || normalized.contains("device removed")
+    {
         "model_unavailable_metal_device"
-    } else if normalized.contains("basert runtime poisoned: metal_command_buffer") {
+    } else if normalized.contains("basert runtime poisoned: metal_command_buffer")
+        || normalized.contains("command buffer failed")
+    {
         "model_unavailable_metal_command_buffer"
     } else if normalized.contains("timed out") || normalized.contains("timeout") {
         "model_unavailable_timeout"
@@ -5230,6 +5240,12 @@ mod tests {
     fn legacy_model_error_codes_are_normalized_and_fail_closed() {
         assert_eq!(
             normalized_legacy_model_error_code("BaseRT runtime poisoned: metal_oom"),
+            "model_unavailable_metal_oom"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code(
+                "BaseRT error: kIOGPUCommandBufferCallbackErrorOutOfMemory"
+            ),
             "model_unavailable_metal_oom"
         );
         assert_eq!(
