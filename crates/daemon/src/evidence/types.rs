@@ -56,6 +56,9 @@ pub(crate) enum VerificationLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Classification {
     Recognized(EvidenceIntent),
+    RequiresPublicProductIdentity {
+        prompt: String,
+    },
     NeedsClarification {
         prompt: String,
         alternatives: Vec<IntentSummary>,

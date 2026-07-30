@@ -33,11 +33,11 @@ use filesystem_connector::{
 use whatsapp_connector::WhatsappSendTarget;
 
 use crate::evidence::{
-    assess_claim_relevance, execute_evidence_turn, normalize_numeric_claim,
-    requires_public_sd_card_identity, Classification, Completeness, EvidenceBundle,
-    EvidenceContext, EvidenceIntent, EvidenceIntentClassifier, EvidenceOrigin, EvidenceRequest,
-    SynthesisContract, SynthesisObserver, SynthesisPhaseEvent, SynthesisService, ValidationOutcome,
-    EVIDENCE_SCHEMA_VERSION, PUBLIC_PRODUCT_IDENTITY_CLARIFICATION,
+    assess_claim_relevance, execute_evidence_turn, normalize_numeric_claim, Classification,
+    Completeness, EvidenceBundle, EvidenceContext, EvidenceIntent, EvidenceIntentClassifier,
+    EvidenceOrigin, EvidenceRequest, SynthesisContract, SynthesisObserver, SynthesisPhaseEvent,
+    SynthesisService, ValidationOutcome, EVIDENCE_SCHEMA_VERSION,
+    PUBLIC_PRODUCT_IDENTITY_CLARIFICATION,
 };
 use crate::{
     audit_fs, json_str_arg, request_tool_approval, run_aerospace, save_last_file_ref,
@@ -773,6 +773,7 @@ fn routed_evidence_intent(
             Some(intent)
         }
         Classification::Recognized(_)
+        | Classification::RequiresPublicProductIdentity { .. }
         | Classification::NeedsClarification { .. }
         | Classification::NotEvidenceIntent => None,
     }
@@ -1645,10 +1646,11 @@ fn prepare_turn_routing(
             guidance: None,
         };
     }
-    let clarification = if flag == EvidenceOrchestratorFlag::Enabled
-        && requires_public_sd_card_identity(&user_message.to_lowercase())
-    {
-        Some(PUBLIC_PRODUCT_IDENTITY_CLARIFICATION.to_string())
+    let clarification = if flag == EvidenceOrchestratorFlag::Enabled {
+        match EvidenceIntentClassifier.classify(user_message) {
+            Classification::RequiresPublicProductIdentity { prompt } => Some(prompt),
+            _ => None,
+        }
     } else {
         None
     };
@@ -6037,6 +6039,19 @@ mod tests {
         );
         assert!(rollback.clarification.is_none());
         assert_eq!(rollback.tools.len(), 2);
+
+        let hyphenated = prepare_turn_routing(
+            EvidenceOrchestratorFlag::Enabled,
+            &ExecOrigin::Chat,
+            "clarification-session",
+            "Search for the specifications of that SD-card",
+            vec![test_tool("web_search"), test_tool("web_fetch")],
+        );
+        assert_eq!(
+            hyphenated.clarification.as_deref(),
+            Some(PUBLIC_PRODUCT_IDENTITY_CLARIFICATION)
+        );
+        assert!(hyphenated.tools.is_empty());
     }
 
     #[test]

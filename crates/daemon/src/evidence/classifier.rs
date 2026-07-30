@@ -78,11 +78,10 @@ impl EvidenceIntentClassifier {
         if mail {
             return self.classify_mail(text, &normalized);
         }
-        if requires_public_sd_card_identity(&normalized) {
-            return clarification(
-                PUBLIC_PRODUCT_IDENTITY_CLARIFICATION,
-                vec![("Provide a public product identity", EvidenceScope::Web)],
-            );
+        if requires_public_sd_card_identity(text) {
+            return Classification::RequiresPublicProductIdentity {
+                prompt: PUBLIC_PRODUCT_IDENTITY_CLARIFICATION.to_string(),
+            };
         }
         if web_fact {
             let verification = if needs_corroboration(&normalized) {
@@ -162,7 +161,10 @@ impl EvidenceIntentClassifier {
     }
 }
 
-pub(crate) fn requires_public_sd_card_identity(normalized: &str) -> bool {
+fn requires_public_sd_card_identity(request: &str) -> bool {
+    let normalized = normalize(request);
+    let normalized =
+        normalized.trim_matches(|character: char| ".,;:!?()[]{}<>\"'".contains(character));
     let requests_specification_research = has_any(
         normalized,
         &[
@@ -185,15 +187,32 @@ pub(crate) fn requires_public_sd_card_identity(normalized: &str) -> bool {
         &[
             "that sd card",
             "the sd card mentioned",
+            "the sd card mentioned above",
             "mentioned sd card",
             "sd card above",
             "that memory card",
             "the memory card mentioned",
+            "the memory card mentioned above",
             "mentioned memory card",
             "memory card above",
         ],
     );
-    requests_specification_research && refers_to_unnamed_sd_card
+    requests_specification_research
+        && refers_to_unnamed_sd_card
+        && [
+            "that sd card",
+            "the sd card mentioned",
+            "the sd card mentioned above",
+            "mentioned sd card",
+            "sd card above",
+            "that memory card",
+            "the memory card mentioned",
+            "the memory card mentioned above",
+            "mentioned memory card",
+            "memory card above",
+        ]
+        .iter()
+        .any(|referent| normalized.ends_with(referent))
 }
 
 fn normalize(value: &str) -> String {
@@ -420,7 +439,7 @@ mod unresolved_product_research_tests {
 
         assert!(matches!(
             classification,
-            Classification::NeedsClarification { ref prompt, .. }
+            Classification::RequiresPublicProductIdentity { ref prompt }
                 if prompt == PUBLIC_PRODUCT_IDENTITY_CLARIFICATION
         ));
     }
@@ -429,6 +448,23 @@ mod unresolved_product_research_tests {
     fn bare_sd_card_mention_is_not_web_research() {
         assert_eq!(
             EvidenceIntentClassifier.classify("That SD card looks useful"),
+            Classification::NotEvidenceIntent
+        );
+    }
+
+    #[test]
+    fn hyphenated_generic_sd_card_follow_up_requires_public_identity() {
+        assert!(matches!(
+            EvidenceIntentClassifier.classify("Search for the specifications of that SD-card"),
+            Classification::RequiresPublicProductIdentity { .. }
+        ));
+    }
+
+    #[test]
+    fn same_message_public_identity_is_not_treated_as_unresolved() {
+        assert_eq!(
+            EvidenceIntentClassifier
+                .classify("Search for specifications of that SD card Acme Ultra 512 GB"),
             Classification::NotEvidenceIntent
         );
     }
