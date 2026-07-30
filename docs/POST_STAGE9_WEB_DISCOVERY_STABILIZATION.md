@@ -50,5 +50,6 @@ with `duplicate`.
 authenticated status, `401` at the unauthenticated status boundary, Tavily as the first live
 discovery provider, structural credential-pattern absence in bundle/app-data/log/plist/process
 state, and the signed deterministic all-fetch-failure shortfall from the Stage 8 acceptance report.
-That report is bound to the expected source commit and signed app binary SHA-256. The script never
-reads or emits the Keychain value and writes only structural results.
+That report is bound to the expected source commit, and its recorded SHA-256 must match the exact
+preserved signed acceptance executable supplied to the post-Stage 9 check. The script never reads
+or emits the Keychain value and writes only structural results.

@@ -202,4 +202,16 @@ final class TavilyConfigurationSyncTests: XCTestCase {
         XCTAssertEqual(second, .configurationFailed)
         XCTAssertEqual(recorder.attempts, 0)
     }
+
+    func testFailedFirstNormalizedStatusReportHasOneBoundedRetry() {
+        let reporter = TavilyConfigurationFailureReporter(maxAttemptsPerDaemon: 2)
+
+        XCTAssertTrue(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+        reporter.didAttempt(accepted: false)
+        XCTAssertTrue(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+        reporter.didAttempt(accepted: true)
+        XCTAssertFalse(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+
+        XCTAssertTrue(reporter.shouldAttempt(processID: 202, status: .configurationFailed))
+    }
 }

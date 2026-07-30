@@ -61,6 +61,40 @@ final class TavilyConfigurationSynchronizer {
 }
 
 @MainActor
+final class TavilyConfigurationFailureReporter {
+    private let maxAttemptsPerDaemon: Int
+    private var processID: Int?
+    private var attempts = 0
+    private var delivered = false
+
+    init(maxAttemptsPerDaemon: Int = 2) {
+        self.maxAttemptsPerDaemon = max(1, maxAttemptsPerDaemon)
+    }
+
+    func shouldAttempt(
+        processID currentProcessID: Int?,
+        status: DaemonClient.TavilyConfigurationStatus
+    ) -> Bool {
+        if processID != currentProcessID {
+            processID = currentProcessID
+            attempts = 0
+            delivered = false
+        }
+        guard status == .configurationFailed else {
+            attempts = 0
+            delivered = false
+            return false
+        }
+        return currentProcessID != nil && !delivered && attempts < maxAttemptsPerDaemon
+    }
+
+    func didAttempt(accepted: Bool) {
+        attempts += 1
+        delivered = accepted
+    }
+}
+
+@MainActor
 final class TavilyConfigurationManager {
     private static let logger = Logger(
         subsystem: "sk.bagent.app",
@@ -68,9 +102,9 @@ final class TavilyConfigurationManager {
     )
     private let client: DaemonClient
     private let synchronizer: TavilyConfigurationSynchronizer
+    private let failureReporter = TavilyConfigurationFailureReporter()
     private var monitorTask: Task<Void, Never>?
     private var lastRecordedStatus: DaemonClient.TavilyConfigurationStatus?
-    private var failureReportedProcessID: Int?
 
     init(client: DaemonClient = DaemonClient()) {
         self.client = client
@@ -88,13 +122,12 @@ final class TavilyConfigurationManager {
                     loadCredential: KeychainStore.readTavilyCredential,
                     configure: client.configureTavily
                 )
-                if status == .configurationFailed,
-                   failureReportedProcessID != health.processID
-                {
-                    _ = await client.recordTavilyConfigurationFailure()
-                    failureReportedProcessID = health.processID
-                } else if status != .configurationFailed {
-                    failureReportedProcessID = nil
+                if failureReporter.shouldAttempt(
+                    processID: health.processID,
+                    status: status
+                ) {
+                    let accepted = await client.recordTavilyConfigurationFailure()
+                    failureReporter.didAttempt(accepted: accepted)
                 }
                 record(status)
                 try? await Task.sleep(for: .seconds(2))

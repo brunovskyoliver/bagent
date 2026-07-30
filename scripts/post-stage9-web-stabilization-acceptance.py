@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -180,17 +181,18 @@ def process_state_has_key_pattern(process_id: int) -> bool:
 
 
 def verify_deterministic_shortfall(
-    report_path: pathlib.Path, expected_commit: str
+    report_path: pathlib.Path,
+    signed_app: pathlib.Path,
+    expected_commit: str,
 ) -> dict[str, object]:
     report = json.loads(report_path.read_text())
     provenance = report.get("provenance", {})
     if provenance.get("source_commit") != expected_commit:
         raise AssertionError("deterministic signed report commit provenance changed")
     signed_app_sha256 = provenance.get("signed_app_sha256")
-    if not isinstance(signed_app_sha256, str) or not re.fullmatch(
-        r"[0-9a-f]{64}", signed_app_sha256
-    ):
-        raise AssertionError("deterministic signed report binary provenance is absent")
+    actual_signed_app_sha256 = hashlib.sha256(signed_app.read_bytes()).hexdigest()
+    if signed_app_sha256 != actual_signed_app_sha256:
+        raise AssertionError("deterministic signed report binary provenance changed")
     case = report["cases"]["web_all_fetch_failure"]
     outcome = case["outcome"]
     proof = {
@@ -216,6 +218,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--app-bundle", type=pathlib.Path, required=True)
     parser.add_argument("--deterministic-report", type=pathlib.Path, required=True)
+    parser.add_argument("--deterministic-signed-app", type=pathlib.Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
@@ -256,7 +259,9 @@ def main() -> None:
     live, session_id = signed_live_web_turn(base_url, token)
     delete_session(base_url, token, session_id)
     deterministic_shortfall = verify_deterministic_shortfall(
-        args.deterministic_report, args.expected_commit
+        args.deterministic_report,
+        args.deterministic_signed_app,
+        args.expected_commit,
     )
     launch_agent = pathlib.Path.home() / "Library/LaunchAgents/com.bagent.daemon.plist"
     scan_paths = [
@@ -265,6 +270,7 @@ def main() -> None:
         pathlib.Path.home() / "Library/Logs/bagent",
         launch_agent,
         args.deterministic_report,
+        args.deterministic_signed_app,
     ]
     artifact_pattern_absent = not files_have_key_pattern(scan_paths)
     process_pattern_absent = not process_state_has_key_pattern(process_id)
