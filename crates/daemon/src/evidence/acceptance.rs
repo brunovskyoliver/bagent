@@ -322,14 +322,16 @@ impl TypedWebEvidenceAdapter for AcceptanceWebAdapter {
             provider_set: providers.clone(),
         };
         let statuses = self.provider_statuses();
-        if statuses.is_some() && self.scenario != AcceptanceAcquisition::WebDdgFallback {
-            return OperationResult::succeeded(
-                operation.key(),
-                WebSearchResult {
-                    providers: statuses.expect("checked acceptance provider statuses"),
-                    candidates: Vec::new(),
-                },
-            );
+        if self.scenario != AcceptanceAcquisition::WebDdgFallback {
+            if let Some(provider_statuses) = &statuses {
+                return OperationResult::succeeded(
+                    operation.key(),
+                    WebSearchResult {
+                        providers: provider_statuses.clone(),
+                        candidates: Vec::new(),
+                    },
+                );
+            }
         }
         let candidates = acceptance_candidates(self.scenario);
         let mut discovered = self.discovered.lock().expect("acceptance discovery set");
