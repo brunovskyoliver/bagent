@@ -491,7 +491,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         enabled = evidence_orchestrator == agent_exec::EvidenceOrchestratorFlag::Enabled,
         env = agent_exec::EVIDENCE_ORCHESTRATOR_FLAG_ENV,
-        "typed Mail evidence orchestrator feature flag"
+        "typed evidence production routing"
     );
 
     // Automated mail sync: battery-aware interval poller
@@ -4085,6 +4085,15 @@ async fn save_last_whatsapp_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "stage8-acceptance"))]
+    #[tokio::test]
+    async fn ordinary_build_exposes_no_acceptance_fixture_route() {
+        assert_eq!(
+            stage8_acceptance_not_found_handler().await,
+            StatusCode::NOT_FOUND
+        );
+    }
 
     #[test]
     fn attachment_upload_policy_rejects_images_for_text_only_basert() {

@@ -1,6 +1,6 @@
 # Free Tavily web discovery
 
-Bagent can use Tavily's free Search API as candidate discovery for the flagged typed evidence
+Bagent can use Tavily's free Search API as candidate discovery for the default typed evidence
 route. The legacy agentic web tool remains on Wikipedia plus DuckDuckGo so it cannot consume an
 unbounded number of free credits. Tavily snippets remain discovery-only: every selected result is
 still fetched by bagent and must pass its URL, DNS, redirect, peer-IP, SSRF, extraction, relevance,
@@ -47,5 +47,6 @@ profile, `.env` file, or source-controlled configuration.
 - Bagent cannot enable Tavily pay-as-you-go. Keep the Tavily account on its free Researcher plan and
   do not add a payment method if paid overage is unwanted.
 
-`BAGENT_EVIDENCE_ORCHESTRATOR` remains disabled by default; configuring Tavily does not enable the
-redesigned evidence route.
+The typed evidence route is enabled by default. Configuring Tavily does not change routing.
+`BAGENT_EVIDENCE_ORCHESTRATOR=0` restores the legacy agentic route after daemon restart; that
+legacy web path remains Keychain-free and does not receive the Tavily credential.

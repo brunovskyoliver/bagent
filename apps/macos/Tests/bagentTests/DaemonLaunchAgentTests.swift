@@ -2,6 +2,28 @@ import XCTest
 @testable import bagent
 
 final class DaemonLaunchAgentTests: XCTestCase {
+    func testRuntimeEnvironmentPreservesExplicitEvidenceRollbackOnly() {
+        let rollback = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
+            "BAGENT_EVIDENCE_ORCHESTRATOR": "0",
+            "BAGENT_STAGE8_ACCEPTANCE_FIXTURES": "0",
+        ])
+        XCTAssertEqual(rollback["BAGENT_EVIDENCE_ORCHESTRATOR"], "0")
+        XCTAssertNil(rollback["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+
+        let invalid = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
+            "BAGENT_EVIDENCE_ORCHESTRATOR": "unexpected",
+        ])
+        XCTAssertEqual(invalid["BAGENT_EVIDENCE_ORCHESTRATOR"], "unexpected")
+
+        let ordinary = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [:])
+        XCTAssertNil(ordinary["BAGENT_EVIDENCE_ORCHESTRATOR"])
+        XCTAssertNil(ordinary["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+
+        var rollbackWithoutRouting = rollback
+        rollbackWithoutRouting.removeValue(forKey: "BAGENT_EVIDENCE_ORCHESTRATOR")
+        XCTAssertEqual(rollbackWithoutRouting, ordinary)
+    }
+
     func testPlistContainsBinaryLabelAndSortedEnv() throws {
         let plist = DaemonLaunchAgent.plistContent(
             binaryPath: "/Applications/bagent.app/Contents/MacOS/bagentd",

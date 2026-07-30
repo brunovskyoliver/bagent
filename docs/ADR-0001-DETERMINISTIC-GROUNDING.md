@@ -2,7 +2,8 @@
 
 Date: 2026-07-29
 
-Status: Accepted for the opt-in evidence path. Stage 9/default enablement remains unauthorized.
+Status: Accepted. Stage 9 makes this canonical path the production default for its
+existing supported evidence intents.
 
 ## Context
 
@@ -34,4 +35,8 @@ validated bundle and canonical answer.
 Correctness and terminal availability no longer depend on model acceptance or model
 residency. Invalid model output is never exposed. A poisoned BaseRT residency is
 restarted for later clean-process polish, while the current turn returns its already
-available canonical answer. Default enablement still requires separate final acceptance.
+available canonical answer.
+
+Stage 8 passed the reproducible release gate at
+`96756b27c1d5798887e3baa379d5b0ab449bbc09`. Stage 9 is authorized to select this
+accepted path by default without changing its grounding or polish contracts.

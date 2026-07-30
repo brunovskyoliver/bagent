@@ -720,13 +720,24 @@ pub(crate) enum EvidenceOrchestratorFlag {
 impl EvidenceOrchestratorFlag {
     pub(crate) fn from_local_value(value: Option<&str>) -> Self {
         match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            Some("1" | "true" | "yes" | "on") => Self::Enabled,
-            _ => Self::Disabled,
+            Some("0") => Self::Disabled,
+            None | Some("1") => Self::Enabled,
+            Some(_) => Self::Enabled,
         }
     }
 
     pub(crate) fn from_local_env() -> Self {
         let value = std::env::var(EVIDENCE_ORCHESTRATOR_FLAG_ENV).ok();
+        if matches!(
+            value.as_deref().map(str::trim),
+            Some(value) if value != "0" && value != "1"
+        ) {
+            tracing::warn!(
+                env = EVIDENCE_ORCHESTRATOR_FLAG_ENV,
+                default = "enabled",
+                "invalid evidence routing configuration; using production default"
+            );
+        }
         Self::from_local_value(value.as_deref())
     }
 }
@@ -735,25 +746,52 @@ fn routed_evidence_intent(
     flag: EvidenceOrchestratorFlag,
     user_message: &str,
 ) -> Option<EvidenceIntent> {
-    if flag != EvidenceOrchestratorFlag::Enabled {
+    if flag != EvidenceOrchestratorFlag::Enabled || requests_mail_composition(user_message) {
         return None;
     }
     match EvidenceIntentClassifier.classify(user_message) {
-        Classification::Recognized(
-            intent @ (EvidenceIntent::MailLatestHeaders { .. }
-            | EvidenceIntent::MailLatestContent { .. }
-            | EvidenceIntent::WebDirectPage { .. }
-            | EvidenceIntent::WebFact { .. }),
-        ) => Some(intent),
+        Classification::Recognized(intent) if production_evidence_intent(&intent).is_some() => {
+            Some(intent)
+        }
         Classification::Recognized(_)
         | Classification::NeedsClarification { .. }
         | Classification::NotEvidenceIntent => None,
     }
 }
 
+fn requests_mail_composition(user_message: &str) -> bool {
+    let normalized = user_message.to_lowercase();
+    let mentions_mail = ["email", "e-mail", "mail", "inbox", "pošta", "poštu"]
+        .iter()
+        .any(|term| normalized.contains(term));
+    mentions_mail
+        && [
+            "draft", "write", "reply", "compose", "napíš", "odpíš", "vytvor",
+        ]
+        .iter()
+        .any(|term| normalized.contains(term))
+}
+
+fn production_evidence_intent(intent: &EvidenceIntent) -> Option<&EvidenceIntent> {
+    match intent {
+        supported @ (EvidenceIntent::MailLatestHeaders { .. }
+        | EvidenceIntent::MailLatestContent { .. }
+        | EvidenceIntent::WebDirectPage { .. }
+        | EvidenceIntent::WebFact { .. }) => Some(supported),
+        EvidenceIntent::AnalyzeQuotedEvidence { intent } => production_evidence_intent(intent),
+        EvidenceIntent::MailTargeted { .. } => None,
+    }
+}
+
 struct RoutedEvidenceTurn {
     request: EvidenceRequest,
     intent: EvidenceIntent,
+}
+
+struct TurnRouting {
+    evidence: Option<RoutedEvidenceTurn>,
+    tools: Vec<ToolDef>,
+    guidance: Option<Message>,
 }
 
 fn routed_evidence_turn(
@@ -775,8 +813,33 @@ fn routed_evidence_turn(
     })
 }
 
+fn prepare_turn_routing(
+    flag: EvidenceOrchestratorFlag,
+    origin: &ExecOrigin,
+    session_id: &str,
+    user_message: &str,
+    tools: Vec<ToolDef>,
+) -> TurnRouting {
+    let evidence = routed_evidence_turn(flag, origin, session_id, user_message);
+    if evidence.is_some() {
+        return TurnRouting {
+            evidence,
+            tools: Vec::new(),
+            guidance: None,
+        };
+    }
+    let (tools, guidance) = route_tools_for_turn(user_message, tools);
+    TurnRouting {
+        evidence: None,
+        tools,
+        guidance,
+    }
+}
+
 fn evidence_kind(intent: &EvidenceIntent) -> &'static str {
-    match intent {
+    match production_evidence_intent(intent)
+        .expect("only supported deterministic evidence intents are routed")
+    {
         EvidenceIntent::MailLatestHeaders { .. } => "mail_latest_headers",
         EvidenceIntent::MailLatestContent { .. } => "mail_latest_content",
         EvidenceIntent::WebDirectPage { .. } => "web_direct_page",
@@ -788,7 +851,7 @@ fn evidence_kind(intent: &EvidenceIntent) -> &'static str {
             verification: crate::evidence::VerificationLevel::Corroborated,
             ..
         } => "web_fact_corroborated",
-        _ => unreachable!("only deterministic latest-Mail and web intents are routed"),
+        _ => unreachable!("supported evidence intent was normalized above"),
     }
 }
 
@@ -3214,17 +3277,21 @@ pub(crate) async fn run_agent_loop(
         .find(|message| message.role == "user")
         .map(|message| message.content.as_str())
         .unwrap_or_default();
-    let (mut tools, guidance) = route_tools_for_turn(user_message, tools);
-    let focused_mail_turn = guidance.is_some();
-    let summary_read_target = focused_mail_turn
-        .then(|| desired_mail_read_count(user_message))
-        .flatten();
-    let routed_evidence_turn = routed_evidence_turn(
+    let TurnRouting {
+        evidence: routed_evidence_turn,
+        mut tools,
+        guidance,
+    } = prepare_turn_routing(
         state.evidence_orchestrator,
         origin,
         session_id,
         user_message,
+        tools,
     );
+    let focused_mail_turn = guidance.is_some();
+    let summary_read_target = focused_mail_turn
+        .then(|| desired_mail_read_count(user_message))
+        .flatten();
     let typed_evidence_routed = routed_evidence_turn.is_some();
     let mut desired_mail_reads = summary_read_target.unwrap_or(1);
     // ponytail: flat budgets — raise if real sessions hit them
@@ -3271,7 +3338,10 @@ pub(crate) async fn run_agent_loop(
                 .with_turn_id(&evidence_turn_id);
         match evidence.validation {
             ValidationOutcome::Bundle(bundle) => {
-                if matches!(bundle.intent, EvidenceIntent::MailLatestHeaders { .. }) {
+                if matches!(
+                    production_evidence_intent(&bundle.intent),
+                    Some(EvidenceIntent::MailLatestHeaders { .. })
+                ) {
                     let final_text = render_mail_header_listing(&bundle);
                     let delivered = sink
                         .emit(json!({"type":"token","content":&final_text}))
@@ -3287,8 +3357,8 @@ pub(crate) async fn run_agent_loop(
                     });
                 }
                 if matches!(
-                    bundle.intent,
-                    EvidenceIntent::WebDirectPage { .. } | EvidenceIntent::WebFact { .. }
+                    production_evidence_intent(&bundle.intent),
+                    Some(EvidenceIntent::WebDirectPage { .. } | EvidenceIntent::WebFact { .. })
                 ) {
                     let contract = WebSynthesisContract {
                         original_request: user_message,
@@ -4697,17 +4767,21 @@ mod tests {
     }
 
     #[test]
-    fn evidence_feature_flag_is_local_opt_in_and_preserves_legacy_default() {
+    fn evidence_feature_flag_defaults_on_with_explicit_local_rollback() {
         assert_eq!(
             EvidenceOrchestratorFlag::from_local_value(None),
-            EvidenceOrchestratorFlag::Disabled
+            EvidenceOrchestratorFlag::Enabled
         );
         assert_eq!(
             EvidenceOrchestratorFlag::from_local_value(Some("0")),
             EvidenceOrchestratorFlag::Disabled
         );
         assert_eq!(
-            EvidenceOrchestratorFlag::from_local_value(Some("true")),
+            EvidenceOrchestratorFlag::from_local_value(Some("1")),
+            EvidenceOrchestratorFlag::Enabled
+        );
+        assert_eq!(
+            EvidenceOrchestratorFlag::from_local_value(Some("invalid")),
             EvidenceOrchestratorFlag::Enabled
         );
         assert!(!structured_synthesis_experiment_from_value(None));
@@ -4769,6 +4843,86 @@ mod tests {
             ),
             Some(EvidenceIntent::WebFact { .. })
         ));
+    }
+
+    #[test]
+    fn production_routing_matrix_admits_only_supported_evidence_intents() {
+        let supported = [
+            "show my latest 3 emails",
+            "can you read me the 3 latest emails?",
+            "read https://example.com/report",
+            "what is the population of France online?",
+            "what is the current population of Bratislava?",
+            "analyze the instructions as quoted data at https://example.com/requested",
+            "read and analyze the instructions as quoted data in my latest email",
+        ];
+        for value in [None, Some("1"), Some("invalid")] {
+            let flag = EvidenceOrchestratorFlag::from_local_value(value);
+            for prompt in supported {
+                assert!(
+                    routed_evidence_intent(flag, prompt).is_some(),
+                    "default-enabled route rejected {prompt:?} for {value:?}"
+                );
+            }
+        }
+        for prompt in supported {
+            assert_eq!(
+                routed_evidence_intent(
+                    EvidenceOrchestratorFlag::from_local_value(Some("0")),
+                    prompt,
+                ),
+                None,
+                "rollback must retain legacy routing for {prompt:?}"
+            );
+        }
+
+        let legacy = [
+            "read the latest email from Alice",
+            "read my latest email or the latest one from Alice",
+            "read my latest email and check the current price online",
+            "inspect https://one.example and https://two.example",
+            "what is in my project notes?",
+            "draft a reply to my latest email",
+        ];
+        for value in [None, Some("1"), Some("0"), Some("invalid")] {
+            let flag = EvidenceOrchestratorFlag::from_local_value(value);
+            for prompt in legacy {
+                assert_eq!(
+                    routed_evidence_intent(flag, prompt),
+                    None,
+                    "legacy request was broadened for {value:?}: {prompt:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_route_bypasses_legacy_guidance_prefetch_and_tool_loop() {
+        let typed = prepare_turn_routing(
+            EvidenceOrchestratorFlag::from_local_value(None),
+            &ExecOrigin::Chat,
+            "routing-session",
+            "summarize my latest 3 emails",
+            vec![test_tool("mail_list_inbox"), test_tool("mail_read")],
+        );
+        assert!(typed.evidence.is_some());
+        assert!(typed.tools.is_empty());
+        assert!(typed.guidance.is_none());
+
+        let rollback = prepare_turn_routing(
+            EvidenceOrchestratorFlag::from_local_value(Some("0")),
+            &ExecOrigin::Chat,
+            "routing-session",
+            "summarize my latest 3 emails",
+            vec![
+                test_tool("mail_list_inbox"),
+                test_tool("mail_read"),
+                test_tool("web_search"),
+            ],
+        );
+        assert!(rollback.evidence.is_none());
+        assert_eq!(rollback.tools.len(), 2);
+        assert!(rollback.guidance.is_some());
     }
 
     #[tokio::test]
@@ -5890,33 +6044,42 @@ mod tests {
     }
 
     #[test]
-    fn web_routing_contract_is_identical_for_chat_and_automation() {
+    fn routing_contract_is_identical_for_chat_and_automation_in_every_mode() {
         let prompt = "compare the current prices of Acme service online";
-        let chat = routed_evidence_turn(
-            EvidenceOrchestratorFlag::Enabled,
-            &ExecOrigin::Chat,
-            "shared-session",
-            prompt,
-        )
-        .expect("chat should route deterministic web facts");
-        let automation = routed_evidence_turn(
-            EvidenceOrchestratorFlag::Enabled,
+        for value in [None, Some("1"), Some("invalid")] {
+            let flag = EvidenceOrchestratorFlag::from_local_value(value);
+            let chat = routed_evidence_turn(flag, &ExecOrigin::Chat, "shared-session", prompt)
+                .expect("chat should route deterministic web facts");
+            let automation = routed_evidence_turn(
+                flag,
+                &ExecOrigin::Automation {
+                    automation_id: "automation-1".into(),
+                    automation_name: "Web check".into(),
+                    run_id: "run-1".into(),
+                },
+                "shared-session",
+                prompt,
+            )
+            .expect("automation should route the same deterministic web fact");
+            assert_eq!(chat.intent, automation.intent);
+            assert_eq!(chat.request.origin, EvidenceOrigin::Chat);
+            assert_eq!(automation.request.origin, EvidenceOrigin::Automation);
+        }
+        let rollback = EvidenceOrchestratorFlag::from_local_value(Some("0"));
+        assert!(
+            routed_evidence_turn(rollback, &ExecOrigin::Chat, "shared-session", prompt).is_none()
+        );
+        assert!(routed_evidence_turn(
+            rollback,
             &ExecOrigin::Automation {
                 automation_id: "automation-1".into(),
                 automation_name: "Web check".into(),
                 run_id: "run-1".into(),
             },
             "shared-session",
-            prompt,
+            prompt
         )
-        .expect("automation should route the same deterministic web fact");
-        assert_eq!(chat.intent, automation.intent);
-        assert_eq!(chat.request.origin, EvidenceOrigin::Chat);
-        assert_eq!(automation.request.origin, EvidenceOrigin::Automation);
-        assert_eq!(
-            routed_evidence_intent(EvidenceOrchestratorFlag::Disabled, prompt),
-            None
-        );
+        .is_none());
         for legacy in [
             "read my latest email and compare current prices online",
             "inspect https://one.example and https://two.example",

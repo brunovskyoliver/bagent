@@ -166,11 +166,19 @@ There is no routing pipeline — it was replaced by an agentic tool-calling loop
 (the model sees native tool definitions and decides what to call). `MODEL_ROUTER.md`
 described the old design and has been removed.
 
-The typed Mail/web evidence-answer path is locally opt-in with
-`BAGENT_EVIDENCE_ORCHESTRATOR=1`. When enabled, deterministically classified latest-Mail
-Header Listings, Content Readings, direct pages, and factual web verification use the
-typed adapter/orchestrator. Targeted Mail, ambiguous or mixed turns, and unrelated
-requests remain on the agentic loop. The flag defaults off, restoring legacy routing.
+The typed Mail/web evidence-answer path is the production default for deterministically
+classified latest-Mail Header Listings, latest-Mail Content Readings, direct pages,
+single-authority web facts, corroborated web facts, and their supported quoted-evidence
+wrappers. Its classifier is intentionally narrow. Targeted Mail, ambiguous Mail,
+mixed Mail/web, multi-page ambiguity, unrelated requests, unsupported classifications,
+and ordinary agentic tool use remain on the agentic loop.
+
+`BAGENT_EVIDENCE_ORCHESTRATOR` controls routing only. Absent or `1` selects the typed
+route; `0` immediately restores the previous agentic loop after daemon restart. Any
+other value uses the production default and emits a normalized warning that does not
+include the supplied value. Typed routing is decided before legacy Mail prefetch,
+guidance, prose-result heuristics, or agentic tools are prepared, preventing duplicate
+Mail/web operations. See [`STAGE9_ROUTING_ROLLBACK.md`](STAGE9_ROUTING_ROLLBACK.md).
 
 The bounded typed route uses Tavily Basic plus DuckDuckGo when the signed app supplies a
 Tavily key ephemerally from Keychain. Without a key it retains Wikipedia plus DuckDuckGo;
@@ -194,7 +202,8 @@ a grounding-quality fallback. Structured synthesis remains a disabled experiment
 - Codex CLI → advanced cross-source tasks, approval-gated.
 - Cloud LLM → opt-in only.
 
-See the "Agentic tool loop" section of `CLAUDE.md` for the loop itself.
+See the "Agentic tool loop" section of `CLAUDE.md` for the retained rollback and
+unsupported-intent loop.
 
 ---
 

@@ -2,9 +2,9 @@
 
 Date: 2026-07-30
 
-Status: Accepted for Stage 8 acceptance. Stage 9 remains unauthorized until a
-definitive campaign against the exact clean acceptance-infrastructure commit
-passes every authorization condition below.
+Status: Accepted. The definitive campaign at
+`96756b27c1d5798887e3baa379d5b0ab449bbc09` passed every authorization condition;
+Stage 9 default routing is authorized under this decision.
 
 ## Context
 
@@ -61,14 +61,14 @@ is a hard acceptance failure.
 
 ## Stage 9 authorization rule
 
-Stage 9 may be authorized only when all of the following pass on the same exact
-clean commit:
+Stage 9 was authorized when all of the following passed on the same exact clean
+commit:
 
 1. Every mandatory deterministic signed fixture passes twice with identical
    structural results.
 2. The live observational smoke produces no unsafe, fabricated, unsupported,
    or incorrectly cited answer.
-3. Default-off routing and rollback behavior pass.
+3. The candidate's routing default and explicit rollback behavior pass.
 4. Privacy scans, strict signing, release validation, and runtime cleanup pass.
 
 Live safe unavailable, partial, or verification-shortfall outcomes are
@@ -82,7 +82,8 @@ Release authorization becomes reproducible without weakening product rules.
 This decision changes test reliability only. It does not change what counts as
 evidence; it does not lower grounding, first-party authority, source
 independence, entity relevance, redirect/final-URL validation, citation, or
-safety requirements; and it does not enable the evidence route by default.
+safety requirements. Stage 9 may enable the accepted evidence route by default
+without changing this release gate.
 
 Ordinary builds do not compile the fixture module. Acceptance-compiled builds
 still return 404 unless explicitly activated at daemon startup, and return 401
