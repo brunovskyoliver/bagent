@@ -987,12 +987,7 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
             && !is_supported_web_fact_topic_word(&lower)
             && !is_supported_command_noun_at(tokens, index)
             && !(is_supported_fact_request_verb(&lower)
-                && !tokens[..index].iter().any(|prior| {
-                    let prior = prior.to_lowercase();
-                    is_supported_web_fact_topic_word(&prior)
-                        || (!is_supported_web_fact_query_word(&prior)
-                            && !prior.chars().all(|character| character.is_ascii_digit()))
-                }))
+                && fact_request_verb_is_leading(tokens, index))
         {
             return false;
         }
@@ -1149,12 +1144,35 @@ fn is_supported_command_noun_at(tokens: &[&str], index: usize) -> bool {
                 && tokens[index - 1].eq_ignore_ascii_case("nintendo")
                 && index + 1 == tokens.len()
         }
+        "view" => matches!(next.as_deref(), Some("count" | "counts")),
         _ => false,
     }
 }
 
 fn is_supported_fact_request_verb(token: &str) -> bool {
     matches!(token, "check" | "find" | "tell" | "verify")
+}
+
+fn fact_request_verb_is_leading(tokens: &[&str], index: usize) -> bool {
+    let prefix = tokens[..index]
+        .iter()
+        .map(|token| token.to_lowercase())
+        .collect::<Vec<_>>();
+    prefix.is_empty()
+        || matches!(
+            prefix.as_slice(),
+            [value] if matches!(value.as_str(), "please" | "kindly")
+        )
+        || matches!(
+            prefix.as_slice(),
+            [first, second]
+                if matches!(first.as_str(), "can" | "could" | "would") && second == "you"
+        )
+        || matches!(
+            prefix.as_slice(),
+            [first, second, third]
+                if first == "what" && second == "can" && third == "you"
+        )
 }
 
 fn entity_conjunction_phrase_is_supported(tokens: &[&str]) -> bool {
@@ -5655,6 +5673,10 @@ mod tests {
             "what is the current archive format?",
             "what is the current run time online?",
             "what is the current list price of the iPhone 17 online?",
+            "what is the current view count of this video online?",
+            "check the current price of service A online?",
+            "can you find the current population of Bratislava online?",
+            "tell me the current weather online?",
             "what is the current price of Nintendo Switch?",
             "what is the current price of nintendo switch?",
             "what is the current weather",
@@ -5755,6 +5777,9 @@ mod tests {
             "what is the current weather check my project file?",
             "what is the current weather find my notes?",
             "what is the current weather tell me what is in my file?",
+            "what is the current service available online check my files?",
+            "what is available online tell me what is in my file?",
+            "what is online find my notes?",
             "what is the population of France and Germany delete file?",
             "compare prices of Apple and Microsoft and browse website",
             "compare prices of Apple and Microsoft browse website",
