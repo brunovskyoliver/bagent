@@ -5125,7 +5125,7 @@ fn normalized_legacy_model_error_code(error: &str) -> &'static str {
         }
     } else if normalized.starts_with("basert error:")
         || normalized.starts_with("basert stream read:")
-        || normalized.starts_with("post /v1/chat/completions: http 5")
+        || normalized.starts_with("post /v1/chat/completions:")
     {
         "model_unavailable_basert"
     } else if normalized.contains("timed out") || normalized.contains("timeout") {
@@ -5272,6 +5272,14 @@ mod tests {
             normalized_legacy_model_error_code(
                 "BaseRT stream reader supplied an arbitrary failure"
             ),
+            "model_error"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("POST /v1/chat/completions: HTTP 400 Bad Request"),
+            "model_unavailable_basert"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("POST /v1/chat/completions lookalike"),
             "model_error"
         );
         assert_eq!(
