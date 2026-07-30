@@ -1,8 +1,8 @@
 # Stage 8 definitive acceptance — `96756b2`
 
-Date: 2026-07-30  
-Candidate: `96756b27c1d5798887e3baa379d5b0ab449bbc09`  
-Baseline product revision: `8536f01`  
+Date: 2026-07-30
+Candidate: `96756b27c1d5798887e3baa379d5b0ab449bbc09`
+Baseline product revision: `8536f01`
 Acceptance interpretation: [ADR-0002](ADR-0002-REPRODUCIBLE-STAGE8-RELEASE-GATE.md)
 
 ## Verdict
