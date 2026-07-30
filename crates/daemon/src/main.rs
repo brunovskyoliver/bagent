@@ -2002,6 +2002,13 @@ async fn chat(
     let acceptance_runtime_active = state.acceptance.is_some();
     #[cfg(not(feature = "stage8-acceptance"))]
     let acceptance_runtime_active = false;
+    #[cfg(feature = "stage8-acceptance")]
+    let acceptance_fixture_active = state
+        .acceptance
+        .as_ref()
+        .is_some_and(|control| control.selection().is_some());
+    #[cfg(not(feature = "stage8-acceptance"))]
+    let acceptance_fixture_active = false;
 
     tokio::spawn(async move {
         let t0 = std::time::Instant::now();
@@ -2352,8 +2359,11 @@ async fn chat(
 
         // Forward execution events onto this request's SSE stream.
         let (ev_tx, mut ev_rx) = mpsc::channel::<serde_json::Value>(64);
-        let sink =
-            agent_exec::EventSink::with_diagnostics(ev_tx, state.evidence_diagnostics.clone());
+        let sink = if acceptance_fixture_active {
+            agent_exec::EventSink::without_diagnostics(ev_tx)
+        } else {
+            agent_exec::EventSink::with_diagnostics(ev_tx, state.evidence_diagnostics.clone())
+        };
         let sse_tx = tx.clone();
         let forwarder = tokio::spawn(async move {
             while let Some(v) = ev_rx.recv().await {

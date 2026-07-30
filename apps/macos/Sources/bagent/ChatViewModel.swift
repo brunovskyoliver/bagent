@@ -61,6 +61,7 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
 struct EvidenceLogicalActivity: Identifiable, Equatable {
     let id: String
     var operation: String
+    var argumentHash: String
     var executionStatus: DaemonClient.EvidenceExecutionStatus
     var contribution: DaemonClient.EvidenceContribution
     var evidenceCount: Int
@@ -74,6 +75,7 @@ struct EvidenceLogicalActivity: Identifiable, Equatable {
     init(event: DaemonClient.LogicalActivityEvent) {
         id = event.activityId
         operation = event.normalizedOperation
+        argumentHash = event.argumentHash
         executionStatus = event.executionStatus
         contribution = event.contribution
         evidenceCount = event.evidenceCount
@@ -87,6 +89,7 @@ struct EvidenceLogicalActivity: Identifiable, Equatable {
 
     mutating func update(from event: DaemonClient.LogicalActivityEvent) {
         operation = event.normalizedOperation
+        argumentHash = event.argumentHash
         executionStatus = event.executionStatus
         contribution = event.contribution
         evidenceCount = event.evidenceCount
@@ -100,6 +103,30 @@ struct EvidenceLogicalActivity: Identifiable, Equatable {
 }
 
 enum EvidencePresentation {
+    @discardableResult
+    static func apply(_ event: DaemonClient.ChatEvent, to message: inout ChatMessage) -> String? {
+        switch event {
+        case .evidencePhase(let phase):
+            message.evidencePhase = phase
+            return phaseLabel(phase)
+        case .logicalActivityStarted(let activity), .logicalActivityCompleted(let activity):
+            if let index = message.evidenceActivities.firstIndex(where: { $0.id == activity.activityId }) {
+                message.evidenceActivities[index].update(from: activity)
+            } else {
+                message.evidenceActivities.append(EvidenceLogicalActivity(event: activity))
+            }
+            return nil
+        case .evidenceOutcome(let outcome):
+            message.evidenceOutcome = outcome
+            return outcomeLabel(outcome)
+        case .evidencePolish(let polish):
+            message.evidencePolishStatus = polish.status
+            return nil
+        default:
+            return nil
+        }
+    }
+
     static func phaseLabel(_ event: DaemonClient.EvidencePhaseEvent) -> String {
         let progress = progressSuffix(completed: event.completed, total: event.total)
         switch event.phase {
@@ -1783,31 +1810,13 @@ final class ChatViewModel: ObservableObject {
                             messages[idx].activities[activityIndex].status = event.status ?? "completed"
                             messages[idx].activities[activityIndex].durationMs = event.durationMs
                         }
-                    case .evidencePhase(let event):
-                        messages[idx].evidencePhase = event
-                        toolStatus = EvidencePresentation.phaseLabel(event)
-                    case .logicalActivityStarted(let event):
-                        let activity = EvidenceLogicalActivity(event: event)
-                        if let activityIndex = messages[idx].evidenceActivities.firstIndex(
-                            where: { $0.id == activity.id }
-                        ) {
-                            messages[idx].evidenceActivities[activityIndex].update(from: event)
-                        } else {
-                            messages[idx].evidenceActivities.append(activity)
+                    case .evidencePhase, .logicalActivityStarted, .logicalActivityCompleted,
+                         .evidenceOutcome, .evidencePolish:
+                        if let status = EvidencePresentation.apply(event, to: &messages[idx]) {
+                            toolStatus = status
                         }
-                    case .logicalActivityCompleted(let event):
-                        if let activityIndex = messages[idx].evidenceActivities.firstIndex(
-                            where: { $0.id == event.activityId }
-                        ) {
-                            messages[idx].evidenceActivities[activityIndex].update(from: event)
-                        } else {
-                            messages[idx].evidenceActivities.append(EvidenceLogicalActivity(event: event))
-                        }
-                    case .evidenceOutcome(let event):
-                        messages[idx].evidenceOutcome = event
-                        toolStatus = EvidencePresentation.outcomeLabel(event)
-                    case .evidencePolish(let event):
-                        messages[idx].evidencePolishStatus = event.status
+                    case .evidenceAcquisitionDiagnostic:
+                        break
                     case .sourceDiscovered(let source):
                         if !messages[idx].sources.contains(where: { $0.id == source.id }) {
                             messages[idx].sources.append(source)

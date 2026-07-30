@@ -113,8 +113,7 @@ pub(crate) struct EventSink {
 }
 
 impl EventSink {
-    #[cfg(test)]
-    pub(crate) fn new(tx: mpsc::Sender<serde_json::Value>) -> Self {
+    pub(crate) fn without_diagnostics(tx: mpsc::Sender<serde_json::Value>) -> Self {
         Self {
             tx,
             diagnostics: None,
@@ -4948,7 +4947,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let outcome = run_evidence_synthesis(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             "configured-4b",
             original_request,
             &bundle,
@@ -5009,7 +5008,7 @@ mod tests {
 
         let outcome = run_evidence_synthesis(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             "configured-4b",
             "read my latest three emails",
             &bundle,
@@ -5055,7 +5054,7 @@ mod tests {
 
         let outcome = run_evidence_synthesis_with_limits(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             "configured-4b",
             "read my latest three emails",
             &bundle,
@@ -5424,7 +5423,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let response = run_evidence_synthesis(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             "configured-4b",
             original_request,
             bundle,
@@ -5483,7 +5482,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let response = run_evidence_synthesis(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             "configured-4b",
             original_request,
             bundle,
@@ -5656,7 +5655,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4096);
         let outcome = run_evidence_synthesis(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             DEFAULT_CHAT_MODEL,
             "can you read me the last 3 emails?",
             &bundle,
@@ -5708,7 +5707,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4096);
         let outcome = run_web_evidence_synthesis(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             DEFAULT_CHAT_MODEL,
             "Read https://iana.org/help/example-domains",
             &bundle,
@@ -6057,7 +6056,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let outcome = run_web_evidence_synthesis(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             "configured-4b",
             "read https://example.com/requested",
             &bundle,
@@ -6168,7 +6167,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let outcome = run_web_evidence_synthesis(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             "configured-4b",
             "read the page",
             &bundle,
@@ -6566,7 +6565,7 @@ mod tests {
 
         run_web_evidence_synthesis(
             &client,
-            &EventSink::new(tx),
+            &EventSink::without_diagnostics(tx),
             "configured-4b",
             "read the page",
             &bundle,
@@ -6696,7 +6695,7 @@ mod tests {
     #[tokio::test]
     async fn event_sink_emits_exactly_one_terminal_outcome_per_turn() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let sink = EventSink::new(tx);
+        let sink = EventSink::without_diagnostics(tx);
         let outcome = json!({
             "type": "evidence_outcome",
             "turn_id": "turn-terminal",

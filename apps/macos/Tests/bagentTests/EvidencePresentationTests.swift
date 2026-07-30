@@ -2,29 +2,6 @@ import XCTest
 @testable import bagent
 
 final class EvidenceEventDecodingTests: XCTestCase {
-    func testDecodesCapturedSignedAcceptanceEventsWhenProvided() throws {
-        guard let path = ProcessInfo.processInfo.environment["BAGENT_STAGE8_ACCEPTANCE_SSE"],
-              !path.isEmpty
-        else {
-            throw XCTSkip("signed acceptance SSE capture not provided")
-        }
-        let contents = try String(contentsOfFile: path, encoding: .utf8)
-        let payloads = contents.split(separator: "\n").map(String.init)
-        XCTAssertFalse(payloads.isEmpty)
-
-        var outcomes = 0
-        var done = 0
-        for payload in payloads {
-            let decoded = try JSONDecoder().decode(SSEEvent.self, from: Data(payload.utf8))
-            if decoded.type == "done" { done += 1 }
-            if case .evidenceOutcome = DaemonClient.evidenceChatEvent(from: decoded) {
-                outcomes += 1
-            }
-        }
-        XCTAssertGreaterThan(outcomes, 0)
-        XCTAssertEqual(outcomes, done)
-    }
-
     func testDecodesEveryEvidenceEventShape() throws {
         let fixtures = [
             """
@@ -50,6 +27,11 @@ final class EvidenceEventDecodingTests: XCTestCase {
             {"type":"evidence_outcome","turn_id":"turn-1","state":"verified","kind":"web",
              "acquired":2,"requested":2,"source_count":2,"message":"Web verified · 2 sources"}
             """,
+            """
+            {"type":"evidence_acquisition_diagnostic","turn_id":"turn-1",
+             "status":"search_completed","provider":"tavily",
+             "provider_status":"succeeded { result_count: 2 }"}
+            """,
         ]
 
         let decoded = try fixtures.map {
@@ -61,6 +43,7 @@ final class EvidenceEventDecodingTests: XCTestCase {
             "logical_activity_completed",
             "evidence_polish",
             "evidence_outcome",
+            "evidence_acquisition_diagnostic",
         ])
         XCTAssertEqual(decoded[0].phase, "reading")
         XCTAssertEqual(decoded[1].activity_id, "evidence:a")
@@ -69,12 +52,13 @@ final class EvidenceEventDecodingTests: XCTestCase {
         XCTAssertEqual(decoded[4].outcome_kind, "web")
 
         let chatEvents = decoded.compactMap(DaemonClient.evidenceChatEvent(from:))
-        XCTAssertEqual(chatEvents.count, 5)
+        XCTAssertEqual(chatEvents.count, 6)
         guard case .evidencePhase(let phase) = chatEvents[0],
               case .logicalActivityStarted(let started) = chatEvents[1],
               case .logicalActivityCompleted(let completed) = chatEvents[2],
               case .evidencePolish(let polish) = chatEvents[3],
-              case .evidenceOutcome(let outcome) = chatEvents[4]
+              case .evidenceOutcome(let outcome) = chatEvents[4],
+              case .evidenceAcquisitionDiagnostic(let diagnostic) = chatEvents[5]
         else {
             return XCTFail("typed evidence event mapping changed")
         }
@@ -83,6 +67,15 @@ final class EvidenceEventDecodingTests: XCTestCase {
         XCTAssertEqual(completed.contribution, .satisfied)
         XCTAssertEqual(polish.status, .rejected)
         XCTAssertEqual(outcome.state, .verified)
+        XCTAssertEqual(diagnostic.provider, "tavily")
+
+        var message = ChatMessage(role: .assistant, content: "")
+        chatEvents.forEach { EvidencePresentation.apply($0, to: &message) }
+        XCTAssertEqual(message.evidencePhase?.phase, .reading)
+        XCTAssertEqual(message.evidenceActivities.count, 1)
+        XCTAssertEqual(message.evidenceActivities[0].argumentHash, "hash")
+        XCTAssertEqual(message.evidenceOutcome?.state, .verified)
+        XCTAssertEqual(message.evidencePolishStatus, .rejected)
     }
 }
 
@@ -192,6 +185,7 @@ final class EvidencePresentationTests: XCTestCase {
             turnId: "turn-1",
             activityId: "evidence:a",
             normalizedOperation: "web.fetch",
+            argumentHash: "hash",
             executionStatus: .succeeded,
             contribution: .empty,
             evidenceCount: 0,

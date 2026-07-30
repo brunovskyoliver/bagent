@@ -349,6 +349,7 @@ struct DaemonClient: Sendable {
         let turnId: String
         let activityId: String
         let normalizedOperation: String
+        let argumentHash: String
         let executionStatus: EvidenceExecutionStatus
         let contribution: EvidenceContribution
         let evidenceCount: Int
@@ -370,6 +371,12 @@ struct DaemonClient: Sendable {
         let message: String
     }
 
+    struct EvidenceAcquisitionDiagnostic: Sendable, Equatable {
+        let status: String
+        let provider: String?
+        let providerStatus: String?
+    }
+
     struct TranscriptSource: Identifiable, Sendable, Equatable {
         let id: String
         let title: String
@@ -386,6 +393,7 @@ struct DaemonClient: Sendable {
         case logicalActivityCompleted(LogicalActivityEvent)
         case evidencePolish(EvidencePolishEvent)
         case evidenceOutcome(EvidenceOutcomeEvent)
+        case evidenceAcquisitionDiagnostic(EvidenceAcquisitionDiagnostic)
         case sourceDiscovered(TranscriptSource)
         case debugTrace(DebugTraceSummary)
         case memorySaved(id: String)
@@ -425,6 +433,7 @@ struct DaemonClient: Sendable {
             guard let turnId = event.turn_id,
                   let activityId = event.activity_id,
                   let operation = event.normalized_operation,
+                  let argumentHash = event.argument_hash,
                   let rawExecution = event.execution_status,
                   let execution = EvidenceExecutionStatus(rawValue: rawExecution),
                   let rawContribution = event.contribution,
@@ -434,6 +443,7 @@ struct DaemonClient: Sendable {
                 turnId: turnId,
                 activityId: activityId,
                 normalizedOperation: operation,
+                argumentHash: argumentHash,
                 executionStatus: execution,
                 contribution: contribution,
                 evidenceCount: event.evidence_count ?? 0,
@@ -470,6 +480,13 @@ struct DaemonClient: Sendable {
                   let status = EvidencePolishStatus(rawValue: rawStatus)
             else { return nil }
             return .evidencePolish(.init(turnId: turnId, status: status))
+        case "evidence_acquisition_diagnostic":
+            guard let status = event.status else { return nil }
+            return .evidenceAcquisitionDiagnostic(.init(
+                status: status,
+                provider: event.provider,
+                providerStatus: event.provider_status
+            ))
         default:
             return nil
         }
@@ -582,6 +599,28 @@ struct DaemonClient: Sendable {
     struct HistoryTurn: Encodable {
         let role: String
         let content: String
+    }
+
+    func configureStage8Acceptance(acquisition: String?, polish: String?) async throws {
+        guard ProcessInfo.processInfo.environment[Stage8AcceptanceCLI.environmentKey] == "1" else {
+            throw DaemonError.badStatus
+        }
+        let c = try await loadCreds()
+        var req = authedRequest("/acceptance/stage8/fixture", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Selection: Encodable {
+            let acquisition: String
+            let polish: String
+        }
+        struct Body: Encodable {
+            let selection: Selection?
+        }
+        req.httpBody = try JSONEncoder().encode(Body(selection: acquisition.map {
+            Selection(acquisition: $0, polish: polish ?? "unavailable")
+        }))
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try validateOK(data: data, response: response)
     }
 
     func chatStream(
@@ -1610,6 +1649,7 @@ struct SSEEvent: Decodable {
     let total: Int?
     let activity_id: String?
     let normalized_operation: String?
+    let argument_hash: String?
     let execution_status: String?
     let contribution: String?
     let evidence_count: Int?
@@ -1622,6 +1662,8 @@ struct SSEEvent: Decodable {
     let acquired: Int?
     let requested: Int?
     let source_count: Int?
+    let provider: String?
+    let provider_status: String?
     let domain: String?
     let attachments: [DaemonClient.MailAttachmentRef]?
     // mail_found event fields
