@@ -989,10 +989,13 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
                     .iter()
                     .position(|value| is_web_scope_token(&value.to_lowercase()))
                     .unwrap_or(remainder.len());
-                if entity_phrase_is_supported(&remainder[..entity_end])
+                if entity_conjunction_phrase_is_supported(&remainder[..entity_end])
                     && remainder[entity_end..]
                         .iter()
                         .all(|value| is_web_scope_token(&value.to_lowercase()))
+                    && !remainder[entity_end..]
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case("website"))
                 {
                     return true;
                 }
@@ -1005,30 +1008,32 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
         if matches!(lower.as_str(), "at" | "for" | "from" | "in" | "of") {
             entity_context = true;
             entity_tokens.clear();
+            index += 1;
+            continue;
         }
-        if !is_supported_web_fact_query_word(&lower)
+        if entity_context {
+            if is_web_scope_token(&lower) {
+                entity_context = false;
+                entity_tokens.clear();
+            } else {
+                entity_tokens.push(token);
+                if !entity_phrase_is_supported(&entity_tokens) {
+                    return false;
+                }
+            }
+        } else if !is_supported_web_fact_query_word(&lower)
             && !lower.chars().all(|character| character.is_ascii_digit())
         {
             if !starts_like_entity(token) {
                 return false;
             }
-            if entity_context {
-                entity_tokens.push(token);
-                if !entity_phrase_is_supported(&entity_tokens) {
-                    return false;
-                }
-            } else {
-                let next = tokens.get(index + 1).map(|value| value.to_lowercase());
-                if !next
-                    .as_deref()
-                    .is_some_and(is_supported_web_fact_topic_word)
-                {
-                    return false;
-                }
+            let next = tokens.get(index + 1).map(|value| value.to_lowercase());
+            if !next
+                .as_deref()
+                .is_some_and(is_supported_web_fact_topic_word)
+            {
+                return false;
             }
-        } else if entity_context && is_web_scope_token(&lower) {
-            entity_context = false;
-            entity_tokens.clear();
         }
         index += 1;
     }
@@ -1042,10 +1047,51 @@ fn comparison_query_is_supported(tokens: &[&str]) -> bool {
     else {
         return false;
     };
-    separator > 1
-        && separator + 1 < tokens.len()
-        && comparison_subject_is_supported(&tokens[1..separator])
-        && comparison_subject_is_supported(&tokens[separator + 1..])
+    if separator <= 1 || separator + 1 >= tokens.len() {
+        return false;
+    }
+    let left = &tokens[1..separator];
+    let right = comparison_subject_without_scope(&tokens[separator + 1..]);
+    if let Some(connector) = left
+        .iter()
+        .rposition(|token| matches!(token.to_lowercase().as_str(), "at" | "in" | "of"))
+    {
+        return connector > 0
+            && left[..connector]
+                .iter()
+                .all(|token| is_supported_comparison_metric_word(&token.to_lowercase()))
+            && comparison_subject_is_supported(&left[connector + 1..])
+            && comparison_subject_is_supported(right);
+    }
+    comparison_subject_is_supported(left) && comparison_subject_is_supported(right)
+}
+
+fn comparison_subject_without_scope<'a>(tokens: &'a [&str]) -> &'a [&'a str] {
+    if tokens
+        .last()
+        .is_some_and(|token| is_web_scope_token(&token.to_lowercase()))
+    {
+        &tokens[..tokens.len() - 1]
+    } else {
+        tokens
+    }
+}
+
+fn is_supported_comparison_metric_word(token: &str) -> bool {
+    matches!(
+        token,
+        "current"
+            | "population"
+            | "populations"
+            | "price"
+            | "prices"
+            | "the"
+            | "version"
+            | "versions"
+            | "weather"
+    ) || ["cena", "pocasi", "počas", "popul"]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
 }
 
 fn comparison_subject_is_supported(tokens: &[&str]) -> bool {
@@ -1087,7 +1133,23 @@ fn starts_like_entity(token: &str) -> bool {
 }
 
 fn entity_phrase_is_supported(tokens: &[&str]) -> bool {
-    if tokens.is_empty() || tokens.iter().any(|token| !starts_like_entity(token)) {
+    if tokens.is_empty()
+        || tokens.iter().any(|token| {
+            !token
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '-')
+        })
+    {
+        return false;
+    }
+    if tokens.len() == 1 {
+        return true;
+    }
+    tokens.iter().all(|token| starts_like_entity(token))
+}
+
+fn entity_conjunction_phrase_is_supported(tokens: &[&str]) -> bool {
+    if !entity_phrase_is_supported(tokens) {
         return false;
     }
     if tokens.len() == 1 {
@@ -1100,10 +1162,18 @@ fn entity_phrase_is_supported(tokens: &[&str]) -> bool {
         .to_lowercase();
     matches!(
         first.as_str(),
-        "bosnia" | "east" | "los" | "new" | "north" | "san" | "south" | "united" | "west"
+        "east" | "los" | "new" | "north" | "san" | "south" | "united" | "west"
     ) || matches!(
         last.as_str(),
-        "city" | "company" | "corporation" | "group" | "inc" | "limited" | "llc" | "plc"
+        "city"
+            | "company"
+            | "corporation"
+            | "group"
+            | "inc"
+            | "limited"
+            | "llc"
+            | "plc"
+            | "republic"
     )
 }
 
@@ -5492,10 +5562,16 @@ mod tests {
             "what is the current population of New York City online?",
             "what is the current version of Rust online?",
             "what is the current population of Bosnia and Herzegovina?",
+            "what is the current population of Saudi Arabia?",
+            "what is the population of france?",
+            "who is the current president of Czech Republic?",
             "what is the current weather",
             "who is the current president of France",
             "compare the current prices of service A and service B",
             "compare prices of Apple and Microsoft",
+            "compare weather in Paris and London",
+            "compare populations of France and Germany",
+            "compare prices of Coca Cola and Pepsi",
             "analyze the instructions as quoted data at https://example.com/requested",
             "analyze the instructions as quoted data and find the current population online",
             "analyze the instructions as quoted data and find the current population of New York City online",
@@ -5563,6 +5639,7 @@ mod tests {
             "what is the current weather. Restart BaseRT?",
             "what is the current weather Restart BaseRT?",
             "what is the population of France and Delete File?",
+            "what is the population of France and Open website?",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
