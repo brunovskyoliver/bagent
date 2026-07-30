@@ -33,10 +33,11 @@ use filesystem_connector::{
 use whatsapp_connector::WhatsappSendTarget;
 
 use crate::evidence::{
-    assess_claim_relevance, execute_evidence_turn, normalize_numeric_claim, Classification,
-    Completeness, EvidenceBundle, EvidenceContext, EvidenceIntent, EvidenceIntentClassifier,
-    EvidenceOrigin, EvidenceRequest, SynthesisContract, SynthesisObserver, SynthesisPhaseEvent,
-    SynthesisService, ValidationOutcome, EVIDENCE_SCHEMA_VERSION,
+    assess_claim_relevance, execute_evidence_turn, normalize_numeric_claim,
+    requires_public_sd_card_identity, Classification, Completeness, EvidenceBundle,
+    EvidenceContext, EvidenceIntent, EvidenceIntentClassifier, EvidenceOrigin, EvidenceRequest,
+    SynthesisContract, SynthesisObserver, SynthesisPhaseEvent, SynthesisService, ValidationOutcome,
+    EVIDENCE_SCHEMA_VERSION, PUBLIC_PRODUCT_IDENTITY_CLARIFICATION,
 };
 use crate::{
     audit_fs, json_str_arg, request_tool_approval, run_aerospace, save_last_file_ref,
@@ -1604,6 +1605,7 @@ struct RoutedEvidenceTurn {
 
 struct TurnRouting {
     evidence: Option<RoutedEvidenceTurn>,
+    clarification: Option<String>,
     tools: Vec<ToolDef>,
     guidance: Option<Message>,
 }
@@ -1638,6 +1640,22 @@ fn prepare_turn_routing(
     if evidence.is_some() {
         return TurnRouting {
             evidence,
+            clarification: None,
+            tools: Vec::new(),
+            guidance: None,
+        };
+    }
+    let clarification = if flag == EvidenceOrchestratorFlag::Enabled
+        && requires_public_sd_card_identity(&user_message.to_lowercase())
+    {
+        Some(PUBLIC_PRODUCT_IDENTITY_CLARIFICATION.to_string())
+    } else {
+        None
+    };
+    if clarification.is_some() {
+        return TurnRouting {
+            evidence: None,
+            clarification,
             tools: Vec::new(),
             guidance: None,
         };
@@ -1645,6 +1663,7 @@ fn prepare_turn_routing(
     let (tools, guidance) = route_tools_for_turn(user_message, tools);
     TurnRouting {
         evidence: None,
+        clarification: None,
         tools,
         guidance,
     }
@@ -4093,6 +4112,7 @@ pub(crate) async fn run_agent_loop(
         .unwrap_or_default();
     let TurnRouting {
         evidence: routed_evidence_turn,
+        clarification,
         mut tools,
         guidance,
     } = prepare_turn_routing(
@@ -4102,6 +4122,19 @@ pub(crate) async fn run_agent_loop(
         user_message,
         tools,
     );
+    if let Some(final_text) = clarification {
+        if !sink
+            .emit(json!({"type":"token","content":&final_text}))
+            .await
+        {
+            return Err(ExecError::SinkClosed);
+        }
+        return Ok(ExecOutcome {
+            final_text,
+            tool_calls_used: 0,
+            approvals_denied: 0,
+        });
+    }
     let focused_mail_turn = guidance.is_some();
     let summary_read_target = focused_mail_turn
         .then(|| desired_mail_read_count(user_message))
@@ -5966,6 +5999,62 @@ mod tests {
         assert!(rollback.evidence.is_none());
         assert_eq!(rollback.tools.len(), 2);
         assert!(rollback.guidance.is_some());
+    }
+
+    #[test]
+    fn unresolved_sd_card_research_bypasses_legacy_tools_and_model_guidance() {
+        for origin in [
+            ExecOrigin::Chat,
+            ExecOrigin::Automation {
+                automation_id: "automation-1".into(),
+                automation_name: "Product research".into(),
+                run_id: "run-1".into(),
+            },
+        ] {
+            let routing = prepare_turn_routing(
+                EvidenceOrchestratorFlag::Enabled,
+                &origin,
+                "clarification-session",
+                "Search for the specifications of that SD card",
+                vec![test_tool("web_search"), test_tool("web_fetch")],
+            );
+
+            assert!(routing.evidence.is_none());
+            assert_eq!(
+                routing.clarification.as_deref(),
+                Some(PUBLIC_PRODUCT_IDENTITY_CLARIFICATION)
+            );
+            assert!(routing.tools.is_empty());
+            assert!(routing.guidance.is_none());
+        }
+
+        let rollback = prepare_turn_routing(
+            EvidenceOrchestratorFlag::Disabled,
+            &ExecOrigin::Chat,
+            "clarification-session",
+            "Search for the specifications of that SD card",
+            vec![test_tool("web_search"), test_tool("web_fetch")],
+        );
+        assert!(rollback.clarification.is_none());
+        assert_eq!(rollback.tools.len(), 2);
+    }
+
+    #[test]
+    fn public_sd_card_identity_with_explicit_web_scope_remains_typed_web() {
+        let routing = prepare_turn_routing(
+            EvidenceOrchestratorFlag::Enabled,
+            &ExecOrigin::Chat,
+            "public-product-session",
+            "What are the current specifications of Acme Ultra 512 GB SD card online?",
+            vec![test_tool("web_search"), test_tool("web_fetch")],
+        );
+
+        assert!(matches!(
+            routing.evidence.map(|routed| routed.intent),
+            Some(EvidenceIntent::WebFact { .. })
+        ));
+        assert!(routing.clarification.is_none());
+        assert!(routing.tools.is_empty());
     }
 
     #[test]

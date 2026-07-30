@@ -4,6 +4,9 @@ use super::{Classification, EvidenceIntent, EvidenceScope, IntentSummary, Verifi
 
 pub(crate) struct EvidenceIntentClassifier;
 
+pub(crate) const PUBLIC_PRODUCT_IDENTITY_CLARIFICATION: &str =
+    "Please provide a public make/model or URL for the item you want me to research.";
+
 impl EvidenceIntentClassifier {
     pub(crate) fn classify(&self, request: &str) -> Classification {
         let text = request.trim();
@@ -74,6 +77,12 @@ impl EvidenceIntentClassifier {
         }
         if mail {
             return self.classify_mail(text, &normalized);
+        }
+        if requires_public_sd_card_identity(&normalized) {
+            return clarification(
+                PUBLIC_PRODUCT_IDENTITY_CLARIFICATION,
+                vec![("Provide a public product identity", EvidenceScope::Web)],
+            );
         }
         if web_fact {
             let verification = if needs_corroboration(&normalized) {
@@ -151,6 +160,40 @@ impl EvidenceIntentClassifier {
         };
         recognized(intent, normalized)
     }
+}
+
+pub(crate) fn requires_public_sd_card_identity(normalized: &str) -> bool {
+    let requests_specification_research = has_any(
+        normalized,
+        &[
+            "search",
+            "look up",
+            "lookup",
+            "research",
+            "find specifications",
+            "find specs",
+            "vyhladaj",
+            "vyhladat",
+            "hladaj",
+        ],
+    ) && has_any(
+        normalized,
+        &["specification", "specifications", "specs", "specifik"],
+    );
+    let refers_to_unnamed_sd_card = has_any(
+        normalized,
+        &[
+            "that sd card",
+            "the sd card mentioned",
+            "mentioned sd card",
+            "sd card above",
+            "that memory card",
+            "the memory card mentioned",
+            "mentioned memory card",
+            "memory card above",
+        ],
+    );
+    requests_specification_research && refers_to_unnamed_sd_card
 }
 
 fn normalize(value: &str) -> String {
@@ -363,5 +406,30 @@ fn recognized(intent: EvidenceIntent, normalized: &str) -> Classification {
         })
     } else {
         Classification::Recognized(intent)
+    }
+}
+
+#[cfg(test)]
+mod unresolved_product_research_tests {
+    use super::*;
+
+    #[test]
+    fn generic_sd_card_specification_follow_up_requires_public_identity() {
+        let classification =
+            EvidenceIntentClassifier.classify("Search for the specifications of that SD card");
+
+        assert!(matches!(
+            classification,
+            Classification::NeedsClarification { ref prompt, .. }
+                if prompt == PUBLIC_PRODUCT_IDENTITY_CLARIFICATION
+        ));
+    }
+
+    #[test]
+    fn bare_sd_card_mention_is_not_web_research() {
+        assert_eq!(
+            EvidenceIntentClassifier.classify("That SD card looks useful"),
+            Classification::NotEvidenceIntent
+        );
     }
 }
