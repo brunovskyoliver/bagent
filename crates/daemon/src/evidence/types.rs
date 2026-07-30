@@ -436,6 +436,8 @@ pub(crate) struct WebFetchEvidence {
     pub characters_extracted: u64,
     pub extraction: ExtractionStatus,
     pub quality: ExtractionQuality,
+    #[serde(default)]
+    pub page_owner_identity_bound: bool,
     pub authority: SourceAuthority,
     pub source_identity: SourceIdentity,
     pub passages: Vec<EvidencePassage>,

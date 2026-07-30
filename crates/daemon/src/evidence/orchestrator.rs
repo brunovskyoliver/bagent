@@ -6,9 +6,9 @@ use serde_json::json;
 use url::Url;
 
 use super::{
-    assess_claim_relevance, candidate_is_first_party, candidate_is_query_relevant,
-    candidate_query_relevance_score, candidate_source_identity, direct_web_candidate,
-    linked_web_candidate, normalize_numeric_claim, prepare_web_candidates,
+    assess_claim_relevance, candidate_discovery_identity_matches, candidate_is_first_party,
+    candidate_is_query_relevant, candidate_query_relevance_score, candidate_source_identity,
+    direct_web_candidate, linked_web_candidate, normalize_numeric_claim, prepare_web_candidates,
     AppleMailEvidenceAdapter, EvidenceConflict, EvidenceContribution, EvidenceIntent,
     EvidenceOperation, EvidencePhase, EvidencePhaseEvent, EvidencePlanner, EvidenceRequest,
     EvidenceResults, ExecutionStatus, ExtractionStatus, FailureCode, LogicalActivityCompletion,
@@ -1328,14 +1328,9 @@ fn apply_ranked_authority(
 ) {
     if !query.is_empty() {
         if let Some(evidence) = result.value.as_mut() {
-            let mut final_candidate = candidate.clone();
-            final_candidate.requested_url = evidence.final_url.clone();
-            let candidate_identity_matches = candidate_is_first_party(query, &final_candidate);
-            let page_identity_matches = evidence.passages.iter().any(|passage| {
-                final_candidate.title = passage.text.clone();
-                candidate_is_first_party(query, &final_candidate)
-            });
-            if !candidate_identity_matches && !page_identity_matches {
+            let discovery_identity_matches = candidate_discovery_identity_matches(query, candidate);
+            let page_identity_matches = fetched_page_claims_owner_identity(query, evidence);
+            if !page_identity_matches || !discovery_identity_matches {
                 if evidence.authority == SourceAuthority::FirstParty {
                     evidence.authority = SourceAuthority::AuthoritativeReference;
                 }
@@ -1344,6 +1339,20 @@ fn apply_ranked_authority(
             evidence.authority = SourceAuthority::FirstParty;
         }
     }
+}
+
+fn fetched_page_claims_owner_identity(query: &str, evidence: &WebFetchEvidence) -> bool {
+    evidence.page_owner_identity_bound
+        && (1..=evidence.passages.len().min(2)).any(|width| {
+            evidence.passages.windows(width).any(|adjacent| {
+                let contextual = adjacent
+                    .iter()
+                    .map(|passage| passage.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(": ");
+                assess_claim_relevance(query, &contextual).eligible
+            })
+        })
 }
 
 fn apply_passage_selection(
@@ -1781,7 +1790,7 @@ where
         };
         let remaining_budget =
             usize::from(plan.budget.mail_body_attempts).saturating_sub(attempts_used);
-        if result.retry_permitted(remaining_budget.min(usize::from(u8::MAX)) as u8) {
+        if mail_body_retry_permitted(&result, remaining_budget.min(usize::from(u8::MAX)) as u8) {
             match gate.admit(&operation).await {
                 Admission::Allowed => {
                     gate.record_execution(&operation).await;
@@ -1954,6 +1963,21 @@ async fn execute_adapter_operation<A: MailEvidenceAdapter + Send>(
         } => adapter.search(normalized_query, *limit).await,
         _ => unreachable!("first Mail operation is a list or search"),
     }
+}
+
+fn mail_body_retry_permitted(
+    result: &OperationResult<MailBodyEvidence>,
+    remaining_global_budget: u8,
+) -> bool {
+    result.retry_permitted(remaining_global_budget)
+        || (remaining_global_budget > 0
+            && result.attempts < 2
+            && result.execution == ExecutionStatus::Succeeded
+            && result.contribution == EvidenceContribution::Empty
+            && result.value.as_ref().is_some_and(|body| {
+                body.body_state == super::BodyState::UnavailableLocally
+                    && body.body_origin == super::BodyOrigin::Unavailable
+            }))
 }
 
 fn first_mail_operation(intent: &EvidenceIntent) -> EvidenceOperation {
@@ -2602,6 +2626,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn transient_unavailable_body_retries_once_and_can_complete_the_reading_batch() {
+        struct UnavailableOnceAdapter {
+            inner: crate::evidence::FakeMailAdapter,
+            read_calls: usize,
+        }
+
+        #[async_trait]
+        impl MailEvidenceAdapter for UnavailableOnceAdapter {
+            async fn list(
+                &mut self,
+                limit: u8,
+                unread_only: bool,
+            ) -> OperationResult<Vec<MailHeaderEvidence>> {
+                self.inner.list(limit, unread_only).await
+            }
+
+            async fn search(
+                &mut self,
+                normalized_query: &str,
+                limit: u8,
+            ) -> OperationResult<Vec<MailHeaderEvidence>> {
+                self.inner.search(normalized_query, limit).await
+            }
+
+            async fn read(
+                &mut self,
+                message_id: &ValidatedMailId,
+            ) -> OperationResult<MailBodyEvidence> {
+                self.read_calls += 1;
+                let mut result = self.inner.read(message_id).await;
+                if self.read_calls == 1 {
+                    let body = result.value.as_mut().expect("fixture body");
+                    body.body.clear();
+                    body.body_state = crate::evidence::BodyState::UnavailableLocally;
+                    body.body_origin = crate::evidence::BodyOrigin::Unavailable;
+                    result.contribution = EvidenceContribution::Empty;
+                }
+                result
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut adapter = UnavailableOnceAdapter {
+            inner: crate::evidence::FakeMailAdapter::with_three_readable_messages(),
+            read_calls: 0,
+        };
+        let mut gate = RecordingGate {
+            log: log.clone(),
+            deny_read_number: None,
+            reads_seen: 0,
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::MailLatestContent {
+            count: 2,
+            requested_count: 2,
+            unread_only: false,
+        });
+
+        let outcome =
+            execute_mail_plan(&mut adapter, &mut gate, "turn-unavailable-retry", &plan).await;
+
+        assert_eq!(adapter.read_calls, 3);
+        assert_eq!(outcome.operations_executed, 4);
+        assert!(matches!(
+            outcome.validation,
+            ValidationOutcome::Bundle(bundle)
+                if bundle.completeness == Completeness::Complete
+                    && bundle.acquired.mail_bodies == 2
+        ));
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.starts_with("gate:mail_read:"))
+                .count(),
+            3
+        );
+    }
+
     #[test]
     fn policy_arguments_match_the_real_mail_connector_shape() {
         let read = EvidenceOperation::MailRead {
@@ -2746,6 +2849,7 @@ mod tests {
                     useful_text_length: text.chars().count() as u64,
                     ..Default::default()
                 },
+                page_owner_identity_bound: true,
                 authority: SourceAuthority::Other,
                 source_identity: super::super::SourceIdentity::new(source).unwrap(),
                 passages: vec![super::super::EvidencePassage {
@@ -2874,7 +2978,8 @@ mod tests {
 
     #[tokio::test]
     async fn web_fact_is_gated_immediately_and_stops_on_ranked_first_party_evidence() {
-        let first_party = web_candidate("https://acme.com/fact", 2);
+        let mut first_party = web_candidate("https://acme.com/fact", 2);
+        first_party.title = "Official website — Acme fact".into();
         let reference = web_candidate("https://en.wikipedia.org/wiki/Acme", 1);
         let reference_failure = OperationResult::without_value(
             EvidenceOperation::WebFetch {
@@ -2892,7 +2997,7 @@ mod tests {
                     &first_party,
                     "https://acme.com/final",
                     "acme.com",
-                    "Acme reports the fact is 42.",
+                    "Official website of Acme. Acme reports the fact is 42.",
                 )],
             ],
         );
@@ -2923,7 +3028,7 @@ mod tests {
     #[tokio::test]
     async fn fetched_final_url_and_page_identity_can_establish_first_party_authority() {
         let mut official = web_candidate("https://www.prezident.sk/en/", 1);
-        official.title = "Home".into();
+        official.title = "President of the Slovak Republic".into();
         let adapter = scripted_web_adapter(
             vec![official.clone()],
             vec![vec![readable_passages(
@@ -2932,6 +3037,7 @@ mod tests {
                 "prezident.sk",
                 &[
                     "President of the Slovak Republic",
+                    "Office of the President of the Slovak Republic",
                     "Peter Pellegrini is the President of the Slovak Republic.",
                 ],
             )]],
@@ -2960,6 +3066,83 @@ mod tests {
             .passages
             .iter()
             .any(|passage| passage.text.contains("Peter Pellegrini")));
+    }
+
+    #[tokio::test]
+    async fn discovery_and_fetched_owner_identity_establish_authority_without_domain_name_trust() {
+        let mut official = web_candidate("https://public-office.example/leader", 1);
+        official.title = "President of the Slovak Republic".to_string();
+        let adapter = scripted_web_adapter(
+            vec![official.clone()],
+            vec![vec![readable_passages(
+                &official,
+                official.requested_url.as_str(),
+                "public-office.example",
+                &[
+                    "President of the Slovak Republic",
+                    "Office of the President of the Slovak Republic",
+                    "Peter Pellegrini is the President of the Slovak Republic.",
+                ],
+            )]],
+        );
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Who is the President of Slovakia? Use the official first-party website.".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let outcome =
+            execute_web_plan(adapter, &mut gate, "turn-discovery-page-owner", &plan, "en").await;
+
+        assert!(matches!(
+            outcome.validation,
+            ValidationOutcome::Bundle(bundle)
+                if bundle.web.len() == 1
+                    && bundle.web[0].evidence.authority == SourceAuthority::FirstParty
+        ));
+    }
+
+    #[tokio::test]
+    async fn publisher_discovery_cannot_be_promoted_to_first_party_by_relevant_page_text() {
+        let mut publisher = web_candidate("https://reference-publisher.example/president", 1);
+        publisher.title = "Official website of the President of the Slovak Republic".to_string();
+        let mut fetched = readable_passages(
+            &publisher,
+            publisher.requested_url.as_str(),
+            "reference-publisher.example",
+            &[
+                "Profiles and reference biographies",
+                "Biography of a public official",
+                "The Office of the President released a public schedule.",
+                "Peter Pellegrini is the President of the Slovak Republic.",
+            ],
+        );
+        fetched
+            .value
+            .as_mut()
+            .expect("publisher fetch")
+            .page_owner_identity_bound = false;
+        let adapter = scripted_web_adapter(vec![publisher.clone()], vec![vec![fetched]]);
+        let mut gate = WebRecordingGate {
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Who is the President of Slovakia? Use the official first-party website.".into(),
+            verification: VerificationLevel::SingleAuthoritative,
+        });
+
+        let outcome =
+            execute_web_plan(adapter, &mut gate, "turn-publisher-not-owner", &plan, "en").await;
+
+        assert!(!matches!(
+            outcome.validation,
+            ValidationOutcome::Bundle(bundle)
+                if bundle.web.iter().any(
+                    |item| item.evidence.authority == SourceAuthority::FirstParty
+                )
+        ));
     }
 
     #[tokio::test]
@@ -3000,7 +3183,7 @@ mod tests {
     async fn bounded_structured_identity_after_visible_blocks_can_establish_first_party_authority()
     {
         let mut official = web_candidate("https://www.prezident.sk/en/", 1);
-        official.title = "Home".into();
+        official.title = "President of the Slovak Republic".into();
         let adapter = scripted_web_adapter(
             vec![official.clone()],
             vec![vec![readable_passages(
@@ -3013,6 +3196,7 @@ mod tests {
                     "Events",
                     "Speeches",
                     "Contact",
+                    "Office of the President of the Slovak Republic",
                     "Peter Pellegrini is the President of the Slovak Republic.",
                 ],
             )]],
@@ -3425,7 +3609,8 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_duplicate_web_operations_are_suppressed_before_gate_and_fetch() {
-        let first = web_candidate("https://acme.com/fact?utm_source=one", 1);
+        let mut first = web_candidate("https://acme.com/fact?utm_source=one", 1);
+        first.title = "Official website — Acme fact".into();
         let second = web_candidate("https://acme.com/fact#top", 2);
         assert_eq!(first.candidate_id, second.candidate_id);
         let adapter = scripted_web_adapter(
@@ -3435,7 +3620,7 @@ mod tests {
                     &first,
                     "https://acme.com/fact",
                     "acme.com",
-                    "Acme fact is 42.",
+                    "Official website of Acme. Acme fact is 42.",
                 )],
                 Vec::new(),
             ],
@@ -3473,7 +3658,8 @@ mod tests {
 
     #[tokio::test]
     async fn web_fact_retains_query_relevant_numeric_passages_instead_of_page_beginning() {
-        let candidate = web_candidate("https://bratislava.sk/population", 1);
+        let mut candidate = web_candidate("https://bratislava.sk/population", 1);
+        candidate.title = "Official website — Bratislava population".into();
         let adapter = scripted_web_adapter(
             vec![candidate.clone()],
             vec![vec![readable_passages(
@@ -3481,10 +3667,11 @@ mod tests {
                 candidate.requested_url.as_str(),
                 "bratislava.sk",
                 &[
+                    "Official website of the Bratislava city office",
                     "Home Services City office Contact Sitemap",
                     "Bratislava has a long history and many cultural institutions.",
                     "Population data",
-                    "Bratislava had 475,503 residents as of 31 December 2024.",
+                    "Bratislava city proper population was 475,503 as of 31 December 2024.",
                     "Related links and archived reports",
                 ],
             )]],

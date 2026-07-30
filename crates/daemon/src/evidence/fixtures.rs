@@ -201,6 +201,7 @@ pub(crate) fn redirected_readable_page() -> EvidenceResults {
                     useful_text_length: 50,
                     ..Default::default()
                 },
+                page_owner_identity_bound: false,
                 authority: SourceAuthority::FirstParty,
                 source_identity: SourceIdentity::new("publisher-example").unwrap(),
                 passages: vec![EvidencePassage {

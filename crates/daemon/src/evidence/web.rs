@@ -884,6 +884,7 @@ async fn typed_fetch<N: WebNetwork>(
         characters_extracted: 0,
         extraction: ExtractionStatus::Empty,
         quality: ExtractionQuality::default(),
+        page_owner_identity_bound: false,
         authority: authority_for(candidate.provider, &final_url),
         source_identity: source_identity_for(&final_url),
         passages: Vec::new(),
@@ -902,13 +903,14 @@ async fn typed_fetch<N: WebNetwork>(
         let body = String::from_utf8_lossy(&response.body);
         let extracted =
             if evidence.content_type.contains("html") || evidence.content_type.is_empty() {
-                extract_main_content(&body, &final_url)
+                extract_main_content(&body, &final_url, candidate)
             } else {
                 let text = normalize_visible_text(&body);
                 MainContent {
                     passages: split_bounded_passages(std::slice::from_ref(&text)),
                     useful_text_length: text.chars().count(),
                     boilerplate_ratio_basis_points: 0,
+                    page_owner_identity_bound: false,
                 }
             };
         evidence.characters_extracted = extracted
@@ -923,6 +925,7 @@ async fn typed_fetch<N: WebNetwork>(
             query_coverage_basis_points: 0,
             low_quality_reason: extraction_low_quality_reason(&extracted),
         };
+        evidence.page_owner_identity_bound = extracted.page_owner_identity_bound;
         let truncated =
             response.body_truncated || extracted.passages.len() >= MAX_EXTRACTED_PASSAGES;
         if extracted.passages.is_empty() {
@@ -1228,11 +1231,7 @@ fn candidate_rank_key(candidate: &WebCandidate, query_terms: &[String]) -> (u8, 
         .filter(|term| haystack.contains(term.as_str()))
         .count()
         .min(usize::from(u16::MAX)) as u16;
-    let authority = if candidate_ownership_matches(candidate, query_terms) {
-        0
-    } else {
-        candidate_authority_score(candidate, query_terms).saturating_add(1)
-    };
+    let authority = candidate_authority_score(candidate, query_terms);
     let freshness = candidate_freshness_score(candidate);
     (
         authority,
@@ -1339,14 +1338,237 @@ pub(crate) fn assess_claim_relevance(query: &str, passage: &str) -> ClaimEvidenc
         numeric_or_date_relevant,
         eligible: covered >= minimum_covered_terms
             && (!numeric_required || numeric_or_date_relevant)
-            && passage_agrees_with_requested_relationship(query, passage),
+            && passage_agrees_with_requested_relationship(query, passage)
+            && (numeric_required || passage_contains_nonnumeric_answer_value(query, passage)),
     }
 }
 
-fn passage_agrees_with_requested_relationship(query: &str, passage: &str) -> bool {
+fn passage_contains_nonnumeric_answer_value(query: &str, passage: &str) -> bool {
+    let query_terms = normalized_ranking_terms(query);
+    let query_numbers = numeric_tokens(query);
+    if query_requests_office_holder(query) {
+        return passage_contains_office_holder_name(passage);
+    }
+    let key_covers_query = |key: &str| {
+        let key_terms = normalized_ranking_terms(key);
+        query_terms
+            .iter()
+            .filter(|term| key_terms.contains(term))
+            .count()
+            >= query_terms.len().min(2)
+    };
+    let contains_answer_value = |value: &str| {
+        if numeric_tokens(value)
+            .iter()
+            .any(|number| !query_numbers.contains(number))
+        {
+            return true;
+        }
+        let novel_terms = normalized_ranking_terms(value)
+            .into_iter()
+            .filter(|term| {
+                !query_terms.contains(term)
+                    && ![
+                        "home",
+                        "menu",
+                        "navigation",
+                        "official",
+                        "page",
+                        "site",
+                        "source",
+                        "website",
+                    ]
+                    .contains(&term.as_str())
+            })
+            .collect::<Vec<_>>();
+        let only_boilerplate = novel_terms.iter().all(|term| {
+            [
+                "click",
+                "continue",
+                "described",
+                "detail",
+                "explore",
+                "here",
+                "learn",
+                "more",
+                "read",
+                "view",
+            ]
+            .contains(&term.as_str())
+        });
+        !novel_terms.is_empty()
+            && !only_boilerplate
+            && (!query.to_ascii_lowercase().contains("capital")
+                || named_answer_term_count(query, value) >= 1)
+    };
+    let key_value_answer = passage
+        .rsplit_once(':')
+        .is_some_and(|(key, value)| key_covers_query(key) && contains_answer_value(value));
+    if key_value_answer {
+        return true;
+    }
+    let lower = passage.to_ascii_lowercase();
+    [
+        " is ",
+        " are ",
+        " was ",
+        " were ",
+        " has ",
+        " have ",
+        " serves as ",
+        " was elected ",
+        " elected president ",
+        " assumed office ",
+        " took office ",
+        " became president ",
+    ]
+    .iter()
+    .any(|relation| {
+        lower.find(relation).is_some_and(|position| {
+            let left = &passage[..position];
+            let right = &passage[position + relation.len()..];
+            (key_covers_query(left) && contains_answer_value(right))
+                || (key_covers_query(right) && contains_answer_value(left))
+        })
+    })
+}
+
+fn named_answer_term_count(query: &str, value: &str) -> usize {
+    let query_terms = normalized_ranking_terms(query);
+    value
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(|character: char| !character.is_alphanumeric());
+            let normalized = normalized_ranking_terms(token);
+            (person_name_word_for_claim(token)
+                && normalized.iter().any(|term| !query_terms.contains(term)))
+            .then_some(())
+        })
+        .count()
+}
+
+fn passage_contains_office_holder_name(passage: &str) -> bool {
+    let lower = passage.to_ascii_lowercase();
+    for relation in [" is ", " serves as "] {
+        if let Some(position) = lower.find(relation) {
+            let left = &passage[..position];
+            let right = &passage[position + relation.len()..];
+            if left.to_ascii_lowercase().contains("president")
+                && leading_person_name_for_claim(right)
+            {
+                return true;
+            }
+            if right.to_ascii_lowercase().contains("president")
+                && trailing_person_name_for_claim(left)
+            {
+                return true;
+            }
+        }
+    }
+    [
+        " was elected ",
+        " elected president ",
+        " assumed office ",
+        " took office ",
+        " became president ",
+    ]
+    .iter()
+    .any(|relation| {
+        lower.find(relation).is_some_and(|position| {
+            let before = &passage[..position];
+            let pronoun_subject = before
+                .split_whitespace()
+                .last()
+                .map(|word| {
+                    word.trim_matches(|character: char| !character.is_alphabetic())
+                        .to_ascii_lowercase()
+                })
+                .is_some_and(|word| matches!(word.as_str(), "he" | "she"));
+            (trailing_person_name_for_claim(before)
+                || (pronoun_subject && contains_biographical_person_antecedent(before)))
+                && lower.contains("president")
+        })
+    })
+}
+
+fn contains_biographical_person_antecedent(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let Some(biography_position) = [" was born", " born in", " born on"]
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+    else {
+        return false;
+    };
+    let before_biography = &value[..biography_position];
+    trailing_person_name_for_claim(before_biography)
+        && before_biography
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| {
+                person_name_word_for_claim(pair[0]) && person_name_word_for_claim(pair[1])
+            })
+            .count()
+            == 1
+}
+
+fn leading_person_name_for_claim(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .take_while(|word| person_name_word_for_claim(word))
+        .take(4)
+        .count()
+        >= 2
+}
+
+fn trailing_person_name_for_claim(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .rev()
+        .take_while(|word| person_name_word_for_claim(word))
+        .take(4)
+        .count()
+        >= 2
+}
+
+fn person_name_word_for_claim(value: &str) -> bool {
+    let trimmed =
+        value.trim_matches(|character: char| !character.is_alphabetic() && character != '-');
+    let lower = trimmed.to_ascii_lowercase();
+    if [
+        "available",
+        "click",
+        "continue",
+        "detail",
+        "details",
+        "explore",
+        "he",
+        "here",
+        "learn",
+        "more",
+        "online",
+        "office",
+        "president",
+        "read",
+        "republic",
+        "slovak",
+        "slovakia",
+        "she",
+        "view",
+    ]
+    .contains(&lower.as_str())
+    {
+        return false;
+    }
+    let mut characters = trimmed.chars();
+    characters.next().is_some_and(char::is_uppercase)
+        && characters.all(|character| character.is_alphabetic() || character == '-')
+}
+
+fn query_requests_office_holder(query: &str) -> bool {
     let query = format!(" {} ", query.to_ascii_lowercase());
-    let passage = format!(" {} ", passage.to_ascii_lowercase());
-    let requests_office_holder = query.contains(" president ")
+    query.contains(" president ")
         && [
             " who ",
             " name ",
@@ -1355,7 +1577,13 @@ fn passage_agrees_with_requested_relationship(query: &str, passage: &str) -> boo
             " serves as ",
         ]
         .iter()
-        .any(|marker| query.contains(marker));
+        .any(|marker| query.contains(marker))
+}
+
+fn passage_agrees_with_requested_relationship(query: &str, passage: &str) -> bool {
+    let query = format!(" {} ", query.to_ascii_lowercase());
+    let passage = format!(" {} ", passage.to_ascii_lowercase());
+    let requests_office_holder = query_requests_office_holder(&query);
     if requests_office_holder {
         return passage.contains(" president ")
             && [
@@ -1409,6 +1637,9 @@ pub(crate) fn normalize_numeric_claim(value: &str) -> String {
 
 fn passage_contains_claim_number(query: &str, passage: &str) -> bool {
     let population = query.to_ascii_lowercase().contains("population");
+    if population {
+        return population_passage_has_unambiguous_figure(passage);
+    }
     let characters = passage.chars().collect::<Vec<_>>();
     let mut index = 0usize;
     while index < characters.len() {
@@ -1440,6 +1671,189 @@ fn passage_contains_claim_number(query: &str, passage: &str) -> bool {
     false
 }
 
+fn population_passage_has_unambiguous_figure(passage: &str) -> bool {
+    if population_definition_scope_count(passage) > 1
+        || population_definition_language_is_uncertain(passage)
+    {
+        return false;
+    }
+    let tokens = numeric_tokens(passage);
+    let years = tokens
+        .iter()
+        .filter(|token| numeric_token_is_year(token))
+        .count();
+    let figures = tokens
+        .iter()
+        .filter(|token| numeric_token_is_claim_figure(token))
+        .count();
+    figures == 1
+        && population_definition_scope_count(passage) == 1
+        && (years == 0 || (years == 1 && population_figure_and_year_share_claim_unit(passage)))
+}
+
+fn population_definition_scope_count(passage: &str) -> usize {
+    let normalized = passage
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    [
+        ["city proper", "municipal population", "municipality"]
+            .iter()
+            .any(|marker| normalized.contains(marker)),
+        ["metropolitan area", "metro area", "metropolitan population"]
+            .iter()
+            .any(|marker| normalized.contains(marker)),
+        ["urban area", "urban population"]
+            .iter()
+            .any(|marker| normalized.contains(marker)),
+        ["agglomeration", "functional urban area"]
+            .iter()
+            .any(|marker| normalized.contains(marker)),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count()
+}
+
+fn population_definition_language_is_uncertain(passage: &str) -> bool {
+    let lower = passage.to_ascii_lowercase();
+    [
+        "may mean",
+        "might mean",
+        "can mean",
+        "depending on definition",
+        "depending on the definition",
+        "definition varies",
+        "definitions vary",
+        "not specified whether",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn population_figure_and_year_share_claim_unit(passage: &str) -> bool {
+    passage
+        .split(['.', '!', '?', '\n'])
+        .map(str::trim)
+        .filter(|unit| !unit.is_empty())
+        .any(|unit| {
+            if population_date_context_is_publication(&unit.to_ascii_lowercase()) {
+                return false;
+            }
+            let tokens = numeric_tokens(unit);
+            let Some(year) = tokens.iter().find(|token| numeric_token_is_year(token)) else {
+                return false;
+            };
+            let Some(figure) = tokens
+                .iter()
+                .find(|token| numeric_token_is_claim_figure(token))
+            else {
+                return false;
+            };
+            let Some(figure_position) = unit.find(figure.as_str()) else {
+                return false;
+            };
+            let Some(year_position) = unit.rfind(year.as_str()) else {
+                return false;
+            };
+            if figure_position < year_position {
+                let relation =
+                    unit[figure_position + figure.len()..year_position].to_ascii_lowercase();
+                return [
+                    "as of",
+                    " in ",
+                    " for ",
+                    " on ",
+                    "at the end of",
+                    "reference date",
+                ]
+                .iter()
+                .any(|marker| relation.contains(marker));
+            }
+            let normalized = unit
+                .to_ascii_lowercase()
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character
+                    } else {
+                        ' '
+                    }
+                })
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let between = unit[year_position + year.len()..figure_position].to_ascii_lowercase();
+            normalized.contains("population")
+                && between.contains("population")
+                && [
+                    " is ",
+                    " was ",
+                    " stands at ",
+                    " stood at ",
+                    " reached ",
+                    " estimated at ",
+                    " estimate of ",
+                ]
+                .iter()
+                .any(|marker| format!(" {between} ").contains(marker))
+        })
+}
+
+fn population_date_context_is_publication(context: &str) -> bool {
+    [
+        "published",
+        "publication",
+        "updated",
+        "copyright",
+        "retrieved",
+        "accessed",
+        "released",
+    ]
+    .iter()
+    .any(|marker| context.contains(marker))
+}
+
+fn numeric_token_is_year(token: &str) -> bool {
+    let token = token.trim_matches([',', '.', '%']);
+    let bare_year = token
+        .parse::<u16>()
+        .is_ok_and(|year| (1900..=2100).contains(&year));
+    let dated_year = ['-', '/'].into_iter().any(|separator| {
+        let components = token.split(separator).collect::<Vec<_>>();
+        components.len() == 3
+            && components[0]
+                .parse::<u16>()
+                .is_ok_and(|year| (1900..=2100).contains(&year))
+            && components[1]
+                .parse::<u8>()
+                .is_ok_and(|month| (1..=12).contains(&month))
+            && components[2]
+                .parse::<u8>()
+                .is_ok_and(|day| (1..=31).contains(&day))
+    });
+    bare_year || dated_year
+}
+
+fn numeric_token_is_claim_figure(token: &str) -> bool {
+    let digits = token
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    !numeric_token_is_year(token) && digits.len() >= 3
+}
+
 fn query_requires_numeric_or_date_evidence(query: &str) -> bool {
     let normalized = query.to_ascii_lowercase();
     [
@@ -1463,46 +1877,15 @@ fn query_requires_numeric_or_date_evidence(query: &str) -> bool {
 }
 
 fn candidate_authority_score(candidate: &WebCandidate, query_terms: &[String]) -> u8 {
-    let host = candidate
-        .requested_url
-        .host_str()
-        .unwrap_or_default()
-        .trim_start_matches("www.")
-        .to_ascii_lowercase();
-    let labels = host.split('.').collect::<Vec<_>>();
-    let registrable_label = labels
-        .get(labels.len().saturating_sub(2))
-        .copied()
-        .unwrap_or_default();
     let title = candidate.title.to_ascii_lowercase();
-    let named_organization = registrable_label.len() >= 4
-        && (query_terms.iter().any(|term| term == registrable_label)
-            || query_terms.iter().enumerate().any(|(left_index, left)| {
-                query_terms.iter().enumerate().any(|(right_index, right)| {
-                    left_index != right_index && format!("{left}{right}") == registrable_label
-                })
-            }));
-    let official_metadata = title.contains("official site") || title.contains("official website");
+    let official_metadata = metadata_claims_official_ownership(&title);
     let title_terms = normalized_ranking_terms(&candidate.title);
     let title_agreement = query_terms
         .iter()
         .filter(|term| title_terms.contains(term))
         .count()
         >= query_terms.len().min(2);
-    let national_office_domain = labels.last().is_some_and(|suffix| *suffix == "sk")
-        && query_terms.iter().any(|term| term == "slovak")
-        && query_terms.iter().any(|term| term == "president")
-        && matches!(registrable_label, "prezident" | "president")
-        && title_agreement;
-    if host.ends_with(".gov")
-        || host.ends_with(".gov.sk")
-        || host.ends_with(".europa.eu")
-        || host.ends_with(".edu")
-        || host.ends_with(".ac.uk")
-        || host.ends_with(".int")
-        || (named_organization && official_metadata)
-        || national_office_domain
-    {
+    if official_metadata && title_agreement {
         0
     } else if candidate.provider == WebProvider::Wikipedia {
         1
@@ -1526,41 +1909,41 @@ fn candidate_freshness_score(candidate: &WebCandidate) -> u16 {
 }
 
 pub(crate) fn candidate_is_first_party(query: &str, candidate: &WebCandidate) -> bool {
-    let query_terms = normalized_ranking_terms(query);
-    candidate_ownership_matches(candidate, &query_terms)
+    if !candidate_discovery_identity_matches(query, candidate) {
+        return false;
+    }
+    let metadata = format!("{} {}", candidate.title, candidate.snippet).to_ascii_lowercase();
+    metadata_claims_official_ownership(&metadata)
 }
 
-fn candidate_ownership_matches(candidate: &WebCandidate, query_terms: &[String]) -> bool {
-    let host = candidate
-        .requested_url
-        .host_str()
-        .unwrap_or_default()
-        .trim_start_matches("www.")
-        .to_ascii_lowercase();
-    let labels = host.split('.').collect::<Vec<_>>();
-    let registrable_label = labels
-        .get(labels.len().saturating_sub(2))
-        .copied()
-        .unwrap_or_default();
-    let organization_matches = registrable_label.len() >= 4
-        && (query_terms.iter().any(|term| term == registrable_label)
-            || query_terms.iter().enumerate().any(|(left_index, left)| {
-                query_terms.iter().enumerate().any(|(right_index, right)| {
-                    left_index != right_index && format!("{left}{right}") == registrable_label
-                })
-            }));
-    let government_owner_matches = (host.ends_with(".gov")
-        || host.ends_with(".gov.sk")
-        || host.ends_with(".europa.eu")
-        || host.ends_with(".int"))
-        && labels
+fn metadata_claims_official_ownership(metadata: &str) -> bool {
+    [
+        "official site",
+        "official website",
+        "official homepage",
+        "office of the president",
+    ]
+    .iter()
+    .any(|marker| metadata.contains(marker))
+}
+
+pub(crate) fn candidate_discovery_identity_matches(query: &str, candidate: &WebCandidate) -> bool {
+    let query_terms = normalized_ranking_terms(query);
+    let metadata = format!("{} {}", candidate.title, candidate.snippet);
+    let metadata_terms = normalized_ranking_terms(&metadata);
+    let covered = query_terms
+        .iter()
+        .filter(|term| metadata_terms.contains(term))
+        .count();
+    let lower = metadata.to_ascii_lowercase();
+    covered >= query_terms.len().min(2)
+        && !["election history", "election results", "campaign"]
             .iter()
-            .any(|label| query_terms.iter().any(|term| term == label));
-    let national_presidency_matches = labels.last().is_some_and(|suffix| *suffix == "sk")
-        && query_terms.iter().any(|term| term == "slovak")
-        && query_terms.iter().any(|term| term == "president")
-        && matches!(registrable_label, "prezident" | "president");
-    national_presidency_matches || organization_matches || government_owner_matches
+            .any(|marker| lower.contains(marker))
+        && (metadata_claims_official_ownership(&lower)
+            || lower.contains("president of")
+            || lower.contains("office of the president")
+            || candidate_targets_requested_relationship(query, candidate))
 }
 
 pub(crate) fn direct_web_candidate(url: &Url) -> WebCandidate {
@@ -1818,9 +2201,10 @@ struct MainContent {
     passages: Vec<String>,
     useful_text_length: usize,
     boilerplate_ratio_basis_points: u16,
+    page_owner_identity_bound: bool,
 }
 
-fn extract_main_content(html: &str, final_url: &Url) -> MainContent {
+fn extract_main_content(html: &str, final_url: &Url, candidate: &WebCandidate) -> MainContent {
     let document = Html::parse_document(html);
     let main_selector =
         Selector::parse("main, article, [role='main'], #content, #main-content, .main-content")
@@ -1873,13 +2257,13 @@ fn extract_main_content(html: &str, final_url: &Url) -> MainContent {
         .iter()
         .find(|block| block.chars().count() <= 180)
         .cloned();
-    if let Some(title) = document
+    let page_title = document
         .select(&title_selector)
         .next()
         .map(|element| normalized_element_text(&element))
-        .filter(|title| !title.is_empty())
-    {
-        let title_key = normalized_dedup_text(&title);
+        .filter(|title| !title.is_empty());
+    if let Some(title) = page_title.as_ref() {
+        let title_key = normalized_dedup_text(title);
         let duplicates_heading = heading.as_ref().is_some_and(|heading| {
             let heading_key = normalized_dedup_text(heading);
             title_key == heading_key
@@ -1889,7 +2273,7 @@ fn extract_main_content(html: &str, final_url: &Url) -> MainContent {
         if !duplicates_heading {
             blocks.retain(|block| normalized_dedup_text(block) != title_key);
             seen.insert(title_key);
-            blocks.insert(0, title);
+            blocks.insert(0, title.clone());
         }
     }
 
@@ -1914,7 +2298,79 @@ fn extract_main_content(html: &str, final_url: &Url) -> MainContent {
         passages: split_bounded_passages(&blocks),
         useful_text_length,
         boilerplate_ratio_basis_points,
+        page_owner_identity_bound: fetched_primary_identity_matches_discovery(
+            candidate,
+            page_title.as_deref(),
+            page_heading.as_deref(),
+        ),
     }
+}
+
+fn fetched_primary_identity_matches_discovery(
+    candidate: &WebCandidate,
+    page_title: Option<&str>,
+    page_heading: Option<&str>,
+) -> bool {
+    let discovery = format!("{} {}", candidate.title, candidate.snippet).to_ascii_lowercase();
+    [page_title, page_heading]
+        .into_iter()
+        .flatten()
+        .filter(|value| institutional_primary_identity(value))
+        .any(|primary_identity| {
+            let discovery_terms = normalized_ranking_terms(&discovery);
+            let primary_terms = normalized_ranking_terms(primary_identity);
+            discovery_terms
+                .iter()
+                .filter(|term| primary_terms.contains(term))
+                .count()
+                >= 2
+        })
+}
+
+fn institutional_primary_identity(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.split_whitespace().count() > 14
+        || [
+            " releases ",
+            " released ",
+            " announces ",
+            " announced ",
+            " says ",
+            " statement ",
+            " report ",
+            " reports ",
+            " news ",
+            " profile ",
+            " biography ",
+            " election ",
+            " campaign ",
+        ]
+        .iter()
+        .any(|marker| format!(" {lower} ").contains(marker))
+    {
+        return false;
+    }
+    let identity_segments = lower
+        .split(['|', '—', '–'])
+        .flat_map(|segment| segment.split(" - "))
+        .map(str::trim);
+    identity_segments.into_iter().any(|segment| {
+        [
+            "office of the president",
+            "president of the slovak republic",
+            "presidential office",
+            "official site",
+            "official website",
+            "official homepage",
+            "city office",
+            "government office",
+            "ministry of",
+            "municipality of",
+            "city of",
+        ]
+        .iter()
+        .any(|marker| segment.starts_with(marker))
+    })
 }
 
 fn extract_structured_passages(
@@ -2765,7 +3221,7 @@ mod tests {
         assert!(
             assess_claim_relevance(
                 query,
-                "Bratislava's 2026 population is estimated at 485,917"
+                "Bratislava's 2026 city proper population is estimated at 485,917"
             )
             .eligible
         );
@@ -2783,6 +3239,50 @@ mod tests {
         );
         assert!(
             assess_claim_relevance(query, "The President of Slovakia is Peter Pellegrini.")
+                .eligible
+        );
+    }
+
+    #[test]
+    fn nonnumeric_fact_relevance_requires_an_answer_value_not_only_query_terms() {
+        let query = "What is the capital of Slovakia?";
+
+        assert!(!assess_claim_relevance(query, "Slovakia capital").eligible);
+        assert!(!assess_claim_relevance(query, "Navigation: Slovakia capital").eligible);
+        assert!(
+            !assess_claim_relevance(query, "Navigation: Slovakia capital — Read more").eligible
+        );
+        assert!(!assess_claim_relevance(query, "Slovakia capital: Read more").eligible);
+        assert!(!assess_claim_relevance(query, "Slovakia capital: View details").eligible);
+        assert!(!assess_claim_relevance(query, "Slovakia capital: Explore").eligible);
+        assert!(
+            !assess_claim_relevance(query, "The capital of Slovakia is described here.").eligible
+        );
+        assert!(assess_claim_relevance(query, "Slovakia — capital: Bratislava.").eligible);
+        assert!(assess_claim_relevance(query, "The capital of Slovakia is Bratislava.").eligible);
+    }
+
+    #[test]
+    fn office_holder_relevance_requires_a_named_person_value() {
+        let query = "Who is the current President of Slovakia?";
+
+        assert!(
+            !assess_claim_relevance(query, "The President of Slovakia is available online.")
+                .eligible
+        );
+        assert!(
+            !assess_claim_relevance(query, "The President of Slovakia is Available Online.")
+                .eligible
+        );
+        assert!(
+            !assess_claim_relevance(
+                query,
+                "Read More: The President of Slovakia is available online."
+            )
+            .eligible
+        );
+        assert!(
+            assess_claim_relevance(query, "Peter Pellegrini is the President of Slovakia.")
                 .eligible
         );
     }
@@ -2811,7 +3311,7 @@ mod tests {
     fn relevant_national_presidency_candidate_is_preferred_but_not_accepted_by_domain_alone() {
         let query = "Who is the President of Slovakia? Use the official first-party website.";
         let mut official = candidate("https://www.prezident.sk/en/", WebProvider::Tavily, 4);
-        official.title = "President of the Slovak Republic".to_string();
+        official.title = "Official website of the President of the Slovak Republic".to_string();
         let mut unrelated = candidate(
             "https://elections.example/presidential-election",
             WebProvider::Tavily,
@@ -3201,6 +3701,369 @@ mod tests {
             evidence.quality.low_quality_reason,
             Some(ExtractionLowQualityReason::NoClaimRelevantPassage)
         );
+    }
+
+    #[tokio::test]
+    async fn population_figure_with_multiple_unbound_reference_years_never_becomes_a_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "statistics.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Bratislava population</title></head><body><main>
+                <h1>Bratislava population</h1>
+                <p>The population of Bratislava was 475,503; reference years shown nearby are 2023 and 2024.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://statistics.example/bratislava",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "What is the current population of Bratislava?",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        let evidence = result.value.expect("fetched page");
+        assert!(evidence.passages.is_empty());
+        assert_eq!(
+            evidence.quality.low_quality_reason,
+            Some(ExtractionLowQualityReason::NoClaimRelevantPassage)
+        );
+    }
+
+    #[tokio::test]
+    async fn population_figure_with_explicitly_ambiguous_definition_never_becomes_a_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "statistics.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Bratislava population</title></head><body><main>
+                <h1>Bratislava population</h1>
+                <p>Published in 2024. Population may mean city proper or metropolitan area: 475,503.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://statistics.example/bratislava",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "What is the current population of Bratislava?",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        let evidence = result.value.expect("fetched page");
+        assert!(evidence.passages.is_empty());
+        assert_eq!(
+            evidence.quality.low_quality_reason,
+            Some(ExtractionLowQualityReason::NoClaimRelevantPassage)
+        );
+    }
+
+    #[tokio::test]
+    async fn population_figure_shared_by_competing_definition_scopes_never_becomes_a_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "statistics.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Bratislava population</title></head><body><main>
+                <h1>Bratislava population</h1>
+                <p>Bratislava city-proper and metropolitan-area population: 475,503 in 2024.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://statistics.example/bratislava",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "What is the current population of Bratislava?",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        let evidence = result.value.expect("fetched page");
+        assert!(evidence.passages.is_empty());
+        assert_eq!(
+            evidence.quality.low_quality_reason,
+            Some(ExtractionLowQualityReason::NoClaimRelevantPassage)
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_year_before_population_figure_is_not_a_reference_date() {
+        let network = MockNetwork::default();
+        network.reply(
+            "statistics.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Bratislava population</title></head><body><main>
+                <h1>Bratislava population</h1>
+                <p>Published in 2024, Bratislava's population is 475,503.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut result = typed_fetch(
+            &network,
+            &candidate(
+                "https://statistics.example/bratislava",
+                WebProvider::Tavily,
+                1,
+            ),
+        )
+        .await;
+        crate::evidence::orchestrator::rank_fact_passages(
+            "What is the current population of Bratislava?",
+            result.value.as_mut().expect("fetched page"),
+        );
+
+        let evidence = result.value.expect("fetched page");
+        assert!(evidence.passages.is_empty());
+        assert_eq!(
+            evidence.quality.low_quality_reason,
+            Some(ExtractionLowQualityReason::NoClaimRelevantPassage)
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_page_identity_not_quoted_body_text_binds_discovered_owner() {
+        let official_network = MockNetwork::default();
+        official_network.reply(
+            "public-office.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>President of the Slovak Republic</title></head><body><main>
+                <h1>Office of the President of the Slovak Republic</h1>
+                <p>Peter Pellegrini is the President of the Slovak Republic.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut official = candidate(
+            "https://public-office.example/leader",
+            WebProvider::Tavily,
+            1,
+        );
+        official.title = "President of the Slovak Republic".into();
+        let official_result = typed_fetch(&official_network, &official).await;
+        assert!(
+            official_result
+                .value
+                .expect("official fetch")
+                .page_owner_identity_bound
+        );
+
+        let publisher_network = MockNetwork::default();
+        publisher_network.reply(
+            "publisher.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Profiles and biographies</title></head><body><main>
+                <h1>Biography of a public official</h1>
+                <p>The Office of the President released a public schedule.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut publisher = candidate("https://publisher.example/profile", WebProvider::Tavily, 1);
+        publisher.title = "Official website of the President of the Slovak Republic".into();
+        let publisher_result = typed_fetch(&publisher_network, &publisher).await;
+        assert!(
+            !publisher_result
+                .value
+                .expect("publisher fetch")
+                .page_owner_identity_bound
+        );
+
+        let topical_network = MockNetwork::default();
+        topical_network.reply(
+            "topical-publisher.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Office of the President of the Slovak Republic releases statement</title></head><body><main>
+                <h1>Office of the President of the Slovak Republic releases statement</h1>
+                <p>Peter Pellegrini is the President of the Slovak Republic.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut topical = candidate(
+            "https://topical-publisher.example/profile",
+            WebProvider::Tavily,
+            1,
+        );
+        topical.title = "President of the Slovak Republic".into();
+        assert!(
+            !typed_fetch(&topical_network, &topical)
+                .await
+                .value
+                .expect("topical publisher fetch")
+                .page_owner_identity_bound
+        );
+
+        let descriptive_network = MockNetwork::default();
+        descriptive_network.reply(
+            "city-publisher.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Population of the City of Bratislava</title></head><body><main>
+                <h1>Population of the City of Bratislava</h1>
+                <p>City proper population was 475,503 as of 2024.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut descriptive = candidate(
+            "https://city-publisher.example/population",
+            WebProvider::Tavily,
+            1,
+        );
+        descriptive.title = "Population of the City of Bratislava".into();
+        assert!(
+            !typed_fetch(&descriptive_network, &descriptive)
+                .await
+                .value
+                .expect("descriptive publisher fetch")
+                .page_owner_identity_bound
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_primary_heading_can_bind_owner_when_generic_title_does_not() {
+        let network = MockNetwork::default();
+        network.reply(
+            "public-office.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Office of the President | Home</title></head><body><main>
+                <h1>Office of the President of the Slovak Republic</h1>
+                <p>Peter Pellegrini is the President of the Slovak Republic.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut discovered = candidate(
+            "https://public-office.example/leader",
+            WebProvider::Tavily,
+            1,
+        );
+        discovered.title = "President of the Slovak Republic".into();
+
+        assert!(
+            typed_fetch(&network, &discovered)
+                .await
+                .value
+                .expect("official fetch")
+                .page_owner_identity_bound
+        );
+    }
+
+    #[tokio::test]
+    async fn institutional_title_suffix_and_pronoun_bound_biography_form_official_holder_claim() {
+        let network = MockNetwork::default();
+        network.reply(
+            "public-office.example",
+            Ok(response(
+                200,
+                "text/html",
+                r#"<html><head><title>Advisers | President of the Slovak Republic</title></head>
+                <body><main><h1>Advisers</h1>
+                <p>Peter Pellegrini was born in Banská Bystrica. He was elected President of the Slovak Republic in 2024 and assumed office in June 2024.</p>
+                </main></body></html>"#,
+            )),
+        );
+        let mut discovered = candidate(
+            "https://public-office.example/en/advisers",
+            WebProvider::Tavily,
+            1,
+        );
+        discovered.title = "Advisers | President of the Slovak Republic".into();
+        discovered.snippet =
+            "Peter Pellegrini was born in Banská Bystrica. He was elected President of the Slovak Republic."
+                .into();
+        let mut fetched = typed_fetch(&network, &discovered).await;
+        let evidence = fetched.value.as_mut().expect("official fetch");
+        assert!(evidence.page_owner_identity_bound);
+
+        crate::evidence::orchestrator::rank_fact_passages(
+            "Who is the current President of Slovakia?",
+            evidence,
+        );
+
+        assert!(
+            evidence
+                .passages
+                .iter()
+                .any(|passage| passage.text.contains("Peter Pellegrini")),
+            "pronoun-bound lifecycle claim should remain grounded in its named biography passage"
+        );
+    }
+
+    #[test]
+    fn institutional_name_pair_is_not_a_pronoun_antecedent_for_an_office_holder_claim() {
+        assert!(!passage_contains_office_holder_name(
+            "White House issued a statement. He was elected President of Slovakia."
+        ));
+        assert!(!passage_contains_office_holder_name(
+            "White House reported that Alex was born in 1980. He was elected President of Slovakia."
+        ));
+    }
+
+    #[test]
+    fn competing_biographical_names_do_not_bind_a_pronoun_holder_claim() {
+        assert!(!passage_contains_office_holder_name(
+            "Alice Adams introduced Carol Clark, who was born in London. She was elected President of Slovakia."
+        ));
+    }
+
+    #[test]
+    fn population_association_rejects_publication_context_and_unscoped_yearless_estimates() {
+        assert!(!population_passage_has_unambiguous_figure(
+            "Published in 2024, population was 475,503."
+        ));
+        assert!(!population_passage_has_unambiguous_figure(
+            "Population was 475,503 in a report published in 2024."
+        ));
+        assert!(!population_passage_has_unambiguous_figure(
+            "City proper population was 475,503 in 2024 publication."
+        ));
+        assert!(!population_passage_has_unambiguous_figure(
+            "Population was 475,503 in 2024."
+        ));
+        assert!(!population_passage_has_unambiguous_figure(
+            "Official population estimate: 475,503."
+        ));
+        assert!(population_passage_has_unambiguous_figure(
+            "City proper population was 475,503."
+        ));
+        assert!(population_passage_has_unambiguous_figure(
+            "City proper population was 475,503 as of 2024-12-31."
+        ));
+        assert!(population_passage_has_unambiguous_figure(
+            "City proper population was 475,503 as of 2024/12/31."
+        ));
     }
 
     #[tokio::test]
@@ -4220,6 +5083,7 @@ mod tests {
                     useful_text_length: u64::from(extraction == ExtractionStatus::Readable) * 8,
                     ..Default::default()
                 },
+                page_owner_identity_bound: false,
                 authority: SourceAuthority::FirstParty,
                 source_identity: source_identity_for(&candidate.requested_url),
                 passages: if extraction == ExtractionStatus::Readable {

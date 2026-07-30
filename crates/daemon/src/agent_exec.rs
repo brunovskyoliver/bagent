@@ -2744,16 +2744,21 @@ fn deterministic_fact_claim(query: &str, item: &crate::evidence::WebBundleItem) 
     if item.evidence.quality.low_quality_reason.is_some() {
         return None;
     }
-    item.evidence.passages.iter().find_map(|passage| {
+    for passage in &item.evidence.passages {
         let sentences = sentence_like_chunks(&passage.text);
-        sentences
-            .into_iter()
-            .find(|sentence| {
-                structurally_supported_fact_claim(sentence)
-                    && assess_claim_relevance(query, sentence).eligible
-            })
-            .and_then(|sentence| concise_sentence_prefix(sentence, 260))
-    })
+        for width in 1..=sentences.len().min(2) {
+            for adjacent in sentences.windows(width) {
+                let claim = adjacent.join(" ");
+                if assess_claim_relevance(query, &claim).eligible {
+                    let normalized = claim.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !normalized.is_empty() {
+                        return Some(truncate_at_word(&normalized, 260));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 struct DeterministicConflictClaim {
@@ -2937,68 +2942,6 @@ fn contains_non_year_number(value: &str) -> bool {
                     .is_ok_and(|year| (1900..=2100).contains(&year)))
         }
     })
-}
-
-fn structurally_supported_fact_claim(value: &str) -> bool {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if [
-        "navigation",
-        "menu",
-        "cookie settings",
-        "privacy policy",
-        "skip to content",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
-        return false;
-    }
-
-    let words = trimmed.split_whitespace().collect::<Vec<_>>();
-    let numeric_words = words
-        .iter()
-        .filter(|word| word.chars().any(|character| character.is_ascii_digit()))
-        .count();
-    let lexical_words = words
-        .iter()
-        .filter(|word| word.chars().any(|character| character.is_alphabetic()))
-        .count();
-    let has_sentence_punctuation = trimmed.ends_with(['.', '!', '?']);
-    let has_factual_relation = [
-        " is ",
-        " are ",
-        " was ",
-        " were ",
-        " has ",
-        " have ",
-        " reports ",
-        " reported ",
-        " estimates ",
-        " estimated ",
-        " reached ",
-        " stood at ",
-        " serves as ",
-        " was elected ",
-        " elected president ",
-        " assumed office ",
-        " took office ",
-        " became president ",
-    ]
-    .iter()
-    .any(|relation| format!(" {lower} ").contains(relation));
-
-    // Flattened tables and title/navigation concatenations can contain relevant
-    // terms and many values, but do not preserve which date or definition owns
-    // each value. Only sentence-like prose with an explicit factual relation is
-    // eligible for deterministic rendering.
-    if numeric_words >= 2 && lexical_words <= numeric_words {
-        return false;
-    }
-    has_factual_relation && (has_sentence_punctuation || lexical_words >= 5)
 }
 
 fn sentence_like_chunks(value: &str) -> Vec<&str> {
@@ -6280,7 +6223,7 @@ mod tests {
 
         let mut results = fixtures::two_independent_readable_pages();
         results.web_fetches[0].value.as_mut().unwrap().passages[0].text =
-            "The population of Bratislava was 475,503 at the end of 2024.".into();
+            "The city proper population of Bratislava was 475,503 at the end of 2024.".into();
         results.web_fetches[1].value.as_mut().unwrap().passages[0].text =
             "The urban-area population estimate for Bratislava was 440,948 in 2025.".into();
         results.conflicts.push(EvidenceConflict {
@@ -6306,7 +6249,7 @@ mod tests {
         assert!(rendered.contains("440,948"));
         assert!(rendered.contains("unresolved conflicting figures"));
         assert!(rendered.contains(
-            "- source: publisher-example; reported figure: 475,503; reference date: end of 2024."
+            "- source: publisher-example; reported figure: 475,503; reference date: end of 2024; population definition: city proper."
         ));
         assert!(rendered.contains("- source: publisher-authority; reported figure: 440,948; reference date: 2025; population definition: urban area."));
         assert!(rendered.contains("[Source](https://example.com/final)"));
@@ -6362,6 +6305,108 @@ mod tests {
             canonical.outcome_status,
             crate::evidence::CanonicalOutcomeStatus::Conflict
         );
+    }
+
+    #[test]
+    fn complete_corroborated_bundle_with_adjacent_context_renders_verified_with_two_citations() {
+        use crate::evidence::{fixtures, EvidenceValidator, VerificationLevel};
+
+        let mut results = fixtures::two_independent_readable_pages();
+        results.web_fetches[0].value.as_mut().unwrap().passages[0].text =
+            "President of Slovakia.\nPeter Pellegrini was elected the country's next head of state."
+                .into();
+        results.web_fetches[1].value.as_mut().unwrap().passages[0].text =
+            "President of Slovakia.\nPeter Pellegrini assumed office on 15 June 2024.".into();
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Who is the current President of Slovakia? Verify the answer with two independent publishers."
+                .into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        let ValidationOutcome::Bundle(bundle) =
+            EvidenceValidator::validate("turn-complete-corroborated-context", &plan, results)
+        else {
+            panic!("two independently grounded claims should validate");
+        };
+        assert_eq!(bundle.completeness, Completeness::Complete);
+        assert_eq!(bundle.web.len(), 2);
+        assert_eq!(bundle.citation_allowlist.len(), 2);
+
+        let canonical = canonical_web_answer(&bundle);
+
+        assert_eq!(
+            canonical.outcome_status,
+            crate::evidence::CanonicalOutcomeStatus::Verified,
+            "{}",
+            canonical.text
+        );
+        assert_eq!(canonical.covered_evidence_ids.len(), 2);
+        assert_eq!(canonical.citation_targets.len(), 2);
+        assert!(!canonical.text.starts_with("Verification Shortfall:"));
+    }
+
+    #[test]
+    fn complete_stands_at_population_claims_render_verified_with_two_citations() {
+        use crate::evidence::{fixtures, EvidenceValidator, VerificationLevel};
+
+        let mut results = fixtures::two_independent_readable_pages();
+        results.web_fetches[0].value.as_mut().unwrap().passages[0].text =
+            "Bratislava city proper population stands at 475,503 as of 2024.".into();
+        results.web_fetches[1].value.as_mut().unwrap().passages[0].text =
+            "Bratislava city proper population stands at 475,503 as of 2024.".into();
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current city proper population of Bratislava? Verify it with two independent publishers."
+                .into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        let ValidationOutcome::Bundle(bundle) =
+            EvidenceValidator::validate("turn-complete-stands-at", &plan, results)
+        else {
+            panic!("two independently grounded claims should validate");
+        };
+
+        let canonical = canonical_web_answer(&bundle);
+
+        assert_eq!(
+            canonical.outcome_status,
+            crate::evidence::CanonicalOutcomeStatus::Verified,
+            "{}",
+            canonical.text
+        );
+        assert_eq!(canonical.covered_evidence_ids.len(), 2);
+        assert_eq!(canonical.citation_targets.len(), 2);
+    }
+
+    #[test]
+    fn complete_validated_capital_claims_render_verified_with_two_citations() {
+        use crate::evidence::{fixtures, EvidenceValidator, VerificationLevel};
+
+        let mut results = fixtures::two_independent_readable_pages();
+        results.web_fetches[0].value.as_mut().unwrap().passages[0].text =
+            "Slovakia — capital: Bratislava.".into();
+        results.web_fetches[1].value.as_mut().unwrap().passages[0].text =
+            "Slovakia — capital: Bratislava.".into();
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the capital of Slovakia? Verify it with two independent publishers."
+                .into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        let ValidationOutcome::Bundle(bundle) =
+            EvidenceValidator::validate("turn-complete-capital", &plan, results)
+        else {
+            panic!("two independently grounded claims should validate");
+        };
+        assert_eq!(bundle.completeness, Completeness::Complete);
+
+        let canonical = canonical_web_answer(&bundle);
+
+        assert_eq!(
+            canonical.outcome_status,
+            crate::evidence::CanonicalOutcomeStatus::Verified,
+            "{}",
+            canonical.text
+        );
+        assert_eq!(canonical.covered_evidence_ids.len(), 2);
+        assert_eq!(canonical.citation_targets.len(), 2);
     }
 
     #[test]
@@ -6433,28 +6478,6 @@ mod tests {
         .expect("nearest explicit survey date must own the refined figure");
         assert_eq!(refined.reported_figure, "8,848.86");
         assert_eq!(refined.reference_date.as_deref(), Some("2020"));
-    }
-
-    #[test]
-    fn deterministic_fact_claim_rejects_navigation_and_title_concatenation() {
-        assert!(!structurally_supported_fact_claim(
-            "Bratislava Population City statistics Navigation Menu Privacy Policy 475,503"
-        ));
-        assert!(!structurally_supported_fact_claim(
-            "Bratislava 442,197 428,672 411,228 475,503 480,902"
-        ));
-        assert!(structurally_supported_fact_claim(
-            "The population of Bratislava was 475,503 at the end of 2024."
-        ));
-        assert!(structurally_supported_fact_claim(
-            "The urban-area population estimate for Bratislava was 440,948 in 2025."
-        ));
-        assert!(structurally_supported_fact_claim(
-            "President of the Slovak Republic: Peter Pellegrini: Assumed office on 15 June 2024."
-        ));
-        assert!(structurally_supported_fact_claim(
-            "Peter Pellegrini is the President of Slovakia"
-        ));
     }
 
     #[test]
