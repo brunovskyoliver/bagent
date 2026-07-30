@@ -5123,6 +5123,11 @@ fn normalized_legacy_model_error_code(error: &str) -> &'static str {
             BaseRtRuntimeFault::MetalDevice => "model_unavailable_metal_device",
             BaseRtRuntimeFault::MetalCommandBuffer => "model_unavailable_metal_command_buffer",
         }
+    } else if normalized.starts_with("basert error:")
+        || normalized.starts_with("basert stream read")
+        || normalized.starts_with("post /v1/chat/completions: http 5")
+    {
+        "model_unavailable_basert"
     } else if normalized.contains("timed out") || normalized.contains("timeout") {
         "model_unavailable_timeout"
     } else {
@@ -5254,6 +5259,10 @@ mod tests {
         assert_eq!(
             normalized_legacy_model_error_code("device removed by provider"),
             "model_error"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("BaseRT error: generation failed"),
+            "model_unavailable_basert"
         );
         assert_eq!(
             normalized_legacy_model_error_code("request timed out"),

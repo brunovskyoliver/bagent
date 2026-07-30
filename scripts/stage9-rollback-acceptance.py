@@ -297,6 +297,7 @@ def main() -> None:
             "model_unavailable_metal_device",
             "model_unavailable_metal_command_buffer",
             "model_unavailable_timeout",
+            "model_unavailable_basert",
         }
         error_codes = event_summary["error_codes"]
         if "error" in event_types and (
