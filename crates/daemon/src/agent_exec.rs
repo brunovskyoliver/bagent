@@ -978,9 +978,6 @@ fn web_fact_has_supported_structure(outer_request: &str) -> bool {
 fn fact_query_is_supported(tokens: &[&str]) -> bool {
     let mut entity_context = false;
     let mut entity_tokens: Vec<&str> = Vec::new();
-    let last_fact_topic = tokens
-        .iter()
-        .rposition(|token| is_supported_web_fact_topic_word(&token.to_lowercase()));
     let mut index = 0;
     while index < tokens.len() {
         let token = tokens[index];
@@ -1029,10 +1026,7 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
         {
             if (is_known_agentic_command_word(&lower)
                 && !is_supported_web_fact_topic_word(&lower)
-                && !is_supported_command_homonym_noun(&lower)
-                && ((index + 1 < tokens.len()
-                    && last_fact_topic.is_none_or(|topic| index > topic))
-                    || index + 1 == tokens.len()))
+                && !is_supported_command_noun_at(tokens, index))
                 || !token
                     .chars()
                     .all(|character| character.is_alphanumeric() || character == '-')
@@ -1122,15 +1116,29 @@ fn entity_phrase_is_supported(tokens: &[&str]) -> bool {
         if !is_known_agentic_command_word(&lower) || is_supported_web_fact_topic_word(&lower) {
             return false;
         }
-        !is_supported_command_homonym_noun(&lower)
-            && !tokens[index + 1..]
-                .iter()
-                .any(|next| is_supported_web_fact_topic_word(&next.to_lowercase()))
+        !is_supported_command_noun_at(tokens, index)
     })
 }
 
-fn is_supported_command_homonym_noun(token: &str) -> bool {
-    matches!(token, "switch")
+fn is_supported_command_noun_at(tokens: &[&str], index: usize) -> bool {
+    let lower = tokens[index].to_lowercase();
+    let next = tokens.get(index + 1).map(|token| token.to_lowercase());
+    let next_next = tokens.get(index + 2).map(|token| token.to_lowercase());
+    match lower.as_str() {
+        "archive" => next.as_deref() == Some("format"),
+        "download" => next.as_deref() == Some("speed"),
+        "export" => matches!(next.as_deref(), Some("price" | "prices")),
+        "install" => next.as_deref() == Some("size"),
+        "open" => next.as_deref() == Some("source") && next_next.as_deref() == Some("license"),
+        "restart" => next.as_deref() == Some("policy"),
+        "run" => next.as_deref() == Some("time"),
+        "switch" => {
+            index > 0
+                && tokens[index - 1].eq_ignore_ascii_case("nintendo")
+                && index + 1 == tokens.len()
+        }
+        _ => false,
+    }
 }
 
 fn entity_conjunction_phrase_is_supported(tokens: &[&str]) -> bool {
@@ -5618,6 +5626,9 @@ mod tests {
             "what is the current open source license?",
             "what is the current download speed online?",
             "what is the current restart policy?",
+            "what is the current install size of X?",
+            "what is the current archive format?",
+            "what is the current run time online?",
             "what is the current price of Nintendo Switch?",
             "what is the current price of nintendo switch?",
             "what is the current weather",
@@ -5710,6 +5721,8 @@ mod tests {
             "what is the current GDP Restart?",
             "what is the current price of Nintendo Switch restart?",
             "what is the current price of Nintendo Switch restart server?",
+            "what is the current price of Nintendo open weather app?",
+            "what is the current weather switch account?",
             "what is the population of France and Germany delete file?",
             "compare prices of Apple and Microsoft and browse website",
             "compare prices of Apple and Microsoft browse website",
@@ -5718,6 +5731,7 @@ mod tests {
             "compare prices of Apple and Microsoft browse Google",
             "compare prices of Apple and Microsoft browse browser",
             "compare prices of Apple and Microsoft delete account",
+            "compare prices of Apple and Microsoft open weather app",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
