@@ -1139,6 +1139,7 @@ fn is_supported_command_noun_at(tokens: &[&str], index: usize) -> bool {
         "open" => next.as_deref() == Some("source") && next_next.as_deref() == Some("license"),
         "restart" => next.as_deref() == Some("policy"),
         "run" => next.as_deref() == Some("time"),
+        "show" => matches!(next.as_deref(), Some("time" | "times")),
         "switch" => {
             index > 0
                 && tokens[index - 1].eq_ignore_ascii_case("nintendo")
@@ -1150,7 +1151,7 @@ fn is_supported_command_noun_at(tokens: &[&str], index: usize) -> bool {
 }
 
 fn is_supported_fact_request_verb(token: &str) -> bool {
-    matches!(token, "check" | "find" | "tell" | "verify")
+    matches!(token, "check" | "find" | "give" | "tell" | "verify")
 }
 
 fn fact_request_verb_is_leading(tokens: &[&str], index: usize) -> bool {
@@ -1246,6 +1247,7 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "flag"
             | "find"
             | "forward"
+            | "give"
             | "install"
             | "inspect"
             | "launch"
@@ -5677,6 +5679,7 @@ mod tests {
             "check the current price of service A online?",
             "can you find the current population of Bratislava online?",
             "tell me the current weather online?",
+            "what are the current show times for Wicked online?",
             "what is the current price of Nintendo Switch?",
             "what is the current price of nintendo switch?",
             "what is the current weather",
@@ -5780,6 +5783,8 @@ mod tests {
             "what is the current service available online check my files?",
             "what is available online tell me what is in my file?",
             "what is online find my notes?",
+            "what is the current weather give me my project file?",
+            "what is the current weather give me my notes?",
             "what is the population of France and Germany delete file?",
             "compare prices of Apple and Microsoft and browse website",
             "compare prices of Apple and Microsoft browse website",
