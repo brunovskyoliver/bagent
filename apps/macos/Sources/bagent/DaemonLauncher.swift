@@ -5,6 +5,15 @@ import Darwin
 enum DaemonLaunchAgent {
     static let label = "com.bagent.daemon"
 
+    private static func xmlEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+    }
+
     static func runtimeEnvironment(processEnvironment: [String: String]) -> [String: String] {
         var environment = [
             "BAGENT_BASERT_BASE_URL": "http://127.0.0.1:8082/v1",
@@ -42,7 +51,9 @@ enum DaemonLaunchAgent {
     static func plistContent(binaryPath: String, environment: [String: String]) -> String {
         let envEntries = environment
             .sorted { $0.key < $1.key }
-            .map { "        <key>\($0.key)</key>\n        <string>\($0.value)</string>" }
+            .map {
+                "        <key>\(xmlEscaped($0.key))</key>\n        <string>\(xmlEscaped($0.value))</string>"
+            }
             .joined(separator: "\n")
         return """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -53,7 +64,7 @@ enum DaemonLaunchAgent {
             <string>\(label)</string>
             <key>ProgramArguments</key>
             <array>
-                <string>\(binaryPath)</string>
+                <string>\(xmlEscaped(binaryPath))</string>
             </array>
             <key>EnvironmentVariables</key>
             <dict>
@@ -67,9 +78,9 @@ enum DaemonLaunchAgent {
                 <false/>
             </dict>
             <key>StandardOutPath</key>
-            <string>\(logURL.path)</string>
+            <string>\(xmlEscaped(logURL.path))</string>
             <key>StandardErrorPath</key>
-            <string>\(logURL.path)</string>
+            <string>\(xmlEscaped(logURL.path))</string>
         </dict>
         </plist>
         """

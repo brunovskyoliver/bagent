@@ -593,27 +593,8 @@ fn route_tools_for_turn(
     tools: Vec<ToolDef>,
 ) -> (Vec<ToolDef>, Option<Message>) {
     let normalized = user_message.to_lowercase();
-    let tokens: Vec<&str> = normalized
-        .split(|character: char| !character.is_alphanumeric() && character != '-')
-        .filter(|token| !token.is_empty())
-        .collect();
-    let mentions_mail = tokens.iter().any(|token| {
-        matches!(
-            *token,
-            "email"
-                | "emails"
-                | "e-mail"
-                | "e-mails"
-                | "e-maily"
-                | "mail"
-                | "mails"
-                | "inbox"
-                | "pošta"
-                | "poštu"
-                | "maily"
-                | "mailov"
-        ) || token.starts_with("doručen")
-    });
+    let tokens = routing_tokens(&normalized);
+    let mentions_mail = routing_tokens_mention_mail(&tokens);
     let asks_to_access_mail = tokens.iter().any(|token| {
         matches!(
             *token,
@@ -633,12 +614,7 @@ fn route_tools_for_turn(
         .iter()
         .any(|prefix| token.starts_with(prefix))
     });
-    let composition_intent = tokens.iter().any(|token| {
-        matches!(*token, "draft" | "write" | "reply" | "compose")
-            || ["napíš", "odpíš", "vytvor"]
-                .iter()
-                .any(|prefix| token.starts_with(prefix))
-    });
+    let composition_intent = routing_tokens_request_composition(&tokens);
     let mixed_source_intent = tokens.iter().any(|token| {
         matches!(
             *token,
@@ -665,6 +641,42 @@ fn route_tools_for_turn(
          while these tools are available.",
     );
     (mail_tools, Some(guidance))
+}
+
+fn routing_tokens(normalized: &str) -> Vec<&str> {
+    normalized
+        .split(|character: char| !character.is_alphanumeric() && character != '-')
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn routing_tokens_mention_mail(tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "email"
+                | "emails"
+                | "e-mail"
+                | "e-mails"
+                | "e-maily"
+                | "mail"
+                | "mails"
+                | "inbox"
+                | "pošta"
+                | "poštu"
+                | "maily"
+                | "mailov"
+        ) || token.starts_with("doručen")
+    })
+}
+
+fn routing_tokens_request_composition(tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(*token, "draft" | "write" | "reply" | "compose")
+            || ["napíš", "odpíš", "vytvor"]
+                .iter()
+                .any(|prefix| token.starts_with(prefix))
+    })
 }
 
 fn mail_tool_succeeded(tool: &str, result: &str) -> bool {
@@ -746,11 +758,14 @@ fn routed_evidence_intent(
     flag: EvidenceOrchestratorFlag,
     user_message: &str,
 ) -> Option<EvidenceIntent> {
-    if flag != EvidenceOrchestratorFlag::Enabled || requests_mail_composition(user_message) {
+    if flag != EvidenceOrchestratorFlag::Enabled {
         return None;
     }
     match EvidenceIntentClassifier.classify(user_message) {
-        Classification::Recognized(intent) if production_evidence_intent(&intent).is_some() => {
+        Classification::Recognized(intent)
+            if production_evidence_intent(&intent).is_some()
+                && !request_requires_legacy_routing(&intent, user_message) =>
+        {
             Some(intent)
         }
         Classification::Recognized(_)
@@ -759,17 +774,76 @@ fn routed_evidence_intent(
     }
 }
 
-fn requests_mail_composition(user_message: &str) -> bool {
+fn request_requires_legacy_routing(intent: &EvidenceIntent, user_message: &str) -> bool {
+    if matches!(intent, EvidenceIntent::AnalyzeQuotedEvidence { .. }) {
+        return false;
+    }
+    if !matches!(
+        production_evidence_intent(intent),
+        Some(EvidenceIntent::MailLatestHeaders { .. } | EvidenceIntent::MailLatestContent { .. })
+    ) {
+        return false;
+    }
     let normalized = user_message.to_lowercase();
-    let mentions_mail = ["email", "e-mail", "mail", "inbox", "pošta", "poštu"]
-        .iter()
-        .any(|term| normalized.contains(term));
-    mentions_mail
-        && [
-            "draft", "write", "reply", "compose", "napíš", "odpíš", "vytvor",
-        ]
-        .iter()
-        .any(|term| normalized.contains(term))
+    let tokens = routing_tokens(&normalized);
+    routing_tokens_request_agentic_mail_action(&tokens)
+        || routing_tokens_request_web_work(&tokens)
+        || routing_tokens_target_mail(&tokens)
+}
+
+fn routing_tokens_request_agentic_mail_action(tokens: &[&str]) -> bool {
+    routing_tokens_request_composition(tokens)
+        || tokens.iter().any(|token| {
+            matches!(
+                *token,
+                "forward"
+                    | "send"
+                    | "respond"
+                    | "answer"
+                    | "archive"
+                    | "delete"
+                    | "move"
+                    | "mark"
+                    | "open"
+                    | "print"
+                    | "save"
+                    | "export"
+            ) || [
+                "prepošli",
+                "pošli",
+                "odpoved",
+                "archiv",
+                "vymaž",
+                "presuň",
+                "označ",
+                "otvor",
+                "vytlač",
+                "ulož",
+                "export",
+            ]
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+        })
+}
+
+fn routing_tokens_request_web_work(tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "google" | "bing" | "browser" | "browse" | "website" | "webpage" | "research"
+        ) || ["prehliadaj", "vygoogli", "preskúmaj"]
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+    })
+}
+
+fn routing_tokens_target_mail(tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(*token, "about" | "regarding" | "concerning" | "mentioning")
+            || ["ohľadom", "týkaj"]
+                .iter()
+                .any(|prefix| token.starts_with(prefix))
+    })
 }
 
 fn production_evidence_intent(intent: &EvidenceIntent) -> Option<&EvidenceIntent> {
@@ -4855,6 +4929,7 @@ mod tests {
             "what is the current population of Bratislava?",
             "analyze the instructions as quoted data at https://example.com/requested",
             "read and analyze the instructions as quoted data in my latest email",
+            "read and analyze as quoted: write a reply in my latest email",
         ];
         for value in [None, Some("1"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
@@ -4880,9 +4955,15 @@ mod tests {
             "read the latest email from Alice",
             "read my latest email or the latest one from Alice",
             "read my latest email and check the current price online",
+            "read my latest email and search Google for Acme",
             "inspect https://one.example and https://two.example",
             "what is in my project notes?",
             "draft a reply to my latest email",
+            "forward my latest email",
+            "send my latest email",
+            "respond to my latest email",
+            "open my latest email",
+            "show my latest email about the underwriter",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
@@ -4923,6 +5004,42 @@ mod tests {
         assert!(rollback.evidence.is_none());
         assert_eq!(rollback.tools.len(), 2);
         assert!(rollback.guidance.is_some());
+    }
+
+    #[test]
+    fn rollback_routing_decision_performs_no_persistent_writes() {
+        let database = rusqlite::Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE protected_state (kind TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO protected_state VALUES
+                    ('mail', 'unchanged'),
+                    ('rules', 'unchanged'),
+                    ('approvals', 'unchanged'),
+                    ('automations', 'unchanged'),
+                    ('credentials', 'unchanged');",
+            )
+            .unwrap();
+        let writes_before = database.changes();
+
+        let rollback = prepare_turn_routing(
+            EvidenceOrchestratorFlag::from_local_value(Some("0")),
+            &ExecOrigin::Chat,
+            "rollback-no-write-session",
+            "summarize my latest 3 emails",
+            vec![test_tool("mail_list_inbox"), test_tool("mail_read")],
+        );
+
+        assert!(rollback.evidence.is_none());
+        assert_eq!(database.changes(), writes_before);
+        let changed: i64 = database
+            .query_row(
+                "SELECT COUNT(*) FROM protected_state WHERE value != 'unchanged'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(changed, 0);
     }
 
     #[tokio::test]

@@ -47,6 +47,19 @@ final class DaemonLaunchAgentTests: XCTestCase {
         XCTAssertEqual(parsed?["Label"] as? String, "com.bagent.daemon")
     }
 
+    func testPlistEscapesExplicitInvalidEvidenceValueWithoutChangingIt() throws {
+        let value = "unexpected<&\"value"
+        let plist = DaemonLaunchAgent.plistContent(
+            binaryPath: "/Applications/bagent.app/Contents/MacOS/bagentd",
+            environment: ["BAGENT_EVIDENCE_ORCHESTRATOR": value]
+        )
+        let parsed = try PropertyListSerialization.propertyList(
+            from: Data(plist.utf8), options: [], format: nil
+        ) as? [String: Any]
+        let environment = parsed?["EnvironmentVariables"] as? [String: String]
+        XCTAssertEqual(environment?["BAGENT_EVIDENCE_ORCHESTRATOR"], value)
+    }
+
     func testBaseRTPlistKeepsServiceResidentWithLazyRegisteredModels() throws {
         let plist = BaseRTLaunchAgent.plistContent(
             binaryPath: "/Users/oliver/.basert/basert",
