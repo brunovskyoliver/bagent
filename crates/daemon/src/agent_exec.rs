@@ -5124,7 +5124,7 @@ fn normalized_legacy_model_error_code(error: &str) -> &'static str {
             BaseRtRuntimeFault::MetalCommandBuffer => "model_unavailable_metal_command_buffer",
         }
     } else if normalized.starts_with("basert error:")
-        || normalized.starts_with("basert stream read")
+        || normalized.starts_with("basert stream read:")
         || normalized.starts_with("post /v1/chat/completions: http 5")
     {
         "model_unavailable_basert"
@@ -5263,6 +5263,16 @@ mod tests {
         assert_eq!(
             normalized_legacy_model_error_code("BaseRT error: generation failed"),
             "model_unavailable_basert"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("BaseRT stream read: connection closed"),
+            "model_unavailable_basert"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code(
+                "BaseRT stream reader supplied an arbitrary failure"
+            ),
+            "model_error"
         );
         assert_eq!(
             normalized_legacy_model_error_code("request timed out"),
