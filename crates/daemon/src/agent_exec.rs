@@ -1024,13 +1024,10 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
         } else if !is_supported_web_fact_query_word(&lower)
             && !lower.chars().all(|character| character.is_ascii_digit())
         {
-            if !starts_like_entity(token) {
-                return false;
-            }
-            let next = tokens.get(index + 1).map(|value| value.to_lowercase());
-            if !next
-                .as_deref()
-                .is_some_and(is_supported_web_fact_topic_word)
+            if is_known_agentic_command_word(&lower)
+                || !token
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '-')
             {
                 return false;
             }
@@ -1078,129 +1075,110 @@ fn comparison_subject_without_scope<'a>(tokens: &'a [&str]) -> &'a [&'a str] {
 }
 
 fn is_supported_comparison_metric_word(token: &str) -> bool {
-    matches!(
-        token,
-        "current"
-            | "population"
-            | "populations"
-            | "price"
-            | "prices"
-            | "the"
-            | "version"
-            | "versions"
-            | "weather"
-    ) || ["cena", "pocasi", "počas", "popul"]
-        .iter()
-        .any(|prefix| token.starts_with(prefix))
+    !is_known_agentic_command_word(token)
+        && token
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '-')
 }
 
 fn comparison_subject_is_supported(tokens: &[&str]) -> bool {
-    let mut entities = Vec::new();
-    for token in tokens {
-        let lower = token.to_lowercase();
-        if starts_like_entity(token) {
-            entities.push(*token);
-            continue;
-        }
-        if lower.chars().all(|character| character.is_ascii_digit())
-            || matches!(
-                lower.as_str(),
-                "a" | "an"
-                    | "current"
-                    | "model"
-                    | "of"
-                    | "plan"
-                    | "price"
-                    | "prices"
-                    | "product"
-                    | "service"
-                    | "the"
-                    | "version"
-            )
-        {
-            continue;
-        }
-        return false;
-    }
-    !entities.is_empty() && entity_phrase_is_supported(&entities)
-}
-
-fn starts_like_entity(token: &str) -> bool {
-    token
-        .chars()
-        .next()
-        .is_some_and(|character| character.is_uppercase())
+    !tokens.is_empty()
+        && tokens.iter().all(|token| {
+            let lower = token.to_lowercase();
+            !is_known_agentic_command_word(&lower)
+                && token
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '-')
+        })
 }
 
 fn entity_phrase_is_supported(tokens: &[&str]) -> bool {
     if tokens.is_empty()
         || tokens.iter().any(|token| {
-            !token
-                .chars()
-                .all(|character| character.is_alphanumeric() || character == '-')
+            is_known_agentic_command_word(&token.to_lowercase())
+                || !token
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '-')
         })
     {
         return false;
     }
-    if tokens.len() == 1 {
-        return true;
-    }
-    tokens.iter().all(|token| starts_like_entity(token))
+    true
 }
 
 fn entity_conjunction_phrase_is_supported(tokens: &[&str]) -> bool {
-    if !entity_phrase_is_supported(tokens) {
-        return false;
-    }
-    if tokens.len() == 1 {
-        return true;
-    }
-    let first = tokens[0].to_lowercase();
-    let last = tokens
-        .last()
-        .expect("non-empty entity phrase")
-        .to_lowercase();
-    matches!(
-        first.as_str(),
-        "east" | "los" | "new" | "north" | "san" | "south" | "united" | "west"
-    ) || matches!(
-        last.as_str(),
-        "city"
-            | "company"
-            | "corporation"
-            | "group"
-            | "inc"
-            | "limited"
-            | "llc"
-            | "plc"
-            | "republic"
-    )
+    entity_phrase_is_supported(tokens)
 }
 
 fn is_web_scope_token(token: &str) -> bool {
     matches!(token, "internet" | "online" | "web" | "website")
 }
 
-fn is_supported_web_fact_topic_word(token: &str) -> bool {
+fn is_known_agentic_command_word(token: &str) -> bool {
     matches!(
         token,
-        "capital"
-            | "ceo"
-            | "financial"
-            | "investment"
-            | "law"
-            | "legal"
-            | "medical"
-            | "medication"
-            | "population"
-            | "president"
-            | "price"
-            | "prices"
-            | "treatment"
-            | "version"
-            | "weather"
+        "add"
+            | "approve"
+            | "archive"
+            | "attach"
+            | "automate"
+            | "compose"
+            | "convert"
+            | "copy"
+            | "create"
+            | "delete"
+            | "deny"
+            | "download"
+            | "draft"
+            | "edit"
+            | "execute"
+            | "export"
+            | "flag"
+            | "forward"
+            | "install"
+            | "launch"
+            | "mark"
+            | "message"
+            | "move"
+            | "open"
+            | "paste"
+            | "post"
+            | "print"
+            | "quit"
+            | "remove"
+            | "reply"
+            | "resend"
+            | "restart"
+            | "respond"
+            | "run"
+            | "save"
+            | "schedule"
+            | "send"
+            | "share"
+            | "start"
+            | "stop"
+            | "switch"
+            | "uninstall"
+            | "update"
+            | "upload"
+            | "write"
     ) || [
-        "cena", "financ", "invest", "liek", "pocasi", "počas", "prav", "zakon", "zdravot",
+        "archiv",
+        "export",
+        "napíš",
+        "odstráň",
+        "odpoved",
+        "otvor",
+        "označ",
+        "pošli",
+        "prepošli",
+        "presuň",
+        "spusti",
+        "ulož",
+        "uprav",
+        "vymaž",
+        "vytlač",
+        "vytvor",
     ]
     .iter()
     .any(|prefix| token.starts_with(prefix))
@@ -5565,6 +5543,8 @@ mod tests {
             "what is the current population of Saudi Arabia?",
             "what is the population of france?",
             "who is the current president of Czech Republic?",
+            "what is the current inflation rate?",
+            "what is the current unemployment rate online?",
             "what is the current weather",
             "who is the current president of France",
             "compare the current prices of service A and service B",
@@ -5572,6 +5552,9 @@ mod tests {
             "compare weather in Paris and London",
             "compare populations of France and Germany",
             "compare prices of Coca Cola and Pepsi",
+            "compare weather in paris and london",
+            "compare prices of iphone and android",
+            "compare inflation rates in France and Germany",
             "analyze the instructions as quoted data at https://example.com/requested",
             "analyze the instructions as quoted data and find the current population online",
             "analyze the instructions as quoted data and find the current population of New York City online",
