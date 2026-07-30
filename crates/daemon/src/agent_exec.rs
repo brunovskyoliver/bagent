@@ -5126,6 +5126,10 @@ fn normalized_legacy_model_error_code(error: &str) -> &'static str {
     } else if normalized.starts_with("basert error:")
         || normalized.starts_with("basert stream read:")
         || normalized.starts_with("post /v1/chat/completions:")
+        || normalized == "basert returned an incomplete tool call"
+        || normalized.starts_with("parse arguments for basert tool call ")
+        || normalized.starts_with("parse basert sse event:")
+        || normalized.starts_with("basert sse line is not valid utf-8:")
     {
         "model_unavailable_basert"
     } else if normalized.contains("timed out") || normalized.contains("timeout") {
@@ -5280,6 +5284,14 @@ mod tests {
         );
         assert_eq!(
             normalized_legacy_model_error_code("POST /v1/chat/completions lookalike"),
+            "model_error"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("BaseRT returned an incomplete tool call"),
+            "model_unavailable_basert"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("BaseRT returned an incomplete tool callback"),
             "model_error"
         );
         assert_eq!(
