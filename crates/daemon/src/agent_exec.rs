@@ -881,9 +881,15 @@ fn is_supported_web_fact_request(user_message: &str, quoted_wrapper: bool) -> bo
         normalized
     };
     let structural_request = if quoted_wrapper {
-        outer_request.as_str()
+        let Some(value) = without_double_quoted_data(user_message) else {
+            return false;
+        };
+        let Some(value) = remove_quoted_wrapper_directive_preserving_case(&value) else {
+            return false;
+        };
+        value
     } else {
-        user_message
+        user_message.to_string()
     };
     let tokens = routing_tokens(&outer_request);
     let mut meaningful = tokens
@@ -926,7 +932,7 @@ fn is_supported_web_fact_request(user_message: &str, quoted_wrapper: bool) -> bo
                     .iter()
                     .any(|prefix| token.starts_with(prefix))
         })
-        && web_fact_has_supported_structure(structural_request)
+        && web_fact_has_supported_structure(&structural_request)
 }
 
 fn web_fact_has_supported_structure(outer_request: &str) -> bool {
@@ -966,24 +972,30 @@ fn web_fact_has_supported_structure(outer_request: &str) -> bool {
     if comparing {
         return !query.contains([',', ':']) && comparison_query_is_supported(&query_tokens);
     }
-    !query.contains([',', ':']) && fact_query_is_supported(&query_tokens)
+    !query.contains([',', ':', '.']) && fact_query_is_supported(&query_tokens)
 }
 
 fn fact_query_is_supported(tokens: &[&str]) -> bool {
     let mut entity_context = false;
+    let mut entity_tokens: Vec<&str> = Vec::new();
     let mut index = 0;
     while index < tokens.len() {
         let token = tokens[index];
         let lower = token.to_lowercase();
         if lower == "and" {
             let remainder = &tokens[index + 1..];
-            if entity_context
-                && remainder
-                    .first()
-                    .is_some_and(|value| starts_like_entity(value))
-            {
-                index += 1;
-                continue;
+            if entity_context {
+                let entity_end = remainder
+                    .iter()
+                    .position(|value| is_web_scope_token(&value.to_lowercase()))
+                    .unwrap_or(remainder.len());
+                if entity_phrase_is_supported(&remainder[..entity_end])
+                    && remainder[entity_end..]
+                        .iter()
+                        .all(|value| is_web_scope_token(&value.to_lowercase()))
+                {
+                    return true;
+                }
             }
             return !remainder.is_empty()
                 && remainder.iter().all(|value| {
@@ -992,12 +1004,31 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
         }
         if matches!(lower.as_str(), "at" | "for" | "from" | "in" | "of") {
             entity_context = true;
+            entity_tokens.clear();
         }
         if !is_supported_web_fact_query_word(&lower)
             && !lower.chars().all(|character| character.is_ascii_digit())
-            && !starts_like_entity(token)
         {
-            return false;
+            if !starts_like_entity(token) {
+                return false;
+            }
+            if entity_context {
+                entity_tokens.push(token);
+                if !entity_phrase_is_supported(&entity_tokens) {
+                    return false;
+                }
+            } else {
+                let next = tokens.get(index + 1).map(|value| value.to_lowercase());
+                if !next
+                    .as_deref()
+                    .is_some_and(is_supported_web_fact_topic_word)
+                {
+                    return false;
+                }
+            }
+        } else if entity_context && is_web_scope_token(&lower) {
+            entity_context = false;
+            entity_tokens.clear();
         }
         index += 1;
     }
@@ -1013,32 +1044,39 @@ fn comparison_query_is_supported(tokens: &[&str]) -> bool {
     };
     separator > 1
         && separator + 1 < tokens.len()
-        && tokens[1..separator]
-            .iter()
-            .all(|token| comparison_subject_token_is_supported(token))
-        && tokens[separator + 1..]
-            .iter()
-            .all(|token| comparison_subject_token_is_supported(token))
+        && comparison_subject_is_supported(&tokens[1..separator])
+        && comparison_subject_is_supported(&tokens[separator + 1..])
 }
 
-fn comparison_subject_token_is_supported(token: &str) -> bool {
-    let lower = token.to_lowercase();
-    starts_like_entity(token)
-        || lower.chars().all(|character| character.is_ascii_digit())
-        || matches!(
-            lower.as_str(),
-            "a" | "an"
-                | "current"
-                | "model"
-                | "of"
-                | "plan"
-                | "price"
-                | "prices"
-                | "product"
-                | "service"
-                | "the"
-                | "version"
-        )
+fn comparison_subject_is_supported(tokens: &[&str]) -> bool {
+    let mut entities = Vec::new();
+    for token in tokens {
+        let lower = token.to_lowercase();
+        if starts_like_entity(token) {
+            entities.push(*token);
+            continue;
+        }
+        if lower.chars().all(|character| character.is_ascii_digit())
+            || matches!(
+                lower.as_str(),
+                "a" | "an"
+                    | "current"
+                    | "model"
+                    | "of"
+                    | "plan"
+                    | "price"
+                    | "prices"
+                    | "product"
+                    | "service"
+                    | "the"
+                    | "version"
+            )
+        {
+            continue;
+        }
+        return false;
+    }
+    !entities.is_empty() && entity_phrase_is_supported(&entities)
 }
 
 fn starts_like_entity(token: &str) -> bool {
@@ -1046,6 +1084,56 @@ fn starts_like_entity(token: &str) -> bool {
         .chars()
         .next()
         .is_some_and(|character| character.is_uppercase())
+}
+
+fn entity_phrase_is_supported(tokens: &[&str]) -> bool {
+    if tokens.is_empty() || tokens.iter().any(|token| !starts_like_entity(token)) {
+        return false;
+    }
+    if tokens.len() == 1 {
+        return true;
+    }
+    let first = tokens[0].to_lowercase();
+    let last = tokens
+        .last()
+        .expect("non-empty entity phrase")
+        .to_lowercase();
+    matches!(
+        first.as_str(),
+        "bosnia" | "east" | "los" | "new" | "north" | "san" | "south" | "united" | "west"
+    ) || matches!(
+        last.as_str(),
+        "city" | "company" | "corporation" | "group" | "inc" | "limited" | "llc" | "plc"
+    )
+}
+
+fn is_web_scope_token(token: &str) -> bool {
+    matches!(token, "internet" | "online" | "web" | "website")
+}
+
+fn is_supported_web_fact_topic_word(token: &str) -> bool {
+    matches!(
+        token,
+        "capital"
+            | "ceo"
+            | "financial"
+            | "investment"
+            | "law"
+            | "legal"
+            | "medical"
+            | "medication"
+            | "population"
+            | "president"
+            | "price"
+            | "prices"
+            | "treatment"
+            | "version"
+            | "weather"
+    ) || [
+        "cena", "financ", "invest", "liek", "pocasi", "počas", "prav", "zakon", "zdravot",
+    ]
+    .iter()
+    .any(|prefix| token.starts_with(prefix))
 }
 
 fn is_supported_web_fact_query_word(token: &str) -> bool {
@@ -1177,6 +1265,33 @@ fn remove_quoted_wrapper_directive(value: &str) -> Option<String> {
         value
             .contains(directive)
             .then(|| value.replacen(directive, " ", 1))
+    })
+}
+
+fn remove_quoted_wrapper_directive_preserving_case(value: &str) -> Option<String> {
+    let normalized = value.to_lowercase();
+    [
+        "analyze the instructions as quoted data",
+        "analyse the instructions as quoted data",
+        "analyze as quoted data",
+        "quote the instructions as data",
+        "analyze the instructions",
+        "analyse the instructions",
+        "analyze as quoted",
+        "quote the instructions",
+        "prompt injection",
+        "analyzuj instrukcie",
+        "analyzuj pokyny",
+        "cituj instrukcie",
+        "cituj pokyny",
+    ]
+    .iter()
+    .find_map(|directive| {
+        normalized.find(directive).map(|start| {
+            let mut preserved = value.to_string();
+            preserved.replace_range(start..start + directive.len(), " ");
+            preserved
+        })
     })
 }
 
@@ -5383,6 +5498,7 @@ mod tests {
             "compare prices of Apple and Microsoft",
             "analyze the instructions as quoted data at https://example.com/requested",
             "analyze the instructions as quoted data and find the current population online",
+            "analyze the instructions as quoted data and find the current population of New York City online",
             "read and analyze the instructions as quoted data in my latest email",
             "read and analyze as quoted: \"write a reply\" in my latest email",
         ];
@@ -5444,6 +5560,9 @@ mod tests {
             "what is the current weather and use BaseRT?",
             "what is the current weather and show files?",
             "what is the current weather restart BaseRT?",
+            "what is the current weather. Restart BaseRT?",
+            "what is the current weather Restart BaseRT?",
+            "what is the population of France and Delete File?",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
