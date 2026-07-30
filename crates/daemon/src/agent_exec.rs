@@ -978,7 +978,9 @@ fn web_fact_has_supported_structure(outer_request: &str) -> bool {
 fn fact_query_is_supported(tokens: &[&str]) -> bool {
     let mut entity_context = false;
     let mut entity_tokens: Vec<&str> = Vec::new();
-    let mut seen_fact_topic = false;
+    let last_fact_topic = tokens
+        .iter()
+        .rposition(|token| is_supported_web_fact_topic_word(&token.to_lowercase()));
     let mut index = 0;
     while index < tokens.len() {
         let token = tokens[index];
@@ -1025,18 +1027,16 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
         } else if !is_supported_web_fact_query_word(&lower)
             && !lower.chars().all(|character| character.is_ascii_digit())
         {
-            if (seen_fact_topic
-                && is_known_agentic_command_word(&lower)
-                && !is_supported_web_fact_topic_word(&lower))
+            if (is_known_agentic_command_word(&lower)
+                && !is_supported_web_fact_topic_word(&lower)
+                && index + 1 < tokens.len()
+                && last_fact_topic.is_none_or(|topic| index > topic))
                 || !token
                     .chars()
                     .all(|character| character.is_alphanumeric() || character == '-')
             {
                 return false;
             }
-        }
-        if !entity_context && is_supported_web_fact_topic_word(&lower) {
-            seen_fact_topic = true;
         }
         index += 1;
     }
@@ -1058,7 +1058,18 @@ fn comparison_query_is_supported(tokens: &[&str]) -> bool {
         return false;
     }
     let left = &tokens[1..separator];
-    let right = comparison_subject_without_scope(&tokens[separator + 1..]);
+    let right_with_scope = &tokens[separator + 1..];
+    if right_with_scope.len() >= 2
+        && right_with_scope
+            .last()
+            .is_some_and(|token| is_web_scope_token(&token.to_lowercase()))
+        && is_known_agentic_command_word(
+            &right_with_scope[right_with_scope.len() - 2].to_lowercase(),
+        )
+    {
+        return false;
+    }
+    let right = comparison_subject_without_scope(right_with_scope);
     if let Some(connector) = left
         .iter()
         .rposition(|token| matches!(token.to_lowercase().as_str(), "at" | "in" | "of"))
@@ -1111,7 +1122,9 @@ fn entity_phrase_is_supported(tokens: &[&str]) -> bool {
     {
         return false;
     }
-    true
+    !tokens.iter().enumerate().any(|(index, token)| {
+        index + 1 < tokens.len() && is_known_agentic_command_word(&token.to_lowercase())
+    })
 }
 
 fn entity_conjunction_phrase_is_supported(tokens: &[&str]) -> bool {
@@ -5678,7 +5691,12 @@ mod tests {
             "what is the population of France and Open website?",
             "what is the current population browse website?",
             "what is the current population search Google?",
+            "what is the current price of Nintendo Switch restart BaseRT?",
+            "what is the current GDP restart BaseRT?",
+            "what is the current mayor browse website?",
+            "what is the population of France and Germany delete file?",
             "compare prices of Apple and Microsoft and browse website",
+            "compare prices of Apple and Microsoft browse website",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
