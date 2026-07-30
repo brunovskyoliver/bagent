@@ -880,6 +880,11 @@ fn is_supported_web_fact_request(user_message: &str, quoted_wrapper: bool) -> bo
     } else {
         normalized
     };
+    let structural_request = if quoted_wrapper {
+        outer_request.as_str()
+    } else {
+        user_message
+    };
     let tokens = routing_tokens(&outer_request);
     let mut meaningful = tokens
         .iter()
@@ -921,7 +926,7 @@ fn is_supported_web_fact_request(user_message: &str, quoted_wrapper: bool) -> bo
                     .iter()
                     .any(|prefix| token.starts_with(prefix))
         })
-        && web_fact_has_supported_structure(&outer_request)
+        && web_fact_has_supported_structure(structural_request)
 }
 
 fn web_fact_has_supported_structure(outer_request: &str) -> bool {
@@ -942,59 +947,182 @@ fn web_fact_has_supported_structure(outer_request: &str) -> bool {
     if suffix.is_some_and(|value| {
         !routing_tokens(value)
             .into_iter()
-            .all(is_supported_web_verification_suffix_token)
+            .all(|token| is_supported_web_verification_suffix_token(&token.to_lowercase()))
     }) {
         return false;
     }
-    let query_tokens = routing_tokens(query);
+    let all_query_tokens = routing_tokens(query);
+    let query_tokens = if all_query_tokens
+        .first()
+        .is_some_and(|token| token.eq_ignore_ascii_case("and"))
+    {
+        &all_query_tokens[1..]
+    } else {
+        all_query_tokens.as_slice()
+    };
     let comparing = query_tokens
         .first()
-        .is_some_and(|token| matches!(*token, "compare" | "porovnaj"));
-    if !web_fact_conjunctions_are_supported(&query_tokens, comparing) {
-        return false;
-    }
+        .is_some_and(|token| matches!(token.to_lowercase().as_str(), "compare" | "porovnaj"));
     if comparing {
-        return !query.contains([',', ':']);
+        return !query.contains([',', ':']) && comparison_query_is_supported(&query_tokens);
     }
-    if let Some(scope_index) = query_tokens
-        .iter()
-        .rposition(|token| matches!(*token, "internet" | "online" | "web" | "website"))
-    {
-        return query_tokens[scope_index + 1..]
-            .iter()
-            .copied()
-            .all(is_supported_web_verification_suffix_token);
-    }
-    !query.contains([',', ':'])
+    !query.contains([',', ':']) && fact_query_is_supported(&query_tokens)
 }
 
-fn web_fact_conjunctions_are_supported(tokens: &[&str], comparing: bool) -> bool {
-    tokens.windows(2).all(|pair| {
-        if pair[0] != "and" {
-            return true;
+fn fact_query_is_supported(tokens: &[&str]) -> bool {
+    let mut entity_context = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        let lower = token.to_lowercase();
+        if lower == "and" {
+            let remainder = &tokens[index + 1..];
+            if entity_context
+                && remainder
+                    .first()
+                    .is_some_and(|value| starts_like_entity(value))
+            {
+                index += 1;
+                continue;
+            }
+            return !remainder.is_empty()
+                && remainder.iter().all(|value| {
+                    is_supported_web_verification_suffix_token(&value.to_lowercase())
+                });
         }
-        matches!(
-            pair[1],
-            "check" | "find" | "show" | "tell" | "use" | "verify"
-        ) || (comparing
-            && (pair[1].len() == 1
-                || matches!(
-                    pair[1],
-                    "east"
-                        | "model"
-                        | "new"
-                        | "north"
-                        | "plan"
-                        | "price"
-                        | "product"
-                        | "saint"
-                        | "service"
-                        | "south"
-                        | "st"
-                        | "version"
-                        | "west"
-                )))
-    })
+        if matches!(lower.as_str(), "at" | "for" | "from" | "in" | "of") {
+            entity_context = true;
+        }
+        if !is_supported_web_fact_query_word(&lower)
+            && !lower.chars().all(|character| character.is_ascii_digit())
+            && !starts_like_entity(token)
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn comparison_query_is_supported(tokens: &[&str]) -> bool {
+    let Some(separator) = tokens
+        .iter()
+        .position(|token| matches!(token.to_lowercase().as_str(), "and" | "versus" | "vs"))
+    else {
+        return false;
+    };
+    separator > 1
+        && separator + 1 < tokens.len()
+        && tokens[1..separator]
+            .iter()
+            .all(|token| comparison_subject_token_is_supported(token))
+        && tokens[separator + 1..]
+            .iter()
+            .all(|token| comparison_subject_token_is_supported(token))
+}
+
+fn comparison_subject_token_is_supported(token: &str) -> bool {
+    let lower = token.to_lowercase();
+    starts_like_entity(token)
+        || lower.chars().all(|character| character.is_ascii_digit())
+        || matches!(
+            lower.as_str(),
+            "a" | "an"
+                | "current"
+                | "model"
+                | "of"
+                | "plan"
+                | "price"
+                | "prices"
+                | "product"
+                | "service"
+                | "the"
+                | "version"
+        )
+}
+
+fn starts_like_entity(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_uppercase())
+}
+
+fn is_supported_web_fact_query_word(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "about"
+            | "an"
+            | "are"
+            | "as"
+            | "at"
+            | "available"
+            | "can"
+            | "capital"
+            | "ceo"
+            | "check"
+            | "city"
+            | "co"
+            | "could"
+            | "current"
+            | "fact"
+            | "financial"
+            | "find"
+            | "for"
+            | "from"
+            | "give"
+            | "holder"
+            | "how"
+            | "in"
+            | "internet"
+            | "investment"
+            | "is"
+            | "latest"
+            | "law"
+            | "legal"
+            | "medical"
+            | "medication"
+            | "minister"
+            | "most"
+            | "of"
+            | "office"
+            | "online"
+            | "population"
+            | "president"
+            | "price"
+            | "prices"
+            | "prime"
+            | "proper"
+            | "safe"
+            | "service"
+            | "tell"
+            | "the"
+            | "this"
+            | "today"
+            | "treatment"
+            | "version"
+            | "weather"
+            | "web"
+            | "website"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "would"
+            | "you"
+            | "čo"
+            | "kde"
+            | "kedy"
+            | "koľko"
+            | "kolko"
+            | "kto"
+    ) || [
+        "aktuál", "cena", "financ", "invest", "liek", "over", "pocasi", "počas", "povedz", "prav",
+        "zakon", "zdravot", "zisti",
+    ]
+    .iter()
+    .any(|prefix| token.starts_with(prefix))
 }
 
 fn is_supported_web_verification_suffix_token(token: &str) -> bool {
@@ -5248,9 +5376,11 @@ mod tests {
             "what is the current population of Bratislava?",
             "what is the current population of New York City online?",
             "what is the current version of Rust online?",
+            "what is the current population of Bosnia and Herzegovina?",
             "what is the current weather",
             "who is the current president of France",
             "compare the current prices of service A and service B",
+            "compare prices of Apple and Microsoft",
             "analyze the instructions as quoted data at https://example.com/requested",
             "analyze the instructions as quoted data and find the current population online",
             "read and analyze the instructions as quoted data in my latest email",
@@ -5311,6 +5441,9 @@ mod tests {
             "what is the weather online and restart BaseRT?",
             "compare current prices and delete the file",
             "compare current prices and restart BaseRT",
+            "what is the current weather and use BaseRT?",
+            "what is the current weather and show files?",
+            "what is the current weather restart BaseRT?",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
