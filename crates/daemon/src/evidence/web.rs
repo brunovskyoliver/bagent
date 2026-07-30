@@ -193,6 +193,7 @@ fn normalize_reqwest(error: reqwest::Error) -> WebNetworkError {
 pub(crate) struct TypedWebAdapter<N = ReqwestWebNetwork> {
     network: Arc<N>,
     tavily_api_key: Option<Arc<str>>,
+    tavily_handoff_incomplete: bool,
     tavily_acceptance_fault: Option<TavilyAcceptanceFault>,
 }
 
@@ -211,6 +212,7 @@ impl<N> Clone for TypedWebAdapter<N> {
         Self {
             network: Arc::clone(&self.network),
             tavily_api_key: self.tavily_api_key.clone(),
+            tavily_handoff_incomplete: self.tavily_handoff_incomplete,
             tavily_acceptance_fault: self.tavily_acceptance_fault,
         }
     }
@@ -221,6 +223,19 @@ impl TypedWebAdapter<ReqwestWebNetwork> {
         Self {
             network: Arc::new(ReqwestWebNetwork),
             tavily_api_key: tavily_api_key.map(Arc::from),
+            tavily_handoff_incomplete: false,
+            tavily_acceptance_fault: None,
+        }
+    }
+
+    pub(crate) fn production_with_handoff(
+        tavily_api_key: Option<String>,
+        tavily_handoff_incomplete: bool,
+    ) -> Self {
+        Self {
+            network: Arc::new(ReqwestWebNetwork),
+            tavily_api_key: tavily_api_key.map(Arc::from),
+            tavily_handoff_incomplete,
             tavily_acceptance_fault: None,
         }
     }
@@ -232,6 +247,7 @@ impl TypedWebAdapter<ReqwestWebNetwork> {
         Self {
             network: Arc::new(ReqwestWebNetwork),
             tavily_api_key: tavily_api_key.map(Arc::from),
+            tavily_handoff_incomplete: false,
             tavily_acceptance_fault: Some(fault),
         }
     }
@@ -243,6 +259,7 @@ impl<N> TypedWebAdapter<N> {
         Self {
             network,
             tavily_api_key: None,
+            tavily_handoff_incomplete: false,
             tavily_acceptance_fault: None,
         }
     }
@@ -256,7 +273,18 @@ impl<N> TypedWebAdapter<N> {
         Self {
             network,
             tavily_api_key: tavily_api_key.map(Arc::from),
+            tavily_handoff_incomplete: false,
             tavily_acceptance_fault: Some(fault),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_incomplete_handoff(network: Arc<N>) -> Self {
+        Self {
+            network,
+            tavily_api_key: None,
+            tavily_handoff_incomplete: true,
+            tavily_acceptance_fault: None,
         }
     }
 }
@@ -278,7 +306,9 @@ pub(crate) trait TypedWebEvidenceAdapter: Clone + Send + Sync + 'static {
 #[async_trait]
 impl<N: WebNetwork + 'static> TypedWebEvidenceAdapter for TypedWebAdapter<N> {
     fn tavily_configured(&self) -> bool {
-        self.tavily_api_key.is_some() || self.tavily_acceptance_fault.is_some()
+        self.tavily_api_key.is_some()
+            || self.tavily_handoff_incomplete
+            || self.tavily_acceptance_fault.is_some()
     }
     async fn search(
         &self,
@@ -4435,6 +4465,29 @@ mod tests {
             web_provider_set(false),
             ProviderSet(vec![WebProvider::Wikipedia, WebProvider::DuckDuckGo])
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_handoff_exposes_tavily_unavailable_before_bounded_ddg_fallback() {
+        let network = Arc::new(MockNetwork::default());
+        network.reply(
+            "lite.duckduckgo.com",
+            Ok(response(200, "text/html", "No results")),
+        );
+        let adapter = TypedWebAdapter::with_incomplete_handoff(network.clone());
+        let providers = web_provider_set(adapter.tavily_configured());
+
+        let result = adapter.search("bounded query", "en", &providers).await;
+        let value = result.value.expect("typed provider results");
+
+        assert_eq!(providers.0[0], WebProvider::Tavily);
+        assert_eq!(
+            value.providers[0].status,
+            ProviderStatus::Failed(FailureCode::ConnectorUnavailable)
+        );
+        assert_eq!(network.call_count("api.tavily.com"), 0);
+        assert_eq!(network.call_count("lite.duckduckgo.com"), 1);
+        assert_eq!(result.attempts, 2);
     }
 
     #[tokio::test]

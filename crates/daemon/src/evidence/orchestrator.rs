@@ -277,8 +277,16 @@ pub(crate) async fn execute_evidence_turn(
         {
             return Ok(execute_web_plan(adapter, &mut gate, &request.turn_id, &plan, "en").await);
         }
-        let tavily_api_key = ctx.state.tavily_api_key.read().await.clone();
-        let adapter = TypedWebAdapter::production(tavily_api_key);
+        let tavily_configuration = ctx.state.tavily_configuration.read().await;
+        let tavily_api_key = tavily_configuration.credential();
+        let tavily_handoff_incomplete = !matches!(
+            tavily_configuration.status(),
+            super::super::TavilyConfigurationStatus::Configured
+                | super::super::TavilyConfigurationStatus::Absent
+        );
+        drop(tavily_configuration);
+        let adapter =
+            TypedWebAdapter::production_with_handoff(tavily_api_key, tavily_handoff_incomplete);
         execute_web_plan(adapter, &mut gate, &request.turn_id, &plan, "en").await
     } else {
         return Err(EvidenceExecError::UnsupportedIntent);
@@ -615,17 +623,29 @@ where
         }
         for candidate_id in scheduled {
             if let Some(mut result) = completed.remove(&candidate_id) {
-                if let Some(evidence) = result.value.as_ref() {
-                    let duplicate_source = results.web_fetches.iter().any(|prior| {
-                        prior.value.as_ref().is_some_and(|prior| {
-                            prior.final_url == evidence.final_url
-                                || prior.source_identity == evidence.source_identity
-                                || evidence_content_fingerprint(prior)
-                                    == evidence_content_fingerprint(evidence)
-                        })
-                    });
-                    if duplicate_source {
-                        result.contribution = EvidenceContribution::Duplicate;
+                if matches!(result.execution, ExecutionStatus::Succeeded) {
+                    if let Some(evidence) = result.value.as_ref() {
+                        let duplicate_source = results.web_fetches.iter().any(|prior| {
+                            matches!(prior.execution, ExecutionStatus::Succeeded)
+                                && prior.value.as_ref().is_some_and(|prior_evidence| {
+                                    prior_evidence.final_url == evidence.final_url
+                                        || prior_evidence.source_identity
+                                            == evidence.source_identity
+                                        || (matches!(
+                                            prior.contribution,
+                                            EvidenceContribution::Satisfied
+                                                | EvidenceContribution::Partial
+                                        ) && matches!(
+                                            result.contribution,
+                                            EvidenceContribution::Satisfied
+                                                | EvidenceContribution::Partial
+                                        ) && evidence_content_fingerprint(prior_evidence)
+                                            == evidence_content_fingerprint(evidence))
+                                })
+                        });
+                        if duplicate_source {
+                            result.contribution = EvidenceContribution::Duplicate;
+                        }
                     }
                 }
                 let operation = EvidenceOperation::WebFetch {
@@ -3707,13 +3727,26 @@ mod tests {
                     && event["normalized_operation"] == "web.fetch"
             })
             .collect::<Vec<_>>();
-        assert_eq!(fetch_completions.len(), 2);
-        assert!(fetch_completions
-            .iter()
+        assert!(fetch_completions.len() >= 2);
+        let mut first_completion_by_activity = HashMap::new();
+        for event in &fetch_completions {
+            first_completion_by_activity
+                .entry(event["activity_id"].as_str().unwrap())
+                .or_insert(*event);
+        }
+        assert_eq!(first_completion_by_activity.len(), 2);
+        assert!(first_completion_by_activity
+            .values()
             .all(|event| event["contribution"] == "irrelevant"));
-        assert!(fetch_completions
+
+        let suppressed_duplicates = fetch_completions
             .iter()
-            .all(|event| event["duplicates_suppressed"] == 0));
+            .filter(|event| event["contribution"] == "duplicate")
+            .collect::<Vec<_>>();
+        assert!(!suppressed_duplicates.is_empty());
+        assert!(suppressed_duplicates
+            .iter()
+            .all(|event| event["duplicates_suppressed"] == 1));
     }
 
     #[tokio::test]

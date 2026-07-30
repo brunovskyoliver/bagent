@@ -5,6 +5,8 @@ import AppKit
 
 struct DaemonHealth: Sendable {
     let daemonUp: Bool
+    let processID: Int?
+    let tavilyConfiguration: DaemonClient.TavilyConfigurationStatus
     let baseRTUp: Bool
     let model: String
     let classifierModel: String
@@ -13,6 +15,32 @@ struct DaemonHealth: Sendable {
     let codexConnector: Bool
     let odooConnector: Bool
     let whatsappConnector: Bool
+
+    init(
+        daemonUp: Bool,
+        processID: Int? = nil,
+        tavilyConfiguration: DaemonClient.TavilyConfigurationStatus = .pending,
+        baseRTUp: Bool,
+        model: String,
+        classifierModel: String,
+        mailConnector: Bool,
+        notesConnector: Bool,
+        codexConnector: Bool,
+        odooConnector: Bool,
+        whatsappConnector: Bool
+    ) {
+        self.daemonUp = daemonUp
+        self.processID = processID
+        self.tavilyConfiguration = tavilyConfiguration
+        self.baseRTUp = baseRTUp
+        self.model = model
+        self.classifierModel = classifierModel
+        self.mailConnector = mailConnector
+        self.notesConnector = notesConnector
+        self.codexConnector = codexConnector
+        self.odooConnector = odooConnector
+        self.whatsappConnector = whatsappConnector
+    }
 }
 
 // MARK: - Memory
@@ -76,6 +104,13 @@ struct ScreenIntentResponse: Decodable, Sendable {
 // MARK: - Client
 
 struct DaemonClient: Sendable {
+
+    enum TavilyConfigurationStatus: String, Codable, Sendable, Equatable {
+        case pending
+        case configured
+        case absent
+        case configurationFailed = "configuration_failed"
+    }
 
     private static let dataDir = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)
@@ -170,11 +205,15 @@ struct DaemonClient: Sendable {
             struct HealthResp: Decodable {
                 let status: String; let basert: Bool; let model: String
                 let classifier_model: String?
+                let process_id: Int?
+                let tavily_configuration: TavilyConfigurationStatus?
                 let connectors: ConnectorResp?
             }
             let h = try JSONDecoder().decode(HealthResp.self, from: data)
             return DaemonHealth(
                 daemonUp: h.status == "ok",
+                processID: h.process_id,
+                tavilyConfiguration: h.tavily_configuration ?? .pending,
                 baseRTUp: h.basert,
                 model: h.model,
                 classifierModel: h.classifier_model ?? BaseRTLaunchAgent.model,
@@ -1300,7 +1339,7 @@ struct DaemonClient: Sendable {
 
     // MARK: - Odoo (Phase 6B — MCP)
 
-    func configureTavily(apiKey: String?) async throws {
+    func configureTavily(apiKey: String?) async throws -> TavilyConfigurationStatus {
         let c = try await loadCreds()
         var req = authedRequest("/web/tavily/config", creds: c)
         req.httpMethod = "POST"
@@ -1309,6 +1348,8 @@ struct DaemonClient: Sendable {
         req.httpBody = try JSONEncoder().encode(Body(api_key: apiKey))
         let (data, response) = try await URLSession.shared.data(for: req)
         try validateOK(data: data, response: response)
+        struct Resp: Decodable { let status: TavilyConfigurationStatus }
+        return try JSONDecoder().decode(Resp.self, from: data).status
     }
 
     struct OdooConfigResult: Decodable, Sendable {

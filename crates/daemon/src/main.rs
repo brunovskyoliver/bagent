@@ -90,7 +90,7 @@ struct AppState {
     odoo: Arc<RwLock<Option<OdooConnector>>>,
     /// Tavily key is supplied ephemerally by the signed app from Keychain.
     /// It is never persisted by the daemon or included in diagnostics.
-    tavily_api_key: Arc<RwLock<Option<String>>>,
+    tavily_configuration: Arc<RwLock<TavilyConfiguration>>,
     /// Compiled and activated only for signed Stage 8 acceptance campaigns.
     #[cfg(feature = "stage8-acceptance")]
     acceptance: Option<evidence::AcceptanceControl>,
@@ -289,6 +289,8 @@ struct MailOpenReq {
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    process_id: u32,
+    tavily_configuration: TavilyConfigurationStatus,
     basert: bool,
     model: String,
     classifier_model: String,
@@ -666,7 +668,7 @@ async fn main() -> Result<()> {
 
     // Odoo connector — starts unconfigured; Swift configures it lazily via POST /odoo/config.
     let odoo: Arc<RwLock<Option<OdooConnector>>> = Arc::new(RwLock::new(None));
-    let tavily_api_key: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    let tavily_configuration = Arc::new(RwLock::new(TavilyConfiguration::pending()));
 
     // WhatsApp connector — always present; autostarts only for prior paired sessions.
     let whatsapp = Arc::new(WhatsappConnector::new(WhatsappConfig::default()));
@@ -703,7 +705,7 @@ async fn main() -> Result<()> {
         task_rater,
         codex,
         odoo,
-        tavily_api_key,
+        tavily_configuration,
         #[cfg(feature = "stage8-acceptance")]
         acceptance,
         whatsapp,
@@ -823,6 +825,7 @@ async fn main() -> Result<()> {
         .route("/odoo/status", get(odoo_status_handler))
         .route("/odoo/open", post(odoo_open_handler))
         .route("/web/tavily/config", post(tavily_config_handler))
+        .route("/web/tavily/status", get(tavily_status_handler))
         // Phase 11 — WhatsApp connector
         .route("/whatsapp/status", get(whatsapp_status_handler))
         .route("/whatsapp/start", post(whatsapp_start_handler))
@@ -1805,6 +1808,7 @@ async fn stage8_acceptance_not_found_handler() -> StatusCode {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let odoo_configured = state.odoo.read().await.is_some();
+    let tavily_configuration = state.tavily_configuration.read().await.status();
     let wa_status = state
         .whatsapp
         .status()
@@ -1817,6 +1821,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         });
     Json(HealthResponse {
         status: "ok",
+        process_id: std::process::id(),
+        tavily_configuration,
         basert: state.inference.is_up().await,
         model: state.default_model,
         classifier_model: state.classifier_model,
@@ -3548,6 +3554,56 @@ struct TavilyConfigRequest {
     api_key: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TavilyConfigurationStatus {
+    Pending,
+    Configured,
+    Absent,
+    ConfigurationFailed,
+}
+
+struct TavilyConfiguration {
+    api_key: Option<String>,
+    status: TavilyConfigurationStatus,
+}
+
+impl TavilyConfiguration {
+    fn pending() -> Self {
+        Self {
+            api_key: None,
+            status: TavilyConfigurationStatus::Pending,
+        }
+    }
+
+    fn status(&self) -> TavilyConfigurationStatus {
+        self.status
+    }
+
+    fn credential(&self) -> Option<String> {
+        self.api_key.clone()
+    }
+
+    fn apply(&mut self, api_key: Option<String>) -> Result<(), ()> {
+        let key = api_key.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        if key.as_ref().is_some_and(|value| value.len() > 512) {
+            self.api_key = None;
+            self.status = TavilyConfigurationStatus::ConfigurationFailed;
+            return Err(());
+        }
+        self.status = if key.is_some() {
+            TavilyConfigurationStatus::Configured
+        } else {
+            TavilyConfigurationStatus::Absent
+        };
+        self.api_key = key;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "stage8-acceptance")]
 #[derive(Deserialize)]
 struct Stage8AcceptanceFixtureRequest {
@@ -3577,19 +3633,29 @@ async fn tavily_config_handler(
     State(state): State<AppState>,
     Json(body): Json<TavilyConfigRequest>,
 ) -> impl IntoResponse {
-    let key = body
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if key.is_some_and(|value| value.len() > 512) {
+    let mut configuration = state.tavily_configuration.write().await;
+    if configuration.apply(body.api_key).is_err() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "invalid_api_key" })),
+            Json(serde_json::json!({
+                "ok": false,
+                "status": TavilyConfigurationStatus::ConfigurationFailed,
+                "error": "configuration_failed"
+            })),
         );
     }
-    *state.tavily_api_key.write().await = key.map(str::to_string);
-    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "status": configuration.status()
+        })),
+    )
+}
+
+async fn tavily_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let status = state.tavily_configuration.read().await.status();
+    Json(serde_json::json!({ "status": status }))
 }
 
 // ── WhatsApp handlers (Phase 11) ─────────────────────────────────────────────
@@ -4088,7 +4154,7 @@ mod tests {
 
     #[test]
     fn tavily_configuration_status_never_exposes_credential_material() {
-        let configuration = TavilyConfiguration::pending();
+        let mut configuration = TavilyConfiguration::pending();
         assert_eq!(configuration.status(), TavilyConfigurationStatus::Pending);
 
         configuration.apply(None).unwrap();
@@ -4097,11 +4163,23 @@ mod tests {
 
         let credential = String::from_iter(std::iter::repeat_n('k', 32));
         configuration.apply(Some(credential)).unwrap();
-        assert_eq!(configuration.status(), TavilyConfigurationStatus::Configured);
+        assert_eq!(
+            configuration.status(),
+            TavilyConfigurationStatus::Configured
+        );
         assert!(configuration.credential().is_some());
 
         let serialized = serde_json::to_string(&configuration.status()).unwrap();
         assert_eq!(serialized, "\"configured\"");
+
+        assert!(configuration
+            .apply(Some(String::from_iter(std::iter::repeat_n('k', 513))))
+            .is_err());
+        assert_eq!(
+            configuration.status(),
+            TavilyConfigurationStatus::ConfigurationFailed
+        );
+        assert!(configuration.credential().is_none());
     }
 
     #[cfg(not(feature = "stage8-acceptance"))]

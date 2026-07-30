@@ -148,7 +148,9 @@ enum EvidencePresentation {
     }
 
     static func activityDetail(_ activity: EvidenceLogicalActivity) -> String {
-        var parts = [activity.contribution.rawValue]
+        var parts = [activity.executionStatus == .succeeded
+            ? activity.contribution.rawValue
+            : activity.executionStatus.rawValue]
         if activity.evidenceCount > 0 {
             parts.append("\(activity.evidenceCount) evidence")
         }
@@ -1597,8 +1599,6 @@ final class ChatViewModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
-        let tavilyKey = KeychainStore.loadTavilyAPIKey().flatMap { $0.isEmpty ? nil : $0 }
-        try? await client.configureTavily(apiKey: tavilyKey)
         // Odoo connects lazily on the first Odoo turn, avoiding MCP startup and
         // Keychain prompts during app launch.
         await refreshWhatsappStatusNow()

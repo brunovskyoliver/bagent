@@ -3,6 +3,7 @@ import XCTest
 
 @MainActor
 final class TavilyConfigurationSyncTests: XCTestCase {
+    @MainActor
     private final class Recorder {
         var attempts = 0
         var failFirstAttempt = false
@@ -146,5 +147,39 @@ final class TavilyConfigurationSyncTests: XCTestCase {
 
         XCTAssertEqual(status, .absent)
         XCTAssertEqual(recorder.attempts, 1)
+    }
+
+    func testExistingConfiguredDaemonNeedsNoCredentialResendAfterAppRelaunch() async {
+        let sync = TavilyConfigurationSynchronizer()
+        let recorder = Recorder()
+        let credential = String(repeating: "k", count: 32)
+
+        let status = await sync.synchronize(
+            health: health(tavily: .configured),
+            loadCredential: { credential },
+            configure: recorder.configure
+        )
+
+        XCTAssertEqual(status, .configured)
+        XCTAssertEqual(recorder.attempts, 0)
+    }
+
+    func testRepeatedConfigurationFailuresStayBoundedForOneDaemon() async {
+        let sync = TavilyConfigurationSynchronizer(maxAttemptsPerDaemon: 2)
+        let credential = String(repeating: "k", count: 32)
+        var attempts = 0
+
+        for _ in 0..<4 {
+            _ = await sync.synchronize(
+                health: health(),
+                loadCredential: { credential },
+                configure: { _ in
+                    attempts += 1
+                    throw DaemonError.notReady
+                }
+            )
+        }
+
+        XCTAssertEqual(attempts, 2)
     }
 }

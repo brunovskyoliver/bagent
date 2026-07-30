@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var notchController: NotchWindowController?
     private var daemonLauncher: DaemonLauncher?
+    private var tavilyConfigurationManager: TavilyConfigurationManager?
     private var chatViewModel: ChatViewModel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -14,6 +15,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let launcher = DaemonLauncher()
         launcher.launch()
         daemonLauncher = launcher
+
+        let tavilyConfigurationManager = TavilyConfigurationManager()
+        tavilyConfigurationManager.start()
+        self.tavilyConfigurationManager = tavilyConfigurationManager
 
         let vm = ChatViewModel()
         chatViewModel = vm
@@ -43,6 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         GlobalHotkey.unregister()
         chatViewModel?.cmuxMonitor.stop()
+        tavilyConfigurationManager?.stop()
         daemonLauncher?.stop()
     }
 }
