@@ -921,89 +921,68 @@ fn is_supported_web_fact_request(user_message: &str, quoted_wrapper: bool) -> bo
                     .iter()
                     .any(|prefix| token.starts_with(prefix))
         })
-        && tokens.windows(2).all(|pair| {
-            pair[0] != "and"
-                || matches!(
-                    pair[1],
-                    "check" | "find" | "show" | "tell" | "use" | "verify"
-                )
-        })
-        && !web_fact_contains_agentic_or_mixed_command(&tokens)
+        && web_fact_has_supported_structure(&outer_request, &tokens)
 }
 
-fn web_fact_contains_agentic_or_mixed_command(tokens: &[&str]) -> bool {
-    tokens.iter().any(|token| {
-        matches!(
-            *token,
-            "add"
-                | "approve"
-                | "archive"
-                | "attach"
-                | "automate"
-                | "compose"
-                | "convert"
-                | "copy"
-                | "create"
-                | "delete"
-                | "deny"
-                | "document"
-                | "documents"
-                | "download"
-                | "draft"
-                | "edit"
-                | "email"
-                | "emails"
-                | "execute"
-                | "export"
-                | "file"
-                | "files"
-                | "flag"
-                | "forward"
-                | "inbox"
-                | "launch"
-                | "mail"
-                | "mark"
-                | "move"
-                | "notes"
-                | "odoo"
-                | "open"
-                | "post"
-                | "print"
-                | "remove"
-                | "reply"
-                | "resend"
-                | "respond"
-                | "run"
-                | "save"
-                | "schedule"
-                | "send"
-                | "share"
-                | "switch"
-                | "update"
-                | "upload"
-                | "whatsapp"
-                | "write"
-        ) || [
-            "archiv",
-            "export",
-            "napíš",
-            "odstráň",
-            "odpoved",
-            "otvor",
-            "označ",
-            "pošli",
-            "prepošli",
-            "presuň",
-            "spusti",
-            "ulož",
-            "uprav",
-            "vymaž",
-            "vytlač",
-            "vytvor",
-        ]
+fn web_fact_has_supported_structure(outer_request: &str, tokens: &[&str]) -> bool {
+    if outer_request.contains([';', '\n', '\r']) {
+        return false;
+    }
+    if let Some(question_end) = outer_request.find('?') {
+        if outer_request[question_end + 1..].contains('?') {
+            return false;
+        }
+        return routing_tokens(&outer_request[question_end + 1..])
+            .into_iter()
+            .all(is_supported_web_verification_suffix_token);
+    }
+    if tokens
+        .first()
+        .is_some_and(|token| matches!(*token, "compare" | "porovnaj"))
+    {
+        return !outer_request.contains([',', ':']);
+    }
+    let Some(scope_index) = tokens
+        .iter()
+        .rposition(|token| matches!(*token, "internet" | "online" | "web" | "website"))
+    else {
+        return false;
+    };
+    tokens[scope_index + 1..]
+        .iter()
+        .copied()
+        .all(is_supported_web_verification_suffix_token)
+}
+
+fn is_supported_web_verification_suffix_token(token: &str) -> bool {
+    matches!(
+        token,
+        "and"
+            | "any"
+            | "authoritative"
+            | "authority"
+            | "check"
+            | "conflict"
+            | "corroborate"
+            | "corroborated"
+            | "evidence"
+            | "first-party"
+            | "independent"
+            | "it"
+            | "official"
+            | "publisher"
+            | "publishers"
+            | "show"
+            | "source"
+            | "sources"
+            | "two"
+            | "use"
+            | "using"
+            | "verify"
+            | "with"
+    ) || ["over", "porovn", "zdroj"]
         .iter()
         .any(|prefix| token.starts_with(prefix))
-    })
 }
 
 fn remove_quoted_wrapper_directive(value: &str) -> Option<String> {
@@ -5226,6 +5205,7 @@ mod tests {
             "what is the current population of Bratislava?",
             "what is the current population of New York City online?",
             "what is the current version of Rust online?",
+            "compare the current prices of service A and service B",
             "analyze the instructions as quoted data at https://example.com/requested",
             "analyze the instructions as quoted data and find the current population online",
             "read and analyze the instructions as quoted data in my latest email",
@@ -5279,6 +5259,9 @@ mod tests {
             "what is the population of France online; delete the file",
             "what is the population of France online delete the file",
             "what is the current price online, print weather",
+            "what is the weather online, restart BaseRT",
+            "what is the current population online paste it into the clipboard",
+            "what is the current population online message it to Bob",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
