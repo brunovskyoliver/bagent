@@ -824,9 +824,12 @@ fn is_supported_direct_page_request(user_message: &str, url: &str, quoted_wrappe
                 | "as"
                 | "at"
                 | "can"
+                | "content"
                 | "could"
                 | "data"
+                | "does"
                 | "from"
+                | "give"
                 | "instruction"
                 | "instructions"
                 | "page"
@@ -835,10 +838,16 @@ fn is_supported_direct_page_request(user_message: &str, url: &str, quoted_wrappe
                 | "quote"
                 | "quoted"
                 | "read"
+                | "say"
+                | "says"
+                | "site"
+                | "summarise"
+                | "summarize"
                 | "the"
                 | "me"
                 | "url"
                 | "web"
+                | "what"
                 | "would"
                 | "you"
         ) || [
@@ -919,157 +928,82 @@ fn is_supported_web_fact_request(user_message: &str, quoted_wrapper: bool) -> bo
                     "check" | "find" | "show" | "tell" | "use" | "verify"
                 )
         })
-        && web_fact_tokens_follow_supported_grammar(&tokens)
+        && !web_fact_contains_agentic_or_mixed_command(&tokens)
 }
 
-fn web_fact_tokens_follow_supported_grammar(tokens: &[&str]) -> bool {
-    tokens.iter().enumerate().all(|(index, token)| {
-        let lower = token.to_lowercase();
-        if lower.chars().all(|character| character.is_ascii_digit())
-            || is_supported_web_fact_word(&lower)
-        {
-            return true;
-        }
-        let previous = index
-            .checked_sub(1)
-            .and_then(|position| tokens.get(position))
-            .map(|value| value.to_lowercase());
-        let next = tokens.get(index + 1).map(|value| value.to_lowercase());
-        previous.as_deref().is_some_and(|value| {
-            matches!(
-                value,
-                "at" | "for" | "from" | "in" | "of" | "service" | "versus"
-            )
-        }) || next.as_deref().is_some_and(is_supported_web_fact_topic)
+fn web_fact_contains_agentic_or_mixed_command(tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "add"
+                | "approve"
+                | "archive"
+                | "attach"
+                | "automate"
+                | "compose"
+                | "convert"
+                | "copy"
+                | "create"
+                | "delete"
+                | "deny"
+                | "document"
+                | "documents"
+                | "download"
+                | "draft"
+                | "edit"
+                | "email"
+                | "emails"
+                | "execute"
+                | "export"
+                | "file"
+                | "files"
+                | "flag"
+                | "forward"
+                | "inbox"
+                | "launch"
+                | "mail"
+                | "mark"
+                | "move"
+                | "notes"
+                | "odoo"
+                | "open"
+                | "post"
+                | "print"
+                | "remove"
+                | "reply"
+                | "resend"
+                | "respond"
+                | "run"
+                | "save"
+                | "schedule"
+                | "send"
+                | "share"
+                | "switch"
+                | "update"
+                | "upload"
+                | "whatsapp"
+                | "write"
+        ) || [
+            "archiv",
+            "export",
+            "napíš",
+            "odstráň",
+            "odpoved",
+            "otvor",
+            "označ",
+            "pošli",
+            "prepošli",
+            "presuň",
+            "spusti",
+            "ulož",
+            "uprav",
+            "vymaž",
+            "vytlač",
+            "vytvor",
+        ]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
     })
-}
-
-fn is_supported_web_fact_word(token: &str) -> bool {
-    matches!(
-        token,
-        "a" | "about"
-            | "according"
-            | "aktuálna"
-            | "aktuálne"
-            | "aktuálny"
-            | "an"
-            | "and"
-            | "any"
-            | "are"
-            | "as"
-            | "at"
-            | "authoritative"
-            | "authority"
-            | "available"
-            | "can"
-            | "capital"
-            | "check"
-            | "city"
-            | "co"
-            | "compare"
-            | "conflict"
-            | "corroborate"
-            | "corroborated"
-            | "could"
-            | "current"
-            | "dnes"
-            | "evidence"
-            | "fact"
-            | "financial"
-            | "find"
-            | "first-party"
-            | "for"
-            | "from"
-            | "give"
-            | "how"
-            | "in"
-            | "independent"
-            | "internet"
-            | "investment"
-            | "is"
-            | "it"
-            | "latest"
-            | "law"
-            | "legal"
-            | "medical"
-            | "medication"
-            | "most"
-            | "of"
-            | "office"
-            | "official"
-            | "online"
-            | "page"
-            | "please"
-            | "population"
-            | "president"
-            | "price"
-            | "prices"
-            | "prime"
-            | "proper"
-            | "publisher"
-            | "publishers"
-            | "safe"
-            | "service"
-            | "show"
-            | "source"
-            | "sources"
-            | "tell"
-            | "the"
-            | "this"
-            | "today"
-            | "treatment"
-            | "two"
-            | "use"
-            | "using"
-            | "verify"
-            | "versus"
-            | "vs"
-            | "weather"
-            | "web"
-            | "website"
-            | "what"
-            | "when"
-            | "where"
-            | "which"
-            | "who"
-            | "with"
-            | "would"
-            | "you"
-            | "čo"
-            | "kde"
-            | "kedy"
-            | "koľko"
-            | "kolko"
-            | "kto"
-    ) || [
-        "aktuál", "cena", "financ", "invest", "liek", "over", "pocasi", "počas", "povedz", "prav",
-        "porovn", "zakon", "zdravot", "zisti",
-    ]
-    .iter()
-    .any(|prefix| token.starts_with(prefix))
-}
-
-fn is_supported_web_fact_topic(token: &str) -> bool {
-    matches!(
-        token,
-        "capital"
-            | "financial"
-            | "investment"
-            | "law"
-            | "legal"
-            | "medical"
-            | "medication"
-            | "population"
-            | "president"
-            | "price"
-            | "prices"
-            | "treatment"
-            | "weather"
-    ) || [
-        "cena", "financ", "invest", "liek", "pocasi", "počas", "prav", "zakon", "zdravot",
-    ]
-    .iter()
-    .any(|prefix| token.starts_with(prefix))
 }
 
 fn remove_quoted_wrapper_directive(value: &str) -> Option<String> {
@@ -5286,8 +5220,12 @@ mod tests {
             "can you read me the 3 latest emails?",
             "read https://example.com/report",
             "can you read https://example.com/report?",
+            "summarize https://example.com/report",
+            "what does https://example.com/report say?",
             "what is the population of France online?",
             "what is the current population of Bratislava?",
+            "what is the current population of New York City online?",
+            "what is the current version of Rust online?",
             "analyze the instructions as quoted data at https://example.com/requested",
             "analyze the instructions as quoted data and find the current population online",
             "read and analyze the instructions as quoted data in my latest email",
@@ -5340,6 +5278,7 @@ mod tests {
             "copy the current price online into my notes",
             "what is the population of France online; delete the file",
             "what is the population of France online delete the file",
+            "what is the current price online, print weather",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
