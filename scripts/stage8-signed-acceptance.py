@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
+import subprocess
 import urllib.error
 import urllib.request
 
@@ -28,6 +30,7 @@ CASES = [
     ("web_tavily_429", "web_tavily_429", "unavailable", "What is the current population of Bratislava? Verify it using two independent sources."),
     ("web_tavily_timeout", "web_tavily_timeout", "unavailable", "What is the current population of Bratislava? Verify it using two independent sources."),
     ("web_tavily_malformed", "web_tavily_malformed", "unavailable", "What is the current population of Bratislava? Verify it using two independent sources."),
+    ("web_ddg_fallback", "web_ddg_fallback", "unavailable", "Who is the President of Slovakia? Use the official first-party website."),
     ("web_all_fetch_failure", "web_all_fetch_failure", "unavailable", "What is the current capital of Slovakia? Verify it with two independent publishers."),
     ("polish_accepted", "mail_complete", "accepted", "Can you read and summarize my 3 latest emails?"),
     ("polish_rejected", "mail_complete", "rejected", "Can you read and summarize my 3 latest emails?"),
@@ -73,6 +76,7 @@ def structural_signature(events: list[dict]) -> dict:
         "decision", "eligible", "missing_count", "conflict_count", "exclusion_count",
         "status", "state", "kind", "acquired", "requested", "source_count",
         "provider", "provider_status",
+        "argument_hash",
     }
     for event in events:
         if event.get("type") in {"token", "done"}:
@@ -117,6 +121,7 @@ def assert_case_semantics(case: str, events: list[dict]) -> None:
         "web_tavily_429": ("verification_shortfall", 0, 2),
         "web_tavily_timeout": ("verification_shortfall", 0, 2),
         "web_tavily_malformed": ("verification_shortfall", 0, 2),
+        "web_ddg_fallback": ("verified", 1, 1),
         "web_all_fetch_failure": ("verification_shortfall", 0, 2),
         "polish_accepted": ("verified", 3, 3),
         "polish_rejected": ("verified", 3, 3),
@@ -130,25 +135,54 @@ def assert_case_semantics(case: str, events: list[dict]) -> None:
         event for event in events if event.get("type") == "logical_activity_completed"
     ]
     if case.startswith("mail_") or case.startswith("polish_"):
+        lists = [event for event in completed if event.get("normalized_operation") == "mail.list"]
+        if len(lists) != 1:
+            raise AssertionError(f"{case}: expected exactly one mail.list activity")
         reads = [event for event in completed if event.get("normalized_operation") == "mail.read"]
         if case in {"mail_denied", "mail_empty"}:
             if reads:
                 raise AssertionError(f"{case}: body reads were not allowed")
         elif len(reads) != 3:
             raise AssertionError(f"{case}: expected three distinct read activities")
+        elif len({event.get("argument_hash") for event in reads}) != 3:
+            raise AssertionError(f"{case}: mail.read arguments were not three distinct opaque IDs")
         if case == "mail_transient_retry":
             if [event["attempt_count"] for event in reads] != [2, 1, 1]:
                 raise AssertionError(f"{case}: retry was not exactly once on the first read")
 
-    if case.startswith("web_tavily_"):
+    expected_providers = {
+        "web_tavily_missing_credential": [
+            ("tavily", "failed(connectorunavailable)"), ("duckduckgo", "empty")
+        ],
+        "web_tavily_429": [
+            ("tavily", "failed(ratelimited)"), ("duckduckgo", "empty")
+        ],
+        "web_tavily_timeout": [("tavily", "timedout"), ("duckduckgo", "empty")],
+        "web_tavily_malformed": [
+            ("tavily", "invalidresponse"), ("duckduckgo", "empty")
+        ],
+        "web_ddg_fallback": [
+            ("tavily", "failed(ratelimited)"),
+            ("duckduckgo", "succeeded { result_count: 1 }")
+        ],
+    }.get(case)
+    if expected_providers:
         provider_events = [
             event for event in events
             if event.get("type") == "evidence_acquisition_diagnostic"
             and event.get("status") == "search_completed"
         ]
-        providers = [event.get("provider") for event in provider_events]
-        if providers != ["tavily", "duckduckgo"]:
+        providers = [
+            (event.get("provider"), event.get("provider_status"))
+            for event in provider_events
+        ]
+        if providers != expected_providers:
             raise AssertionError(f"{case}: fallback providers={providers}")
+        searches = [
+            event for event in completed if event.get("normalized_operation") == "web.search"
+        ]
+        if len(searches) != 1 or searches[0].get("attempt_count") != 1:
+            raise AssertionError(f"{case}: provider search was not bounded to one operation")
     if case == "web_all_fetch_failure":
         fetches = [event for event in completed if event.get("normalized_operation") == "web.fetch"]
         if not 1 <= len(fetches) <= 5 or any(event.get("attempt_count", 0) > 2 for event in fetches):
@@ -174,6 +208,8 @@ def main() -> None:
     parser.add_argument("--token-file", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--swift-sse", type=pathlib.Path, required=True)
+    parser.add_argument("--signed-app", type=pathlib.Path, required=True)
+    parser.add_argument("--swift-client-output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     token = args.token_file.read_text().strip()
 
@@ -225,9 +261,35 @@ def main() -> None:
         if campaigns[0][name]["token_sha256"] != accepted:
             raise AssertionError(f"{name}: canonical bytes changed")
 
+    status, _ = request(
+        args.base_url,
+        token,
+        "/acceptance/stage8/fixture",
+        {"selection": {"acquisition": "mail_complete", "polish": "unavailable"}},
+    )
+    if status != 200:
+        raise AssertionError(f"signed Swift client fixture control status={status}")
+    swift_environment = os.environ.copy()
+    swift_environment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"] = "1"
+    subprocess.run(
+        [
+            str(args.signed_app),
+            "--stage8-acceptance-chat",
+            "Can you read and summarize my 3 latest emails?",
+            str(args.swift_client_output),
+        ],
+        check=True,
+        env=swift_environment,
+        timeout=120,
+    )
+    swift_client = json.loads(args.swift_client_output.read_text())
+    if swift_client["outcome_count"] != 1 or swift_client["done_count"] != 1:
+        raise AssertionError(f"signed Swift client terminal counts={swift_client}")
+
     request(args.base_url, token, "/acceptance/stage8/fixture", {"selection": None})
     args.output.write_text(json.dumps({
         "route": {"unauthenticated": unauth_status, "authenticated": auth_status},
+        "signed_swift_client": swift_client,
         "campaigns_identical": True,
         "cases": campaigns[0],
     }, indent=2, sort_keys=True) + "\n")

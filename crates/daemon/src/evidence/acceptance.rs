@@ -53,6 +53,7 @@ pub(crate) enum AcceptanceAcquisition {
     WebTavily429,
     WebTavilyTimeout,
     WebTavilyMalformed,
+    WebDdgFallback,
     WebAllFetchFailure,
 }
 
@@ -249,6 +250,7 @@ impl AcceptanceWebAdapter {
                 | AcceptanceAcquisition::WebTavily429
                 | AcceptanceAcquisition::WebTavilyTimeout
                 | AcceptanceAcquisition::WebTavilyMalformed
+                | AcceptanceAcquisition::WebDdgFallback
                 | AcceptanceAcquisition::WebAllFetchFailure
         )
         .then(|| Self {
@@ -265,6 +267,20 @@ impl AcceptanceWebAdapter {
             AcceptanceAcquisition::WebTavily429 => ProviderStatus::Failed(FailureCode::RateLimited),
             AcceptanceAcquisition::WebTavilyTimeout => ProviderStatus::TimedOut,
             AcceptanceAcquisition::WebTavilyMalformed => ProviderStatus::InvalidResponse,
+            AcceptanceAcquisition::WebDdgFallback => {
+                return Some(vec![
+                    ProviderResult {
+                        provider: WebProvider::Tavily,
+                        status: ProviderStatus::Failed(FailureCode::RateLimited),
+                        duration_ms: 0,
+                    },
+                    ProviderResult {
+                        provider: WebProvider::DuckDuckGo,
+                        status: ProviderStatus::Succeeded { result_count: 1 },
+                        duration_ms: 0,
+                    },
+                ]);
+            }
             _ => return None,
         };
         Some(vec![
@@ -291,6 +307,7 @@ impl TypedWebEvidenceAdapter for AcceptanceWebAdapter {
                 | AcceptanceAcquisition::WebTavily429
                 | AcceptanceAcquisition::WebTavilyTimeout
                 | AcceptanceAcquisition::WebTavilyMalformed
+                | AcceptanceAcquisition::WebDdgFallback
         )
     }
 
@@ -304,11 +321,12 @@ impl TypedWebEvidenceAdapter for AcceptanceWebAdapter {
             normalized_query: query.to_string(),
             provider_set: providers.clone(),
         };
-        if let Some(statuses) = self.provider_statuses() {
+        let statuses = self.provider_statuses();
+        if statuses.is_some() && self.scenario != AcceptanceAcquisition::WebDdgFallback {
             return OperationResult::succeeded(
                 operation.key(),
                 WebSearchResult {
-                    providers: statuses,
+                    providers: statuses.expect("checked acceptance provider statuses"),
                     candidates: Vec::new(),
                 },
             );
@@ -324,13 +342,15 @@ impl TypedWebEvidenceAdapter for AcceptanceWebAdapter {
         OperationResult::succeeded(
             operation.key(),
             WebSearchResult {
-                providers: vec![ProviderResult {
-                    provider: WebProvider::DuckDuckGo,
-                    status: ProviderStatus::Succeeded {
-                        result_count: candidates.len() as u16,
-                    },
-                    duration_ms: 0,
-                }],
+                providers: statuses.unwrap_or_else(|| {
+                    vec![ProviderResult {
+                        provider: WebProvider::DuckDuckGo,
+                        status: ProviderStatus::Succeeded {
+                            result_count: candidates.len() as u16,
+                        },
+                        duration_ms: 0,
+                    }]
+                }),
                 candidates,
             },
         )
@@ -451,7 +471,7 @@ fn acceptance_mail_headers() -> Vec<MailHeaderEvidence> {
 
 fn acceptance_candidates(scenario: AcceptanceAcquisition) -> Vec<WebCandidate> {
     let specs: &[(&str, &str)] = match scenario {
-        AcceptanceAcquisition::WebAuthoritative => &[(
+        AcceptanceAcquisition::WebAuthoritative | AcceptanceAcquisition::WebDdgFallback => &[(
             "https://public-office.example/president",
             "President of the Slovak Republic",
         )],
@@ -498,7 +518,7 @@ fn acceptance_candidates(scenario: AcceptanceAcquisition) -> Vec<WebCandidate> {
 fn acceptance_fetch(scenario: AcceptanceAcquisition, candidate: &WebCandidate) -> WebFetchEvidence {
     let index = candidate.rank as usize;
     let (final_url, identity, passages, owner_bound) = match scenario {
-        AcceptanceAcquisition::WebAuthoritative => (
+        AcceptanceAcquisition::WebAuthoritative | AcceptanceAcquisition::WebDdgFallback => (
             candidate.requested_url.clone(),
             "public-office.example",
             vec![

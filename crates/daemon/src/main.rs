@@ -843,6 +843,18 @@ async fn main() -> Result<()> {
             "/acceptance/stage8/fixture",
             post(stage8_acceptance_fixture_handler),
         );
+    } else {
+        app = app.route(
+            "/acceptance/stage8/fixture",
+            post(stage8_acceptance_not_found_handler),
+        );
+    }
+    #[cfg(not(feature = "stage8-acceptance"))]
+    {
+        app = app.route(
+            "/acceptance/stage8/fixture",
+            post(stage8_acceptance_not_found_handler),
+        );
     }
     let app = app
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
@@ -1758,6 +1770,10 @@ async fn require_auth(
     req: axum::extract::Request,
     next: middleware::Next,
 ) -> Result<axum::response::Response, StatusCode> {
+    if req.uri().path() == "/acceptance/stage8/fixture" && !stage8_acceptance_route_enabled(&state)
+    {
+        return Ok(next.run(req).await);
+    }
     let ok = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
@@ -1767,6 +1783,22 @@ async fn require_auth(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
+}
+
+fn stage8_acceptance_route_enabled(state: &AppState) -> bool {
+    #[cfg(feature = "stage8-acceptance")]
+    {
+        state.acceptance.is_some()
+    }
+    #[cfg(not(feature = "stage8-acceptance"))]
+    {
+        let _ = state;
+        false
+    }
+}
+
+async fn stage8_acceptance_not_found_handler() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 // ── Core handlers ─────────────────────────────────────────────────────────────
