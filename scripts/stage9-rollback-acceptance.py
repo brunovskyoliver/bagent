@@ -162,6 +162,7 @@ def chat(base_url: str, token: str, session_id: str) -> dict[str, object]:
         method="POST",
     )
     event_types: list[str] = []
+    error_codes: list[str] = []
     tavily_activity_count = 0
     response_present = False
     with urllib.request.urlopen(request, timeout=360) as response:
@@ -178,11 +179,14 @@ def chat(base_url: str, token: str, session_id: str) -> dict[str, object]:
                 if isinstance(event_type, str):
                     event_types.append(event_type)
                     response_present = response_present or event_type == "token"
+                    if event_type == "error" and isinstance(event.get("code"), str):
+                        error_codes.append(event["code"])
                 if str(event.get("provider", "")).lower() == "tavily":
                     tavily_activity_count += 1
                 del event
     return {
         "event_types": event_types,
+        "error_codes": error_codes,
         "response_present": response_present,
         "tavily_activity_count": tavily_activity_count,
     }
@@ -288,6 +292,17 @@ def main() -> None:
             raise AssertionError("rollback did not emit exactly one safe legacy terminal")
         if not event_summary["response_present"] and "error" not in event_types:
             raise AssertionError("prior loop produced neither a response nor safe error")
+        safe_error_codes = {
+            "model_unavailable_metal_oom",
+            "model_unavailable_metal_device",
+            "model_unavailable_metal_command_buffer",
+            "model_unavailable_timeout",
+        }
+        error_codes = event_summary["error_codes"]
+        if "error" in event_types and (
+            len(error_codes) != 1 or error_codes[0] not in safe_error_codes
+        ):
+            raise AssertionError("rollback emitted an unknown or unsafe legacy error code")
         if "tool_call" not in event_types and not event_summary["response_present"]:
             raise AssertionError("rollback did not demonstrate the prior agentic loop")
         if state_before_activation != state_after_turn:
@@ -300,6 +315,7 @@ def main() -> None:
                 {
                     "done_count": event_types.count("done"),
                     "error_count": event_types.count("error"),
+                    "error_code": error_codes[0] if error_codes else None,
                     "legacy_tool_call_count": event_types.count("tool_call"),
                     "protected_state": state_after_turn,
                     "rollback_activation_state_unchanged": True,

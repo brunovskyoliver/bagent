@@ -4403,8 +4403,9 @@ pub(crate) async fn run_agent_loop(
                     }
                 }
                 Err(e) => {
+                    let error_code = normalized_legacy_model_error_code(&e.to_string());
                     let _ = sink
-                        .emit(json!({"type":"error","message": e.to_string()}))
+                        .emit(json!({"type":"error","code":error_code,"message": e.to_string()}))
                         .await;
                     return Err(ExecError::Model(e.to_string()));
                 }
@@ -4442,8 +4443,9 @@ pub(crate) async fn run_agent_loop(
                 }
                 Ok(ChatStreamEvent::ToolCalls(calls)) => round_calls.extend(calls),
                 Err(e) => {
+                    let error_code = normalized_legacy_model_error_code(&e.to_string());
                     let _ = sink
-                        .emit(json!({"type":"error","message": e.to_string()}))
+                        .emit(json!({"type":"error","code":error_code,"message": e.to_string()}))
                         .await;
                     return Err(ExecError::Model(e.to_string()));
                 }
@@ -5106,6 +5108,21 @@ pub(crate) async fn run_agent_loop(
     })
 }
 
+fn normalized_legacy_model_error_code(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("basert runtime poisoned: metal_oom") {
+        "model_unavailable_metal_oom"
+    } else if normalized.contains("basert runtime poisoned: metal_device") {
+        "model_unavailable_metal_device"
+    } else if normalized.contains("basert runtime poisoned: metal_command_buffer") {
+        "model_unavailable_metal_command_buffer"
+    } else if normalized.contains("timed out") || normalized.contains("timeout") {
+        "model_unavailable_timeout"
+    } else {
+        "model_error"
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TranscriptSource {
     id: String,
@@ -5200,6 +5217,22 @@ fn should_publish_model_delta_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_model_error_codes_are_normalized_and_fail_closed() {
+        assert_eq!(
+            normalized_legacy_model_error_code("BaseRT runtime poisoned: metal_oom"),
+            "model_unavailable_metal_oom"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("request timed out"),
+            "model_unavailable_timeout"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("unexpected private provider detail"),
+            "model_error"
+        );
+    }
     use crate::evidence::{
         execute_mail_plan, execute_unavailable_mail_plan, Admission, EvidenceOperation,
         EvidenceOperationGate, EvidencePlanner, EvidenceResults, EvidenceTurnOutcome,
