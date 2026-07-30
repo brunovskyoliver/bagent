@@ -1586,9 +1586,7 @@ final class ChatViewModel: ObservableObject {
         // Keychain prompts during app launch.
         await refreshWhatsappStatusNow()
         permissions.refresh()
-        if messages.isEmpty {
-            await startFreshSession()
-        } else if sessionId == nil {
+        if !messages.isEmpty && sessionId == nil {
             await startNewSession()
         }
     }
