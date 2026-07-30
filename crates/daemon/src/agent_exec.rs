@@ -5124,11 +5124,14 @@ fn normalized_legacy_model_error_code(error: &str) -> &'static str {
             BaseRtRuntimeFault::MetalCommandBuffer => "model_unavailable_metal_command_buffer",
         }
     } else if normalized.starts_with("basert error:")
+        || normalized == "basert stream read"
         || normalized.starts_with("basert stream read:")
         || normalized.starts_with("post /v1/chat/completions:")
         || normalized == "basert returned an incomplete tool call"
         || normalized.starts_with("parse arguments for basert tool call ")
+        || normalized == "parse basert sse event"
         || normalized.starts_with("parse basert sse event:")
+        || normalized == "basert sse line is not valid utf-8"
         || normalized.starts_with("basert sse line is not valid utf-8:")
     {
         "model_unavailable_basert"
@@ -5270,6 +5273,10 @@ mod tests {
         );
         assert_eq!(
             normalized_legacy_model_error_code("BaseRT stream read: connection closed"),
+            "model_unavailable_basert"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("BaseRT stream read"),
             "model_unavailable_basert"
         );
         assert_eq!(
