@@ -12,7 +12,10 @@
 
 #[cfg(test)]
 use basert_connector::BaseRtClient;
-use basert_connector::{ChatStreamEvent, Message, ToolCall, ToolCallFunction, ToolDef};
+use basert_connector::{
+    classify_basert_runtime_fault, BaseRtRuntimeFault, ChatStreamEvent, Message, ToolCall,
+    ToolCallFunction, ToolDef,
+};
 use futures_util::StreamExt;
 #[cfg(test)]
 use serde::Deserialize;
@@ -5108,22 +5111,18 @@ pub(crate) async fn run_agent_loop(
 
 fn normalized_legacy_model_error_code(error: &str) -> &'static str {
     let normalized = error.to_ascii_lowercase();
-    if normalized.contains("basert runtime poisoned: metal_oom")
-        || normalized.contains("kiogpucommandbuffercallbackerroroutofmemory")
-        || normalized.contains("insufficient memory")
-        || normalized.contains("out of memory")
-    {
+    if normalized.contains("basert runtime poisoned: metal_oom") {
         "model_unavailable_metal_oom"
-    } else if normalized.contains("basert runtime poisoned: metal_device")
-        || normalized.contains("device lost")
-        || normalized.contains("device was lost")
-        || normalized.contains("device removed")
-    {
+    } else if normalized.contains("basert runtime poisoned: metal_device") {
         "model_unavailable_metal_device"
-    } else if normalized.contains("basert runtime poisoned: metal_command_buffer")
-        || normalized.contains("command buffer failed")
-    {
+    } else if normalized.contains("basert runtime poisoned: metal_command_buffer") {
         "model_unavailable_metal_command_buffer"
+    } else if let Some(fault) = classify_basert_runtime_fault(error) {
+        match fault {
+            BaseRtRuntimeFault::MetalOutOfMemory => "model_unavailable_metal_oom",
+            BaseRtRuntimeFault::MetalDevice => "model_unavailable_metal_device",
+            BaseRtRuntimeFault::MetalCommandBuffer => "model_unavailable_metal_command_buffer",
+        }
     } else if normalized.contains("timed out") || normalized.contains("timeout") {
         "model_unavailable_timeout"
     } else {
@@ -5247,6 +5246,14 @@ mod tests {
                 "BaseRT error: kIOGPUCommandBufferCallbackErrorOutOfMemory"
             ),
             "model_unavailable_metal_oom"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("upstream out of memory"),
+            "model_error"
+        );
+        assert_eq!(
+            normalized_legacy_model_error_code("device removed by provider"),
+            "model_error"
         );
         assert_eq!(
             normalized_legacy_model_error_code("request timed out"),
