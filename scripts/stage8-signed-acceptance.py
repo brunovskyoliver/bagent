@@ -38,6 +38,33 @@ CASES = [
     ("polish_unavailable", "mail_complete", "unavailable", "Can you read and summarize my 3 latest emails?"),
 ]
 
+# Reviewed canonical answer bytes and citation sets for every signed fixture.
+# Keeping only hashes and byte counts makes the release proof exact without
+# persisting Mail bodies, fixture passages, or raw SSE payloads.
+EXPECTED_OUTPUTS = {
+    "mail_complete": ("c8f21965b0a34f06fd38ccaa312f01b9d0383fc7d54a50ed97ed8499139eda31", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 308),
+    "mail_denied": ("85099cc6a2241fa664e14a53d9671d49c5a1ee288d87bc1ff3ff910dc03ac9de", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 76),
+    "mail_empty": ("e09eb37f97be2bc9ce203b4992d598b1cd06bbaaf3b4ad654a3e2644f394ccd1", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 107),
+    "mail_partial": ("0ddcdfab9a841ffef27f430ad896bca686c7957d4d04337f41405744a0dbaa7d", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 158),
+    "mail_transient_retry": ("c8f21965b0a34f06fd38ccaa312f01b9d0383fc7d54a50ed97ed8499139eda31", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 308),
+    "mail_unavailable": ("0883bc983ba1ee1226dd19e6492a5f7a6f9ce0785458d951a4d13f1c21d5df51", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 103),
+    "polish_accepted": ("c8f21965b0a34f06fd38ccaa312f01b9d0383fc7d54a50ed97ed8499139eda31", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 308),
+    "polish_rejected": ("c8f21965b0a34f06fd38ccaa312f01b9d0383fc7d54a50ed97ed8499139eda31", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 308),
+    "polish_unavailable": ("c8f21965b0a34f06fd38ccaa312f01b9d0383fc7d54a50ed97ed8499139eda31", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 308),
+    "web_all_fetch_failure": ("8e490d2ff86e9872e8ddcd9bbd2e5366789409f0ba0078ae07af9c1ef90ce307", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 135),
+    "web_ambiguous_table": ("a3bdb70c3acbdb0ff22095739e61266798e6d96026eba4b849bbe1cdab3a420b", "5f5afcb085819143fa14e799251b4f679bec2cb6a1bc663d6dedb87891e52132", 289),
+    "web_authoritative": ("b374c10983370be9d2c7f142a69c4016d8b729b1a8c039d3459c4e13bfe731d6", "07d29843a3756a145e6f1a37dfa06d63ffd4fad035dda5cf01050c315b7289c4", 107),
+    "web_conflict": ("27b3b3ad4eca2bc2c5d192021901c1fc111e31fbf220383dd8ba2ad1d26db0e0", "5f5afcb085819143fa14e799251b4f679bec2cb6a1bc663d6dedb87891e52132", 424),
+    "web_corroborated": ("ab41279257520af6739e1509f5779e3f890742a3d6d954f431d79497988bf742", "5f5afcb085819143fa14e799251b4f679bec2cb6a1bc663d6dedb87891e52132", 226),
+    "web_ddg_fallback": ("b374c10983370be9d2c7f142a69c4016d8b729b1a8c039d3459c4e13bfe731d6", "07d29843a3756a145e6f1a37dfa06d63ffd4fad035dda5cf01050c315b7289c4", 107),
+    "web_irrelevant_entity": ("5fa6e9720c0b51d06c37f3dcd506eab1fb39ba75d1fab5b010d51fb2ef95bb26", "eca8e5dc204fe1f042f7d02e16eb19e7b0b7f7c609b3cd623a64fcba816a4e71", 225),
+    "web_redirect": ("5313a50f6c1d642fedf2c1aefab415a5b81c98439689bafca995a12306d27cfa", "f5b6f0a6239fb29e6ba9b13b857e0c33521883a19c73c957a4e6e166c70fd3af", 103),
+    "web_tavily_429": ("8e490d2ff86e9872e8ddcd9bbd2e5366789409f0ba0078ae07af9c1ef90ce307", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 135),
+    "web_tavily_malformed": ("8e490d2ff86e9872e8ddcd9bbd2e5366789409f0ba0078ae07af9c1ef90ce307", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 135),
+    "web_tavily_missing_credential": ("8e490d2ff86e9872e8ddcd9bbd2e5366789409f0ba0078ae07af9c1ef90ce307", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 135),
+    "web_tavily_timeout": ("8e490d2ff86e9872e8ddcd9bbd2e5366789409f0ba0078ae07af9c1ef90ce307", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 135),
+}
+
 
 def request(base: str, token: str | None, path: str, payload: dict) -> tuple[int, bytes]:
     headers = {"Content-Type": "application/json"}
@@ -87,6 +114,13 @@ def assert_case_semantics(case: str, result: dict) -> None:
     if not result["ui_outcome_present"]:
         raise AssertionError(f"{case}: signed UI presentation path did not retain the outcome")
     outcome = result["outcome"]
+    actual_output = (
+        result["token_sha256"],
+        result["citation_set_sha256"],
+        result["token_bytes"],
+    )
+    if actual_output != EXPECTED_OUTPUTS[case]:
+        raise AssertionError(f"{case}: canonical answer or citation bytes changed")
     expected = {
         "mail_complete": ("verified", 3, 3),
         "mail_transient_retry": ("verified", 3, 3),
