@@ -1410,10 +1410,12 @@ fn is_supported_web_verification_suffix_token(token: &str) -> bool {
             | "show"
             | "source"
             | "sources"
+            | "the"
             | "two"
             | "use"
             | "using"
             | "verify"
+            | "website"
             | "with"
     ) || ["over", "porovn", "zdroj"]
         .iter()
@@ -5670,6 +5672,7 @@ mod tests {
             "what is the current population of Bosnia and Herzegovina?",
             "what is the current population of Saudi Arabia?",
             "what is the population of france?",
+            "Who is the President of Slovakia? Use the official first-party website.",
             "who is the current president of Czech Republic?",
             "what is the current inflation rate?",
             "what is the current unemployment rate online?",
