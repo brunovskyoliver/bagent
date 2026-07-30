@@ -32,12 +32,13 @@ use filesystem_connector::{
 };
 use whatsapp_connector::WhatsappSendTarget;
 
+#[cfg(test)]
+use crate::evidence::PUBLIC_PRODUCT_IDENTITY_CLARIFICATION;
 use crate::evidence::{
     assess_claim_relevance, execute_evidence_turn, normalize_numeric_claim, Classification,
     Completeness, EvidenceBundle, EvidenceContext, EvidenceIntent, EvidenceIntentClassifier,
     EvidenceOrigin, EvidenceRequest, SynthesisContract, SynthesisObserver, SynthesisPhaseEvent,
     SynthesisService, ValidationOutcome, EVIDENCE_SCHEMA_VERSION,
-    PUBLIC_PRODUCT_IDENTITY_CLARIFICATION,
 };
 use crate::{
     audit_fs, json_str_arg, request_tool_approval, run_aerospace, save_last_file_ref,
