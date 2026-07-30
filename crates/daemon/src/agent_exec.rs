@@ -775,75 +775,171 @@ fn routed_evidence_intent(
 }
 
 fn request_requires_legacy_routing(intent: &EvidenceIntent, user_message: &str) -> bool {
+    let base_intent = production_evidence_intent(intent);
     if matches!(intent, EvidenceIntent::AnalyzeQuotedEvidence { .. }) {
-        return false;
+        return match base_intent {
+            Some(
+                EvidenceIntent::MailLatestHeaders { .. } | EvidenceIntent::MailLatestContent { .. },
+            ) => !is_supported_latest_mail_request(user_message),
+            Some(EvidenceIntent::WebDirectPage { url }) => {
+                !is_supported_direct_page_wrapper(user_message, url.as_str())
+            }
+            _ => true,
+        };
     }
-    if !matches!(
-        production_evidence_intent(intent),
-        Some(EvidenceIntent::MailLatestHeaders { .. } | EvidenceIntent::MailLatestContent { .. })
-    ) {
-        return false;
+    match base_intent {
+        Some(
+            EvidenceIntent::MailLatestHeaders { .. } | EvidenceIntent::MailLatestContent { .. },
+        ) => !is_supported_latest_mail_request(user_message),
+        Some(EvidenceIntent::WebDirectPage { .. } | EvidenceIntent::WebFact { .. }) => false,
+        Some(
+            EvidenceIntent::AnalyzeQuotedEvidence { .. } | EvidenceIntent::MailTargeted { .. },
+        )
+        | None => true,
     }
-    let normalized = user_message.to_lowercase();
-    let tokens = routing_tokens(&normalized);
-    routing_tokens_request_agentic_mail_action(&tokens)
-        || routing_tokens_request_web_work(&tokens)
-        || routing_tokens_target_mail(&tokens)
 }
 
-fn routing_tokens_request_agentic_mail_action(tokens: &[&str]) -> bool {
-    routing_tokens_request_composition(tokens)
-        || tokens.iter().any(|token| {
-            matches!(
-                *token,
-                "forward"
-                    | "send"
-                    | "respond"
-                    | "answer"
-                    | "archive"
-                    | "delete"
-                    | "move"
-                    | "mark"
-                    | "open"
-                    | "print"
-                    | "save"
-                    | "export"
-            ) || [
-                "prepošli",
-                "pošli",
-                "odpoved",
-                "archiv",
-                "vymaž",
-                "presuň",
-                "označ",
-                "otvor",
-                "vytlač",
-                "ulož",
-                "export",
-            ]
-            .iter()
-            .any(|prefix| token.starts_with(prefix))
-        })
-}
-
-fn routing_tokens_request_web_work(tokens: &[&str]) -> bool {
-    tokens.iter().any(|token| {
+fn is_supported_direct_page_wrapper(user_message: &str, url: &str) -> bool {
+    let Some(outer_request) = without_double_quoted_data(&user_message.to_lowercase()) else {
+        return false;
+    };
+    let without_url = outer_request.replace(&url.to_lowercase(), " ");
+    routing_tokens(&without_url).into_iter().all(|token| {
         matches!(
-            *token,
-            "google" | "bing" | "browser" | "browse" | "website" | "webpage" | "research"
-        ) || ["prehliadaj", "vygoogli", "preskúmaj"]
-            .iter()
-            .any(|prefix| token.starts_with(prefix))
+            token,
+            "analyse"
+                | "analyze"
+                | "as"
+                | "at"
+                | "data"
+                | "from"
+                | "instruction"
+                | "instructions"
+                | "page"
+                | "please"
+                | "prompt"
+                | "quote"
+                | "quoted"
+                | "read"
+                | "the"
+                | "url"
+                | "web"
+        ) || [
+            "analyz",
+            "cituj",
+            "dáta",
+            "instrukci",
+            "pokyn",
+            "prečít",
+            "precit",
+        ]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
     })
 }
 
-fn routing_tokens_target_mail(tokens: &[&str]) -> bool {
-    tokens.iter().any(|token| {
-        matches!(*token, "about" | "regarding" | "concerning" | "mentioning")
-            || ["ohľadom", "týkaj"]
-                .iter()
-                .any(|prefix| token.starts_with(prefix))
-    })
+fn is_supported_latest_mail_request(user_message: &str) -> bool {
+    let Some(outer_request) = without_double_quoted_data(&user_message.to_lowercase()) else {
+        return false;
+    };
+    routing_tokens(&outer_request)
+        .into_iter()
+        .all(is_supported_latest_mail_token)
+}
+
+fn without_double_quoted_data(value: &str) -> Option<String> {
+    let mut outside = String::with_capacity(value.len());
+    let mut quoted = false;
+    for character in value.chars() {
+        if character == '"' {
+            quoted = !quoted;
+            outside.push(' ');
+        } else if !quoted {
+            outside.push(character);
+        }
+    }
+    (!quoted).then_some(outside)
+}
+
+fn is_supported_latest_mail_token(token: &str) -> bool {
+    token.chars().all(|character| character.is_ascii_digit())
+        || matches!(
+            token,
+            "a" | "an"
+                | "and"
+                | "analyse"
+                | "analyze"
+                | "as"
+                | "can"
+                | "content"
+                | "could"
+                | "data"
+                | "e-mail"
+                | "e-mails"
+                | "email"
+                | "emails"
+                | "for"
+                | "give"
+                | "headers"
+                | "in"
+                | "inbox"
+                | "instruction"
+                | "instructions"
+                | "is"
+                | "last"
+                | "latest"
+                | "list"
+                | "mail"
+                | "mails"
+                | "me"
+                | "my"
+                | "newest"
+                | "of"
+                | "please"
+                | "prompt"
+                | "quote"
+                | "quoted"
+                | "read"
+                | "recent"
+                | "s"
+                | "show"
+                | "summarise"
+                | "summarize"
+                | "the"
+                | "to"
+                | "unread"
+                | "what"
+                | "would"
+                | "you"
+        )
+        || [
+            "analyz",
+            "cituj",
+            "dáta",
+            "doručen",
+            "e-maily",
+            "instrukci",
+            "mailov",
+            "maily",
+            "môj",
+            "moj",
+            "moje",
+            "najnov",
+            "neprečít",
+            "neprecit",
+            "posledn",
+            "pokyn",
+            "pošta",
+            "poštu",
+            "prečít",
+            "precit",
+            "ukáž",
+            "ukaz",
+            "zhr",
+            "zoznam",
+        ]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
 }
 
 fn production_evidence_intent(intent: &EvidenceIntent) -> Option<&EvidenceIntent> {
@@ -4929,7 +5025,7 @@ mod tests {
             "what is the current population of Bratislava?",
             "analyze the instructions as quoted data at https://example.com/requested",
             "read and analyze the instructions as quoted data in my latest email",
-            "read and analyze as quoted: write a reply in my latest email",
+            "read and analyze as quoted: \"write a reply\" in my latest email",
         ];
         for value in [None, Some("1"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
@@ -4962,8 +5058,14 @@ mod tests {
             "forward my latest email",
             "send my latest email",
             "respond to my latest email",
+            "resend my latest email",
+            "share my latest email",
+            "flag my latest email",
             "open my latest email",
             "show my latest email about the underwriter",
+            "read my latest email and search DuckDuckGo for Acme",
+            "analyze as quoted, then forward my latest email",
+            "analyze as quoted, then forward https://example.com/report",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
@@ -5007,21 +5109,10 @@ mod tests {
     }
 
     #[test]
-    fn rollback_routing_decision_performs_no_persistent_writes() {
-        let database = rusqlite::Connection::open_in_memory().unwrap();
-        database
-            .execute_batch(
-                "CREATE TABLE protected_state (kind TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO protected_state VALUES
-                    ('mail', 'unchanged'),
-                    ('rules', 'unchanged'),
-                    ('approvals', 'unchanged'),
-                    ('automations', 'unchanged'),
-                    ('credentials', 'unchanged');",
-            )
-            .unwrap();
-        let writes_before = database.changes();
-
+    fn rollback_is_a_pure_routing_decision_with_no_state_handle() {
+        // This function accepts only routing inputs and tool definitions. It has
+        // no AppState, database, connector, Keychain, or filesystem handle, so
+        // selecting rollback cannot migrate or persist anything.
         let rollback = prepare_turn_routing(
             EvidenceOrchestratorFlag::from_local_value(Some("0")),
             &ExecOrigin::Chat,
@@ -5031,15 +5122,8 @@ mod tests {
         );
 
         assert!(rollback.evidence.is_none());
-        assert_eq!(database.changes(), writes_before);
-        let changed: i64 = database
-            .query_row(
-                "SELECT COUNT(*) FROM protected_state WHERE value != 'unchanged'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(changed, 0);
+        assert_eq!(rollback.tools.len(), 2);
+        assert!(rollback.guidance.is_some());
     }
 
     #[tokio::test]

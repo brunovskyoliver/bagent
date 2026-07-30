@@ -35,6 +35,18 @@ rollback effective immediately for subsequent turns. This changes routing
 only: it performs no migration and does not modify Mail, rules, approvals,
 automations, credentials, or stored user data. It requires no app reinstall.
 
+Release acceptance verifies that boundary against an ordinary signed bundle:
+
+```sh
+python3 scripts/stage9-rollback-acceptance.py \
+  --app-bundle /Applications/bagent.app \
+  --output /tmp/stage9-rollback.json
+```
+
+The report contains only structural event counts and hashes of protected local
+tables. It never reads or emits Mail content, the daemon token, or the Tavily
+secret. The script restores the absent-flag default after its rollback turn.
+
 ## Restore the production default
 
 ```zsh
