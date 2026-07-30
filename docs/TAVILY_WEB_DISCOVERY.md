@@ -20,7 +20,10 @@ unset TAVILY_API_KEY
 The signed app reads the key and sends it over the authenticated loopback daemon API. A bounded
 configuration monitor waits for daemon readiness and repeats the handoff after daemon PID changes,
 client reconnection, or app relaunch. The daemon keeps the key only in memory for that process
-lifetime. To remove the credential:
+lifetime. App relaunch deliberately resends once even if the existing daemon reports configured,
+so a changed Keychain value cannot leave stale daemon state. A Keychain read failure is recorded
+as `configuration_failed`; it is never treated as absence and never sends a clearing `null`.
+To remove the credential:
 
 ```zsh
 security delete-generic-password -s sk.bagent.app -a bagent.tavily.apikey

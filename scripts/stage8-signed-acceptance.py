@@ -260,7 +260,18 @@ def main() -> None:
             raise AssertionError(f"{name}: canonical bytes changed")
 
     request(args.base_url, token, "/acceptance/stage8/fixture", {"selection": None})
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    source_commit = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
     args.output.write_text(json.dumps({
+        "provenance": {
+            "source_commit": source_commit,
+            "signed_app_sha256": hashlib.sha256(args.signed_app.read_bytes()).hexdigest(),
+        },
         "route": {"unauthenticated": unauth_status, "authenticated": auth_status},
         "signed_swift_cases_per_campaign": len(CASES),
         "campaigns_identical": True,

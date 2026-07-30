@@ -6,6 +6,7 @@ final class TavilyConfigurationSynchronizer {
     private let maxAttemptsPerDaemon: Int
     private var processID: Int?
     private var attempts = 0
+    private var synchronizedCurrentDaemon = false
 
     init(maxAttemptsPerDaemon: Int = 2) {
         self.maxAttemptsPerDaemon = max(1, maxAttemptsPerDaemon)
@@ -13,7 +14,7 @@ final class TavilyConfigurationSynchronizer {
 
     func synchronize(
         health: DaemonHealth,
-        loadCredential: () -> String?,
+        loadCredential: () -> KeychainStore.TavilyCredentialRead,
         configure: (String?) async throws -> DaemonClient.TavilyConfigurationStatus
     ) async -> DaemonClient.TavilyConfigurationStatus {
         guard health.daemonUp, let currentProcessID = health.processID else {
@@ -22,25 +23,35 @@ final class TavilyConfigurationSynchronizer {
         if processID != currentProcessID {
             processID = currentProcessID
             attempts = 0
-        }
-
-        let credential = loadCredential().flatMap { $0.isEmpty ? nil : $0 }
-        let desiredStatus: DaemonClient.TavilyConfigurationStatus = credential == nil
-            ? .absent
-            : .configured
-        if health.tavilyConfiguration == desiredStatus {
-            attempts = 0
-            return desiredStatus
+            synchronizedCurrentDaemon = false
         }
         guard attempts < maxAttemptsPerDaemon else {
             return .configurationFailed
         }
 
+        let credential: String?
+        switch loadCredential() {
+        case .present(let value):
+            credential = value.isEmpty ? nil : value
+        case .absent:
+            credential = nil
+        case .failed:
+            attempts += 1
+            return .configurationFailed
+        }
+        let desiredStatus: DaemonClient.TavilyConfigurationStatus = credential == nil
+            ? .absent
+            : .configured
+        if synchronizedCurrentDaemon && health.tavilyConfiguration == desiredStatus {
+            attempts = 0
+            return desiredStatus
+        }
         attempts += 1
         do {
             let status = try await configure(credential)
             if status == desiredStatus {
                 attempts = 0
+                synchronizedCurrentDaemon = true
             }
             return status
         } catch {
@@ -59,6 +70,7 @@ final class TavilyConfigurationManager {
     private let synchronizer: TavilyConfigurationSynchronizer
     private var monitorTask: Task<Void, Never>?
     private var lastRecordedStatus: DaemonClient.TavilyConfigurationStatus?
+    private var failureReportedProcessID: Int?
 
     init(client: DaemonClient = DaemonClient()) {
         self.client = client
@@ -73,9 +85,17 @@ final class TavilyConfigurationManager {
                 let health = await client.healthStatus()
                 let status = await synchronizer.synchronize(
                     health: health,
-                    loadCredential: KeychainStore.loadTavilyAPIKey,
+                    loadCredential: KeychainStore.readTavilyCredential,
                     configure: client.configureTavily
                 )
+                if status == .configurationFailed,
+                   failureReportedProcessID != health.processID
+                {
+                    _ = await client.recordTavilyConfigurationFailure()
+                    failureReportedProcessID = health.processID
+                } else if status != .configurationFailed {
+                    failureReportedProcessID = nil
+                }
                 record(status)
                 try? await Task.sleep(for: .seconds(2))
             }

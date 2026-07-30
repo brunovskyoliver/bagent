@@ -825,6 +825,10 @@ async fn main() -> Result<()> {
         .route("/odoo/status", get(odoo_status_handler))
         .route("/odoo/open", post(odoo_open_handler))
         .route("/web/tavily/config", post(tavily_config_handler))
+        .route(
+            "/web/tavily/config/failure",
+            post(tavily_config_failure_handler),
+        )
         .route("/web/tavily/status", get(tavily_status_handler))
         // Phase 11 — WhatsApp connector
         .route("/whatsapp/status", get(whatsapp_status_handler))
@@ -3580,8 +3584,14 @@ impl TavilyConfiguration {
         self.status
     }
 
-    fn credential(&self) -> Option<String> {
-        self.api_key.clone()
+    fn active_credential(&self) -> Option<String> {
+        matches!(self.status, TavilyConfigurationStatus::Configured)
+            .then(|| self.api_key.clone())
+            .flatten()
+    }
+
+    fn mark_failed(&mut self) {
+        self.status = TavilyConfigurationStatus::ConfigurationFailed;
     }
 
     fn apply(&mut self, api_key: Option<String>) -> Result<(), ()> {
@@ -3656,6 +3666,12 @@ async fn tavily_config_handler(
 async fn tavily_status_handler(State(state): State<AppState>) -> impl IntoResponse {
     let status = state.tavily_configuration.read().await.status();
     Json(serde_json::json!({ "status": status }))
+}
+
+async fn tavily_config_failure_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mut configuration = state.tavily_configuration.write().await;
+    configuration.mark_failed();
+    Json(serde_json::json!({ "status": configuration.status() }))
 }
 
 // ── WhatsApp handlers (Phase 11) ─────────────────────────────────────────────
@@ -4159,7 +4175,15 @@ mod tests {
 
         configuration.apply(None).unwrap();
         assert_eq!(configuration.status(), TavilyConfigurationStatus::Absent);
-        assert!(configuration.credential().is_none());
+        assert!(configuration.active_credential().is_none());
+
+        configuration.apply(None).unwrap();
+        configuration.mark_failed();
+        assert_eq!(
+            configuration.status(),
+            TavilyConfigurationStatus::ConfigurationFailed
+        );
+        assert!(configuration.active_credential().is_none());
 
         let credential = String::from_iter(std::iter::repeat_n('k', 32));
         configuration.apply(Some(credential)).unwrap();
@@ -4167,7 +4191,19 @@ mod tests {
             configuration.status(),
             TavilyConfigurationStatus::Configured
         );
-        assert!(configuration.credential().is_some());
+        assert!(configuration.active_credential().is_some());
+
+        configuration.mark_failed();
+        assert_eq!(
+            configuration.status(),
+            TavilyConfigurationStatus::ConfigurationFailed
+        );
+        assert!(configuration.api_key.is_some());
+        assert!(configuration.active_credential().is_none());
+
+        configuration
+            .apply(Some(String::from_iter(std::iter::repeat_n('k', 32))))
+            .unwrap();
 
         let serialized = serde_json::to_string(&configuration.status()).unwrap();
         assert_eq!(serialized, "\"configured\"");
@@ -4179,7 +4215,7 @@ mod tests {
             configuration.status(),
             TavilyConfigurationStatus::ConfigurationFailed
         );
-        assert!(configuration.credential().is_none());
+        assert!(configuration.active_credential().is_none());
     }
 
     #[cfg(not(feature = "stage8-acceptance"))]

@@ -278,9 +278,10 @@ pub(crate) async fn execute_evidence_turn(
             return Ok(execute_web_plan(adapter, &mut gate, &request.turn_id, &plan, "en").await);
         }
         let tavily_configuration = ctx.state.tavily_configuration.read().await;
-        let tavily_api_key = tavily_configuration.credential();
+        let tavily_status = tavily_configuration.status();
+        let tavily_api_key = tavily_configuration.active_credential();
         let tavily_handoff_incomplete = !matches!(
-            tavily_configuration.status(),
+            tavily_status,
             super::super::TavilyConfigurationStatus::Configured
                 | super::super::TavilyConfigurationStatus::Absent
         );
