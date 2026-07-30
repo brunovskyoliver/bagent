@@ -978,6 +978,7 @@ fn web_fact_has_supported_structure(outer_request: &str) -> bool {
 fn fact_query_is_supported(tokens: &[&str]) -> bool {
     let mut entity_context = false;
     let mut entity_tokens: Vec<&str> = Vec::new();
+    let mut seen_fact_topic = false;
     let mut index = 0;
     while index < tokens.len() {
         let token = tokens[index];
@@ -1024,7 +1025,9 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
         } else if !is_supported_web_fact_query_word(&lower)
             && !lower.chars().all(|character| character.is_ascii_digit())
         {
-            if is_known_agentic_command_word(&lower)
+            if (seen_fact_topic
+                && is_known_agentic_command_word(&lower)
+                && !is_supported_web_fact_topic_word(&lower))
                 || !token
                     .chars()
                     .all(|character| character.is_alphanumeric() || character == '-')
@@ -1032,18 +1035,25 @@ fn fact_query_is_supported(tokens: &[&str]) -> bool {
                 return false;
             }
         }
+        if !entity_context && is_supported_web_fact_topic_word(&lower) {
+            seen_fact_topic = true;
+        }
         index += 1;
     }
     true
 }
 
 fn comparison_query_is_supported(tokens: &[&str]) -> bool {
-    let Some(separator) = tokens
+    let separators = tokens
         .iter()
-        .position(|token| matches!(token.to_lowercase().as_str(), "and" | "versus" | "vs"))
-    else {
+        .enumerate()
+        .filter(|(_, token)| matches!(token.to_lowercase().as_str(), "and" | "versus" | "vs"))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [separator] = separators.as_slice() else {
         return false;
     };
+    let separator = *separator;
     if separator <= 1 || separator + 1 >= tokens.len() {
         return false;
     }
@@ -1057,8 +1067,8 @@ fn comparison_query_is_supported(tokens: &[&str]) -> bool {
             && left[..connector]
                 .iter()
                 .all(|token| is_supported_comparison_metric_word(&token.to_lowercase()))
-            && comparison_subject_is_supported(&left[connector + 1..])
-            && comparison_subject_is_supported(right);
+            && entity_phrase_is_supported(&left[connector + 1..])
+            && entity_phrase_is_supported(right);
     }
     comparison_subject_is_supported(left) && comparison_subject_is_supported(right)
 }
@@ -1075,10 +1085,9 @@ fn comparison_subject_without_scope<'a>(tokens: &'a [&str]) -> &'a [&'a str] {
 }
 
 fn is_supported_comparison_metric_word(token: &str) -> bool {
-    !is_known_agentic_command_word(token)
-        && token
-            .chars()
-            .all(|character| character.is_alphanumeric() || character == '-')
+    token
+        .chars()
+        .all(|character| character.is_alphanumeric() || character == '-')
 }
 
 fn comparison_subject_is_supported(tokens: &[&str]) -> bool {
@@ -1095,10 +1104,9 @@ fn comparison_subject_is_supported(tokens: &[&str]) -> bool {
 fn entity_phrase_is_supported(tokens: &[&str]) -> bool {
     if tokens.is_empty()
         || tokens.iter().any(|token| {
-            is_known_agentic_command_word(&token.to_lowercase())
-                || !token
-                    .chars()
-                    .all(|character| character.is_alphanumeric() || character == '-')
+            !token
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '-')
         })
     {
         return false;
@@ -1108,10 +1116,47 @@ fn entity_phrase_is_supported(tokens: &[&str]) -> bool {
 
 fn entity_conjunction_phrase_is_supported(tokens: &[&str]) -> bool {
     entity_phrase_is_supported(tokens)
+        && tokens
+            .first()
+            .is_some_and(|token| !is_known_agentic_command_word(&token.to_lowercase()))
 }
 
 fn is_web_scope_token(token: &str) -> bool {
     matches!(token, "internet" | "online" | "web" | "website")
+}
+
+fn is_supported_web_fact_topic_word(token: &str) -> bool {
+    matches!(
+        token,
+        "capital"
+            | "ceo"
+            | "financial"
+            | "inflation"
+            | "investment"
+            | "law"
+            | "legal"
+            | "license"
+            | "medical"
+            | "medication"
+            | "population"
+            | "populations"
+            | "president"
+            | "price"
+            | "prices"
+            | "rate"
+            | "rates"
+            | "treatment"
+            | "unemployment"
+            | "update"
+            | "version"
+            | "versions"
+            | "weather"
+    ) || [
+        "cena", "financ", "infl", "invest", "liek", "pocasi", "počas", "popul", "prav", "zakon",
+        "zdravot",
+    ]
+    .iter()
+    .any(|prefix| token.starts_with(prefix))
 }
 
 fn is_known_agentic_command_word(token: &str) -> bool {
@@ -1122,6 +1167,7 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "archive"
             | "attach"
             | "automate"
+            | "browse"
             | "compose"
             | "convert"
             | "copy"
@@ -1153,6 +1199,7 @@ fn is_known_agentic_command_word(token: &str) -> bool {
             | "run"
             | "save"
             | "schedule"
+            | "search"
             | "send"
             | "share"
             | "start"
@@ -5545,6 +5592,10 @@ mod tests {
             "who is the current president of Czech Republic?",
             "what is the current inflation rate?",
             "what is the current unemployment rate online?",
+            "what is the latest Windows update?",
+            "what is the current export price?",
+            "what is the current open source license?",
+            "what is the current price of Nintendo Switch?",
             "what is the current weather",
             "who is the current president of France",
             "compare the current prices of service A and service B",
@@ -5555,6 +5606,7 @@ mod tests {
             "compare weather in paris and london",
             "compare prices of iphone and android",
             "compare inflation rates in France and Germany",
+            "compare prices of Nintendo Switch and Steam Deck",
             "analyze the instructions as quoted data at https://example.com/requested",
             "analyze the instructions as quoted data and find the current population online",
             "analyze the instructions as quoted data and find the current population of New York City online",
@@ -5624,6 +5676,9 @@ mod tests {
             "what is the current weather Restart BaseRT?",
             "what is the population of France and Delete File?",
             "what is the population of France and Open website?",
+            "what is the current population browse website?",
+            "what is the current population search Google?",
+            "compare prices of Apple and Microsoft and browse website",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
