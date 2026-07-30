@@ -52,6 +52,37 @@ final class StreamingPresentationTests: XCTestCase {
         XCTAssertFalse(rendered.string.contains("```"))
     }
 
+    func testTextStorageUpdaterSurvivesStreamedMarkdownNormalizationAndFinalReplacement() {
+        let storage = NSTextStorage()
+        let streamed = """
+        Read 2 of 3 emails · partial
+
+        1. **Sender:** team@mail.perplexity.ai
+           **Subject:** Product update
+        2. [Sender](https://example.com): alerts@example.com
+        """
+
+        for end in streamed.indices {
+            let source = String(streamed[...end])
+            let expected = NotchMarkdown.attributedString(source)
+            NotchTextStorageUpdater.apply(expected, to: storage)
+            XCTAssertEqual(
+                storage.string,
+                expected.string,
+                "Text storage diverged after streaming source prefix \(source.count)"
+            )
+        }
+
+        // Evidence finalization may replace an intermediate draft with a
+        // shorter canonical answer; this must reset rather than deriving a
+        // replacement range from earlier rendered markdown.
+        let finalized = NotchMarkdown.attributedString(
+            "Read 2 of 3 emails · partial\n\n1. Sender: team@mail.perplexity.ai"
+        )
+        NotchTextStorageUpdater.apply(finalized, to: storage)
+        XCTAssertEqual(storage.string, finalized.string)
+    }
+
     func testOutputStatusDotStaysAtTopRightInsteadOfBridgeCenter() {
         let point = NotchStatusDotGeometry.outputTopRight(
             notchOffset: 260,

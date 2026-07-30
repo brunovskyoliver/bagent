@@ -4086,6 +4086,24 @@ async fn save_last_whatsapp_ref(
 mod tests {
     use super::*;
 
+    #[test]
+    fn tavily_configuration_status_never_exposes_credential_material() {
+        let configuration = TavilyConfiguration::pending();
+        assert_eq!(configuration.status(), TavilyConfigurationStatus::Pending);
+
+        configuration.apply(None).unwrap();
+        assert_eq!(configuration.status(), TavilyConfigurationStatus::Absent);
+        assert!(configuration.credential().is_none());
+
+        let credential = String::from_iter(std::iter::repeat_n('k', 32));
+        configuration.apply(Some(credential)).unwrap();
+        assert_eq!(configuration.status(), TavilyConfigurationStatus::Configured);
+        assert!(configuration.credential().is_some());
+
+        let serialized = serde_json::to_string(&configuration.status()).unwrap();
+        assert_eq!(serialized, "\"configured\"");
+    }
+
     #[cfg(not(feature = "stage8-acceptance"))]
     #[tokio::test]
     async fn ordinary_build_exposes_no_acceptance_fixture_route() {

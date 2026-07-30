@@ -3670,6 +3670,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distinct_irrelevant_fetches_are_not_reported_as_duplicate_activities() {
+        let first = web_candidate("https://publisher-one.example/unrelated", 1);
+        let second = web_candidate("https://publisher-two.example/unrelated", 2);
+        let repeated_irrelevant_text = "Generic navigation and contact information.";
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second.clone()],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    first.requested_url.as_str(),
+                    "publisher-one.example",
+                    repeated_irrelevant_text,
+                )],
+                vec![readable_fetch(
+                    &second,
+                    second.requested_url.as_str(),
+                    "publisher-two.example",
+                    repeated_irrelevant_text,
+                )],
+            ],
+        );
+        let mut gate = EventRecordingGate::new();
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava?".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+
+        let _ = execute_web_plan(adapter, &mut gate, "turn-irrelevant", &plan, "en").await;
+
+        let fetch_completions = gate
+            .events
+            .iter()
+            .filter(|event| {
+                event["type"] == "logical_activity_completed"
+                    && event["normalized_operation"] == "web.fetch"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fetch_completions.len(), 2);
+        assert!(fetch_completions
+            .iter()
+            .all(|event| event["contribution"] == "irrelevant"));
+        assert!(fetch_completions
+            .iter()
+            .all(|event| event["duplicates_suppressed"] == 0));
+    }
+
+    #[tokio::test]
     async fn web_fact_retains_query_relevant_numeric_passages_instead_of_page_beginning() {
         let mut candidate = web_candidate("https://bratislava.sk/population", 1);
         candidate.title = "Official website — Bratislava population".into();

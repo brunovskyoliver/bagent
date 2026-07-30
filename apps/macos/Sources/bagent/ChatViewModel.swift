@@ -1310,7 +1310,8 @@ final class ChatViewModel: ObservableObject {
 
     /// Invoked after an input-only turn is submitted so AppKit can collapse the panel.
     var onInputOnlySubmitted: (() -> Void)?
-    /// Invoked when the first assistant token arrives so AppKit can reveal output.
+    /// Invoked when output becomes displayable, or completion must recover a
+    /// missed first-token transition, so AppKit can reveal the output surface.
     var onFirstAssistantToken: (() -> Void)?
 
     // MARK: - cmux notifications
@@ -1519,10 +1520,26 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Init
 
-    init() {
-        startHealthMonitor()
-        startCmuxMonitor()
-        Task { await refreshHealth() }
+    init(startMonitoring: Bool = true) {
+        if startMonitoring {
+            startHealthMonitor()
+            startCmuxMonitor()
+            Task { await refreshHealth() }
+        }
+    }
+
+    func ensureCompletedTurnOutputPresented() {
+        if notchInteractionMode != .output || chatSurfaceMode != .outputExpanded {
+            onFirstAssistantToken?()
+        }
+        // Tests and non-window consumers may not install the AppKit callback.
+        // Completion is authoritative even if click-away collapsed the thinking
+        // surface before the first token reached the main actor.
+        if notchInteractionMode != .output || chatSurfaceMode != .outputExpanded {
+            isExpanded = true
+            chatSurfaceMode = .outputExpanded
+            notchInteractionMode = .output
+        }
     }
 
     // MARK: - Actions
@@ -1769,15 +1786,15 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].debugConversationRecallInjected = trace.conversation_recall_injected
                         if let sid = trace.session_id { sessionId = sid }
                     case .token(let t):
+                        messages[idx].content += t
+                        presenter.enqueue(t)
                         if first {
-                            onFirstAssistantToken?()
                             isThinking = false
                             first = false
+                            ensureCompletedTurnOutputPresented()
                         }
                         // toolStatus intentionally NOT cleared here — the action chip
                         // stays visible while the answer streams; cleared on .done.
-                        messages[idx].content += t
-                        presenter.enqueue(t)
                         // Auto-open Mail after the first sentence has appeared in the response.
                         if !didAutoOpen,
                            let ref = messages[idx].mailRef,
@@ -1877,9 +1894,7 @@ final class ChatViewModel: ObservableObject {
                         isThinking = false
                         streamingAssistantMessageId = nil
                         messages[idx].content = message
-                        if notchInteractionMode == .thinking {
-                            notchInteractionMode = .output
-                        }
+                        ensureCompletedTurnOutputPresented()
                     case .taskRating(let level, let score, let reasons, let privacyRisk):
                         messages[idx].taskRating = (level: level, score: score, reasons: reasons, privacyRisk: privacyRisk)
                     case .done(let returnedSessionId):
@@ -1892,37 +1907,20 @@ final class ChatViewModel: ObservableObject {
                         toolStatus = nil
                         isThinking = false
                         streamingAssistantMessageId = nil
-                        if first && notchInteractionMode == .thinking {
-                            notchInteractionMode = .output
-                        }
-                        if first && chatSurfaceMode == .thinkingHidden {
-                            chatSurfaceMode = .collapsed
-                        }
+                        ensureCompletedTurnOutputPresented()
                         Task { await loadDebugTrace(for: messages[idx].id) }
                     }
                 }
                 await presenter.finish()
-                if first {
-                    isThinking = false
-                    streamingAssistantMessageId = nil
-                    if notchInteractionMode == .thinking {
-                        notchInteractionMode = .output
-                    }
-                    if chatSurfaceMode == .thinkingHidden {
-                        chatSurfaceMode = .collapsed
-                    }
-                }
+                isThinking = false
+                streamingAssistantMessageId = nil
+                ensureCompletedTurnOutputPresented()
             } catch {
                 isThinking = false
                 toolStatus = nil
                 streamingAssistantMessageId = nil
-                if chatSurfaceMode == .thinkingHidden {
-                    chatSurfaceMode = .collapsed
-                }
                 messages[idx].content = "Chyba: \(error.localizedDescription)"
-                if notchInteractionMode == .thinking {
-                    notchInteractionMode = .output
-                }
+                ensureCompletedTurnOutputPresented()
             }
         }
     }

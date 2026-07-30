@@ -64,6 +64,7 @@ enum NotchActivityLayout {
     static let headerHeight: CGFloat = 18
     static let rowHeight: CGFloat = 22
     static let maxRowsHeight: CGFloat = 84
+    static let maxVisibleRows = Int(maxRowsHeight / rowHeight)
 
     static func extraHeight(activityCount: Int, expanded: Bool) -> CGFloat {
         guard activityCount > 0 else { return 0 }
@@ -343,18 +344,24 @@ struct NotchWrapView: View {
         )
     }
 
-    private func outputWingWidth() -> CGFloat {
-        // Ratchet only grows and is clamped to outputWingWidth — once maxed
-        // the (full-text parse + layout) measure can't change the answer.
-        if outputWingRatchet >= NotchWrapMetrics.outputWingWidth {
-            return outputWingRatchet
-        }
-        let wanted = NotchOutputLayout.wingWidth(
+    private func measuredOutputWingWidth() -> CGFloat {
+        NotchOutputLayout.wingWidth(
             text: outputResponseText,
             notchWidth: notchWidth
         )
-        if wanted > outputWingRatchet { outputWingRatchet = wanted }
-        return outputWingRatchet
+    }
+
+    private func outputWingWidth() -> CGFloat {
+        // Layout evaluation must be pure. Advancing the grow-only ratchet from
+        // this getter publishes @State while SwiftUI is rendering, recursively
+        // invalidating NSHostingView and eventually poisoning NSEventThread.
+        max(outputWingRatchet, measuredOutputWingWidth())
+    }
+
+    private func advanceOutputWingRatchet() {
+        let measured = measuredOutputWingWidth()
+        guard measured > outputWingRatchet else { return }
+        outputWingRatchet = measured
     }
 
     private func outputBridgeHeight() -> CGFloat {
@@ -392,6 +399,9 @@ struct NotchWrapView: View {
 
     private func refreshOutputSurfaceIfNeeded(force: Bool = false) {
         guard viewModel.notchInteractionMode == .output else { return }
+        // Callers cross the main-queue boundary before reaching this method, so
+        // ratchet state changes happen outside SwiftUI's active update pass.
+        advanceOutputWingRatchet()
         // Streaming text only grows — once the panel is pinned at max in both
         // dimensions nothing a new token adds can change the surface, so skip
         // the (full-text parse + layout) measurement entirely. Without this,
@@ -415,6 +425,12 @@ struct NotchWrapView: View {
             || nextWing == NotchWrapMetrics.outputWingWidth
         guard shouldResize else { return }
         refreshSurface()
+    }
+
+    private func deferOutputSurfaceRefresh(force: Bool = false) {
+        DispatchQueue.main.async {
+            refreshOutputSurfaceIfNeeded(force: force)
+        }
     }
 
     private func refreshSurface() {
@@ -937,8 +953,14 @@ struct NotchWrapView: View {
             cmuxRevealStartedAt = nil
             if dwelt { viewModel.markAllCmuxSeen() }
         }
-        refreshSurface()
-        onHoverChanged(active || isDragTargeted)
+        // SwiftUI may be rebuilding the expanded transcript while AppKit is
+        // still dispatching this hover event. Resizing the notch in that same
+        // transaction can invalidate the event's old tracking hierarchy.
+        // Cross the main-queue boundary before changing any surface geometry.
+        DispatchQueue.main.async {
+            refreshSurface()
+            onHoverChanged(active || isDragTargeted)
+        }
     }
 
     // Split out of `body` so the modifier chain below stays type-checkable.
@@ -1098,21 +1120,21 @@ struct NotchWrapView: View {
             refreshSurface()
         }
         .onChange(of: viewModel.isActivityTranscriptExpanded) {
-            refreshOutputSurfaceIfNeeded(force: true)
+            deferOutputSurfaceRefresh(force: true)
         }
     }
 
     var body: some View {
         interactiveSurface
         .onChange(of: viewModel.streamingChunk) {
-            refreshOutputSurfaceIfNeeded()
+            deferOutputSurfaceRefresh()
         }
         .onChange(of: viewModel.latestAssistantMessageId) {
             outputWingRatchet = NotchWrapMetrics.outputMinWingWidth
-            refreshOutputSurfaceIfNeeded(force: true)
+            deferOutputSurfaceRefresh(force: true)
         }
         .onChange(of: viewModel.isLatestAssistantStreaming) {
-            refreshOutputSurfaceIfNeeded(force: true)
+            deferOutputSurfaceRefresh(force: true)
         }
         .onChange(of: viewModel.notchHoverResetID) {
             isHovered = false
@@ -1432,25 +1454,23 @@ struct InlineNotchContent: View {
         .accessibilityLabel(viewModel.isActivityTranscriptExpanded ? "Collapse assistant activity" : "Expand assistant activity")
 
         if viewModel.isActivityTranscriptExpanded {
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(activities) { activity in
-                        HStack(alignment: .firstTextBaseline, spacing: 5) {
-                            Image(systemName: activity.status == "failed"
-                                ? "exclamationmark.circle"
-                                : (activity.status == "running" ? "circle.dotted" : "checkmark.circle"))
-                                .foregroundStyle(activity.status == "failed" ? Color.orange : NotchWrapMetrics.notchTextSecondary)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(activity.title)
-                                if let detail = activity.detail, !detail.isEmpty {
-                                    Text(detail).foregroundStyle(NotchWrapMetrics.notchTextSecondary).lineLimit(1)
-                                }
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(activities.suffix(NotchActivityLayout.maxVisibleRows))) { activity in
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        Image(systemName: activity.status == "failed"
+                            ? "exclamationmark.circle"
+                            : (activity.status == "running" ? "circle.dotted" : "checkmark.circle"))
+                            .foregroundStyle(activity.status == "failed" ? Color.orange : NotchWrapMetrics.notchTextSecondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(activity.title)
+                            if let detail = activity.detail, !detail.isEmpty {
+                                Text(detail).foregroundStyle(NotchWrapMetrics.notchTextSecondary).lineLimit(1)
                             }
-                            Spacer(minLength: 2)
-                            if let ms = activity.durationMs {
-                                Text(String(format: "%.1fs", Double(ms) / 1000))
-                                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                            }
+                        }
+                        Spacer(minLength: 2)
+                        if let ms = activity.durationMs {
+                            Text(String(format: "%.1fs", Double(ms) / 1000))
+                                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
                         }
                     }
                 }
@@ -1458,6 +1478,7 @@ struct InlineNotchContent: View {
             .font(.system(size: 9.5))
             .padding(.leading, 2)
             .frame(maxHeight: 84)
+            .clipped()
         }
     }
 
@@ -1493,40 +1514,39 @@ struct InlineNotchContent: View {
         )
 
         if viewModel.isActivityTranscriptExpanded {
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(message.evidenceActivities) { activity in
-                        HStack(alignment: .firstTextBaseline, spacing: 5) {
-                            Image(systemName: evidenceActivitySymbol(activity))
-                                .foregroundStyle(
-                                    activity.executionStatus == .failed
-                                        || activity.executionStatus == .denied
-                                        || activity.executionStatus == .timedOut
-                                        ? Color.orange
-                                        : NotchWrapMetrics.notchTextSecondary
-                                )
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(activity.operation)
-                                Text(EvidencePresentation.activityDetail(activity))
-                                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                                    .lineLimit(2)
-                            }
-                            Spacer(minLength: 2)
-                            if activity.durationMs > 0 {
-                                Text(String(format: "%.1fs", Double(activity.durationMs) / 1000))
-                                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                            }
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(message.evidenceActivities.suffix(NotchActivityLayout.maxVisibleRows))) { activity in
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        Image(systemName: evidenceActivitySymbol(activity))
+                            .foregroundStyle(
+                                activity.executionStatus == .failed
+                                    || activity.executionStatus == .denied
+                                    || activity.executionStatus == .timedOut
+                                    ? Color.orange
+                                    : NotchWrapMetrics.notchTextSecondary
+                            )
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(activity.operation)
+                            Text(EvidencePresentation.activityDetail(activity))
+                                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                                .lineLimit(2)
                         }
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel(
-                            "\(activity.operation), \(activity.executionStatus.rawValue), \(EvidencePresentation.activityDetail(activity))"
-                        )
+                        Spacer(minLength: 2)
+                        if activity.durationMs > 0 {
+                            Text(String(format: "%.1fs", Double(activity.durationMs) / 1000))
+                                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        }
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(
+                        "\(activity.operation), \(activity.executionStatus.rawValue), \(EvidencePresentation.activityDetail(activity))"
+                    )
                 }
             }
             .font(.system(size: 9.5))
             .padding(.leading, 2)
             .frame(maxHeight: 84)
+            .clipped()
         }
     }
 
@@ -1652,8 +1672,6 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
             coordinator.sourceIDs = sourceIDs
             coordinator.sources = sources
             coordinator.lastText = nil
-            coordinator.finalizedSource = ""
-            coordinator.finalizedRendered = 0
         }
         if coordinator.lastText != text {
             coordinator.lastText = text
@@ -1687,36 +1705,20 @@ private struct LatestAssistantOutputScrollView: NSViewRepresentable {
         var sources: [DaemonClient.TranscriptSource] = []
         var sourceIDs: [String] = []
         private var lastClipSize: NSSize = .zero
-        // Source text up to (and incl.) the last rendered "\n", and the UTF-16
-        // length its render occupies in the text storage.
-        fileprivate var finalizedSource = ""
-        fileprivate var finalizedRendered = 0
 
-        /// Incremental streaming render. `NotchMarkdown` styles are strictly
-        /// line-scoped, so lines before the last newline never restyle as new
-        /// tokens arrive — only the tail needs re-rendering and TextKit only
-        /// relays the edited range. A full `setAttributedString` per token
-        /// relaid the entire document: O(n²) over a long stream.
+        /// Render the complete canonical value, then append only when the
+        /// complete attributed prefix is unchanged. The former source-line
+        /// bookkeeping inferred a TextKit range from independently normalized
+        /// markdown fragments. A formatter normalization at finalization could
+        /// therefore leave `finalizedRendered` beyond the live storage and
+        /// crash `NSMutableRLEArray` from `replaceCharacters`.
         func applyText(_ text: String) {
             guard let storage = textView?.textStorage else { return }
-            if !text.hasPrefix(finalizedSource) {
-                finalizedSource = ""
-                finalizedRendered = 0
-            }
-            let tail = String(text.dropFirst(finalizedSource.count))
-            let renderedTail = NSMutableAttributedString(
-                attributedString: NotchMarkdown.attributedString(tail)
+            let rendered = NSMutableAttributedString(
+                attributedString: NotchMarkdown.attributedString(text)
             )
-            decorateCitations(renderedTail)
-            storage.replaceCharacters(
-                in: NSRange(location: finalizedRendered, length: storage.length - finalizedRendered),
-                with: renderedTail
-            )
-            if let nl = tail.lastIndex(of: "\n") {
-                let completed = String(tail[...nl])
-                finalizedSource += completed
-                finalizedRendered += NotchMarkdown.attributedString(completed).length
-            }
+            decorateCitations(rendered)
+            NotchTextStorageUpdater.apply(rendered, to: storage)
         }
 
         private func decorateCitations(_ output: NSMutableAttributedString) {

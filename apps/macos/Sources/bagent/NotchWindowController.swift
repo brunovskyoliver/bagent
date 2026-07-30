@@ -63,6 +63,10 @@ final class NotchWindowController: NSObject {
     private var approvalCancellable: AnyCancellable?
     private var previousApp: NSRunningApplication?
 
+#if DEBUG
+    var statusPanelForTesting: NSPanel { statusPanel }
+#endif
+
     init(chatViewModel: ChatViewModel) {
         self.chatViewModel = chatViewModel
         super.init()
@@ -293,10 +297,10 @@ final class NotchWindowController: NSObject {
         reconcileStatusPanelVisibility()
     }
 
-    private func hoverChanged(isHovered: Bool) {
-        // Keep the AppKit window stable. Resizing this panel while SwiftUI also
-        // animates the notch path can clip the bottom arcs into sharp corners.
-        statusPanel.setFrame(pillFrame, display: true, animate: false)
+    private func hoverChanged(isHovered _: Bool) {
+        // The panel already owns the maximum fixed frame. Even assigning that
+        // same frame here forces NSHostingView layout and can re-enter SwiftUI
+        // while a hover/update transaction is still being rendered.
     }
 
     private func resetNotchHoverState() {

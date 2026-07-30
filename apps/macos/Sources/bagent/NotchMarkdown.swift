@@ -346,3 +346,16 @@ enum NotchMarkdown {
         }
     }
 }
+
+/// Keeps TextKit mutations inside ranges obtained from the current attributed
+/// values themselves. This deliberately does not infer rendered UTF-16 offsets
+/// from source markdown: CommonMark normalization can change those lengths
+/// when an incomplete streamed construct becomes complete.
+enum NotchTextStorageUpdater {
+    static func apply(_ rendered: NSAttributedString, to storage: NSTextStorage) {
+        // NSTextStorage may canonicalize attribute runs, so even an apparently
+        // unchanged prefix is not a safe source of replacement offsets. A
+        // whole-value assignment lets TextKit own every range invariant.
+        storage.setAttributedString(rendered)
+    }
+}
