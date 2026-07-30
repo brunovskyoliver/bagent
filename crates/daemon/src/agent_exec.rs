@@ -6877,7 +6877,7 @@ mod tests {
 
     #[test]
     fn routing_contract_is_identical_for_chat_and_automation_in_every_mode() {
-        let prompt = "compare the current prices of Acme service online";
+        let prompt = "compare prices of Acme service and Contoso service online";
         for value in [None, Some("1"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);
             let chat = routed_evidence_turn(flag, &ExecOrigin::Chat, "shared-session", prompt)
