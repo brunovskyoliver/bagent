@@ -780,9 +780,12 @@ fn request_requires_legacy_routing(intent: &EvidenceIntent, user_message: &str) 
         return match base_intent {
             Some(
                 EvidenceIntent::MailLatestHeaders { .. } | EvidenceIntent::MailLatestContent { .. },
-            ) => !is_supported_latest_mail_request(user_message),
+            ) => !is_supported_latest_mail_request(user_message, true),
             Some(EvidenceIntent::WebDirectPage { url }) => {
-                !is_supported_direct_page_wrapper(user_message, url.as_str())
+                !is_supported_direct_page_request(user_message, url.as_str(), true)
+            }
+            Some(EvidenceIntent::WebFact { .. }) => {
+                !is_supported_web_fact_request(user_message, true)
             }
             _ => true,
         };
@@ -790,8 +793,11 @@ fn request_requires_legacy_routing(intent: &EvidenceIntent, user_message: &str) 
     match base_intent {
         Some(
             EvidenceIntent::MailLatestHeaders { .. } | EvidenceIntent::MailLatestContent { .. },
-        ) => !is_supported_latest_mail_request(user_message),
-        Some(EvidenceIntent::WebDirectPage { .. } | EvidenceIntent::WebFact { .. }) => false,
+        ) => !is_supported_latest_mail_request(user_message, false),
+        Some(EvidenceIntent::WebDirectPage { url }) => {
+            !is_supported_direct_page_request(user_message, url.as_str(), false)
+        }
+        Some(EvidenceIntent::WebFact { .. }) => !is_supported_web_fact_request(user_message, false),
         Some(
             EvidenceIntent::AnalyzeQuotedEvidence { .. } | EvidenceIntent::MailTargeted { .. },
         )
@@ -799,9 +805,15 @@ fn request_requires_legacy_routing(intent: &EvidenceIntent, user_message: &str) 
     }
 }
 
-fn is_supported_direct_page_wrapper(user_message: &str, url: &str) -> bool {
-    let Some(outer_request) = without_double_quoted_data(&user_message.to_lowercase()) else {
-        return false;
+fn is_supported_direct_page_request(user_message: &str, url: &str, quoted_wrapper: bool) -> bool {
+    let normalized = user_message.to_lowercase();
+    let outer_request = if quoted_wrapper {
+        let Some(value) = without_double_quoted_data(&normalized) else {
+            return false;
+        };
+        value
+    } else {
+        normalized
     };
     let without_url = outer_request.replace(&url.to_lowercase(), " ");
     routing_tokens(&without_url).into_iter().all(|token| {
@@ -838,9 +850,96 @@ fn is_supported_direct_page_wrapper(user_message: &str, url: &str) -> bool {
     })
 }
 
-fn is_supported_latest_mail_request(user_message: &str) -> bool {
-    let Some(outer_request) = without_double_quoted_data(&user_message.to_lowercase()) else {
+fn is_supported_web_fact_request(user_message: &str, quoted_wrapper: bool) -> bool {
+    let normalized = user_message.to_lowercase();
+    let outer_request = if quoted_wrapper {
+        let Some(value) = without_double_quoted_data(&normalized) else {
+            return false;
+        };
+        let Some(value) = remove_quoted_wrapper_directive(&value) else {
+            return false;
+        };
+        value
+    } else {
+        normalized
+    };
+    let tokens = routing_tokens(&outer_request);
+    let mut meaningful = tokens
+        .iter()
+        .copied()
+        .skip_while(|token| matches!(*token, "and" | "please" | "can" | "could" | "would" | "you"));
+    let Some(first) = meaningful.next() else {
         return false;
+    };
+    let supported_start = matches!(
+        first,
+        "are"
+            | "check"
+            | "find"
+            | "give"
+            | "how"
+            | "is"
+            | "tell"
+            | "verify"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+    ) || [
+        "čo", "co", "kde", "kedy", "koľko", "kolko", "kto", "over", "povedz", "zisti",
+    ]
+    .iter()
+    .any(|prefix| first.starts_with(prefix));
+    supported_start
+        && !tokens.iter().any(|token| {
+            matches!(*token, "afterwards" | "also" | "then")
+                || ["následne", "potom"]
+                    .iter()
+                    .any(|prefix| token.starts_with(prefix))
+        })
+        && tokens.windows(2).all(|pair| {
+            pair[0] != "and"
+                || matches!(
+                    pair[1],
+                    "check" | "find" | "show" | "tell" | "use" | "verify"
+                )
+        })
+}
+
+fn remove_quoted_wrapper_directive(value: &str) -> Option<String> {
+    [
+        "analyze the instructions as quoted data",
+        "analyse the instructions as quoted data",
+        "analyze as quoted data",
+        "quote the instructions as data",
+        "analyze the instructions",
+        "analyse the instructions",
+        "analyze as quoted",
+        "quote the instructions",
+        "prompt injection",
+        "analyzuj instrukcie",
+        "analyzuj pokyny",
+        "cituj instrukcie",
+        "cituj pokyny",
+    ]
+    .iter()
+    .find_map(|directive| {
+        value
+            .contains(directive)
+            .then(|| value.replacen(directive, " ", 1))
+    })
+}
+
+fn is_supported_latest_mail_request(user_message: &str, quoted_wrapper: bool) -> bool {
+    let normalized = user_message.to_lowercase();
+    let outer_request = if quoted_wrapper {
+        let Some(value) = without_double_quoted_data(&normalized) else {
+            return false;
+        };
+        value
+    } else {
+        normalized
     };
     routing_tokens(&outer_request)
         .into_iter()
@@ -5024,6 +5123,7 @@ mod tests {
             "what is the population of France online?",
             "what is the current population of Bratislava?",
             "analyze the instructions as quoted data at https://example.com/requested",
+            "analyze the instructions as quoted data and find the current population online",
             "read and analyze the instructions as quoted data in my latest email",
             "read and analyze as quoted: \"write a reply\" in my latest email",
         ];
@@ -5066,6 +5166,10 @@ mod tests {
             "read my latest email and search DuckDuckGo for Acme",
             "analyze as quoted, then forward my latest email",
             "analyze as quoted, then forward https://example.com/report",
+            "read my latest email and \"forward it\"",
+            "forward https://example.com/report",
+            "share https://example.com/report",
+            "forward the current population of Bratislava online",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
             let flag = EvidenceOrchestratorFlag::from_local_value(value);

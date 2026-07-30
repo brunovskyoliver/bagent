@@ -43,9 +43,12 @@ python3 scripts/stage9-rollback-acceptance.py \
   --output /tmp/stage9-rollback.json
 ```
 
-The report contains only structural event counts and hashes of protected local
-tables. It never reads or emits Mail content, the daemon token, or the Tavily
-secret. The script restores the absent-flag default after its rollback turn.
+The report contains only structural event counts and hashes of all protected
+local tables, `rules.yaml`, attachments, the daemon credential file, and Tavily
+Keychain metadata. It does not retain or emit Mail content, the daemon token,
+or the Tavily secret. It snapshots before rollback activation so migration or
+startup mutation is visible, and verifies the absent-flag daemon restart before
+returning.
 
 ## Restore the production default
 
