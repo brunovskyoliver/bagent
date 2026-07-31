@@ -220,6 +220,18 @@ _Avoid_: Automation Run, model request
 The user-controlled conversation that receives new Conversation Turns and survives app or daemon restart until explicitly cleared. Clearing it starts a fresh Current Chat without deleting Automation Sessions or saved long-term memory.
 _Avoid_: Automation Session, conversation archive
 
+**Current Chat Draft**:
+The user-authored text prepared for the next Current Chat turn but not yet submitted. It remains separate from completed turns and from internal, system, model, or tool prompts.
+_Avoid_: Conversation Turn, prompt log
+
+**Slash Command Candidate**:
+The complete, unmodified Current Chat input when it is one whitespace-free token beginning with `/` at the first character. Only a candidate matching a known command or alias produces suggestions; its entered text is never normalized by suggestion display.
+_Avoid_: Command mode, rewritten input
+
+**Slash Command**:
+A recognized local instruction identified by a canonical name or an explicitly accepted alias. It is handled by bagent itself and never becomes model input or a Conversation Turn.
+_Avoid_: Slash-prefixed prompt, model command
+
 **Clear Current Chat**:
 The explicit `/clear` action that removes only Current Chat content and chat-scoped continuation context before creating a new empty Current Chat. It never deletes Automation Sessions or saved long-term memory.
 _Avoid_: Delete Automation Session, forget memory
@@ -247,6 +259,18 @@ _Avoid_: Chain of thought, activity transcript, notification window
 **Permission Grant Assist**:
 An in-notch guide that opens the relevant macOS privacy pane, presents bagent as a draggable application, rechecks the authoritative system grant, and offers a UI-only relaunch when the grant requires it.
 _Avoid_: Custom permission dialog, automatic grant, daemon restart
+
+**UI-only Relaunch**:
+The bounded replacement of the notch presentation process while the daemon, BaseRT, Automation Runs, and model leases retain their existing ownership and lifecycle.
+_Avoid_: App restart, daemon restart, runtime restart
+
+**UI Relaunch Handoff**:
+The versioned, short-lived, single-use transfer of allowlisted presentation state from the old notch UI to its intended replacement during a UI-only Relaunch.
+_Avoid_: Current Chat snapshot, runtime checkpoint, process archive
+
+**UI Event Consumer**:
+The single notch UI authority that applies daemon events to presentation state. Its identity remains distinct from reconnectable event-stream transport connections.
+_Avoid_: Event connection, duplicate UI subscriber
 
 **Synthesis Fallback**:
 One bounded attempt by the admitted backup model when the preferred synthesis model cannot load, is unavailable, or exceeds its deadline; it reuses the same validated Evidence Bundle.
