@@ -252,6 +252,10 @@ _Avoid_: Automation Session, Task Snapshot
 The immutable task context, observable activity, tool outcomes, and final response owned one-to-one by an Automation Run. It may seed a new Current Chat but is never extended by that chat.
 _Avoid_: Result summary, current chat
 
+**Legacy Run Record**:
+A limited, read-only historical account of an Automation Run that predates the Automation Session contract. It is not an Automation Session, carries no Completion Attention, and cannot seed Continuation.
+_Avoid_: Imported session, Automation Session
+
 **Task Snapshot**:
 The immutable copy of the user-authored automation task and identifying definition context captured for one Automation Session. It excludes internal prompts, hidden reasoning, credentials, and Evidence Content.
 _Avoid_: Current automation definition, system prompt
