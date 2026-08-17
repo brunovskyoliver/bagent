@@ -120,6 +120,10 @@ _Avoid_: Raw connector ID, activity detail
 The privacy-safe provenance of one requested side effect and its user decision, expiry, or restart abandonment. It preserves the action category and request identity without raw arguments, payloads, credentials, or private identities.
 _Avoid_: Raw approval request, inferred denial
 
+**Approval Withdrawal**:
+The terminal invalidation of a pending approval because its Work was cancelled before the user decision or deadline won. It is distinct from denial, expiry, and daemon-restart abandonment.
+_Avoid_: User denial, approval expiry, cancellation acknowledgement
+
 **Fresh Approval**:
 A new, action-specific user decision required for a gated action in its current execution context. Historical approvals and Continuation Provenance never satisfy it.
 _Avoid_: Reused approval, inherited permission
@@ -137,8 +141,12 @@ The durable notice that retained Automation Session content is incomplete, inclu
 _Avoid_: Omission, complete result
 
 **Persistence Allowlist**:
-The closed set of user-visible content and privacy-safe metadata permitted to become durable Automation Session data. Unknown or non-allowlisted fields are discarded before persistence or broadcast.
+The closed set of user-visible content and privacy-safe metadata permitted to become durable Automation Session data. Unknown or non-allowlisted fields are discarded before persistence.
 _Avoid_: Post-hoc redaction, debug capture
+
+**Event Allowlist**:
+The closed subset of privacy-safe identity, lifecycle, queue, activity, approval, and availability facts permitted in daemon events. Content-bearing changes are announced by identity and fetched through an authorized projection rather than embedded in the event.
+_Avoid_: Persistence Allowlist, arbitrary event payload, content stream
 
 **Automation Session Retention**:
 The automatic boundary that keeps at most fifty Automation Sessions per automation and no session longer than ninety days. Active work and pending approvals are never pruned.
@@ -176,9 +184,61 @@ _Avoid_: Agent loop, evidence reacquisition
 Evidence Content withheld from ordinary synthesis because it contains instruction-like material, unless the user explicitly requests analysis of that material as quoted data.
 _Avoid_: Hidden command, trusted instruction
 
+**Work**:
+One executable unit corresponding to exactly one accepted Conversation Turn or one admitted Automation Run, with a stable identity and one authoritative lifecycle from submission through terminal outcome. A scheduler-only skipped occurrence is recorded without Work because execution was never admitted.
+_Avoid_: Model request, UI interaction mode, scheduler occurrence
+
+**Work Identity**:
+The stable opaque identity of one Work, distinct from the identities of its originating Current Chat, Conversation Turn, Automation Definition, Automation Run, or Automation Session.
+_Avoid_: Session ID, model request ID, origin identity
+
+**Work Origin**:
+The immutable classification and provenance that ties one Work to exactly one Conversation Turn or admitted Automation Run without merging their domain identities.
+_Avoid_: Session, mutable execution context, inferred trigger
+
+**Work State**:
+The closed, revisioned lifecycle state of one Work as queued, waiting for a model, running, waiting for approval, cancelling, or in an immutable completed, partial, failed, cancelled, or abandoned outcome.
+_Avoid_: UI mode, inferred progress, independent status flags
+
+**Work Revision**:
+The monotonically increasing version of one Work after an authoritative mutation, used to reject stale mutation and projection without replacing the global Event Cursor.
+_Avoid_: Event sequence, schema version, daemon generation
+
+**Work Snapshot**:
+The privacy-safe authoritative view of Work and related projected state that is consistent through one Event Cursor.
+_Avoid_: Event log, UI cache, Current Chat snapshot
+
+**Event Cursor**:
+The durable position through which authoritative events are known to be committed and from which later events may be resumed or a gap detected.
+_Avoid_: Connection identity, Work revision, receipt timestamp
+
+**Daemon Generation**:
+The opaque identity of one daemon process lifetime, changed on restart without changing durable Work identity or Event Cursor continuity.
+_Avoid_: Work generation, model process identity, event sequence
+
+**Cancellation Intent**:
+The monotonic, acknowledged request to stop one nonterminal Work at its next safe point. It does not itself prove that execution stopped; only a terminal cancelled outcome does.
+_Avoid_: Immediate cancellation, terminal outcome, UI dismissal
+
+**Execution Slot**:
+The bounded admission capacity held by Work while it may execute model or tool activity, distinct from queue position and from a Model Residency Lease.
+_Avoid_: Model Residency Lease, scheduler claim, thread
+
 **Model Residency**:
-The period during which a model's weights remain loaded and ready, distinct from availability of the model service itself. An active Conversation Turn or Automation Run protects residency; otherwise it may end after inactivity or memory pressure without changing task correctness.
+The period during which a model's weights remain loaded and ready, distinct from availability of the model service itself. An active model generation protects residency through a Model Residency Lease; otherwise residency may end after inactivity or memory pressure without changing task correctness.
 _Avoid_: Permanent model ownership, evidence cache
+
+**Model Residency Lease**:
+The non-preemptible protection held for one active model generation so its required Model Residency cannot be changed until that generation ends.
+_Avoid_: Loaded-model ownership, execution slot, cancellation immunity
+
+**Model Runtime Generation**:
+The opaque identity of one bagent-owned port-8082 model process lifetime, changed only by a changed-process restart and kept separate from Daemon Generation.
+_Avoid_: Daemon Generation, Work Revision, independent port-8080 runtime
+
+**Command Acknowledgement**:
+The durable idempotent result of accepting or recognizing one command, distinct from proof that the requested Work has reached a terminal outcome.
+_Avoid_: Work completion, HTTP delivery, event receipt
 
 **Automation Run**:
 One scheduled or manually triggered execution occurrence of an automation, with its own lifecycle and terminal state, isolated from every earlier and later execution.
@@ -271,10 +331,6 @@ _Avoid_: Current Chat snapshot, runtime checkpoint, process archive
 **UI Event Consumer**:
 The single notch UI authority that applies daemon events to presentation state. Its identity remains distinct from reconnectable event-stream transport connections.
 _Avoid_: Event connection, duplicate UI subscriber
-
-**Synthesis Fallback**:
-One bounded attempt by the admitted backup model when the preferred synthesis model cannot load, is unavailable, or exceeds its deadline; it reuses the same validated Evidence Bundle.
-_Avoid_: Evidence retry, model cascade
 
 **Deterministic Rendering**:
 A model-free presentation of validated evidence and shortfalls used when synthesis is ineligible or every admitted synthesis attempt fails.
