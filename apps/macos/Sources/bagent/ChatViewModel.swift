@@ -955,6 +955,7 @@ final class ChatViewModel: ObservableObject {
 
     private var approvalPollTask: Task<Void, Never>?
     private var healthMonitorTask: Task<Void, Never>?
+    private let tavilyConfigurationSynchronizer = TavilyConfigurationSynchronizer()
 
     @Published var selectedModel: String = BaseRTLaunchAgent.model {
         didSet { UserDefaults.standard.set(selectedModel, forKey: "bagent.model") }
@@ -1597,8 +1598,6 @@ final class ChatViewModel: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
-        let tavilyKey = KeychainStore.loadTavilyAPIKey().flatMap { $0.isEmpty ? nil : $0 }
-        try? await client.configureTavily(apiKey: tavilyKey)
         // Odoo connects lazily on the first Odoo turn, avoiding MCP startup and
         // Keychain prompts during app launch.
         await refreshWhatsappStatusNow()
@@ -1614,6 +1613,11 @@ final class ChatViewModel: ObservableObject {
             guard let self else { return }
             while !Task.isCancelled {
                 let health = await client.healthStatus()
+                _ = await tavilyConfigurationSynchronizer.synchronize(
+                    health: health,
+                    loadCredential: KeychainStore.loadTavilyAPIKey,
+                    configure: client.configureTavily
+                )
                 await MainActor.run {
                     self.daemonHealth = health
                 }

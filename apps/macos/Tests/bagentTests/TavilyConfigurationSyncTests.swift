@@ -3,6 +3,7 @@ import XCTest
 
 @MainActor
 final class TavilyConfigurationSyncTests: XCTestCase {
+    @MainActor
     private final class Recorder {
         var attempts = 0
         var failFirstAttempt = false
