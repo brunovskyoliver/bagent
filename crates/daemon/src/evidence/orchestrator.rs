@@ -620,8 +620,7 @@ where
                         prior.value.as_ref().is_some_and(|prior| {
                             prior.final_url == evidence.final_url
                                 || prior.source_identity == evidence.source_identity
-                                || evidence_content_fingerprint(prior)
-                                    == evidence_content_fingerprint(evidence)
+                                || evidence_has_same_nonempty_content(prior, evidence)
                         })
                     });
                     if duplicate_source {
@@ -781,6 +780,11 @@ fn evidence_content_fingerprint(evidence: &WebFetchEvidence) -> String {
         .take(240)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn evidence_has_same_nonempty_content(left: &WebFetchEvidence, right: &WebFetchEvidence) -> bool {
+    let left_fingerprint = evidence_content_fingerprint(left);
+    !left_fingerprint.is_empty() && left_fingerprint == evidence_content_fingerprint(right)
 }
 
 fn search_has_terminal_tavily_failure(search: Option<&OperationResult<WebSearchResult>>) -> bool {
@@ -3692,10 +3696,11 @@ mod tests {
             ],
         );
         let mut gate = EventRecordingGate::new();
-        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+        let mut plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
             query: "What is the current population of Bratislava?".into(),
             verification: VerificationLevel::Corroborated,
         });
+        plan.budget.web_search_attempts = 1;
 
         let _ = execute_web_plan(adapter, &mut gate, "turn-irrelevant", &plan, "en").await;
 
@@ -3708,12 +3713,154 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(fetch_completions.len(), 2);
-        assert!(fetch_completions
+        assert_eq!(
+            fetch_completions
+                .iter()
+                .map(|event| event["contribution"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["irrelevant", "irrelevant"]
+        );
+        assert_eq!(
+            fetch_completions
+                .iter()
+                .map(|event| event["duplicates_suppressed"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_nonempty_claim_content_remains_a_duplicate() {
+        let first = web_candidate("https://publisher-one.example/slovakia", 1);
+        let second = web_candidate("https://publisher-two.example/slovakia", 2);
+        let claim = "Peter Pellegrini is the President of Slovakia and assumed office in 2024.";
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second.clone()],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    first.requested_url.as_str(),
+                    "publisher-one.example",
+                    claim,
+                )],
+                vec![readable_fetch(
+                    &second,
+                    second.requested_url.as_str(),
+                    "publisher-two.example",
+                    claim,
+                )],
+            ],
+        );
+        let mut gate = EventRecordingGate::new();
+        let mut plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Who is the current president of Slovakia?".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        plan.budget.web_search_attempts = 1;
+
+        let _ = execute_web_plan(adapter, &mut gate, "turn-content-duplicate", &plan, "en").await;
+
+        let fetch_completions = gate
+            .events
             .iter()
-            .all(|event| event["contribution"] == "irrelevant"));
-        assert!(fetch_completions
+            .filter(|event| {
+                event["type"] == "logical_activity_completed"
+                    && event["normalized_operation"] == "web.fetch"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fetch_completions.len(), 2);
+        assert_eq!(fetch_completions[0]["contribution"], "satisfied");
+        assert_eq!(fetch_completions[1]["contribution"], "duplicate");
+        assert_eq!(fetch_completions[0]["duplicates_suppressed"], 0);
+        assert_eq!(fetch_completions[1]["duplicates_suppressed"], 1);
+    }
+
+    #[tokio::test]
+    async fn same_final_url_remains_a_duplicate_when_selected_content_is_empty() {
+        let first = web_candidate("https://publisher-one.example/unrelated", 1);
+        let second = web_candidate("https://publisher-two.example/unrelated", 2);
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second.clone()],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    "https://canonical.example/unrelated",
+                    "publisher-one.example",
+                    "Generic navigation and contact information.",
+                )],
+                vec![readable_fetch(
+                    &second,
+                    "https://canonical.example/unrelated",
+                    "publisher-two.example",
+                    "Different generic navigation and contact information.",
+                )],
+            ],
+        );
+        let mut gate = EventRecordingGate::new();
+        let mut plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava?".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        plan.budget.web_search_attempts = 1;
+
+        let _ = execute_web_plan(adapter, &mut gate, "turn-final-url-duplicate", &plan, "en").await;
+
+        let fetch_completions = gate
+            .events
             .iter()
-            .all(|event| event["duplicates_suppressed"] == 0));
+            .filter(|event| {
+                event["type"] == "logical_activity_completed"
+                    && event["normalized_operation"] == "web.fetch"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fetch_completions.len(), 2);
+        assert_eq!(fetch_completions[0]["contribution"], "irrelevant");
+        assert_eq!(fetch_completions[1]["contribution"], "duplicate");
+        assert_eq!(fetch_completions[1]["duplicates_suppressed"], 1);
+    }
+
+    #[tokio::test]
+    async fn same_source_identity_remains_a_duplicate_when_selected_content_is_empty() {
+        let first = web_candidate("https://mirror.example/first", 1);
+        let second = web_candidate("https://mirror.example/second", 2);
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second.clone()],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    first.requested_url.as_str(),
+                    "shared-publisher.example",
+                    "Generic navigation and contact information.",
+                )],
+                vec![readable_fetch(
+                    &second,
+                    second.requested_url.as_str(),
+                    "shared-publisher.example",
+                    "Different generic navigation and contact information.",
+                )],
+            ],
+        );
+        let mut gate = EventRecordingGate::new();
+        let mut plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava?".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        plan.budget.web_search_attempts = 1;
+
+        let _ = execute_web_plan(adapter, &mut gate, "turn-source-duplicate", &plan, "en").await;
+
+        let fetch_completions = gate
+            .events
+            .iter()
+            .filter(|event| {
+                event["type"] == "logical_activity_completed"
+                    && event["normalized_operation"] == "web.fetch"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fetch_completions.len(), 2);
+        assert_eq!(fetch_completions[0]["contribution"], "irrelevant");
+        assert_eq!(fetch_completions[1]["contribution"], "duplicate");
+        assert_eq!(fetch_completions[1]["duplicates_suppressed"], 1);
     }
 
     #[tokio::test]
