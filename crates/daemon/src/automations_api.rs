@@ -19,6 +19,10 @@ use bagent_automations::{
     parse_timezone, policy, Automation, AutomationId, AutomationRun, AutomationRunId,
     AutomationRunStatus, AutomationSchedule, ScheduleError,
 };
+use bagentd::work_coordinator::{
+    AutomationDefinitionIdentity, AutomationDefinitionRevision, AutomationRunIdentity,
+    AutomationSessionIdentity, WorkRevision, WorkState,
+};
 
 use crate::{audit_fs, AppState};
 
@@ -236,7 +240,8 @@ pub(crate) fn repo_set_enabled(
 
 pub(crate) fn repo_has_active_run(conn: &Connection, id: &str) -> Result<bool, RepoError> {
     let active: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM automation_runs WHERE automation_id=?1 AND status='running')",
+        "SELECT EXISTS(SELECT 1 FROM work_automation_runs
+         WHERE historical_automation_identity=?1 AND active=1)",
         params![id],
         |r| r.get(0),
     )?;
@@ -369,7 +374,7 @@ pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<
 
 /// Concise redacted lifecycle event: ids/status/next-run only, no prompts or
 /// summaries — clients refetch the authoritative record.
-fn publish_automation_event(
+fn project_automation_definition_event(
     state: &AppState,
     event_type: &str,
     a_id: &str,
@@ -381,7 +386,7 @@ fn publish_automation_event(
             obj.insert(k.clone(), v.clone());
         }
     }
-    state.publish_event(ev);
+    state.project_legacy_event(ev);
 }
 
 fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
@@ -457,7 +462,7 @@ pub(crate) async fn automations_create(
                 &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
             );
             state.automations_changed.notify_waiters();
-            publish_automation_event(
+            project_automation_definition_event(
                 &state,
                 "automation_created",
                 &a.id.to_string(),
@@ -503,7 +508,7 @@ pub(crate) async fn automation_patch(
                 &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
             );
             state.automations_changed.notify_waiters();
-            publish_automation_event(
+            project_automation_definition_event(
                 &state,
                 "automation_updated",
                 &a.id.to_string(),
@@ -530,7 +535,7 @@ pub(crate) async fn automation_delete(
         Ok(()) => {
             audit_fs(&state.db, "automation_delete", &json!({"id": id}));
             state.automations_changed.notify_waiters();
-            publish_automation_event(&state, "automation_deleted", &id, json!({}));
+            project_automation_definition_event(&state, "automation_deleted", &id, json!({}));
             (StatusCode::OK, Json(json!({"ok": true})))
         }
         Err(e) => repo_error_response(e),
@@ -572,7 +577,7 @@ async fn set_enabled(
                 &json!({"id": id}),
             );
             state.automations_changed.notify_waiters();
-            publish_automation_event(
+            project_automation_definition_event(
                 &state,
                 if enabled {
                     "automation_enabled"
@@ -636,9 +641,7 @@ fn is_evidence_event(event: &serde_json::Value) -> bool {
     )
 }
 
-/// Atomically claim execution: exactly one `running` row per automation.
-/// Returns the claimed run or `ActiveRun` when one is already in flight.
-/// Single short statement under the DB lock — released before any model work.
+/// Prepare an occurrence for authoritative admission by Work Coordinator.
 pub(crate) fn repo_claim_run(
     conn: &Connection,
     automation: &Automation,
@@ -658,27 +661,7 @@ pub(crate) fn repo_claim_run(
         is_catch_up,
         is_manual,
     };
-    // INSERT … WHERE NOT EXISTS(active run) is atomic on one connection.
-    let inserted = conn.execute(
-        &format!(
-            "INSERT INTO automation_runs ({RUN_COLS}, created_at) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 \
-             WHERE NOT EXISTS (SELECT 1 FROM automation_runs WHERE automation_id=?2 AND status='running')"
-        ),
-        params![
-            run.id.to_string(),
-            run.automation_id.to_string(),
-            ts(run.scheduled_for),
-            run.started_at.map(ts),
-            Option::<String>::None,
-            run.status.as_str(),
-            Option::<String>::None,
-            run.is_catch_up as i64,
-            run.is_manual as i64,
-            ts(now),
-        ],
-    )?;
-    if inserted == 0 {
+    if repo_has_active_run(conn, &automation.id.to_string())? {
         return Err(RepoError::ActiveRun);
     }
     Ok(run)
@@ -755,17 +738,46 @@ pub(crate) async fn execute_automation_run(
     automation: Automation,
     run: AutomationRun,
 ) {
-    // Bounded concurrency across scheduled and manual runs. The claim row
-    // already exists, so a queued run simply starts a little later; once the
-    // slot is acquired, started_at is corrected to the actual start.
-    let _permit = state.run_slots.clone().acquire_owned().await.ok();
+    let work_identity = match state.work_authority.submit_automation(
+        format!("automation-admit:{}", run.id),
+        AutomationRunIdentity::new(run.id.to_string()),
+        AutomationSessionIdentity::new(format!("automation-session:{}", run.id)),
+        AutomationDefinitionIdentity::new(automation.id.to_string()),
+        AutomationDefinitionRevision::new(0),
+        Utc::now().timestamp_millis().max(0) as u64,
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(%error, "automation Work admission rejected");
+            return;
+        }
+    };
+    state
+        .work_authority
+        .acquire_automation_slot(work_identity.clone())
+        .await;
+    let waiting_revision = match state.work_authority.transition(
+        format!("automation-waiting:{}", run.id),
+        work_identity.clone(),
+        WorkRevision::new(1),
+        WorkState::WaitingForModel,
+    ) {
+        Ok(revision) => revision,
+        Err(_) => return,
+    };
+    let running_revision = match state.work_authority.transition(
+        format!("automation-running:{}", run.id),
+        work_identity.clone(),
+        waiting_revision,
+        WorkState::Running,
+    ) {
+        Ok(revision) => revision,
+        Err(_) => return,
+    };
     let started_at = Utc::now();
     {
         let conn = state.db.lock().await;
-        let _ = conn.execute(
-            "UPDATE automation_runs SET started_at=?2 WHERE id=?1",
-            rusqlite::params![run.id.to_string(), ts(started_at)],
-        );
+        let _ = repo_insert_run(&conn, &run);
     }
     let ctx = AutomationExecutionContext {
         automation_id: automation.id,
@@ -782,12 +794,6 @@ pub(crate) async fn execute_automation_run(
         automation_name: automation.name.clone(),
         run_id: run.id.to_string(),
     };
-    publish_automation_event(
-        &state,
-        "automation_run_started",
-        &automation.id.to_string(),
-        json!({"run_id": run.id.to_string(), "manual": run.is_manual}),
-    );
     audit_fs(
         &state.db,
         "automation_run_start",
@@ -846,7 +852,7 @@ pub(crate) async fn execute_automation_run(
     let drain = tokio::spawn(async move {
         while let Some(event) = ev_rx.recv().await {
             if is_evidence_event(&event) {
-                event_state.publish_event(event);
+                event_state.project_legacy_event(event);
             }
         }
     });
@@ -855,6 +861,7 @@ pub(crate) async fn execute_automation_run(
         &state,
         &sink,
         &origin,
+        work_identity.clone(),
         &format!("automation-{}", automation.id),
         &state.default_model,
         messages,
@@ -865,6 +872,26 @@ pub(crate) async fn execute_automation_run(
     let _ = drain.await;
 
     let (status, summary) = outcome_to_status(&result);
+    let terminal_state = match status {
+        AutomationRunStatus::Completed => WorkState::Completed,
+        AutomationRunStatus::Partial => WorkState::Partial,
+        AutomationRunStatus::Abandoned => WorkState::Abandoned,
+        _ => WorkState::Failed,
+    };
+    let terminal_revision = state
+        .work_authority
+        .current(&work_identity)
+        .ok()
+        .flatten()
+        .map(|record| record.revision)
+        .unwrap_or(running_revision);
+    let _ = state.work_authority.transition(
+        format!("automation-terminal:{}", run.id),
+        work_identity.clone(),
+        terminal_revision,
+        terminal_state,
+    );
+    state.work_authority.release_execution_slot(&work_identity);
     let now = Utc::now();
     {
         let conn = state.db.lock().await;
@@ -887,12 +914,6 @@ pub(crate) async fn execute_automation_run(
             "run_id": run.id.to_string(),
             "status": status.as_str(),
         }),
-    );
-    publish_automation_event(
-        &state,
-        "automation_run_finished",
-        &automation.id.to_string(),
-        json!({"run_id": run.id.to_string(), "status": status.as_str()}),
     );
     state.automations_changed.notify_waiters();
 }
@@ -930,6 +951,45 @@ pub(crate) async fn automation_run_now(
         }
         Err((code, body)) => (code, body),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_project_active_work(
+    conn: &Connection,
+    automation: &Automation,
+    run: &AutomationRun,
+) {
+    let work = format!("test-work:{}", run.id);
+    conn.execute(
+        "INSERT OR IGNORE INTO works
+         (identity,origin_kind,origin_primary_identity,origin_secondary_identity,
+          origin_historical_identity,origin_definition_revision,state,revision,created_at,updated_at)
+         VALUES (?1,'automation',?2,?3,?4,0,'running',3,?5,?5)",
+        params![work, run.id.to_string(), format!("test-session:{}", run.id),
+            automation.id.to_string(), ts(Utc::now())],
+    ).unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO work_automation_runs
+         (automation_run_identity,automation_session_identity,historical_automation_identity,
+          frozen_definition_revision,work_identity,active)
+         VALUES (?1,?2,?3,0,?4,1)",
+        params![
+            run.id.to_string(),
+            format!("test-session:{}", run.id),
+            automation.id.to_string(),
+            work
+        ],
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn test_finish_active_work(conn: &Connection, run: &AutomationRun) {
+    conn.execute(
+        "UPDATE work_automation_runs SET active=0 WHERE automation_run_identity=?1",
+        params![run.id.to_string()],
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -1110,8 +1170,10 @@ mod tests {
             is_manual: false,
         };
         repo_insert_run(&conn, &run).unwrap();
+        test_project_active_work(&conn, &a, &run);
         assert!(matches!(repo_delete(&conn, &id), Err(RepoError::ActiveRun)));
 
+        test_finish_active_work(&conn, &run);
         repo_finish_run(
             &conn,
             &run.id.to_string(),
@@ -1171,12 +1233,14 @@ mod tests {
         .unwrap();
         let first = repo_claim_run(&conn, &a, now(), false, true, now()).unwrap();
         assert_eq!(first.status, AutomationRunStatus::Running);
+        test_project_active_work(&conn, &a, &first);
         // Second claim while the first is active → conflict.
         assert!(matches!(
             repo_claim_run(&conn, &a, now(), false, true, now()),
             Err(RepoError::ActiveRun)
         ));
         // Finishing releases the claim.
+        test_finish_active_work(&conn, &first);
         repo_finish_run(
             &conn,
             &first.id.to_string(),

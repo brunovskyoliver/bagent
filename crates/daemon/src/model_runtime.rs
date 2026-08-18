@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+pub use crate::work_coordinator::WorkIdentity;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bagent_agent::{AgentInference, InferenceFuture};
@@ -17,15 +18,6 @@ use futures_util::{stream::BoxStream, Stream, StreamExt};
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use tokio::sync::Mutex as AsyncMutex;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct WorkIdentity(String);
-
-impl WorkIdentity {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelClass {
@@ -100,20 +92,20 @@ impl ModelDemand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TypedOrigin {
+pub enum WorkDemandOrigin {
     Foreground,
     Automation,
 }
 
 #[derive(Clone)]
-pub struct TypedModelRuntime {
+pub struct CoordinatedModelRuntime {
     runtime: Arc<ModelRuntime>,
-    origin: TypedOrigin,
+    origin: WorkDemandOrigin,
     work: WorkIdentity,
 }
 
-impl TypedModelRuntime {
-    pub fn new(runtime: Arc<ModelRuntime>, origin: TypedOrigin, work: WorkIdentity) -> Self {
+impl CoordinatedModelRuntime {
+    pub fn new(runtime: Arc<ModelRuntime>, origin: WorkDemandOrigin, work: WorkIdentity) -> Self {
         Self {
             runtime,
             origin,
@@ -121,10 +113,10 @@ impl TypedModelRuntime {
         }
     }
 
-    fn demand(&self, model: ModelClass) -> ModelDemand {
+    pub fn demand(&self, model: ModelClass) -> ModelDemand {
         match self.origin {
-            TypedOrigin::Foreground => ModelDemand::foreground(self.work.clone(), model),
-            TypedOrigin::Automation => ModelDemand::automation(self.work.clone(), model),
+            WorkDemandOrigin::Foreground => ModelDemand::foreground(self.work.clone(), model),
+            WorkDemandOrigin::Automation => ModelDemand::automation(self.work.clone(), model),
         }
     }
 
@@ -151,7 +143,7 @@ impl TypedModelRuntime {
     }
 }
 
-impl AgentInference for TypedModelRuntime {
+impl AgentInference for CoordinatedModelRuntime {
     fn infer_raw<'a>(
         &'a self,
         _model: &'a str,

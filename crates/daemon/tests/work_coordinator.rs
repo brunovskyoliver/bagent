@@ -725,21 +725,29 @@ fn daemon_restart_recovery() {
         after_restart.daemon_generation,
         DaemonGeneration::new("daemon-a10-after")
     );
-    assert_eq!(after_restart.cursor.value(), 23);
+    assert_eq!(after_restart.cursor.value(), 22);
     assert_eq!(after_restart.automation_runs.len(), 1);
     assert!(!after_restart.automation_runs[0].active);
     assert_eq!(after_restart.approvals.len(), 1);
     assert_eq!(
         after_restart.approvals[0].state,
-        bagentd::work_coordinator::ApprovalState::Abandoned
+        bagentd::work_coordinator::ApprovalState::Pending
     );
-    assert_eq!(after_restart.interruptions.len(), 5);
+    assert_eq!(after_restart.interruptions.len(), 4);
     assert!(!after_restart.model_runtime_trusted);
     assert_eq!(after_restart.model_runtime_generation, None);
     for work in &after_restart.works {
         if work.identity.as_str() == "work-a10-completed" {
             assert_eq!(work.state, WorkState::Completed);
             assert_eq!(work.revision.value(), 4);
+        } else if work.identity.as_str() == "work-a10-approval" {
+            assert_eq!(work.state, WorkState::WaitingForApproval);
+            let prior = before_restart
+                .works
+                .iter()
+                .find(|prior| prior.identity == work.identity)
+                .unwrap();
+            assert_eq!(work.revision, prior.revision);
         } else {
             assert_eq!(work.state, WorkState::Abandoned);
             let prior = before_restart
@@ -765,7 +773,7 @@ fn daemon_restart_recovery() {
             .iter()
             .map(|event| event.event_cursor.value())
             .collect::<Vec<_>>(),
-        vec![18, 19, 20, 21, 22, 23]
+        vec![18, 19, 20, 21, 22]
     );
     assert!(recovery_events.iter().all(|event| {
         event.state == WorkState::Abandoned
@@ -808,13 +816,14 @@ fn daemon_restart_fixture_process() {
         snapshot.daemon_generation,
         DaemonGeneration::new("daemon-a10-after")
     );
-    assert!(snapshot
-        .works
-        .iter()
-        .all(|work| { work.state == WorkState::Abandoned || work.state == WorkState::Completed }));
+    assert!(snapshot.works.iter().all(|work| {
+        work.state == WorkState::Abandoned
+            || work.state == WorkState::Completed
+            || work.state == WorkState::WaitingForApproval
+    }));
     assert!(snapshot
         .approvals
         .iter()
-        .all(|approval| approval.state != bagentd::work_coordinator::ApprovalState::Pending));
+        .all(|approval| approval.state == bagentd::work_coordinator::ApprovalState::Pending));
     assert!(!snapshot.model_runtime_trusted);
 }

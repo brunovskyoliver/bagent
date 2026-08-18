@@ -1,7 +1,4 @@
-//! Additive, unused foundations for the daemon-owned Work Coordinator.
-//!
-//! Production lifecycle paths do not call this module before the unified Work
-//! cutover. Its interface is the deterministic test seam for Stage 2.
+//! Daemon-owned authority for admitted Conversation Turns and Automation Runs.
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -9,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, fmt, path::Path, sync::Mutex};
 
 const SCHEMA: &str = include_str!("../migrations/V15__work_coordinator_foundations.sql");
+const CUTOVER_SCHEMA: &str = include_str!("../migrations/V16__unified_work_cutover.sql");
 const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,7 +20,7 @@ impl Default for CoordinatorConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DaemonGeneration(String);
 
@@ -69,7 +67,7 @@ impl WorkIdentitySource for DeterministicWorkIdentitySource {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WorkIdentity(String);
 
@@ -391,6 +389,17 @@ enum CommandKind {
         approval_identity: ApprovalIdentity,
         category: String,
     },
+    ResolveApproval {
+        work_identity: WorkIdentity,
+        expected_revision: WorkRevision,
+        approval_identity: ApprovalIdentity,
+        allow: bool,
+        expected_decision_revision: u64,
+    },
+    Cancel {
+        work_identity: WorkIdentity,
+        expected_revision: WorkRevision,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,6 +520,46 @@ impl Command {
         }
     }
 
+    pub fn resolve_approval(
+        command_identity: impl Into<CommandIdentity>,
+        work_identity: impl Into<WorkIdentity>,
+        expected_revision: WorkRevision,
+        approval_identity: ApprovalIdentity,
+        allow: bool,
+        expected_decision_revision: u64,
+        generation: DaemonGeneration,
+    ) -> Self {
+        Self {
+            command_schema_version: SCHEMA_VERSION,
+            command_identity: command_identity.into(),
+            expected_daemon_generation: generation,
+            kind: CommandKind::ResolveApproval {
+                work_identity: work_identity.into(),
+                expected_revision,
+                approval_identity,
+                allow,
+                expected_decision_revision,
+            },
+        }
+    }
+
+    pub fn cancel(
+        command_identity: impl Into<CommandIdentity>,
+        work_identity: impl Into<WorkIdentity>,
+        expected_revision: WorkRevision,
+        generation: DaemonGeneration,
+    ) -> Self {
+        Self {
+            command_schema_version: SCHEMA_VERSION,
+            command_identity: command_identity.into(),
+            expected_daemon_generation: generation,
+            kind: CommandKind::Cancel {
+                work_identity: work_identity.into(),
+                expected_revision,
+            },
+        }
+    }
+
     fn hash(&self) -> Result<String, CommandError> {
         let bytes = serde_json::to_vec(self).map_err(CommandError::serialization)?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -595,6 +644,7 @@ pub struct WorkRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkSnapshot {
     pub schema_version: u32,
     pub cursor: EventCursor,
@@ -654,6 +704,7 @@ pub struct InterruptionMarker {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkEvent {
     pub schema_version: u32,
     pub event_cursor: EventCursor,
@@ -698,6 +749,64 @@ pub enum EventRead {
     Gap { snapshot: WorkSnapshot },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactWorkProjection {
+    pub schema_version: u32,
+    pub event_cursor: EventCursor,
+    pub daemon_generation: DaemonGeneration,
+    pub work: Vec<CompactWorkItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactWorkItem {
+    pub work_identity: WorkIdentity,
+    pub revision: WorkRevision,
+    pub state: WorkState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkDiagnostic {
+    pub schema_version: u32,
+    pub event_cursor: EventCursor,
+    pub work_count: usize,
+    pub pending_approval_count: usize,
+}
+
+impl WorkSnapshot {
+    pub fn compact_projection(&self) -> CompactWorkProjection {
+        CompactWorkProjection {
+            schema_version: self.schema_version,
+            event_cursor: self.cursor,
+            daemon_generation: self.daemon_generation.clone(),
+            work: self
+                .works
+                .iter()
+                .map(|work| CompactWorkItem {
+                    work_identity: work.identity.clone(),
+                    revision: work.revision,
+                    state: work.state,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn structural_diagnostic(&self) -> WorkDiagnostic {
+        WorkDiagnostic {
+            schema_version: self.schema_version,
+            event_cursor: self.cursor,
+            work_count: self.works.len(),
+            pending_approval_count: self
+                .approvals
+                .iter()
+                .filter(|approval| approval.state == ApprovalState::Pending)
+                .count(),
+        }
+    }
+}
+
 pub struct WorkCoordinator {
     connection: Mutex<Connection>,
     config: CoordinatorConfig,
@@ -739,6 +848,22 @@ impl WorkCoordinator {
         connection
             .execute_batch(SCHEMA)
             .map_err(CommandError::storage)?;
+        let has_decision_revision = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(work_approvals)")
+                .map_err(CommandError::storage)?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(CommandError::storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CommandError::storage)?;
+            columns.iter().any(|column| column == "decision_revision")
+        };
+        if !has_decision_revision {
+            connection
+                .execute_batch(CUTOVER_SCHEMA)
+                .map_err(CommandError::storage)?;
+        }
         initialize_generation(
             &connection,
             &generation,
@@ -983,9 +1108,10 @@ fn initialize_generation(
                 )
                 .collect::<Result<Vec<_>, CommandError>>()?
         };
-        for (work_identity, old_revision, _old_state, origin_kind, origin_identity) in recoverable
-            .into_iter()
-            .filter(|(_, _, state, _, _)| !state.is_terminal())
+        for (work_identity, old_revision, _old_state, origin_kind, origin_identity) in
+            recoverable.into_iter().filter(|(_, _, state, _, _)| {
+                !state.is_terminal() && *state != WorkState::WaitingForApproval
+            })
         {
             let revision = old_revision + 1;
             let committed_at = clock.now();
@@ -1155,6 +1281,14 @@ fn apply_command(
                     params![work_identity.as_str()],
                 )
                 .map_err(CommandError::storage)?;
+            transaction
+                .execute(
+                    "UPDATE work_cutover
+                     SET first_post_cutover_work_at = COALESCE(first_post_cutover_work_at, ?1)
+                     WHERE singleton = 1",
+                    params![committed_at],
+                )
+                .map_err(CommandError::storage)?;
             Ok((
                 work_identity.clone(),
                 WorkRevision::new(1),
@@ -1297,6 +1431,122 @@ fn apply_command(
                 work_identity.clone(),
                 revision,
                 WorkState::WaitingForApproval,
+                EventKind::WorkStateChanged,
+            ))
+        }
+        CommandKind::ResolveApproval {
+            work_identity,
+            expected_revision,
+            approval_identity,
+            allow,
+            expected_decision_revision,
+        } => {
+            let (current_state, current_revision) =
+                load_work_state_revision(transaction, work_identity)?;
+            if current_revision != *expected_revision {
+                return Err(CommandError::Conflict {
+                    current_revision: Some(current_revision),
+                });
+            }
+            if current_state != WorkState::WaitingForApproval {
+                return Err(CommandError::IllegalTransition {
+                    from: current_state,
+                    to: WorkState::Running,
+                });
+            }
+            let approval_changed = transaction
+                .execute(
+                    "UPDATE work_approvals
+                     SET state = ?1, resolved_at = ?2, decision_revision = decision_revision + 1
+                     WHERE identity = ?3 AND work_identity = ?4 AND state = 'pending'
+                       AND decision_revision = ?5",
+                    params![
+                        if *allow { "allowed" } else { "denied" },
+                        committed_at,
+                        approval_identity.as_str(),
+                        work_identity.as_str(),
+                        expected_decision_revision,
+                    ],
+                )
+                .map_err(CommandError::storage)?;
+            if approval_changed != 1 {
+                return Err(CommandError::Conflict {
+                    current_revision: Some(current_revision),
+                });
+            }
+            let next_state = WorkState::Running;
+            let revision = WorkRevision::new(current_revision.value() + 1);
+            transaction
+                .execute(
+                    "UPDATE works SET state = ?1, revision = ?2, updated_at = ?3
+                     WHERE identity = ?4 AND revision = ?5",
+                    params![
+                        next_state.as_str(),
+                        revision.value(),
+                        committed_at,
+                        work_identity.as_str(),
+                        current_revision.value(),
+                    ],
+                )
+                .map_err(CommandError::storage)?;
+            transaction
+                .execute(
+                    "UPDATE work_projections SET revision = ?1 WHERE work_identity = ?2",
+                    params![revision.value(), work_identity.as_str()],
+                )
+                .map_err(CommandError::storage)?;
+            Ok((
+                work_identity.clone(),
+                revision,
+                next_state,
+                EventKind::WorkStateChanged,
+            ))
+        }
+        CommandKind::Cancel {
+            work_identity,
+            expected_revision,
+        } => {
+            let (current_state, current_revision) =
+                load_work_state_revision(transaction, work_identity)?;
+            if current_revision != *expected_revision {
+                return Err(CommandError::Conflict {
+                    current_revision: Some(current_revision),
+                });
+            }
+            if current_state.is_terminal() {
+                return Err(CommandError::TerminalTarget);
+            }
+            let revision = WorkRevision::new(current_revision.value() + 1);
+            transaction
+                .execute(
+                    "UPDATE works SET state = 'cancelling', revision = ?1, updated_at = ?2
+                     WHERE identity = ?3 AND revision = ?4",
+                    params![
+                        revision.value(),
+                        committed_at,
+                        work_identity.as_str(),
+                        current_revision.value(),
+                    ],
+                )
+                .map_err(CommandError::storage)?;
+            transaction
+                .execute(
+                    "UPDATE work_approvals SET state = 'withdrawn', resolved_at = ?1,
+                         decision_revision = decision_revision + 1
+                     WHERE work_identity = ?2 AND state = 'pending'",
+                    params![committed_at, work_identity.as_str()],
+                )
+                .map_err(CommandError::storage)?;
+            transaction
+                .execute(
+                    "UPDATE work_projections SET revision = ?1 WHERE work_identity = ?2",
+                    params![revision.value(), work_identity.as_str()],
+                )
+                .map_err(CommandError::storage)?;
+            Ok((
+                work_identity.clone(),
+                revision,
+                WorkState::Cancelling,
                 EventKind::WorkStateChanged,
             ))
         }

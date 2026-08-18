@@ -215,47 +215,6 @@ fn next_run_changed_event(id: &str, next: Option<DateTime<Utc>>) -> serde_json::
     })
 }
 
-/// Startup recovery: abandoned `running` rows become terminal `abandoned`
-/// (they never revive), their automations advance normally on the next pass,
-/// and stale undecided approvals are denied — approvals are never revived
-/// across a restart.
-pub(crate) fn recover_on_startup(conn: &Connection, now: DateTime<Utc>) -> usize {
-    let nows = now.to_rfc3339();
-    let abandoned = conn
-        .execute(
-            "UPDATE automation_runs SET status='abandoned', finished_at=?1, \
-             result_summary='Daemon restarted during execution.' WHERE status='running'",
-            params![nows],
-        )
-        .unwrap_or(0);
-    if abandoned > 0 {
-        audit(
-            conn,
-            "automation_runs_abandoned",
-            json!({"count": abandoned}),
-        );
-        let _ = conn.execute(
-            "UPDATE automations SET last_run_status='abandoned', last_run_at=?1 \
-             WHERE id IN (SELECT automation_id FROM automation_runs WHERE status='abandoned' AND finished_at=?1)",
-            params![nows],
-        );
-    }
-    let denied = conn
-        .execute(
-            "UPDATE pending_approvals SET decision='deny', decided_at=?1 WHERE decision IS NULL",
-            params![nows],
-        )
-        .unwrap_or(0);
-    if denied > 0 {
-        audit(
-            conn,
-            "approvals_denied_on_restart",
-            json!({"count": denied}),
-        );
-    }
-    abandoned
-}
-
 /// Earliest enabled due instant, for sleep computation.
 fn next_due_at(conn: &Connection) -> Option<DateTime<Utc>> {
     conn.query_row(
@@ -272,20 +231,13 @@ fn next_due_at(conn: &Connection) -> Option<DateTime<Utc>> {
 /// The scheduler task. Runs until the daemon exits; a run in flight at
 /// shutdown is recovered as `abandoned` on the next start.
 pub(crate) async fn run_scheduler(state: AppState) {
-    {
-        let conn = state.db.lock().await;
-        let recovered = recover_on_startup(&conn, Utc::now());
-        if recovered > 0 {
-            tracing::info!("scheduler: recovered {recovered} abandoned run(s)");
-        }
-    }
     loop {
         let pass = {
             let conn = state.db.lock().await;
             scheduler_step(&conn, Utc::now())
         };
         for event in pass.events {
-            state.publish_event(event);
+            state.project_legacy_event(event);
         }
         for (automation, run) in pass.claimed {
             let st = state.clone();
@@ -316,7 +268,10 @@ pub(crate) async fn run_scheduler(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automations_api::{repo_create, repo_recent_runs, repo_set_enabled};
+    use crate::automations_api::{
+        repo_create, repo_recent_runs, repo_set_enabled, test_finish_active_work,
+        test_project_active_work,
+    };
     use bagent_automations::{AutomationRunStatus, AutomationSchedule};
     use chrono::TimeZone;
 
@@ -415,11 +370,13 @@ mod tests {
             t(2026, 7, 18, 5, 0),
         )
         .unwrap();
+        test_project_active_work(&conn, &a, &manual);
         let pass = scheduler_step(&conn, t(2026, 7, 18, 6, 0));
         assert!(pass.claimed.is_empty());
         let after = repo_get(&conn, &a.id.to_string()).unwrap();
         assert_eq!(after.next_run_at, Some(t(2026, 7, 18, 6, 0)));
         // Once the manual run finishes, the deferred occurrence is claimed.
+        test_finish_active_work(&conn, &manual);
         crate::automations_api::repo_finish_run(
             &conn,
             &manual.id.to_string(),
@@ -448,7 +405,7 @@ mod tests {
             t(2026, 7, 17, 10, 0),
         )
         .unwrap();
-        repo_claim_run(
+        let active = repo_claim_run(
             &conn,
             &a,
             t(2026, 7, 17, 11, 0),
@@ -457,6 +414,7 @@ mod tests {
             t(2026, 7, 17, 11, 0),
         )
         .unwrap();
+        test_project_active_work(&conn, &a, &active);
         let pass = scheduler_step(&conn, t(2026, 7, 17, 12, 0));
         assert!(pass.claimed.is_empty());
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
@@ -481,51 +439,6 @@ mod tests {
         assert!(scheduler_step(&conn, t(2026, 7, 18, 6, 0))
             .claimed
             .is_empty());
-    }
-
-    #[test]
-    fn restart_recovery_abandons_runs_and_denies_stale_approvals() {
-        let conn = test_conn();
-        let a = once(&conn, "n", t(2026, 7, 18, 6, 0), t(2026, 7, 17, 0, 0));
-        let run = repo_claim_run(
-            &conn,
-            &a,
-            t(2026, 7, 18, 6, 0),
-            false,
-            false,
-            t(2026, 7, 18, 6, 0),
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO pending_approvals (id, tool_name, description, expires_at, created_at) \
-             VALUES ('ap1', 'whatsapp.send_message', 'x', '2099-01-01T00:00:00Z', '2026-07-18T06:00:00Z')",
-            [],
-        )
-        .unwrap();
-
-        let recovered = recover_on_startup(&conn, t(2026, 7, 18, 6, 30));
-        assert_eq!(recovered, 1);
-        let runs = repo_recent_runs(&conn, &a.id.to_string(), 10).unwrap();
-        assert_eq!(runs[0].status, AutomationRunStatus::Abandoned);
-        assert_eq!(runs[0].id, run.id);
-        let decision: Option<String> = conn
-            .query_row(
-                "SELECT decision FROM pending_approvals WHERE id='ap1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(decision.as_deref(), Some("deny"));
-        // The abandoned run releases the claim: the automation can run again.
-        assert!(repo_claim_run(
-            &conn,
-            &a,
-            t(2026, 7, 18, 7, 0),
-            true,
-            false,
-            t(2026, 7, 18, 7, 0)
-        )
-        .is_ok());
     }
 
     #[test]
@@ -705,6 +618,7 @@ mod tests {
         let claimed = scheduler_step(&conn, t(2026, 7, 17, 9, 45)).claimed;
         assert_eq!(claimed.len(), 1);
         assert!(claimed[0].1.is_catch_up);
+        test_project_active_work(&conn, &a, &claimed[0].1);
         assert_eq!(
             repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
             Some(t(2026, 7, 24, 5, 45))
@@ -746,6 +660,7 @@ mod tests {
         let id = a.id.to_string();
         let claimed = scheduler_step(&conn, t(2026, 7, 18, 6, 0)).claimed;
         assert_eq!(claimed.len(), 1);
+        test_project_active_work(&conn, &a, &claimed[0].1);
 
         // Edit while running: allowed, applies from the next occurrence — the
         // in-flight run keeps its captured prompt/context.
@@ -763,6 +678,7 @@ mod tests {
 
         // Delete while running: deterministic 409 until the run finishes.
         assert!(matches!(repo_delete(&conn, &id), Err(RepoError::ActiveRun)));
+        test_finish_active_work(&conn, &claimed[0].1);
         crate::automations_api::repo_finish_run(
             &conn,
             &claimed[0].1.id.to_string(),
@@ -794,6 +710,7 @@ mod tests {
         // Catch-up claim (3 h late) so lifecycle audit rows exist to inspect.
         let claimed = scheduler_step(&conn, t(2026, 7, 18, 9, 0)).claimed;
         assert_eq!(claimed.len(), 1);
+        crate::automations_api::repo_insert_run(&conn, &claimed[0].1).unwrap();
         crate::automations_api::repo_finish_run(
             &conn,
             &claimed[0].1.id.to_string(),

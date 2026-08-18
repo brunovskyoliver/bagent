@@ -29,6 +29,7 @@ pub(crate) struct EvidenceContext<'a> {
     pub state: &'a AppState,
     pub sink: &'a EventSink,
     pub origin: &'a ExecOrigin,
+    pub work_identity: &'a bagentd::work_coordinator::WorkIdentity,
 }
 
 #[derive(Debug)]
@@ -87,6 +88,7 @@ struct ExistingPolicyGate<'a> {
     state: &'a AppState,
     sink: &'a EventSink,
     origin: &'a ExecOrigin,
+    work_identity: &'a bagentd::work_coordinator::WorkIdentity,
     turn_id: &'a str,
     started_activities: HashSet<super::OperationKey>,
     completed_activities: HashMap<super::OperationKey, LogicalActivityCompletion>,
@@ -222,6 +224,7 @@ impl ExistingPolicyGate<'_> {
                     self.state,
                     self.sink,
                     self.origin,
+                    self.work_identity,
                     rule_name,
                     &self.origin.describe(description),
                 )
@@ -246,6 +249,7 @@ pub(crate) async fn execute_evidence_turn(
         state: ctx.state,
         sink: ctx.sink,
         origin: ctx.origin,
+        work_identity: ctx.work_identity,
         turn_id: &request.turn_id,
         started_activities: HashSet::new(),
         completed_activities: HashMap::new(),

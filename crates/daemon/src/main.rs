@@ -20,8 +20,11 @@ use bagent_attachments::extract as extract_attachment;
 use bagent_memory::MemoryStore;
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
 use bagent_skills::{selector as skill_selector, LoadedSkill};
-use bagentd::model_runtime::{
-    ModelRuntime, ProductionModelConfig, TypedModelRuntime, TypedOrigin, WorkIdentity,
+use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig};
+use bagentd::unified_work::UnifiedWorkAuthority;
+use bagentd::work_coordinator::{
+    ConversationTurnIdentity, CoordinatorConfig, CurrentChatIdentity, DaemonGeneration,
+    WorkCoordinator, WorkRevision, WorkState,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use basert_connector::{Message, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL};
@@ -36,7 +39,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, convert::Infallible, io::Write, path::PathBuf, sync::Arc};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 use whatsapp_connector::{
@@ -65,6 +68,7 @@ struct AppState {
     evidence_orchestrator: agent_exec::EvidenceOrchestratorFlag,
     attachments_dir: PathBuf,
     model_runtime: Arc<ModelRuntime>,
+    work_authority: Arc<UnifiedWorkAuthority>,
     /// Shared preferred/fallback synthesis lifecycle for chat and automations.
     synthesis: Arc<evidence::SynthesisService>,
     /// Privacy-safe bounded structural traces for routed evidence turns.
@@ -75,7 +79,6 @@ struct AppState {
     memory: Arc<MemoryStore>,
     prompt_builder: Arc<PromptBuilder>,
     rules: Arc<RuleEngine>,
-    pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     /// Loaded skill manifests + bodies, scanned at startup.
     skills: Arc<Vec<LoadedSkill>>,
     /// Deterministic task rater — classifies local vs Codex tasks.
@@ -103,15 +106,13 @@ struct AppState {
     /// Daemon-wide event broadcast (GET /events): automation lifecycle +
     /// background approval notifications. Payloads are concise and redacted —
     /// clients refetch authoritative records.
-    events_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
-    /// Bounded automation concurrency (scheduled + run-now share the slots).
-    run_slots: Arc<tokio::sync::Semaphore>,
+    legacy_projection_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 impl AppState {
     /// Fire-and-forget daemon-wide event. Lagging/absent subscribers are fine.
-    fn publish_event(&self, event: serde_json::Value) {
-        let _ = self.events_tx.send(event);
+    fn project_legacy_event(&self, event: serde_json::Value) {
+        let _ = self.legacy_projection_tx.send(event);
     }
 }
 
@@ -359,10 +360,20 @@ async fn main() -> Result<()> {
     )?);
     std::fs::write(data_dir.join("daemon.pid"), std::process::id().to_string())?;
 
-    let mut conn = Connection::open(data_dir.join("bagent.db"))?;
+    let db_path = data_dir.join("bagent.db");
+    let pre_cutover_backup_hash = bagentd::cutover::prepare_pre_cutover_backup(
+        &db_path,
+        &data_dir.join("bagent.pre-stage4.sqlite"),
+    )
+    .map_err(|error| anyhow::anyhow!("prepare Stage 4 database backup: {error}"))?;
+    let mut conn = Connection::open(&db_path)?;
     embedded::migrations::runner()
         .run(&mut conn)
         .map_err(|e| anyhow::anyhow!("migration error: {e}"))?;
+    if let Some(hash) = pre_cutover_backup_hash.as_deref() {
+        bagentd::cutover::record_pre_cutover_backup(&db_path, hash)
+            .map_err(|error| anyhow::anyhow!("record Stage 4 backup: {error}"))?;
+    }
     purge_legacy_context_data(&data_dir, &mut conn);
     let db = Arc::new(Mutex::new(conn));
 
@@ -417,6 +428,20 @@ async fn main() -> Result<()> {
         .initialize()
         .await
         .context("initialize daemon-owned Model Runtime")?;
+    bagentd::cutover::finalize_legacy_boundary(&db_path)
+        .map_err(|error| anyhow::anyhow!("finalize Stage 4 legacy boundary: {error}"))?;
+    let daemon_generation = DaemonGeneration::new(Uuid::new_v4().to_string());
+    let work_authority = Arc::new(UnifiedWorkAuthority::new(
+        Arc::new(
+            WorkCoordinator::open(
+                &db_path,
+                CoordinatorConfig::default(),
+                daemon_generation.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("open unified Work authority: {error}"))?,
+        ),
+        daemon_generation,
+    ));
     #[cfg(feature = "stage8-acceptance")]
     let acceptance = evidence::acceptance_runtime_enabled(
         std::env::var(evidence::STAGE8_ACCEPTANCE_FIXTURES_ENV)
@@ -427,7 +452,7 @@ async fn main() -> Result<()> {
     let synthesis = evidence::SynthesisService::new(model_runtime.clone(), synthesis_config);
 
     // MemoryStore uses a separate connection with std::sync::Mutex (blocking SQLite ops)
-    let mem_conn = rusqlite::Connection::open(data_dir.join("bagent.db"))?;
+    let mem_conn = rusqlite::Connection::open(&db_path)?;
     let mem_db = Arc::new(std::sync::Mutex::new(mem_conn));
     let memory = Arc::new(MemoryStore::new(mem_db).with_data_dir(data_dir.clone()));
     let prompt_builder = Arc::new(PromptBuilder::new());
@@ -546,9 +571,6 @@ async fn main() -> Result<()> {
     let rules = Arc::new(RuleEngine::load_or_default(&rules_path));
     Arc::clone(&rules).spawn_hot_reload();
 
-    let pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-
     // Scan skills directories: repo skills/ first, then user skills dir (override by name).
     let skills = {
         let mut skills_dirs: Vec<std::path::PathBuf> = vec![];
@@ -627,7 +649,7 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         db,
-        db_path: data_dir.join("bagent.db"),
+        db_path,
         token,
         default_model,
         debug_dir,
@@ -635,6 +657,7 @@ async fn main() -> Result<()> {
         evidence_orchestrator,
         attachments_dir,
         model_runtime,
+        work_authority,
         synthesis,
         evidence_diagnostics,
         mail,
@@ -643,7 +666,6 @@ async fn main() -> Result<()> {
         memory,
         prompt_builder,
         rules,
-        pending_approvals,
         skills,
         task_rater,
         codex,
@@ -654,12 +676,35 @@ async fn main() -> Result<()> {
         whatsapp,
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
-        events_tx: tokio::sync::broadcast::channel(256).0,
-        run_slots: Arc::new(tokio::sync::Semaphore::new(
-            bagent_automations::policy::MAX_CONCURRENT_RUNS,
-        )),
+        legacy_projection_tx: tokio::sync::broadcast::channel(256).0,
     };
     state.synthesis.start_maintenance().await;
+
+    let work_projection_state = state.clone();
+    tokio::spawn(async move {
+        let mut cursor = work_projection_state
+            .work_authority
+            .coordinator()
+            .snapshot()
+            .map(|snapshot| snapshot.cursor)
+            .unwrap_or_default();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Ok(bagentd::work_coordinator::EventRead::Events(events)) =
+                work_projection_state.work_authority.coordinator().events(
+                    Some(cursor),
+                    work_projection_state.work_authority.generation(),
+                )
+            {
+                for event in events {
+                    cursor = event.event_cursor;
+                    if let Ok(value) = serde_json::to_value(event) {
+                        work_projection_state.project_legacy_event(value);
+                    }
+                }
+            }
+        }
+    });
 
     // Daemon-owned automation scheduler: recovery at startup, then sleeps
     // until the next due instant (woken immediately by automations_changed).
@@ -1303,19 +1348,73 @@ async fn screen_intent_handler(
     State(state): State<AppState>,
     Json(req): Json<ScreenIntentRequest>,
 ) -> impl IntoResponse {
-    let classifier_runtime: Arc<dyn AgentInference> = Arc::new(TypedModelRuntime::new(
+    let work_identity = match state.work_authority.submit_conversation(
+        format!("screen-intent-admit:{}", Uuid::new_v4()),
+        CurrentChatIdentity::new(format!("screen-intent-chat:{}", Uuid::new_v4())),
+        ConversationTurnIdentity::new(format!("screen-intent-turn:{}", Uuid::new_v4())),
+        chrono::Utc::now().timestamp_millis().max(0) as u64,
+    ) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "wants_screen": false, "wants_ocr": false, "wants_selection": false
+                })),
+            )
+        }
+    };
+    let waiting = state
+        .work_authority
+        .transition(
+            format!("screen-intent-waiting:{}", Uuid::new_v4()),
+            work_identity.clone(),
+            WorkRevision::new(1),
+            WorkState::WaitingForModel,
+        )
+        .ok();
+    let running = waiting.and_then(|revision| {
+        state
+            .work_authority
+            .transition(
+                format!("screen-intent-running:{}", Uuid::new_v4()),
+                work_identity.clone(),
+                revision,
+                WorkState::Running,
+            )
+            .ok()
+    });
+    let classifier_runtime: Arc<dyn AgentInference> = Arc::new(state.work_authority.model_runtime(
         state.model_runtime.clone(),
-        TypedOrigin::Foreground,
-        WorkIdentity::new(format!("legacy:screen-intent:{}", Uuid::new_v4())),
+        work_identity.clone(),
+        bagentd::unified_work::ExecutionOrigin::Foreground,
     ));
     let classifier =
         ScreenIntentClassifier::new(classifier_runtime, state.classifier_model.clone());
     match classifier.classify(&req.message, "").await {
-        Ok(intent) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&intent).unwrap_or_default()),
-        ),
+        Ok(intent) => {
+            if let Some(revision) = running {
+                let _ = state.work_authority.transition(
+                    format!("screen-intent-complete:{}", Uuid::new_v4()),
+                    work_identity,
+                    revision,
+                    WorkState::Completed,
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&intent).unwrap_or_default()),
+            )
+        }
         Err(_) => {
+            if let Some(revision) = running {
+                let _ = state.work_authority.transition(
+                    format!("screen-intent-failed:{}", Uuid::new_v4()),
+                    work_identity,
+                    revision,
+                    WorkState::Failed,
+                );
+            }
             // Graceful degrade — caller treats unknown as "no screen needed"
             (
                 StatusCode::OK,
@@ -1792,7 +1891,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn events_stream(
     State(state): State<AppState>,
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
-    let mut sub = state.events_tx.subscribe();
+    let mut sub = state.legacy_projection_tx.subscribe();
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
     tokio::spawn(async move {
         loop {
@@ -1869,21 +1968,75 @@ async fn approval_decide(
     Path(id): Path<String>,
     Json(req): Json<ApprovalDecideRequest>,
 ) -> impl IntoResponse {
-    let sender = state.pending_approvals.lock().unwrap().remove(&id);
-    if let Some(tx) = sender {
-        let _ = tx.send(req.allow);
-        let decision = if req.allow { "allow" } else { "deny" };
-        let decided_at = chrono::Utc::now().to_rfc3339();
-        if let Ok(db) = state.db.try_lock() {
-            let _ = db.execute(
-                "UPDATE pending_approvals SET decision = ?1, decided_at = ?2 WHERE id = ?3",
-                rusqlite::params![decision, decided_at, id],
-            );
-            let _ = db.execute(
-                "INSERT INTO audit_entries (action, payload, model) VALUES ('approval_decide', ?1, '')",
-                rusqlite::params![serde_json::json!({"id": id, "decision": decision}).to_string()],
+    let decision = if req.allow { "allow" } else { "deny" };
+    let decided_at = chrono::Utc::now().to_rfc3339();
+    // Read both the compatibility projection and canonical approval before
+    // mutating either.  When this is a Work approval, the coordinator commit
+    // must win first: a failed/stale command must never leave Swift observing
+    // an accepted legacy decision that the authoritative state machine
+    // rejected.
+    let canonical = {
+        let db = state.db.lock().await;
+        db.query_row(
+            "SELECT a.work_identity, w.revision, w.origin_kind
+             FROM pending_approvals p
+             LEFT JOIN work_approvals a ON a.identity=p.id AND a.state='pending'
+             LEFT JOIN works w ON w.identity=a.work_identity
+             WHERE p.id=?1 AND p.decision IS NULL AND p.expires_at > ?2",
+            rusqlite::params![id, decided_at],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<u64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok()
+    };
+    let Some((work, revision, origin_kind)) = canonical else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "approval not found or already decided" })),
+        );
+    };
+    if let (Some(work), Some(revision), Some(origin_kind)) = (work, revision, origin_kind) {
+        let execution_origin = if origin_kind == "automation" {
+            bagentd::unified_work::ExecutionOrigin::Automation
+        } else {
+            bagentd::unified_work::ExecutionOrigin::Foreground
+        };
+        if let Err(error) = state.work_authority.resolve_approval(
+            format!("approval-decision:{id}"),
+            bagentd::work_coordinator::WorkIdentity::new(work),
+            WorkRevision::new(revision),
+            bagentd::work_coordinator::ApprovalIdentity::new(id.clone()),
+            req.allow,
+            0,
+            execution_origin,
+            chrono::Utc::now().timestamp_millis().max(0) as u64,
+        ) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": error.to_string() })),
             );
         }
+    }
+    let changed = {
+        let db = state.db.lock().await;
+        db.execute(
+            "UPDATE pending_approvals SET decision = ?1, decided_at = ?2
+             WHERE id = ?3 AND decision IS NULL AND expires_at > ?2",
+            rusqlite::params![decision, decided_at, id],
+        )
+        .unwrap_or(0)
+    };
+    if changed == 1 {
+        let db = state.db.lock().await;
+        let _ = db.execute(
+            "INSERT INTO audit_entries (action, payload, model) VALUES ('approval_decide', ?1, '')",
+            rusqlite::params![serde_json::json!({"id": id, "decision": decision}).to_string()],
+        );
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
         (
@@ -2307,6 +2460,34 @@ async fn chat(
         // ── Agentic tool loop (shared execution service) ─────────────────────
         // One loop for chat and automations lives in agent_exec. Guardrails
         // live in its dispatcher: rules engine verdicts on the actual args,
+        let work_identity = match state.work_authority.submit_conversation(
+            format!("chat-admit:{}", Uuid::new_v4()),
+            CurrentChatIdentity::new(session_id.clone()),
+            ConversationTurnIdentity::new(Uuid::new_v4().to_string()),
+            chrono::Utc::now().timestamp_millis().max(0) as u64,
+        ) {
+            Ok(identity) => identity,
+            Err(_) => return,
+        };
+        let waiting_revision = match state.work_authority.transition(
+            format!("chat-waiting:{}", Uuid::new_v4()),
+            work_identity.clone(),
+            WorkRevision::new(1),
+            WorkState::WaitingForModel,
+        ) {
+            Ok(revision) => revision,
+            Err(_) => return,
+        };
+        let running_revision = match state.work_authority.transition(
+            format!("chat-running:{}", Uuid::new_v4()),
+            work_identity.clone(),
+            waiting_revision,
+            WorkState::Running,
+        ) {
+            Ok(revision) => revision,
+            Err(_) => return,
+        };
+
         // PathPolicy (inside the fs connector), approval modal for writes,
         // per-turn budgets, and an audit entry per call.
         let tools = agent_exec::build_tools(&state, false).await;
@@ -2335,6 +2516,7 @@ async fn chat(
             &state,
             &sink,
             &agent_exec::ExecOrigin::Chat,
+            work_identity.clone(),
             &session_id,
             &effective_model,
             messages,
@@ -2344,9 +2526,39 @@ async fn chat(
         drop(sink);
         let _ = forwarder.await;
         let full_response = match loop_result {
-            Ok(outcome) => outcome.final_text,
+            Ok(outcome) => {
+                let terminal_revision = state
+                    .work_authority
+                    .current(&work_identity)
+                    .ok()
+                    .flatten()
+                    .map(|record| record.revision)
+                    .unwrap_or(running_revision);
+                let _ = state.work_authority.transition(
+                    format!("chat-complete:{}", Uuid::new_v4()),
+                    work_identity,
+                    terminal_revision,
+                    WorkState::Completed,
+                );
+                outcome.final_text
+            }
             // Error already emitted to the stream / client gone.
-            Err(_) => return,
+            Err(_) => {
+                let terminal_revision = state
+                    .work_authority
+                    .current(&work_identity)
+                    .ok()
+                    .flatten()
+                    .map(|record| record.revision)
+                    .unwrap_or(running_revision);
+                let _ = state.work_authority.transition(
+                    format!("chat-failed:{}", Uuid::new_v4()),
+                    work_identity,
+                    terminal_revision,
+                    WorkState::Failed,
+                );
+                return;
+            }
         };
 
         let response_for_audit = full_response.clone();
@@ -2969,9 +3181,8 @@ async fn notes_get(State(state): State<AppState>, Path(pk): Path<i64>) -> impl I
 
 // ── Approval helpers ─────────────────────────────────────────────────────────
 
-/// Core approval logic: insert a `pending_approvals` DB row, register the
-/// oneshot channel, optionally emit an SSE notification, then block until the
-/// user decides (Allow/Deny) or the 60 s countdown elapses.
+/// Core approval logic: persist one authoritative request, then observe its
+/// durable decision until the user decides or the 60 s deadline wins.
 ///
 /// `sse_tx` — pass `Some(&tx)` from the chat SSE flow to emit the
 /// `approval_requested` event; pass `None` for REST callers (the Swift app's
@@ -2982,12 +3193,40 @@ async fn request_approval_core(
     description: &str,
     sink: Option<&agent_exec::EventSink>,
     origin_json: Option<String>,
+    work_context: Option<(CanonicalApprovalWork, agent_exec::ExecOrigin)>,
 ) -> bool {
     let db = &state.db;
-    let pending = &state.pending_approvals;
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+
+    let canonical_approval = work_context.as_ref().and_then(|(context, origin)| {
+        let record = state
+            .work_authority
+            .current(&context.work_identity)
+            .ok()
+            .flatten()?;
+        let execution_origin = if origin.unattended() {
+            bagentd::unified_work::ExecutionOrigin::Automation
+        } else {
+            bagentd::unified_work::ExecutionOrigin::Foreground
+        };
+        state
+            .work_authority
+            .request_approval(
+                format!("approval-request:{id}"),
+                context.work_identity.clone(),
+                record.revision,
+                bagentd::work_coordinator::ApprovalIdentity::new(id.clone()),
+                tool_name,
+                execution_origin,
+            )
+            .ok()
+            .map(|revision| (context.work_identity.clone(), revision, execution_origin))
+    });
+    if let Some((work, _, _)) = canonical_approval.as_ref() {
+        state.work_authority.release_execution_slot(work);
+    }
 
     if let Ok(db) = db.try_lock() {
         let _ = db.execute(
@@ -2996,9 +3235,6 @@ async fn request_approval_core(
             rusqlite::params![id, tool_name, description, expires_at, now, origin_json],
         );
     }
-
-    let (send, recv) = oneshot::channel::<bool>();
-    pending.lock().unwrap().insert(id.clone(), send);
 
     let approval_event = serde_json::json!({
         "type":        "approval_requested",
@@ -3015,45 +3251,86 @@ async fn request_approval_core(
     if let Some(s) = sink {
         let _ = s.emit(approval_event.clone()).await;
     }
-    state.publish_event(approval_event);
+    state.project_legacy_event(approval_event);
 
-    match tokio::time::timeout(tokio::time::Duration::from_secs(60), recv).await {
-        Ok(Ok(decision)) => {
-            let decision_str = if decision { "allow" } else { "deny" };
-            if let Ok(db) = db.try_lock() {
-                let decided_at = chrono::Utc::now().to_rfc3339();
-                let _ = db.execute(
-                    "UPDATE pending_approvals SET decision=?1, decided_at=?2 WHERE id=?3",
-                    rusqlite::params![decision_str, decided_at, id],
-                );
-                let _ = db.execute(
-                    "INSERT INTO audit_entries (action, payload, model) VALUES ('approval', ?1, '')",
-                    rusqlite::params![
-                        serde_json::json!({"id": id, "tool": tool_name, "decision": decision_str})
-                            .to_string()
-                    ],
-                );
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+    loop {
+        let decision = {
+            let db = state.db.lock().await;
+            db.query_row(
+                "SELECT decision FROM pending_approvals WHERE id=?1",
+                rusqlite::params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        if let Some(decision) = decision {
+            if let Some((work, revision, execution_origin)) = canonical_approval.as_ref() {
+                if state
+                    .work_authority
+                    .current(work)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.state == WorkState::WaitingForApproval)
+                {
+                    let _ = state.work_authority.resolve_approval(
+                        format!("approval-observed:{id}"),
+                        work.clone(),
+                        *revision,
+                        bagentd::work_coordinator::ApprovalIdentity::new(id.clone()),
+                        decision == "allow",
+                        0,
+                        *execution_origin,
+                        chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    );
+                }
+                if *execution_origin == bagentd::unified_work::ExecutionOrigin::Automation {
+                    state
+                        .work_authority
+                        .acquire_automation_slot(work.clone())
+                        .await;
+                }
             }
-            decision
+            return decision == "allow";
         }
-        _ => {
-            pending.lock().unwrap().remove(&id);
-            if let Ok(db) = db.try_lock() {
-                let now2 = chrono::Utc::now().to_rfc3339();
-                let _ = db.execute(
-                    "UPDATE pending_approvals SET decision='deny', decided_at=?1 WHERE id=?2",
-                    rusqlite::params![now2, id],
-                );
-                let _ = db.execute(
-                    "INSERT INTO audit_entries (action, payload, model) VALUES ('approval_timeout', ?1, '')",
-                    rusqlite::params![
-                        serde_json::json!({"id": id, "tool": tool_name}).to_string()
-                    ],
-                );
-            }
-            false
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    let now2 = chrono::Utc::now().to_rfc3339();
+    let db = state.db.lock().await;
+    let _ = db.execute(
+        "UPDATE pending_approvals SET decision='deny', decided_at=?1 WHERE id=?2 AND decision IS NULL",
+        rusqlite::params![now2, id],
+    );
+    let _ = db.execute(
+        "INSERT INTO audit_entries (action, payload, model) VALUES ('approval_timeout', ?1, '')",
+        rusqlite::params![serde_json::json!({"id": id, "tool": tool_name}).to_string()],
+    );
+    drop(db);
+    if let Some((work, revision, execution_origin)) = canonical_approval {
+        let _ = state.work_authority.resolve_approval(
+            format!("approval-expired:{id}"),
+            work.clone(),
+            revision,
+            bagentd::work_coordinator::ApprovalIdentity::new(id),
+            false,
+            0,
+            execution_origin,
+            chrono::Utc::now().timestamp_millis().max(0) as u64,
+        );
+        if execution_origin == bagentd::unified_work::ExecutionOrigin::Automation {
+            state.work_authority.acquire_automation_slot(work).await;
         }
     }
+    false
+}
+
+#[derive(Clone)]
+struct CanonicalApprovalWork {
+    work_identity: bagentd::work_coordinator::WorkIdentity,
 }
 
 /// Convenience wrapper for streaming execution paths (always emits the event).
@@ -3061,6 +3338,7 @@ async fn request_tool_approval(
     state: &AppState,
     sink: &agent_exec::EventSink,
     origin: &agent_exec::ExecOrigin,
+    work_identity: &bagentd::work_coordinator::WorkIdentity,
     tool_name: &str,
     description: &str,
 ) -> bool {
@@ -3070,6 +3348,12 @@ async fn request_tool_approval(
         description,
         Some(sink),
         origin.provenance_json(),
+        Some((
+            CanonicalApprovalWork {
+                work_identity: work_identity.clone(),
+            },
+            origin.clone(),
+        )),
     )
     .await
 }
@@ -3242,6 +3526,7 @@ async fn codex_run_task_handler(
         "codex.run_task",
         &approval_description,
         None, // REST path — Swift polls GET /approvals/pending
+        None,
         None,
     )
     .await;
@@ -3859,6 +4144,7 @@ async fn whatsapp_send_handler(
         "whatsapp.send_message",
         &audit_description, // stored in audit_entries — redacted (trap #2)
         None,               // REST path; no SSE channel
+        None,
         None,
     )
     .await;

@@ -10,9 +10,8 @@
 //! - Unknown or unclassified tools fail closed in unattended runs.
 //! - Approval descriptions identify the originating automation.
 
-use bagentd::model_runtime::{
-    ModelClass, ModelDemand, TypedModelRuntime, TypedOrigin, WorkIdentity,
-};
+use bagentd::model_runtime::{ModelClass, ModelDemand, WorkIdentity};
+use bagentd::unified_work::ExecutionOrigin as WorkExecutionOrigin;
 #[cfg(test)]
 use basert_connector::BaseRtClient;
 use basert_connector::{
@@ -104,13 +103,6 @@ impl ExecOrigin {
             Self::Chat => EvidenceOrigin::Chat,
             Self::Automation { .. } => EvidenceOrigin::Automation,
         }
-    }
-}
-
-fn typed_demand(origin: TypedOrigin, work: WorkIdentity, model: ModelClass) -> ModelDemand {
-    match origin {
-        TypedOrigin::Foreground => ModelDemand::foreground(work, model),
-        TypedOrigin::Automation => ModelDemand::automation(work, model),
     }
 }
 
@@ -3618,6 +3610,7 @@ pub(crate) async fn run_agent_loop(
     state: &AppState,
     sink: &EventSink,
     origin: &ExecOrigin,
+    work_identity: WorkIdentity,
     session_id: &str,
     _model: &str,
     mut messages: Vec<Message>,
@@ -3630,16 +3623,15 @@ pub(crate) async fn run_agent_loop(
     let notes = &state.notes;
     let fs_exec = &state.fs;
     let runtime_refs = &state.runtime_refs;
-    let typed_origin = if origin.unattended() {
-        TypedOrigin::Automation
+    let demand_origin = if origin.unattended() {
+        WorkExecutionOrigin::Automation
     } else {
-        TypedOrigin::Foreground
+        WorkExecutionOrigin::Foreground
     };
-    let work_identity = WorkIdentity::new(format!("legacy:{session_id}"));
-    let inference = TypedModelRuntime::new(
+    let inference = state.work_authority.model_runtime(
         state.model_runtime.clone(),
-        typed_origin,
         work_identity.clone(),
+        demand_origin,
     );
 
     let mut full_response = String::new();
@@ -3685,6 +3677,7 @@ pub(crate) async fn run_agent_loop(
                 state,
                 sink,
                 origin,
+                work_identity: &work_identity,
             },
             request,
             intent,
@@ -3742,11 +3735,7 @@ pub(crate) async fn run_agent_loop(
                     };
                     return run_shared_synthesis(
                         &state.synthesis,
-                        typed_demand(
-                            typed_origin,
-                            work_identity.clone(),
-                            ModelClass::Synthesis35B,
-                        ),
+                        inference.demand(ModelClass::Synthesis35B),
                         sink,
                         &contract,
                         tool_calls_used,
@@ -3761,11 +3750,7 @@ pub(crate) async fn run_agent_loop(
                 };
                 return run_shared_synthesis(
                     &state.synthesis,
-                    typed_demand(
-                        typed_origin,
-                        work_identity.clone(),
-                        ModelClass::Synthesis35B,
-                    ),
+                    inference.demand(ModelClass::Synthesis35B),
                     sink,
                     &contract,
                     tool_calls_used,
@@ -3819,6 +3804,7 @@ pub(crate) async fn run_agent_loop(
                     state,
                     sink,
                     origin,
+                    &work_identity,
                     "mail_inbox",
                     &origin.describe("Čítanie poštovej schránky (Apple Mail)"),
                 )
@@ -3877,6 +3863,7 @@ pub(crate) async fn run_agent_loop(
                             state,
                             sink,
                             origin,
+                            &work_identity,
                             "mail_inbox",
                             &origin.describe("Čítanie správy z Apple Mail"),
                         )
@@ -4120,6 +4107,7 @@ pub(crate) async fn run_agent_loop(
                                             state,
                                             sink,
                                             origin,
+                                            &work_identity,
                                             "mail_inbox",
                                             &origin
                                                 .describe("Čítanie poštovej schránky (Apple Mail)"),
@@ -4205,6 +4193,7 @@ pub(crate) async fn run_agent_loop(
                                 state,
                                 sink,
                                 origin,
+                                &work_identity,
                                 "whatsapp.send_message",
                                 &origin.describe(&format!("WhatsApp → {chat_id}: {text}")),
                             )
@@ -4270,6 +4259,7 @@ pub(crate) async fn run_agent_loop(
                                     state,
                                     sink,
                                     origin,
+                                    &work_identity,
                                     "macos.switch_workspace",
                                     &origin.describe(&format!(
                                         "Prepnúť workspace: {}",
@@ -4427,6 +4417,7 @@ pub(crate) async fn run_agent_loop(
                                     state,
                                     sink,
                                     origin,
+                                    &work_identity,
                                     rule_name,
                                     &origin.describe(&format!(
                                         "Open: {}",
@@ -4564,6 +4555,7 @@ pub(crate) async fn run_agent_loop(
                                             state,
                                             sink,
                                             origin,
+                                            &work_identity,
                                             rule_name,
                                             &origin.describe(&format!(
                                                 "Web: {}",
