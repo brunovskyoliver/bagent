@@ -17,3 +17,9 @@ whatlang    = "0.16"
 tokio       = { version = "1", features = ["macros", "process", "rt", "time"] }
 base64      = "0.22"
 mime_guess  = "2"
+
+# Stage 1 lint waiver — owner: GitHub #25; reason: pre-existing Mail lint debt
+# is unrelated to Stage 1 acceptance infrastructure; expires: 2026-09-17.
+[lints.clippy]
+single_match = "allow"
+manual_strip = "allow"

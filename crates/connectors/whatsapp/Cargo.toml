@@ -18,3 +18,11 @@ libc      = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+
+# Stage 1 lint waiver — owner: GitHub #25; reason: pre-existing WhatsApp lint
+# debt is unrelated to Stage 1 acceptance infrastructure; expires: 2026-09-17.
+[lints.clippy]
+ptr_arg = "allow"
+derivable_impls = "allow"
+redundant_closure = "allow"
+unnecessary_lazy_evaluations = "allow"

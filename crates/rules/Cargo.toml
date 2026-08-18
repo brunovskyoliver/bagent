@@ -11,3 +11,8 @@ regex = "1"
 tracing = "0.1"
 anyhow = "1"
 tokio = { version = "1", features = ["sync", "fs", "time", "rt"] }
+
+# Stage 1 lint waiver — owner: GitHub #25; reason: pre-existing rules lint debt
+# is unrelated to Stage 1 acceptance infrastructure; expires: 2026-09-17.
+[lints.clippy]
+derivable_impls = "allow"

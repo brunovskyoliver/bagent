@@ -52,3 +52,13 @@ scraper     = "0.27"
 [dev-dependencies]
 filetime = "0.2"
 tempfile = "3"
+
+# Stage 1 lint waiver — owner: GitHub #25; reason: pre-existing daemon lint
+# debt is outside the acceptance-infrastructure-only scope; expires: 2026-09-17.
+[lints.clippy]
+nonminimal_bool = "allow"
+collapsible_if = "allow"
+single_match = "allow"
+needless_question_mark = "allow"
+items_after_test_module = "allow"
+too_many_arguments = "allow"

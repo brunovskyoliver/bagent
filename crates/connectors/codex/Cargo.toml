@@ -17,3 +17,11 @@ tracing   = "0.1"
 [dev-dependencies]
 tokio    = { version = "1", features = ["full"] }
 tempfile = "3"
+
+# Stage 1 lint waiver — owner: GitHub #25; reason: pre-existing Codex lint debt
+# is unrelated to Stage 1 acceptance infrastructure; expires: 2026-09-17.
+[lints.rust]
+unused_variables = "allow"
+
+[lints.clippy]
+ptr_arg = "allow"

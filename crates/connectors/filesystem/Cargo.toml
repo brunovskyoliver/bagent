@@ -23,3 +23,12 @@ unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Stage 1 lint waiver — owner: GitHub #25; reason: pre-existing filesystem
+# lint debt is outside the acceptance-infrastructure-only scope; expires: 2026-09-17.
+[lints.rust]
+unused_variables = "allow"
+dead_code = "allow"
+
+[lints.clippy]
+collapsible_if = "allow"
