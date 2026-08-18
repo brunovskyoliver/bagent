@@ -444,7 +444,7 @@ final class ChatViewModel: ObservableObject {
     @Published var hoveredSourceMode: SourceMode? = nil
     @Published var isSourcePickerForced = false
     @Published var hasNotch = false
-    @Published var availableModels: [String] = [BaseRTLaunchAgent.model]
+    @Published var availableModels: [String] = [ModelRuntimeConfiguration.model]
     @Published var daemonHealth: DaemonHealth?
     @Published var isSyncing = false
     @Published var lastSyncResult: String? = nil
@@ -957,11 +957,11 @@ final class ChatViewModel: ObservableObject {
     private var healthMonitorTask: Task<Void, Never>?
     private let tavilyConfigurationSynchronizer = TavilyConfigurationSynchronizer()
 
-    @Published var selectedModel: String = BaseRTLaunchAgent.model {
+    @Published var selectedModel: String = ModelRuntimeConfiguration.model {
         didSet { UserDefaults.standard.set(selectedModel, forKey: "bagent.model") }
     }
 
-    @Published var selectedClassifierModel: String = BaseRTLaunchAgent.model {
+    @Published var selectedClassifierModel: String = ModelRuntimeConfiguration.model {
         didSet { UserDefaults.standard.set(selectedClassifierModel, forKey: "bagent.classifier_model") }
     }
 
@@ -1567,10 +1567,10 @@ final class ChatViewModel: ObservableObject {
             if !fetched.isEmpty {
                 availableModels = fetched
                 if !fetched.contains(selectedModel) {
-                    selectedModel = fetched.first ?? BaseRTLaunchAgent.model
+                    selectedModel = fetched.first ?? ModelRuntimeConfiguration.model
                 }
                 if !fetched.contains(selectedClassifierModel) {
-                    selectedClassifierModel = fetched.first ?? BaseRTLaunchAgent.model
+                    selectedClassifierModel = fetched.first ?? ModelRuntimeConfiguration.model
                 }
             }
         } catch {}

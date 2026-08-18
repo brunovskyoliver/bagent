@@ -18,6 +18,8 @@ final class DaemonLaunchAgentTests: XCTestCase {
         let ordinary = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [:])
         XCTAssertNil(ordinary["BAGENT_EVIDENCE_ORCHESTRATOR"])
         XCTAssertNil(ordinary["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+        XCTAssertNil(ordinary["BAGENT_SYNTHESIS_FALLBACK_MODEL_PATH"])
+        XCTAssertNotNil(ordinary["BAGENT_CHAT_MODEL_PATH"])
 
         var rollbackWithoutRouting = rollback
         rollbackWithoutRouting.removeValue(forKey: "BAGENT_EVIDENCE_ORCHESTRATOR")
@@ -29,7 +31,7 @@ final class DaemonLaunchAgentTests: XCTestCase {
             binaryPath: "/Applications/bagent.app/Contents/MacOS/bagentd",
             environment: [
                 "BAGENT_BASERT_BASE_URL": "http://127.0.0.1:8082/v1",
-                "BAGENT_DEFAULT_MODEL": BaseRTLaunchAgent.model,
+                "BAGENT_DEFAULT_MODEL": ModelRuntimeConfiguration.model,
             ]
         )
         XCTAssertTrue(plist.contains("<string>com.bagent.daemon</string>"))
@@ -58,33 +60,5 @@ final class DaemonLaunchAgentTests: XCTestCase {
         ) as? [String: Any]
         let environment = parsed?["EnvironmentVariables"] as? [String: String]
         XCTAssertEqual(environment?["BAGENT_EVIDENCE_ORCHESTRATOR"], value)
-    }
-
-    func testBaseRTPlistKeepsServiceResidentWithLazyRegisteredModels() throws {
-        let plist = BaseRTLaunchAgent.plistContent(
-            binaryPath: "/Users/oliver/.basert/basert",
-            modelDirectory: "/Users/oliver/Library/Application Support/bagent/basert-models"
-        )
-        XCTAssertTrue(plist.contains("<string>com.bagent.basert</string>"))
-        XCTAssertTrue(plist.contains("<string>--model-dir</string>"))
-        XCTAssertTrue(plist.contains(
-            "<string>/Users/oliver/Library/Application Support/bagent/basert-models</string>"))
-        XCTAssertTrue(plist.contains("<string>--idle-timeout</string>"))
-        XCTAssertTrue(plist.contains("<string>1200</string>"))
-        XCTAssertTrue(plist.contains("<string>--max-context</string>"))
-        XCTAssertTrue(plist.contains("<string>4096</string>"))
-        XCTAssertTrue(plist.contains("<string>8082</string>"))
-        XCTAssertTrue(plist.contains("<string>basert-local</string>"))
-        XCTAssertFalse(plist.contains("<string>8080</string>"))
-        XCTAssertFalse(plist.contains("<string>basecompute/Qwen3-4B-Instruct-2507</string>"))
-        XCTAssertFalse(plist.contains("<string>basecompute/Qwen3.6-35B-A3B</string>"))
-
-        let parsed = try PropertyListSerialization.propertyList(
-            from: plist.data(using: .utf8)!, options: [], format: nil
-        ) as? [String: Any]
-        let args = parsed?["ProgramArguments"] as? [String]
-        XCTAssertEqual(args?.first, "/Users/oliver/.basert/basert")
-        XCTAssertEqual(args?.dropFirst().first, "serve")
-        XCTAssertEqual(args?.filter { $0 == "--model-dir" }.count, 1)
     }
 }

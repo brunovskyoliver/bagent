@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use apple_mail_connector::MailSearchFilter;
 use apple_mail_connector::{self, MailConnector};
 use apple_notes_connector::NotesConnector;
@@ -13,15 +13,18 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use bagent_agent::{PromptBuilder, PromptTrace, ScreenIntentClassifier, SelectedSkill, TaskRater};
+use bagent_agent::{
+    AgentInference, PromptBuilder, PromptTrace, ScreenIntentClassifier, SelectedSkill, TaskRater,
+};
 use bagent_attachments::extract as extract_attachment;
 use bagent_memory::MemoryStore;
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
 use bagent_skills::{selector as skill_selector, LoadedSkill};
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use basert_connector::{
-    BaseRtClient, Message, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL,
+use bagentd::model_runtime::{
+    ModelRuntime, ProductionModelConfig, TypedModelRuntime, TypedOrigin, WorkIdentity,
 };
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use basert_connector::{Message, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL};
 use codex_connector::{
     CodexConfig, CodexConnector, CodexContextPacket, CodexExpectedOutput, CodexTask, ContextItem,
 };
@@ -32,13 +35,7 @@ use odoo_connector::{OdooConfig, OdooConnector, OdooError, OdooRecordRef};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{HashMap, HashSet},
-    convert::Infallible,
-    io::Write,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, convert::Infallible, io::Write, path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -67,7 +64,7 @@ struct AppState {
     /// Local opt-in rollback flag for deterministic typed Mail/web evidence routing.
     evidence_orchestrator: agent_exec::EvidenceOrchestratorFlag,
     attachments_dir: PathBuf,
-    inference: BaseRtClient,
+    model_runtime: Arc<ModelRuntime>,
     /// Shared preferred/fallback synthesis lifecycle for chat and automations.
     synthesis: Arc<evidence::SynthesisService>,
     /// Privacy-safe bounded structural traces for routed evidence turns.
@@ -338,68 +335,13 @@ async fn wait_for_shutdown_signal() {
 }
 
 async fn cleanup_runtime_resources(state: &AppState) {
-    state.synthesis.shutdown().await;
-    cleanup_basert_models(state).await;
+    if let Err(error) = state.synthesis.shutdown().await {
+        tracing::error!(%error, "shutdown: Model Runtime retirement was not proven");
+    }
 
     if let Err(e) = state.whatsapp.stop().await {
         tracing::debug!("shutdown: WhatsApp stop skipped: {e}");
     }
-}
-
-async fn cleanup_basert_models(state: &AppState) {
-    let loaded_models = match state.inference.models().await {
-        Ok(models) => models,
-        Err(e) => {
-            tracing::debug!("shutdown: BaseRT model check skipped: {e}");
-            return;
-        }
-    };
-
-    let mut seen = HashSet::new();
-    let mut models_to_unload = Vec::new();
-    for model in [
-        state.default_model.as_str(),
-        state.classifier_model.as_str(),
-    ] {
-        let trimmed = model.trim();
-        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-            if let Some(loaded_name) = matching_loaded_model(&loaded_models, trimmed) {
-                models_to_unload.push(loaded_name);
-            }
-        }
-    }
-
-    for model in models_to_unload {
-        match state.inference.unload_model(&model).await {
-            Ok(()) => tracing::info!(model = %model, "shutdown: BaseRT model unloaded"),
-            Err(e) => tracing::debug!(model = %model, "shutdown: BaseRT unload skipped: {e}"),
-        }
-    }
-}
-
-fn matching_loaded_model(loaded_models: &[String], requested: &str) -> Option<String> {
-    let requested = requested.trim();
-    if requested.is_empty() {
-        return None;
-    }
-    loaded_models.iter().find_map(|loaded| {
-        let loaded = loaded.trim();
-        let exact = loaded == requested;
-        let requested_latest = !requested.contains(':') && loaded == format!("{requested}:latest");
-        let loaded_latest = loaded
-            .strip_suffix(":latest")
-            .map(|base| base == requested)
-            .unwrap_or(false);
-        let requested_latest_alias = requested
-            .strip_suffix(":latest")
-            .map(|base| base == loaded)
-            .unwrap_or(false);
-        if exact || requested_latest || loaded_latest || requested_latest_alias {
-            Some(loaded.to_string())
-        } else {
-            None
-        }
-    })
 }
 
 #[tokio::main]
@@ -457,7 +399,24 @@ async fn main() -> Result<()> {
         std::env::var("BAGENT_BASERT_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     let basert_api_key =
         std::env::var("BAGENT_BASERT_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
-    let inference = BaseRtClient::new(basert_base_url, basert_api_key);
+    let default_model =
+        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
+    let classifier_model =
+        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
+    let synthesis_config = evidence::SynthesisConfig::from_environment();
+    let model_runtime = ModelRuntime::production_from_endpoint(
+        basert_base_url,
+        basert_api_key.clone(),
+        ProductionModelConfig::from_environment(
+            default_model.clone(),
+            synthesis_config.preferred_model.clone(),
+            basert_api_key,
+        ),
+    );
+    model_runtime
+        .initialize()
+        .await
+        .context("initialize daemon-owned Model Runtime")?;
     #[cfg(feature = "stage8-acceptance")]
     let acceptance = evidence::acceptance_runtime_enabled(
         std::env::var(evidence::STAGE8_ACCEPTANCE_FIXTURES_ENV)
@@ -465,19 +424,7 @@ async fn main() -> Result<()> {
             .as_deref(),
     )
     .then(evidence::AcceptanceControl::default);
-    #[cfg(feature = "stage8-acceptance")]
-    let synthesis_client: Arc<dyn evidence::SynthesisModelClient> = match &acceptance {
-        Some(control) => Arc::new(control.synthesis_client(inference.clone())),
-        None => Arc::new(inference.clone()),
-    };
-    #[cfg(not(feature = "stage8-acceptance"))]
-    let synthesis_client: Arc<dyn evidence::SynthesisModelClient> = Arc::new(inference.clone());
-    let synthesis = evidence::SynthesisService::new(
-        synthesis_client,
-        Arc::new(evidence::SystemSynthesisClock::default()),
-        Arc::new(evidence::SystemMemoryPressureSignal::from_environment()),
-        evidence::SynthesisConfig::from_environment(),
-    );
+    let synthesis = evidence::SynthesisService::new(model_runtime.clone(), synthesis_config);
 
     // MemoryStore uses a separate connection with std::sync::Mutex (blocking SQLite ops)
     let mem_conn = rusqlite::Connection::open(data_dir.join("bagent.db"))?;
@@ -485,10 +432,6 @@ async fn main() -> Result<()> {
     let memory = Arc::new(MemoryStore::new(mem_db).with_data_dir(data_dir.clone()));
     let prompt_builder = Arc::new(PromptBuilder::new());
 
-    let default_model =
-        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
-    let classifier_model =
-        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
     let evidence_orchestrator = agent_exec::EvidenceOrchestratorFlag::from_local_env();
     tracing::info!(
         enabled = evidence_orchestrator == agent_exec::EvidenceOrchestratorFlag::Enabled,
@@ -691,7 +634,7 @@ async fn main() -> Result<()> {
         classifier_model,
         evidence_orchestrator,
         attachments_dir,
-        inference,
+        model_runtime,
         synthesis,
         evidence_diagnostics,
         mail,
@@ -1360,8 +1303,13 @@ async fn screen_intent_handler(
     State(state): State<AppState>,
     Json(req): Json<ScreenIntentRequest>,
 ) -> impl IntoResponse {
+    let classifier_runtime: Arc<dyn AgentInference> = Arc::new(TypedModelRuntime::new(
+        state.model_runtime.clone(),
+        TypedOrigin::Foreground,
+        WorkIdentity::new(format!("legacy:screen-intent:{}", Uuid::new_v4())),
+    ));
     let classifier =
-        ScreenIntentClassifier::new(state.inference.clone(), state.classifier_model.clone());
+        ScreenIntentClassifier::new(classifier_runtime, state.classifier_model.clone());
     match classifier.classify(&req.message, "").await {
         Ok(intent) => (
             StatusCode::OK,
@@ -1822,7 +1770,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         status: "ok",
         process_id: std::process::id(),
         tavily_configuration,
-        basert: state.inference.is_up().await,
+        basert: state.model_runtime.health().await,
         model: state.default_model,
         classifier_model: state.classifier_model,
         connectors: ConnectorStatus {
@@ -1867,10 +1815,11 @@ async fn events_stream(
 }
 
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
-    match state.inference.models().await {
-        Ok(names) => {
-            let chat_models = names
+    match state.model_runtime.models().await {
+        Ok(models) => {
+            let chat_models = models
                 .into_iter()
+                .map(|model| model.id)
                 .filter(|name| name == &state.default_model)
                 .collect::<Vec<_>>();
             (

@@ -1,4 +1,5 @@
 mod feedback;
+mod inference;
 mod memory_extractor;
 mod prompt;
 mod screen_intent;
@@ -9,6 +10,7 @@ pub use feedback::{
     has_explicit_trigger, CorrectionClassifier, CorrectionResult, DirectiveExtractor,
     DirectiveResult, StyleProfile,
 };
+pub use inference::{AgentInference, InferenceFuture};
 pub use memory_extractor::MemoryExtractor;
 pub use prompt::{
     preview, BuiltPrompt, PromptBuilder, PromptLayerTrace, PromptMemoryHitTrace,

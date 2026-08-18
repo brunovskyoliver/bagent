@@ -78,7 +78,7 @@ deterministic rendering remains available when 35B is inadmissible or unusable;
   [synthesis.rs](../crates/daemon/src/evidence/synthesis.rs).
 - Restart recovery requires the managed endpoint, a changed launchd PID,
   healthy service, and zero loaded models. See
-  [runtime_control.rs](../crates/daemon/src/evidence/runtime_control.rs).
+  [the research-snapshot runtime control](https://github.com/brunovskyoliver/bagent/blob/dc37a0b07a12384bb78d066769da361c7c140713/crates/daemon/src/evidence/runtime_control.rs).
 - `ensure_fallback()` contains 35B-to-4B lease-safe switching but has no
   production caller; only a test invokes it. Current synthesis failure returns
   the canonical answer without loading 4B. The glossary's “one bounded backup

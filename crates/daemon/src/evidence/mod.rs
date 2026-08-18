@@ -8,7 +8,6 @@ mod diagnostics;
 mod events;
 mod orchestrator;
 mod planner;
-mod runtime_control;
 mod synthesis;
 mod types;
 mod validator;

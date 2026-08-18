@@ -1,6 +1,8 @@
 use anyhow::Result;
-use basert_connector::BaseRtClient;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use crate::AgentInference;
 
 /// Explicit trigger phrases that cause immediate memory capture.
 const EXPLICIT_SK: &[&str] = &[
@@ -49,12 +51,12 @@ pub struct StyleProfile {
 }
 
 pub struct DirectiveExtractor {
-    inference: BaseRtClient,
+    inference: Arc<dyn AgentInference>,
     model: String,
 }
 
 impl DirectiveExtractor {
-    pub fn new(inference: BaseRtClient, model: String) -> Self {
+    pub fn new(inference: Arc<dyn AgentInference>, model: String) -> Self {
         Self { inference, model }
     }
 
@@ -73,22 +75,19 @@ impl DirectiveExtractor {
                \"language\": \"sk|en|und\"\n\
              }}"
         );
-        let response = self
-            .inference
-            .generate_raw(&self.model, &prompt, 0.0)
-            .await?;
+        let response = self.inference.infer_raw(&self.model, &prompt, 0.0).await?;
         let result: DirectiveResult = serde_json::from_str(clean_json(&response))?;
         Ok(Some(result))
     }
 }
 
 pub struct CorrectionClassifier {
-    inference: BaseRtClient,
+    inference: Arc<dyn AgentInference>,
     model: String,
 }
 
 impl CorrectionClassifier {
-    pub fn new(inference: BaseRtClient, model: String) -> Self {
+    pub fn new(inference: Arc<dyn AgentInference>, model: String) -> Self {
         Self { inference, model }
     }
 
@@ -111,10 +110,7 @@ impl CorrectionClassifier {
                \"confidence\": 0.0\n\
              }}"
         );
-        let response = self
-            .inference
-            .generate_raw(&self.model, &prompt, 0.0)
-            .await?;
+        let response = self.inference.infer_raw(&self.model, &prompt, 0.0).await?;
         let result: CorrectionResult = serde_json::from_str(clean_json(&response))?;
         Ok(result)
     }

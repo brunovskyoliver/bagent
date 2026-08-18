@@ -216,7 +216,7 @@ struct DaemonClient: Sendable {
                 tavilyConfiguration: h.tavily_configuration ?? .pending,
                 baseRTUp: h.basert,
                 model: h.model,
-                classifierModel: h.classifier_model ?? BaseRTLaunchAgent.model,
+                classifierModel: h.classifier_model ?? ModelRuntimeConfiguration.model,
                 mailConnector:      h.connectors?.mail      ?? false,
                 notesConnector:     h.connectors?.notes     ?? false,
                 codexConnector:     h.connectors?.codex     ?? false,

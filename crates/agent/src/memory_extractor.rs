@@ -1,8 +1,9 @@
 use anyhow::Result;
 use bagent_memory::{InsertParams, MemoryStore};
-use basert_connector::BaseRtClient;
 use serde::Deserialize;
 use std::sync::Arc;
+
+use crate::AgentInference;
 
 // Thresholds for passive memory extraction
 pub const CONFIDENCE_THRESHOLD: f32 = 0.75;
@@ -81,12 +82,12 @@ impl ExtractionResult {
 }
 
 pub struct MemoryExtractor {
-    inference: BaseRtClient,
+    inference: Arc<dyn AgentInference>,
     model: String,
 }
 
 impl MemoryExtractor {
-    pub fn new(inference: BaseRtClient, model: String) -> Self {
+    pub fn new(inference: Arc<dyn AgentInference>, model: String) -> Self {
         Self { inference, model }
     }
 
@@ -218,10 +219,7 @@ STRICT EXTRACTION RULES:
 - Return ONLY valid JSON."#
         );
 
-        let raw = self
-            .inference
-            .generate_json(&self.model, &prompt, 0.0)
-            .await?;
+        let raw = self.inference.infer_json(&self.model, &prompt, 0.0).await?;
         let result: ExtractionResult = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("memory extraction parse error: {e}\nraw: {raw}"))?;
         Ok(result.all_items())
@@ -298,33 +296,5 @@ mod tests {
                 "Should detect sensitive in: {t}"
             );
         }
-    }
-
-    #[test]
-    #[ignore = "requires BaseRT + classifier model"]
-    fn passive_extraction_returns_empty_for_one_off() {
-        // Run with: cargo test -p bagent-agent -- --include-ignored
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = {
-                use rusqlite::Connection;
-                use std::sync::{Arc, Mutex};
-                let conn = Connection::open_in_memory().unwrap();
-                Arc::new(MemoryStore::new(Arc::new(Mutex::new(conn))))
-            };
-            let extractor = MemoryExtractor::new(
-                BaseRtClient::new("http://127.0.0.1:8082/v1", "basert-local"),
-                "basecompute/Qwen3-4B-Instruct-2507".to_string(),
-            );
-            extractor
-                .run(
-                    "summarize this random news article",
-                    "Here is a summary of the article...",
-                    store,
-                    "en",
-                )
-                .await;
-            // No assertion needed — just checking it doesn't panic
-        });
     }
 }
