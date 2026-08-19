@@ -5,17 +5,13 @@ final class NotchInteractionStateTests: XCTestCase {
     @MainActor
     func testHiddenThinkingCompletionAlwaysPresentsOutputSurface() {
         let viewModel = ChatViewModel(startMonitoring: false)
-        viewModel.isThinking = true
-        viewModel.chatSurfaceMode = .thinkingHidden
-        viewModel.notchInteractionMode = .thinking
+        try! viewModel.installThinkingFixture()
         var outputPresentationRequested = false
         viewModel.onFirstAssistantToken = {
             outputPresentationRequested = true
-            viewModel.chatSurfaceMode = .outputExpanded
-            viewModel.notchInteractionMode = .output
+            viewModel.applyNotchIntent(.openOutput)
         }
 
-        viewModel.isThinking = false
         viewModel.ensureCompletedTurnOutputPresented()
 
         XCTAssertTrue(outputPresentationRequested)
@@ -26,13 +22,11 @@ final class NotchInteractionStateTests: XCTestCase {
     @MainActor
     func testHiddenThinkingWithVisibleOutputUsesOutputPresentationCallback() {
         let viewModel = ChatViewModel(startMonitoring: false)
-        viewModel.chatSurfaceMode = .thinkingHidden
-        viewModel.notchInteractionMode = .thinking
+        try! viewModel.installThinkingFixture()
         var presented = false
         viewModel.onFirstAssistantToken = {
             presented = true
-            viewModel.chatSurfaceMode = .outputExpanded
-            viewModel.notchInteractionMode = .output
+            viewModel.applyNotchIntent(.openOutput)
         }
 
         viewModel.ensureCompletedTurnOutputPresented()
@@ -45,16 +39,11 @@ final class NotchInteractionStateTests: XCTestCase {
     @MainActor
     func testCompletionReopensOutputAfterThinkingWasCollapsed() {
         let viewModel = ChatViewModel(startMonitoring: false)
-        viewModel.isThinking = false
-        viewModel.isExpanded = false
-        viewModel.chatSurfaceMode = .collapsed
-        viewModel.notchInteractionMode = .collapsed
+        viewModel.applyNotchIntent(.collapse)
         var presentationRequests = 0
         viewModel.onFirstAssistantToken = {
             presentationRequests += 1
-            viewModel.isExpanded = true
-            viewModel.chatSurfaceMode = .outputExpanded
-            viewModel.notchInteractionMode = .output
+            viewModel.applyNotchIntent(.openOutput)
         }
 
         viewModel.ensureCompletedTurnOutputPresented()

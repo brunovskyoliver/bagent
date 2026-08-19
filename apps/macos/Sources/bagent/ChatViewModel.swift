@@ -219,15 +219,6 @@ enum ChatSurfaceMode: Equatable {
     case outputExpanded
 }
 
-enum NotchInteractionMode: Equatable {
-    case collapsed
-    case input
-    case thinking
-    case output
-    case settings
-    case automations
-}
-
 /// Step-based state of the `/automations` surface (single source of truth
 /// stays NotchInteractionMode — this only selects what renders inside it).
 enum AutomationsSurfaceState: Equatable {
@@ -433,12 +424,24 @@ final class ChatViewModel: ObservableObject {
     @Published var inputText: String = "" {
         didSet { updateSlashSuggestions() }
     }
-    @Published var isThinking = false
-    /// Transient tool-loop status ("🔎 Searching mail…") shown next to the thinking indicator.
-    @Published var toolStatus: String? = nil
-    @Published var isExpanded = false
-    @Published var chatSurfaceMode: ChatSurfaceMode = .collapsed
-    @Published var notchInteractionMode: NotchInteractionMode = .collapsed
+    var notchPresentation: NotchPresentation { notchEventConsumer.presentation }
+    var notchPresentationPublisher: AnyPublisher<NotchPresentation, Never> {
+        notchEventConsumer.$presentation.eraseToAnyPublisher()
+    }
+    var notchInteractionMode: NotchInteractionMode { notchPresentation.interactionMode }
+    var isThinking: Bool { notchPresentation.isThinking }
+    var isExpanded: Bool { notchPresentation.isExpanded }
+    var chatSurfaceMode: ChatSurfaceMode {
+        switch notchInteractionMode {
+        case .collapsed: .collapsed
+        case .input: .inputOnly
+        case .thinking: .thinkingHidden
+        case .output, .settings, .automations: .outputExpanded
+        }
+    }
+    var toolStatus: String? {
+        notchPresentation.rail.selectedStage == .tool ? notchPresentation.rail.caption : nil
+    }
     @Published var notchHoverResetID = UUID()
     @Published var selectedSourceMode: SourceMode? = nil
     @Published var hoveredSourceMode: SourceMode? = nil
@@ -469,7 +472,7 @@ final class ChatViewModel: ObservableObject {
         inputText = ""
         historyBrowseIndex = nil
         notchSettingsPage = .general
-        notchInteractionMode = .settings
+        applyNotchIntent(.openSettings)
     }
 
     // MARK: - Automations surface (/automations)
@@ -488,7 +491,7 @@ final class ChatViewModel: ObservableObject {
         automationsSurface = .list
         automationsSelectionIndex = 0
         automationsError = nil
-        notchInteractionMode = .automations
+        applyNotchIntent(.openAutomations)
         Task { await refreshAutomations() }
     }
 
@@ -533,7 +536,7 @@ final class ChatViewModel: ObservableObject {
         guard let summary = automation.lastResultSummary, !summary.isEmpty else { return }
         messages.append(ChatMessage(role: .assistant, content: "**\(automation.name)**\n\(summary)"))
         historyBrowseIndex = nil
-        notchInteractionMode = .output
+        applyNotchIntent(.openOutput)
     }
 
     var selectedAutomation: AutomationRecord? {
@@ -908,7 +911,7 @@ final class ChatViewModel: ObservableObject {
         let next = (historyBrowseIndex ?? list.count) - 1
         guard next >= 0 else { return true } // already at oldest — swallow the key
         historyBrowseIndex = next
-        notchInteractionMode = .output
+        applyNotchIntent(.openOutput)
         return true
     }
 
@@ -926,7 +929,7 @@ final class ChatViewModel: ObservableObject {
     func exitHistoryBrowse() {
         guard historyBrowseIndex != nil else { return }
         historyBrowseIndex = nil
-        notchInteractionMode = .input
+        applyNotchIntent(.openInput)
     }
 
     var isLatestAssistantStreaming: Bool {
@@ -1306,7 +1309,9 @@ final class ChatViewModel: ObservableObject {
         UserDefaults.standard.set(UserDefaults.standard.integer(forKey: key) + 1, forKey: key)
     }
 
-    private let client = DaemonClient()
+    private let client: DaemonClient
+    private let notchEventConsumer: NotchEventConsumer
+    private var projectionCancellable: AnyCancellable?
     let permissions = PermissionsManager()
 
     /// Invoked after an input-only turn is submitted so AppKit can collapse the panel.
@@ -1521,7 +1526,12 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Init
 
-    init(startMonitoring: Bool = true) {
+    init(startMonitoring: Bool = true, client: DaemonClient = DaemonClient()) {
+        self.client = client
+        notchEventConsumer = NotchEventConsumer(transport: client)
+        projectionCancellable = notchEventConsumer.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         if startMonitoring {
             startHealthMonitor()
             startCmuxMonitor()
@@ -1529,17 +1539,38 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    func applyNotchIntent(_ intent: NotchLocalIntent) {
+        try? notchEventConsumer.applyLocalIntent(intent)
+    }
+
+    func applyAuthoritativeSnapshot(_ snapshot: NotchWorkSnapshot) throws {
+        try notchEventConsumer.replace(with: snapshot)
+    }
+
+    func activateFocusedNotchActivity() {
+        if notchPresentation.activeAutomationCount > 1 {
+            applyNotchIntent(.cycleAutomation)
+        } else if notchPresentation.activeAutomationCount == 1 {
+            openAutomations()
+        } else if notchPresentation.canOpenFocusedDestination {
+            applyNotchIntent(.openOutput)
+        }
+    }
+
+    func openActiveAutomations() {
+        guard notchPresentation.activeAutomationCount > 0 else { return }
+        openAutomations()
+    }
+
     func ensureCompletedTurnOutputPresented() {
-        if notchInteractionMode != .output || chatSurfaceMode != .outputExpanded {
+        if notchInteractionMode != .output {
             onFirstAssistantToken?()
         }
         // Tests and non-window consumers may not install the AppKit callback.
         // Completion is authoritative even if click-away collapsed the thinking
         // surface before the first token reached the main actor.
-        if notchInteractionMode != .output || chatSurfaceMode != .outputExpanded {
-            isExpanded = true
-            chatSurfaceMode = .outputExpanded
-            notchInteractionMode = .output
+        if notchInteractionMode != .output {
+            applyNotchIntent(.openOutput)
         }
     }
 
@@ -1548,7 +1579,6 @@ final class ChatViewModel: ObservableObject {
     func clear() {
         messages = []
         inputText = ""
-        isThinking = false
         streamingAssistantMessageId = nil
         pendingAttachments = []
         pendingConnectorActions = []
@@ -1709,7 +1739,7 @@ final class ChatViewModel: ObservableObject {
         }
         guard !isThinking else { return }
         let sourceMode = selectedSourceMode
-        let wasInputOnly = chatSurfaceMode == .inputOnly
+        let wasInputOnly = notchInteractionMode == .input
         if messages.isEmpty {
             sessionId = nil
         }
@@ -1731,7 +1761,6 @@ final class ChatViewModel: ObservableObject {
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.attachments = attachments
         messages.append(userMsg)
-        isThinking = true
         if let sourceMode {
             recordSourceModeUse(sourceMode)
         }
@@ -1793,7 +1822,6 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].content += t
                         presenter.enqueue(t)
                         if first {
-                            isThinking = false
                             first = false
                             ensureCompletedTurnOutputPresented()
                         }
@@ -1823,7 +1851,6 @@ final class ChatViewModel: ObservableObject {
                         )
                         messages[idx].activities.removeAll { $0.id == event.id }
                         messages[idx].activities.append(activity)
-                        toolStatus = event.title
                     case .activityCompleted(let event):
                         if let activityIndex = messages[idx].activities.firstIndex(where: { $0.id == event.id }) {
                             messages[idx].activities[activityIndex].status = event.status ?? "completed"
@@ -1831,9 +1858,7 @@ final class ChatViewModel: ObservableObject {
                         }
                     case .evidencePhase, .logicalActivityStarted, .logicalActivityCompleted,
                          .evidenceOutcome, .evidencePolish:
-                        if let status = EvidencePresentation.apply(event, to: &messages[idx]) {
-                            toolStatus = status
-                        }
+                        _ = EvidencePresentation.apply(event, to: &messages[idx])
                     case .evidenceAcquisitionDiagnostic:
                         break
                     case .sourceDiscovered(let source):
@@ -1866,8 +1891,7 @@ final class ChatViewModel: ObservableObject {
                             durationMs: nil
                         ))
                     case .toolCall(let tool):
-                        isThinking = true
-                        toolStatus = Self.toolStatusLabel(for: tool)
+                        _ = tool
                     case .mailAttachments(let refs):
                         let chips = refs.map { ref in
                             ChatAttachment(
@@ -1895,7 +1919,6 @@ final class ChatViewModel: ObservableObject {
                     case .fileOpened:
                         break // no UI action for now; daemon already opened the file
                     case .actionTaken(let message):
-                        isThinking = false
                         streamingAssistantMessageId = nil
                         messages[idx].content = message
                         ensureCompletedTurnOutputPresented()
@@ -1908,20 +1931,15 @@ final class ChatViewModel: ObservableObject {
                             messages[idx].activities[activityIndex].status = "completed"
                         }
                         if let sid = returnedSessionId { sessionId = sid }
-                        toolStatus = nil
-                        isThinking = false
                         streamingAssistantMessageId = nil
                         ensureCompletedTurnOutputPresented()
                         Task { await loadDebugTrace(for: messages[idx].id) }
                     }
                 }
                 await presenter.finish()
-                isThinking = false
                 streamingAssistantMessageId = nil
                 ensureCompletedTurnOutputPresented()
             } catch {
-                isThinking = false
-                toolStatus = nil
                 streamingAssistantMessageId = nil
                 messages[idx].content = "Chyba: \(error.localizedDescription)"
                 ensureCompletedTurnOutputPresented()
@@ -1929,31 +1947,45 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Daemon-wide events (automations + background approvals)
+    // MARK: - Authoritative Work projection
 
     /// Set by AppDelegate — opens the notch when a background approval arrives.
     var onApprovalArrived: (() -> Void)?
-    /// Bumped on any automation lifecycle event; the automations surface
-    /// refetches authoritative records when it changes.
+    /// Bumped after an authoritative Work revision advances; the Automations
+    /// content projection then refetches its authorized records.
     @Published var automationsRefreshID = UUID()
     private var eventsMonitorTask: Task<Void, Never>?
 
-    /// Subscribe to GET /events with reconnect. Pending approvals are fetched
-    /// at start and after every reconnect so durable approvals are not missed.
+    /// Maintain one fenced consumer. Ordered events carry Work revisions; a
+    /// one-second snapshot reconciliation also observes Model Runtime phase.
+    /// Transport failures never synthesize presentation state.
     func startEventsMonitor() {
         eventsMonitorTask?.cancel()
         eventsMonitorTask = Task {
+            var lastCursor: UInt64?
+            var pollCount = 0
             while !Task.isCancelled {
-                await refreshPendingApprovals()
                 do {
-                    for try await event in client.globalEvents() {
-                        guard !Task.isCancelled else { return }
-                        await handleGlobalEvent(event)
+                    try await notchEventConsumer.synchronize()
+                    pollCount += 1
+                    if pollCount.isMultiple(of: 4) {
+                        try await notchEventConsumer.reconcileSnapshot()
                     }
+                    let cursor = notchPresentation.revision.cursor
+                    if cursor != lastCursor {
+                        lastCursor = cursor
+                        await refreshPendingApprovals()
+                        automationsRefreshID = UUID()
+                        if notchInteractionMode == .automations {
+                            await refreshAutomations()
+                        }
+                    }
+                } catch NotchEventTransportError.consumerFenced {
+                    return
                 } catch {
-                    // Daemon restarting or unreachable — retry shortly.
+                    notchEventConsumer.invalidateConsumerFence()
                 }
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .milliseconds(250))
             }
         }
     }
@@ -1961,21 +1993,6 @@ final class ChatViewModel: ObservableObject {
     func stopEventsMonitor() {
         eventsMonitorTask?.cancel()
         eventsMonitorTask = nil
-    }
-
-    private func handleGlobalEvent(_ event: DaemonClient.GlobalEvent) async {
-        switch event.type {
-        case "approval_requested":
-            // Event payloads are notifications, not truth — refetch.
-            await refreshPendingApprovals()
-        case let t where t.hasPrefix("automation"):
-            automationsRefreshID = UUID()
-            if notchInteractionMode == .automations {
-                await refreshAutomations()
-            }
-        default:
-            break
-        }
     }
 
     /// Refetch the authoritative pending-approval list; opens the notch when

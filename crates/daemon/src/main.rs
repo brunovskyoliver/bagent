@@ -20,11 +20,12 @@ use bagent_attachments::extract as extract_attachment;
 use bagent_memory::MemoryStore;
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
 use bagent_skills::{selector as skill_selector, LoadedSkill};
-use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig};
+use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig, RuntimePhase};
 use bagentd::unified_work::UnifiedWorkAuthority;
 use bagentd::work_coordinator::{
-    ConversationTurnIdentity, CoordinatorConfig, CurrentChatIdentity, DaemonGeneration,
-    WorkCoordinator, WorkRevision, WorkState,
+    ApprovalState, ConversationTurnIdentity, CoordinatorConfig, CurrentChatIdentity,
+    DaemonGeneration, EventCursor, EventRead, WorkCoordinator, WorkOrigin, WorkRecord,
+    WorkRevision, WorkSnapshot, WorkState,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use basert_connector::{Message, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL};
@@ -35,7 +36,7 @@ use filesystem_connector::{
     self, open as fs_open, search as fs_search, FileSearchRequest, FsConnector, ReadTextRequest,
 };
 use odoo_connector::{OdooConfig, OdooConnector, OdooError, OdooRecordRef};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, convert::Infallible, io::Write, path::PathBuf, sync::Arc};
@@ -107,6 +108,9 @@ struct AppState {
     /// background approval notifications. Payloads are concise and redacted —
     /// clients refetch authoritative records.
     legacy_projection_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// The current Swift projection consumer. A newer snapshot claim fences
+    /// every older UI process without affecting daemon-owned Work.
+    ui_consumer_fence: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -682,6 +686,7 @@ async fn main() -> Result<()> {
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
         legacy_projection_tx: tokio::sync::broadcast::channel(256).0,
+        ui_consumer_fence: Arc::new(Mutex::new(None)),
     };
     state.synthesis.start_maintenance().await;
 
@@ -720,6 +725,8 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/events", get(events_stream))
+        .route("/work/snapshot", get(work_snapshot))
+        .route("/work/events", get(work_events))
         .route("/models", get(models))
         .route("/chat", post(chat))
         .route("/embeddings", post(embeddings))
@@ -1917,6 +1924,266 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
                 status: wa_status.status.to_string(),
             },
         },
+    })
+}
+
+#[derive(Deserialize)]
+struct WorkSnapshotQuery {
+    consumer_fence: String,
+}
+
+#[derive(Deserialize)]
+struct WorkEventsQuery {
+    after: u64,
+    daemon_generation: String,
+    consumer_fence: String,
+}
+
+async fn work_snapshot(
+    State(state): State<AppState>,
+    Query(query): Query<WorkSnapshotQuery>,
+) -> impl IntoResponse {
+    if query.consumer_fence.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing consumer fence" })),
+        );
+    }
+    *state.ui_consumer_fence.lock().await = Some(query.consumer_fence);
+    match state.work_authority.coordinator().snapshot() {
+        Ok(snapshot) => match notch_projection_context(&state, &snapshot).await {
+            Ok(context) => (
+                StatusCode::OK,
+                Json(notch_snapshot_value(&snapshot, &context)),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{error}") })),
+            ),
+        },
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{error}") })),
+        ),
+    }
+}
+
+async fn work_events(
+    State(state): State<AppState>,
+    Query(query): Query<WorkEventsQuery>,
+) -> impl IntoResponse {
+    let fence_matches = state
+        .ui_consumer_fence
+        .lock()
+        .await
+        .as_deref()
+        .is_some_and(|active| active == query.consumer_fence);
+    if !fence_matches {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "stale consumer fence" })),
+        );
+    }
+
+    let coordinator = state.work_authority.coordinator();
+    match coordinator.events(
+        Some(EventCursor::new(query.after)),
+        &DaemonGeneration::new(query.daemon_generation),
+    ) {
+        Ok(EventRead::Gap { snapshot }) => {
+            match notch_projection_context(&state, &snapshot).await {
+                Ok(context) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "kind": "gap",
+                        "snapshot": notch_snapshot_value(&snapshot, &context),
+                    })),
+                ),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("{error}") })),
+                ),
+            }
+        }
+        Ok(EventRead::Events(events)) => match coordinator.snapshot() {
+            Ok(snapshot) => match notch_projection_context(&state, &snapshot).await {
+                Ok(context) => {
+                    let projected = events
+                        .iter()
+                        .filter_map(|event| {
+                            snapshot
+                                .works
+                                .iter()
+                                .enumerate()
+                                .find(|(_, work)| work.identity == event.work_identity)
+                                .map(|(index, work)| {
+                                    let mut value = notch_work_value(work, index as u64, &context);
+                                    let object =
+                                        value.as_object_mut().expect("work projection object");
+                                    object.insert(
+                                        "revision".to_owned(),
+                                        serde_json::json!(event.work_revision.value()),
+                                    );
+                                    object.insert(
+                                        "state".to_owned(),
+                                        serde_json::to_value(event.state)
+                                            .expect("serializable Work state"),
+                                    );
+                                    object.insert(
+                                    "activity".to_owned(),
+                                    event
+                                        .activity
+                                        .map(|category| serde_json::json!({ "category": category }))
+                                        .unwrap_or(serde_json::Value::Null),
+                                );
+                                    serde_json::json!({
+                                        "schemaVersion": event.schema_version,
+                                        "cursor": event.event_cursor.value(),
+                                        "daemonGeneration": event.daemon_generation.as_str(),
+                                        "work": value,
+                                        "model": context.model_phase,
+                                    })
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({ "kind": "events", "events": projected })),
+                    )
+                }
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("{error}") })),
+                ),
+            },
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{error}") })),
+            ),
+        },
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("{error}") })),
+        ),
+    }
+}
+
+struct NotchProjectionContext {
+    model_phase: &'static str,
+    automation_names: HashMap<String, String>,
+    queue_positions: HashMap<String, u64>,
+    claimed_orders: HashMap<String, u64>,
+}
+
+async fn notch_projection_context(
+    state: &AppState,
+    snapshot: &WorkSnapshot,
+) -> Result<NotchProjectionContext> {
+    let model_phase = match state.model_runtime.snapshot().phase {
+        RuntimePhase::Unavailable => "unavailable",
+        RuntimePhase::Unloaded => "unloaded",
+        RuntimePhase::Loading(_) => "loading",
+        RuntimePhase::LoadedNotReady(_) => "loaded_not_ready",
+        RuntimePhase::Ready(_) => "ready",
+        RuntimePhase::Retiring(_) => "retiring",
+        RuntimePhase::Poisoned(_) => "poisoned",
+        RuntimePhase::Restarting => "restarting",
+    };
+    let db = state.db.lock().await;
+    let mut automation_names = HashMap::new();
+    let mut queue_positions = HashMap::new();
+    let mut claimed_orders = HashMap::new();
+    let mut queued_automations = Vec::new();
+    for work in &snapshot.works {
+        let claimed_order = db.query_row(
+            "SELECT rowid FROM works WHERE identity = ?1",
+            [work.identity.as_str()],
+            |row| row.get::<_, u64>(0),
+        )?;
+        claimed_orders.insert(work.identity.as_str().to_owned(), claimed_order);
+        let WorkOrigin::Automation {
+            historical_automation_identity,
+            ..
+        } = &work.origin
+        else {
+            continue;
+        };
+        if work.state == WorkState::Queued {
+            queued_automations.push((claimed_order, work.identity.as_str().to_owned()));
+        }
+        let name = db
+            .query_row(
+                "SELECT name FROM automations WHERE id = ?1",
+                [historical_automation_identity.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(name) = name {
+            automation_names.insert(work.identity.as_str().to_owned(), name);
+        }
+    }
+    queued_automations.sort_by_key(|(claimed_order, _)| *claimed_order);
+    for (index, (_, identity)) in queued_automations.into_iter().enumerate() {
+        queue_positions.insert(identity, index as u64 + 1);
+    }
+    Ok(NotchProjectionContext {
+        model_phase,
+        automation_names,
+        queue_positions,
+        claimed_orders,
+    })
+}
+
+fn notch_snapshot_value(
+    snapshot: &WorkSnapshot,
+    context: &NotchProjectionContext,
+) -> serde_json::Value {
+    let works = snapshot
+        .works
+        .iter()
+        .enumerate()
+        .map(|(index, work)| notch_work_value(work, index as u64, context))
+        .collect::<Vec<_>>();
+    let pending_approvals = snapshot
+        .approvals
+        .iter()
+        .filter(|approval| approval.state == ApprovalState::Pending)
+        .map(|approval| {
+            serde_json::json!({
+                "identity": approval.identity.as_str(),
+                "workIdentity": approval.work_identity.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schemaVersion": snapshot.schema_version,
+        "cursor": snapshot.cursor.value(),
+        "daemonGeneration": snapshot.daemon_generation.as_str(),
+        "works": works,
+        "pendingApprovals": pending_approvals,
+        "model": context.model_phase,
+    })
+}
+
+fn notch_work_value(
+    work: &WorkRecord,
+    claimed_order: u64,
+    context: &NotchProjectionContext,
+) -> serde_json::Value {
+    let origin = match &work.origin {
+        WorkOrigin::Conversation { .. } => "conversation",
+        WorkOrigin::Automation { .. } => "automation",
+    };
+    serde_json::json!({
+        "identity": work.identity.as_str(),
+        "revision": work.revision.value(),
+        "origin": origin,
+        "state": work.state,
+        "activity": work.activity.map(|category| serde_json::json!({ "category": category })),
+        "queuePosition": context.queue_positions.get(work.identity.as_str()),
+        "automationDisplayName": context.automation_names.get(work.identity.as_str()),
+        "terminalAttention": null,
+        "claimedOrder": context.claimed_orders.get(work.identity.as_str()).copied().unwrap_or(claimed_order),
     })
 }
 
@@ -4434,6 +4701,73 @@ async fn save_last_whatsapp_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notch_projection_is_a_strict_privacy_allowlist() {
+        let snapshot = WorkSnapshot {
+            schema_version: 1,
+            cursor: EventCursor::new(7),
+            daemon_generation: DaemonGeneration::new("daemon-fixture"),
+            works: vec![WorkRecord {
+                identity: bagentd::work_coordinator::WorkIdentity::new("opaque-work"),
+                origin: WorkOrigin::Conversation {
+                    current_chat_identity: CurrentChatIdentity::new("opaque-chat"),
+                    conversation_turn_identity: ConversationTurnIdentity::new("opaque-turn"),
+                },
+                state: WorkState::Running,
+                revision: WorkRevision::new(2),
+                activity: None,
+            }],
+            automation_runs: vec![],
+            approvals: vec![],
+            interruptions: vec![],
+            model_runtime_generation: None,
+            model_runtime_trusted: true,
+        };
+        let context = NotchProjectionContext {
+            model_phase: "ready",
+            automation_names: HashMap::new(),
+            queue_positions: HashMap::new(),
+            claimed_orders: HashMap::new(),
+        };
+
+        let value = notch_snapshot_value(&snapshot, &context);
+        let work = value["works"][0].as_object().unwrap();
+        let actual = work
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "identity",
+            "revision",
+            "origin",
+            "state",
+            "activity",
+            "queuePosition",
+            "automationDisplayName",
+            "terminalAttention",
+            "claimedOrder",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(actual, expected);
+        assert_eq!(value["model"], "ready");
+        let serialized = value.to_string();
+        for forbidden in [
+            "prompt",
+            "reasoning",
+            "toolArguments",
+            "connectorIdentifier",
+            "evidenceContent",
+            "providerError",
+            "credential",
+            "modelOutput",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
 
     #[test]
     fn tavily_configuration_status_never_exposes_credential_material() {

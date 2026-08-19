@@ -12,6 +12,7 @@
 
 use bagentd::model_runtime::{ModelClass, ModelDemand, WorkIdentity};
 use bagentd::unified_work::ExecutionOrigin as WorkExecutionOrigin;
+use bagentd::work_coordinator::WorkActivityCategory;
 #[cfg(test)]
 use basert_connector::BaseRtClient;
 use basert_connector::{
@@ -4054,6 +4055,11 @@ pub(crate) async fn run_agent_loop(
             tool_calls_used += 1;
             let fn_name = &call.function.name;
             let args = &call.function.arguments;
+            let _ = state.work_authority.set_activity(
+                format!("tool-activity-start:{}", call.id),
+                work_identity.clone(),
+                Some(notch_activity_category(fn_name)),
+            );
             tracing::info!("tool loop call {}: {} {:?}", tool_calls_used, fn_name, args);
             let activity_id = format!("tool:{}", call.id);
             let _ = sink
@@ -4661,6 +4667,11 @@ pub(crate) async fn run_agent_loop(
                     "duration_ms": activity_started.elapsed().as_millis() as u64,
                 }))
                 .await;
+            let _ = state.work_authority.set_activity(
+                format!("tool-activity-complete:{}", call.id),
+                work_identity.clone(),
+                None,
+            );
             messages.push(Message::tool_result(&call.id, fn_name, tool_result));
         }
         if let Some(guidance) = batch_followup_guidance {
@@ -4740,6 +4751,19 @@ fn activity_kind(tool: &str) -> &'static str {
         t if t.starts_with("whatsapp_") => "whatsapp",
         t if t.starts_with("notes_") => "notes",
         _ => "tool",
+    }
+}
+
+fn notch_activity_category(tool: &str) -> WorkActivityCategory {
+    match tool {
+        "web_search" | "web_fetch" => WorkActivityCategory::Web,
+        name if name.starts_with("mail_") => WorkActivityCategory::Mail,
+        name if name.starts_with("filesystem_") || name.starts_with("notes_") => {
+            WorkActivityCategory::Filesystem
+        }
+        name if name.starts_with("odoo_") => WorkActivityCategory::Odoo,
+        name if name.starts_with("codex_") => WorkActivityCategory::Codex,
+        _ => WorkActivityCategory::GenericTool,
     }
 }
 

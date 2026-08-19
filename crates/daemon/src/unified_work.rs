@@ -17,7 +17,7 @@ use crate::work_coordinator::{
     ApprovalIdentity, AutomationDefinitionIdentity, AutomationDefinitionRevision,
     AutomationRunIdentity, AutomationSessionIdentity, Command, CommandAcknowledgement,
     CommandError, CommandIdentity, ConversationTurnIdentity, CurrentChatIdentity, DaemonGeneration,
-    WorkCoordinator, WorkIdentity, WorkRevision, WorkState,
+    WorkActivityCategory, WorkCoordinator, WorkIdentity, WorkRevision, WorkState,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -353,6 +353,31 @@ impl UnifiedWorkAuthority {
             .receipt()
             .work_revision;
         Ok(revision)
+    }
+
+    pub fn set_activity(
+        &self,
+        command: impl Into<CommandIdentity>,
+        work: WorkIdentity,
+        category: Option<WorkActivityCategory>,
+    ) -> Result<WorkRevision, CommandError> {
+        let revision = self
+            .current(&work)?
+            .ok_or(CommandError::Conflict {
+                current_revision: None,
+            })?
+            .revision;
+        Ok(self
+            .coordinator
+            .submit(Command::set_activity(
+                command,
+                work,
+                revision,
+                category,
+                self.generation.clone(),
+            ))?
+            .receipt()
+            .work_revision)
     }
 
     pub fn execute_with_adapter(

@@ -3,8 +3,8 @@ use bagentd::work_coordinator::{
     AutomationRunIdentity, AutomationSessionIdentity, Command, CommandAcknowledgement,
     CommandError, ConversationTurnIdentity, CoordinatorConfig, CoordinatorDependencies,
     CurrentChatIdentity, DaemonGeneration, DeterministicWorkIdentitySource, EventCursor, EventRead,
-    FailurePoint, FixedCoordinatorClock, ModelRuntimeGeneration, WorkCoordinator, WorkIdentity,
-    WorkRevision, WorkState,
+    FailurePoint, FixedCoordinatorClock, ModelRuntimeGeneration, WorkActivityCategory,
+    WorkCoordinator, WorkIdentity, WorkRevision, WorkState,
 };
 use tempfile::TempDir;
 
@@ -15,6 +15,91 @@ fn dependencies(identities: &[&str]) -> CoordinatorDependencies {
         )),
         clock: Box::new(FixedCoordinatorClock::new("2026-08-18T16:00:00Z")),
     }
+}
+
+#[test]
+fn activity_updates_are_revisioned_ordered_and_current_only() {
+    let (_temp, coordinator) = fixture("daemon-activity", 32, &["work-activity"]);
+    let created = coordinator
+        .submit(create_conversation(
+            "create-activity",
+            "chat-activity",
+            "turn-activity",
+            "daemon-activity",
+        ))
+        .unwrap();
+    let work = created.receipt().work_identity.clone();
+    coordinator
+        .submit(work_transition(
+            "wait-activity",
+            work.clone(),
+            rev(1),
+            WorkState::WaitingForModel,
+            "daemon-activity",
+        ))
+        .unwrap();
+    coordinator
+        .submit(work_transition(
+            "run-activity",
+            work.clone(),
+            rev(2),
+            WorkState::Running,
+            "daemon-activity",
+        ))
+        .unwrap();
+
+    coordinator
+        .submit(Command::set_activity(
+            "mail-activity",
+            work.clone(),
+            rev(3),
+            Some(WorkActivityCategory::Mail),
+            DaemonGeneration::new("daemon-activity"),
+        ))
+        .unwrap();
+    coordinator
+        .submit(Command::set_activity(
+            "web-activity",
+            work.clone(),
+            rev(4),
+            Some(WorkActivityCategory::Web),
+            DaemonGeneration::new("daemon-activity"),
+        ))
+        .unwrap();
+    coordinator
+        .submit(Command::set_activity(
+            "clear-activity",
+            work,
+            rev(5),
+            None,
+            DaemonGeneration::new("daemon-activity"),
+        ))
+        .unwrap();
+
+    let snapshot = coordinator.snapshot().unwrap();
+    assert_eq!(snapshot.works[0].revision, rev(6));
+    assert_eq!(snapshot.works[0].activity, None);
+    let events = match coordinator
+        .events(
+            Some(EventCursor::new(3)),
+            &DaemonGeneration::new("daemon-activity"),
+        )
+        .unwrap()
+    {
+        EventRead::Events(events) => events,
+        EventRead::Gap { .. } => panic!("activity events retained"),
+    };
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.activity)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(WorkActivityCategory::Mail),
+            Some(WorkActivityCategory::Web),
+            None,
+        ]
+    );
 }
 
 fn rev(value: u64) -> WorkRevision {

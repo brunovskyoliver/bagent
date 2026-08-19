@@ -275,7 +275,7 @@ struct NotchWrapView: View {
 
     private var surfaceAnimation: Animation {
         reduceMotion
-            ? .easeInOut(duration: 0.18)
+            ? .linear(duration: 0)
             : .easeInOut(duration: NotchWrapMetrics.surfaceDuration)
     }
     private var status: AgentStatus { viewModel.agentStatus }
@@ -283,6 +283,13 @@ struct NotchWrapView: View {
         viewModel.notchInteractionMode == .input || viewModel.notchInteractionMode == .output
             || viewModel.notchInteractionMode == .settings
             || viewModel.notchInteractionMode == .automations
+            || isProjectionSurfaceActive
+    }
+    private var isProjectionSurfaceActive: Bool {
+        (viewModel.notchPresentation.geometry.bridgeHeight > 0
+            || viewModel.notchPresentation.statusPill.label != nil)
+            && (viewModel.notchInteractionMode == .collapsed
+                || viewModel.notchInteractionMode == .thinking)
     }
     private var isSettingsActive: Bool { viewModel.notchInteractionMode == .settings }
 
@@ -308,15 +315,24 @@ struct NotchWrapView: View {
     }
 
     private func inlineWingWidth(for mode: NotchInteractionMode) -> CGFloat {
+        if isProjectionSurfaceActive { return viewModel.notchPresentation.geometry.wingWidth }
+        let base: CGFloat
         switch mode {
-        case .output:      return outputWingWidth()
-        case .settings:    return NotchWrapMetrics.settingsWingWidth
-        case .automations: return NotchWrapMetrics.automationsWingWidth
-        default:           return NotchWrapMetrics.inlineWingWidth
+        case .output:      base = outputWingWidth()
+        case .settings:    base = NotchWrapMetrics.settingsWingWidth
+        case .automations: base = NotchWrapMetrics.automationsWingWidth
+        default:           base = NotchWrapMetrics.inlineWingWidth
         }
+        return viewModel.notchPresentation.statusPill.label == nil
+            ? base
+            : max(base, viewModel.notchPresentation.geometry.wingWidth)
     }
 
     private func inlineBridgeHeight(for mode: NotchInteractionMode) -> CGFloat {
+        if isProjectionSurfaceActive { return viewModel.notchPresentation.geometry.bridgeHeight }
+        if mode == .output, viewModel.notchPresentation.focusedWorkIdentity != nil {
+            return viewModel.notchPresentation.geometry.bridgeHeight
+        }
         switch mode {
         case .output:   return outputBridgeHeight()
         case .settings:
@@ -551,8 +567,8 @@ struct NotchWrapView: View {
         if active {
             let delay = reduceMotion ? 0.0 : NotchWrapMetrics.surfaceDuration * 0.62
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard viewModel.notchInteractionMode != .collapsed else { return }
-                withAnimation(.easeOut(duration: reduceMotion ? 0.10 : 0.24)) {
+                guard isInlineActive else { return }
+                withAnimation(.easeOut(duration: reduceMotion ? 0.12 : 0.24)) {
                     inlineContentOpacity = 1
                 }
             }
@@ -685,11 +701,32 @@ struct NotchWrapView: View {
 
     @ViewBuilder
     private var statusDotLayer: some View {
-        if status != .ready || (viewModel.isExpanded && !isInlineActive) {
+        if viewModel.notchPresentation.statusPill.label == nil,
+           status != .ready || (viewModel.isExpanded && !isInlineActive) {
             StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
                 .position(statusDotPos)
                 .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
                 .clipShape(animatedNotchClipShape)
+        }
+    }
+
+    @ViewBuilder
+    private var invariantStatusPillLayer: some View {
+        if viewModel.notchPresentation.statusPill.label != nil {
+            InvariantNotchStatusPill(
+                presentation: viewModel.notchPresentation.statusPill,
+                activeAutomationCount: viewModel.notchPresentation.activeAutomationCount,
+                action: viewModel.openActiveAutomations
+            )
+            .position(
+                x: NotchPillLayout.origin(maxPanelWidth: maxSize.width).x
+                    + NotchPillLayout.size.width / 2,
+                y: NotchPillLayout.origin(maxPanelWidth: maxSize.width).y
+                    + NotchPillLayout.size.height / 2
+            )
+            .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+            .opacity(inlineContentOpacity)
+            .clipShape(animatedNotchClipShape)
         }
     }
 
@@ -1017,6 +1054,7 @@ struct NotchWrapView: View {
             // bg); shown when chat open, task running, approval pending, or error
             // (so a down daemon always surfaces).
             inlineSurfaceLayer
+            invariantStatusPillLayer
             cmuxBannerLayer
             statusDotLayer
             cmuxDotLayer
@@ -1100,6 +1138,9 @@ struct NotchWrapView: View {
         }
         .onChange(of: viewModel.notchInteractionMode) { _, mode in
             if mode != .output { outputWingRatchet = NotchWrapMetrics.outputMinWingWidth }
+            refreshSurface()
+        }
+        .onChange(of: viewModel.notchPresentation.revision) {
             refreshSurface()
         }
         // The setup page is taller than the other settings pages.
@@ -1227,6 +1268,11 @@ struct InlineNotchContent: View {
             // a gated write can be allowed, and it auto-denies after 60 s.
             if let approval = viewModel.pendingApprovals.first {
                 ApprovalModalOverlay(approval: approval, viewModel: viewModel)
+            } else if viewModel.notchPresentation.statusPill.label == "APPROVE" {
+                ActivityPeekStageRailView(
+                    presentation: viewModel.notchPresentation,
+                    action: viewModel.activateFocusedNotchActivity
+                )
             } else if viewModel.showWhatsappPairing {
                 WhatsAppPairingView(viewModel: viewModel)
             } else {
@@ -1234,7 +1280,10 @@ struct InlineNotchContent: View {
                 case .input:
                     inputWithSuggestions
                 case .thinking:
-                    thinkingRow
+                    ActivityPeekStageRailView(
+                        presentation: viewModel.notchPresentation,
+                        action: viewModel.activateFocusedNotchActivity
+                    )
                 case .output:
                     outputView
                 case .settings:
@@ -1242,7 +1291,12 @@ struct InlineNotchContent: View {
                 case .automations:
                     AutomationsNotchContent(viewModel: viewModel)
                 case .collapsed:
-                    EmptyView()
+                    if viewModel.notchPresentation.geometry.bridgeHeight > 0 {
+                        ActivityPeekStageRailView(
+                            presentation: viewModel.notchPresentation,
+                            action: viewModel.activateFocusedNotchActivity
+                        )
+                    }
                 }
             }
         }

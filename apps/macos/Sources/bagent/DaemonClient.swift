@@ -103,7 +103,7 @@ struct ScreenIntentResponse: Decodable, Sendable {
 
 // MARK: - Client
 
-struct DaemonClient: Sendable {
+struct DaemonClient: Sendable, NotchEventTransport {
 
     enum TavilyConfigurationStatus: String, Codable, Sendable, Equatable {
         case pending
@@ -941,44 +941,68 @@ struct DaemonClient: Sendable {
         return prettyJSONString(data)
     }
 
-    // MARK: - Daemon-wide events (GET /events)
+    // MARK: - Authoritative Work projection
 
-    /// One typed envelope per daemon broadcast event. Payloads are concise —
-    /// callers refetch authoritative records instead of trusting them.
-    struct GlobalEvent: Decodable, Sendable {
-        let type: String
-        let automation_id: String?
-        let run_id: String?
-        let status: String?
-        let id: String?          // approval id for approval_requested
+    func fetchSnapshot(consumerFence: String) async throws -> NotchWorkSnapshot {
+        let c = try await loadCreds()
+        var components = URLComponents(
+            url: authedRequest("/work/snapshot", creds: c).url!,
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [URLQueryItem(name: "consumer_fence", value: consumerFence)]
+        var request = authedRequest("/work/snapshot", creds: c)
+        request.url = components.url
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if (response as? HTTPURLResponse)?.statusCode == 409 {
+            throw NotchEventTransportError.consumerFenced
+        }
+        try validateOK(data: data, response: response)
+        return try NotchProjectionDecoder.decodeSnapshot(data)
     }
 
-    /// Long-lived SSE subscription to the daemon broadcast. Throws on
-    /// disconnect — callers loop with a backoff to reconnect.
-    func globalEvents() -> AsyncThrowingStream<GlobalEvent, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    let c = try await loadCreds()
-                    let req = authedRequest("/events", creds: c)
-                    let (bytes, response) = try await URLSession.shared.bytes(for: req)
-                    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                        throw DaemonError.badStatus
-                    }
-                    for try await line in bytes.lines {
-                        guard line.hasPrefix("data: ") else { continue }
-                        let json = String(line.dropFirst(6))
-                        if let data = json.data(using: .utf8),
-                           let event = try? JSONDecoder().decode(GlobalEvent.self, from: data) {
-                            continuation.yield(event)
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
+    func fetchEvents(
+        after cursor: UInt64,
+        daemonGeneration: String,
+        consumerFence: String
+    ) async throws -> NotchEventBatch {
+        let c = try await loadCreds()
+        var components = URLComponents(
+            url: authedRequest("/work/events", creds: c).url!,
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "after", value: String(cursor)),
+            URLQueryItem(name: "daemon_generation", value: daemonGeneration),
+            URLQueryItem(name: "consumer_fence", value: consumerFence),
+        ]
+        var request = authedRequest("/work/events", creds: c)
+        request.url = components.url
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if (response as? HTTPURLResponse)?.statusCode == 409 {
+            throw NotchEventTransportError.consumerFenced
+        }
+        try validateOK(data: data, response: response)
+
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = object["kind"] as? String
+        else { throw DaemonError.badResponse }
+        switch kind {
+        case "events":
+            guard Set(object.keys) == ["kind", "events"],
+                  let values = object["events"] as? [Any]
+            else { throw DaemonError.badResponse }
+            return .events(try values.map { value in
+                try NotchProjectionDecoder.decodeEvent(JSONSerialization.data(withJSONObject: value))
+            })
+        case "gap":
+            guard Set(object.keys) == ["kind", "snapshot"],
+                  let value = object["snapshot"]
+            else { throw DaemonError.badResponse }
+            return .gap(try NotchProjectionDecoder.decodeSnapshot(
+                JSONSerialization.data(withJSONObject: value)
+            ))
+        default:
+            throw DaemonError.badResponse
         }
     }
 
@@ -1660,12 +1684,14 @@ struct ApprovalOrigin: Decodable, Sendable {
 enum DaemonError: LocalizedError {
     case notReady
     case badStatus
+    case badResponse
     case serverError(String)
 
     var errorDescription: String? {
         switch self {
         case .notReady:           return "Daemon sa nespustil včas"
         case .badStatus:          return "Neplatná odpoveď od daemona"
+        case .badResponse:        return "Neplatný formát odpovede daemona"
         case .serverError(let m): return "Chyba servera: \(m)"
         }
     }

@@ -112,7 +112,7 @@ final class NotchWindowController: NSObject {
                 self?.presentOutputChat()
             }
 
-        visibilityCancellable = chatViewModel.$notchInteractionMode
+        visibilityCancellable = chatViewModel.notchPresentationPublisher
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -318,9 +318,7 @@ final class NotchWindowController: NSObject {
         }
         previousApp = NSWorkspace.shared.frontmostApplication
 
-        chatViewModel.isExpanded = true
-        chatViewModel.chatSurfaceMode = .inputOnly
-        chatViewModel.notchInteractionMode = .input
+        chatViewModel.applyNotchIntent(.openInput)
         hoverChanged(isHovered: true)
 
         statusPanel.styleMask = [.borderless]
@@ -336,9 +334,7 @@ final class NotchWindowController: NSObject {
             previousApp = NSWorkspace.shared.frontmostApplication
         }
 
-        chatViewModel.isExpanded = true
-        chatViewModel.chatSurfaceMode = .outputExpanded
-        chatViewModel.notchInteractionMode = .output
+        chatViewModel.applyNotchIntent(.openOutput)
         hoverChanged(isHovered: true)
 
         statusPanel.styleMask = [.borderless]
@@ -496,16 +492,13 @@ final class NotchWindowController: NSObject {
 
     private func collapseInputForThinking() {
         guard chatViewModel.notchInteractionMode == .input else { return }
-        chatViewModel.chatSurfaceMode = .thinkingHidden
-        chatViewModel.notchInteractionMode = .thinking
+        chatViewModel.applyNotchIntent(.collapse)
         reconcileStatusPanelVisibility()
     }
 
     func collapse() {
         guard isNotchInteractionShowing else { return }
-        chatViewModel.isExpanded = false  // triggers SwiftUI spring-out animation
-        chatViewModel.chatSurfaceMode = .collapsed
-        chatViewModel.notchInteractionMode = .collapsed
+        chatViewModel.applyNotchIntent(.collapse)
         chatViewModel.isSourcePickerForced = false
         resetNotchHoverState()
 

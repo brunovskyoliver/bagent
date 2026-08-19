@@ -7,6 +7,7 @@ use std::{collections::VecDeque, fmt, path::Path, sync::Mutex};
 
 const SCHEMA: &str = include_str!("../migrations/V15__work_coordinator_foundations.sql");
 const CUTOVER_SCHEMA: &str = include_str!("../migrations/V16__unified_work_cutover.sql");
+const ACTIVITY_SCHEMA: &str = include_str!("../migrations/V17__work_activity_projection.sql");
 const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +233,49 @@ pub enum WorkState {
     Abandoned,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkActivityCategory {
+    Mail,
+    Web,
+    Filesystem,
+    #[serde(rename = "odoo")]
+    Odoo,
+    Codex,
+    Chat,
+    Automation,
+    GenericTool,
+}
+
+impl WorkActivityCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mail => "mail",
+            Self::Web => "web",
+            Self::Filesystem => "filesystem",
+            Self::Odoo => "odoo",
+            Self::Codex => "codex",
+            Self::Chat => "chat",
+            Self::Automation => "automation",
+            Self::GenericTool => "generic_tool",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, CommandError> {
+        match value {
+            "mail" => Ok(Self::Mail),
+            "web" => Ok(Self::Web),
+            "filesystem" => Ok(Self::Filesystem),
+            "odoo" => Ok(Self::Odoo),
+            "codex" => Ok(Self::Codex),
+            "chat" => Ok(Self::Chat),
+            "automation" => Ok(Self::Automation),
+            "generic_tool" => Ok(Self::GenericTool),
+            other => Err(CommandError::CorruptState(other.to_owned())),
+        }
+    }
+}
+
 impl WorkState {
     fn as_str(self) -> &'static str {
         match self {
@@ -383,6 +427,11 @@ enum CommandKind {
         next_state: WorkState,
         model_runtime_generation: Option<ModelRuntimeGeneration>,
     },
+    SetActivity {
+        work_identity: WorkIdentity,
+        expected_revision: WorkRevision,
+        category: Option<WorkActivityCategory>,
+    },
     RequestApproval {
         work_identity: WorkIdentity,
         expected_revision: WorkRevision,
@@ -497,6 +546,25 @@ impl Command {
             *stored = Some(model_runtime_generation);
         }
         command
+    }
+
+    pub fn set_activity(
+        command_identity: impl Into<CommandIdentity>,
+        work_identity: impl Into<WorkIdentity>,
+        expected_revision: WorkRevision,
+        category: Option<WorkActivityCategory>,
+        generation: DaemonGeneration,
+    ) -> Self {
+        Self {
+            command_schema_version: SCHEMA_VERSION,
+            command_identity: command_identity.into(),
+            expected_daemon_generation: generation,
+            kind: CommandKind::SetActivity {
+                work_identity: work_identity.into(),
+                expected_revision,
+                category,
+            },
+        }
     }
 
     pub fn request_approval(
@@ -641,6 +709,7 @@ pub struct WorkRecord {
     pub origin: WorkOrigin,
     pub state: WorkState,
     pub revision: WorkRevision,
+    pub activity: Option<WorkActivityCategory>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -714,6 +783,7 @@ pub struct WorkEvent {
     pub work_identity: WorkIdentity,
     pub work_revision: WorkRevision,
     pub state: WorkState,
+    pub activity: Option<WorkActivityCategory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,6 +792,7 @@ pub enum EventKind {
     WorkCreated,
     WorkStateChanged,
     WorkRecovered,
+    WorkActivityChanged,
 }
 
 impl EventKind {
@@ -730,6 +801,7 @@ impl EventKind {
             Self::WorkCreated => "work_created",
             Self::WorkStateChanged => "work_state_changed",
             Self::WorkRecovered => "work_recovered",
+            Self::WorkActivityChanged => "work_activity_changed",
         }
     }
 
@@ -738,6 +810,7 @@ impl EventKind {
             "work_created" => Ok(Self::WorkCreated),
             "work_state_changed" => Ok(Self::WorkStateChanged),
             "work_recovered" => Ok(Self::WorkRecovered),
+            "work_activity_changed" => Ok(Self::WorkActivityChanged),
             other => Err(CommandError::CorruptState(other.to_owned())),
         }
     }
@@ -864,6 +937,9 @@ impl WorkCoordinator {
                 .execute_batch(CUTOVER_SCHEMA)
                 .map_err(CommandError::storage)?;
         }
+        connection
+            .execute_batch(ACTIVITY_SCHEMA)
+            .map_err(CommandError::storage)?;
         initialize_generation(
             &connection,
             &generation,
@@ -940,7 +1016,8 @@ impl WorkCoordinator {
         )?;
         inject(failure, FailurePoint::AfterStateMutation)?;
 
-        let payload = serde_json::json!({ "state": state });
+        let activity = load_work_activity(&transaction, &work_identity)?;
+        let payload = serde_json::json!({ "state": state, "activity": activity });
         transaction
             .execute(
                 "INSERT INTO work_event_outbox
@@ -1359,6 +1436,12 @@ fn apply_command(
                         params![work_identity.as_str()],
                     )
                     .map_err(CommandError::storage)?;
+                transaction
+                    .execute(
+                        "DELETE FROM work_activity_projection WHERE work_identity = ?1",
+                        params![work_identity.as_str()],
+                    )
+                    .map_err(CommandError::storage)?;
             }
             if let Some(model_runtime_generation) = model_runtime_generation {
                 transaction
@@ -1374,6 +1457,70 @@ fn apply_command(
                 revision,
                 *next_state,
                 EventKind::WorkStateChanged,
+            ))
+        }
+        CommandKind::SetActivity {
+            work_identity,
+            expected_revision,
+            category,
+        } => {
+            let (current_state, current_revision) =
+                load_work_state_revision(transaction, work_identity)?;
+            if current_revision != *expected_revision {
+                return Err(CommandError::Conflict {
+                    current_revision: Some(current_revision),
+                });
+            }
+            if current_state.is_terminal() {
+                return Err(CommandError::TerminalTarget);
+            }
+            if current_state != WorkState::Running {
+                return Err(CommandError::IllegalTransition {
+                    from: current_state,
+                    to: WorkState::Running,
+                });
+            }
+            let revision = WorkRevision::new(current_revision.value() + 1);
+            transaction
+                .execute(
+                    "UPDATE works SET revision = ?1, updated_at = ?2
+                     WHERE identity = ?3 AND revision = ?4",
+                    params![
+                        revision.value(),
+                        committed_at,
+                        work_identity.as_str(),
+                        current_revision.value(),
+                    ],
+                )
+                .map_err(CommandError::storage)?;
+            if let Some(category) = category {
+                transaction
+                    .execute(
+                        "INSERT INTO work_activity_projection (work_identity, category)
+                         VALUES (?1, ?2)
+                         ON CONFLICT(work_identity) DO UPDATE SET category = excluded.category",
+                        params![work_identity.as_str(), category.as_str()],
+                    )
+                    .map_err(CommandError::storage)?;
+            } else {
+                transaction
+                    .execute(
+                        "DELETE FROM work_activity_projection WHERE work_identity = ?1",
+                        params![work_identity.as_str()],
+                    )
+                    .map_err(CommandError::storage)?;
+            }
+            transaction
+                .execute(
+                    "UPDATE work_projections SET revision = ?1 WHERE work_identity = ?2",
+                    params![revision.value(), work_identity.as_str()],
+                )
+                .map_err(CommandError::storage)?;
+            Ok((
+                work_identity.clone(),
+                revision,
+                current_state,
+                EventKind::WorkActivityChanged,
             ))
         }
         CommandKind::RequestApproval {
@@ -1573,6 +1720,23 @@ fn load_work_state_revision(
     Ok((WorkState::parse(&state)?, WorkRevision::new(revision)))
 }
 
+fn load_work_activity(
+    transaction: &Transaction<'_>,
+    work_identity: &WorkIdentity,
+) -> Result<Option<WorkActivityCategory>, CommandError> {
+    transaction
+        .query_row(
+            "SELECT category FROM work_activity_projection WHERE work_identity = ?1",
+            params![work_identity.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(CommandError::storage)?
+        .as_deref()
+        .map(WorkActivityCategory::parse)
+        .transpose()
+}
+
 fn metadata(connection: &Connection, key: &str) -> Result<Option<String>, CommandError> {
     connection
         .query_row(
@@ -1607,8 +1771,11 @@ fn snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandError> 
     let mut statement = connection
         .prepare(
             "SELECT identity, origin_kind, origin_primary_identity, origin_secondary_identity,
-                    origin_historical_identity, origin_definition_revision, state, revision
-             FROM works ORDER BY identity ASC",
+                    origin_historical_identity, origin_definition_revision, state, revision,
+                    work_activity_projection.category
+             FROM works
+             LEFT JOIN work_activity_projection ON work_activity_projection.work_identity = works.identity
+             ORDER BY identity ASC",
         )
         .map_err(CommandError::storage)?;
     let works = statement
@@ -1622,6 +1789,7 @@ fn snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandError> 
                 row.get::<_, Option<u64>>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, u64>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })
         .map_err(CommandError::storage)?
@@ -1635,6 +1803,7 @@ fn snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandError> 
                 definition_revision,
                 state,
                 revision,
+                activity,
             ) = result.map_err(CommandError::storage)?;
             Ok(WorkRecord {
                 identity: WorkIdentity::new(identity),
@@ -1647,6 +1816,10 @@ fn snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandError> 
                 )?,
                 state: WorkState::parse(&state)?,
                 revision: WorkRevision::new(revision),
+                activity: activity
+                    .as_deref()
+                    .map(WorkActivityCategory::parse)
+                    .transpose()?,
             })
         })
         .collect::<Result<Vec<_>, CommandError>>()?;
@@ -1744,8 +1917,10 @@ fn snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandError> 
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkEvent> {
     let payload: String = row.get(7)?;
-    let state = serde_json::from_str::<serde_json::Value>(&payload)
-        .ok()
+    let payload = serde_json::from_str::<serde_json::Value>(&payload).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let state = Some(&payload)
         .and_then(|value| value.get("state").cloned())
         .and_then(|value| serde_json::from_value(value).ok())
         .ok_or_else(|| {
@@ -1756,6 +1931,18 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkEvent> {
                     std::io::ErrorKind::InvalidData,
                     "invalid Work event payload",
                 )),
+            )
+        })?;
+    let activity = payload
+        .get("activity")
+        .and_then(serde_json::Value::as_str)
+        .map(WorkActivityCategory::parse)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(error),
             )
         })?;
     Ok(WorkEvent {
@@ -1773,6 +1960,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkEvent> {
         work_identity: WorkIdentity::new(row.get::<_, String>(5)?),
         work_revision: WorkRevision::new(row.get(6)?),
         state,
+        activity,
     })
 }
 

@@ -15,8 +15,8 @@ final class ActivityTranscriptHostingTests: XCTestCase {
         XCTAssertEqual(viewModel.notchInteractionMode, .input)
         XCTAssertTrue(controller.isNotchInteractionShowing)
 
-        viewModel.isThinking = true
         viewModel.onInputOnlySubmitted?()
+        try viewModel.installThinkingFixture()
         drainMainRunLoop()
         XCTAssertEqual(viewModel.notchInteractionMode, .thinking)
 
@@ -51,7 +51,6 @@ final class ActivityTranscriptHostingTests: XCTestCase {
 
         viewModel.messages[0].content = "Verified fixture answer"
         viewModel.messages[0].displayedContent = "Verified fixture answer"
-        viewModel.isThinking = false
         viewModel.ensureCompletedTurnOutputPresented()
         for index in 0..<40 {
             let chunk = " final-\(index)"
@@ -61,6 +60,7 @@ final class ActivityTranscriptHostingTests: XCTestCase {
             drainMainRunLoop()
         }
         viewModel.streamingAssistantMessageId = nil
+        try viewModel.installCompletedFixture()
         drainMainRunLoop()
 
         XCTAssertEqual(viewModel.notchInteractionMode, .output)
@@ -89,9 +89,7 @@ final class ActivityTranscriptHostingTests: XCTestCase {
         message.content = ""
         message.displayedContent = ""
         viewModel.messages = [message]
-        viewModel.isThinking = true
-        viewModel.chatSurfaceMode = .thinkingHidden
-        viewModel.notchInteractionMode = .thinking
+        try viewModel.installThinkingFixture()
         viewModel.streamingAssistantMessageId = message.id
 
         let hosted = NSHostingView(rootView: NotchWrapView(
@@ -127,14 +125,11 @@ final class ActivityTranscriptHostingTests: XCTestCase {
 
         // Reproduce click-away winning while the thinking surface is delayed.
         // The completed turn must still reopen the answer surface.
-        viewModel.isExpanded = false
-        viewModel.chatSurfaceMode = .collapsed
-        viewModel.notchInteractionMode = .collapsed
+        viewModel.applyNotchIntent(.collapse)
         drainMainRunLoop()
 
         viewModel.messages[0].content = "Verified answer"
         viewModel.messages[0].displayedContent = "Verified answer"
-        viewModel.isThinking = false
         viewModel.ensureCompletedTurnOutputPresented()
         drainMainRunLoop()
 
@@ -180,7 +175,7 @@ final class ActivityTranscriptHostingTests: XCTestCase {
         for message in [legacyMessage(), evidenceMessage()] {
             let viewModel = ChatViewModel(startMonitoring: false)
             viewModel.messages = [message]
-            viewModel.notchInteractionMode = .output
+            viewModel.applyNotchIntent(.openOutput)
             viewModel.streamingAssistantMessageId = message.id
 
             let hosted = NSHostingView(rootView: NotchWrapView(

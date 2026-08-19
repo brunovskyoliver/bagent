@@ -58,7 +58,7 @@ final class AutomationsSurfaceStateTests: XCTestCase {
 
     func testSelectionNavigationAndDetail() {
         let vm = ChatViewModel()
-        vm.notchInteractionMode = .automations
+        vm.applyNotchIntent(.openAutomations)
         vm.automations = [record("a", name: "A"), record("b", name: "B"), record("c", name: "C")]
         XCTAssertTrue(vm.moveAutomationsSelection(by: 1))
         XCTAssertEqual(vm.automationsSelectionIndex, 1)
@@ -72,7 +72,7 @@ final class AutomationsSurfaceStateTests: XCTestCase {
 
     func testEscapeBackNavigation() {
         let vm = ChatViewModel()
-        vm.notchInteractionMode = .automations
+        vm.applyNotchIntent(.openAutomations)
         vm.automationsSurface = .deleteConfirmation("a")
         XCTAssertTrue(vm.automationsGoBack())
         XCTAssertEqual(vm.automationsSurface, .detail("a"))
