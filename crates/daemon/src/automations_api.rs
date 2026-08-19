@@ -315,7 +315,8 @@ pub(crate) fn repo_run(
         params![automation_id, run_id],
         row_to_run,
     )
-    .map_err(Into::into)
+    .optional()?
+    .ok_or(RepoError::NotFound)
 }
 
 /// Insert a run row (skip records; claims go through repo_claim_run).
