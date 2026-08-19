@@ -1387,6 +1387,11 @@ async fn screen_intent_handler(
             )
             .ok()
     });
+    if running.is_none() {
+        // admit() already granted this Work its execution slot; a failed
+        // WaitingForModel/Running lookup or transition still owes a release.
+        state.work_authority.release_slot(&work_identity);
+    }
     let classifier_runtime: Arc<dyn AgentInference> = Arc::new(state.work_authority.model_runtime(
         state.model_runtime.clone(),
         work_identity.clone(),
@@ -2490,7 +2495,10 @@ async fn chat(
             .map(|record| record.revision)
         {
             Some(revision) => revision,
-            None => return,
+            None => {
+                state.work_authority.release_slot(&work_identity);
+                return;
+            }
         };
         let running_revision = match state.work_authority.transition(
             format!("chat-running:{}", Uuid::new_v4()),
@@ -2499,7 +2507,10 @@ async fn chat(
             WorkState::Running,
         ) {
             Ok(revision) => revision,
-            Err(_) => return,
+            Err(_) => {
+                state.work_authority.release_slot(&work_identity);
+                return;
+            }
         };
 
         // PathPolicy (inside the fs connector), approval modal for writes,

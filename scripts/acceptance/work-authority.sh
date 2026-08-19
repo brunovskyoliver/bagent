@@ -42,6 +42,39 @@ if not re.search(r"ModelDemand::(?:foreground|automation)\s*\(", seed):
     print("A26 FAIL: detector missed seeded caller-owned model demand")
     raise SystemExit(1)
 
+def function_bodies(text: str):
+    """Yield (name, brace-matched body) for every fn in `text`. Heuristic
+    (regex + brace counting, no real parser) but sufficient to catch a
+    function that calls `.admit(` without any `.release_slot(` anywhere in
+    its own body — the shape of a capacity-slot leak on an early return."""
+    for match in re.finditer(r"(?:async\s+)?fn\s+(\w+)", text):
+        brace_start = text.find("{", match.end())
+        if brace_start == -1:
+            continue
+        depth = 0
+        i = brace_start
+        while i < len(text):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        yield match.group(1), text[brace_start : i + 1]
+
+
+admit_release_seed_leaky = "async fn leaky(state: &AppState, work: WorkIdentity) { state.work_authority.admit(work).await; return; }"
+admit_release_seed_hits = [
+    name
+    for name, body in function_bodies(admit_release_seed_leaky)
+    if "work_authority.admit(" in body and ".release_slot(" not in body
+]
+if not admit_release_seed_hits:
+    print("A26 FAIL: detector missed seeded admit-without-release capacity leak")
+    raise SystemExit(1)
+
+
 def strip_tests(text: str) -> str:
     lines = text.splitlines(keepends=True); out=[]; i=0
     while i < len(lines):
@@ -64,6 +97,14 @@ for path in production_paths:
         for match in re.finditer(pattern, synthetic):
             line = synthetic.count("\n", 0, match.start()) + 1
             findings.append(f"{path.relative_to(root)}:{line}: {label}: {match.group(0)}")
+    for name, body in function_bodies(text):
+        if "work_authority.admit(" in body and ".release_slot(" not in body:
+            line = text.count("\n", 0, text.find(body)) + 1
+            findings.append(
+                f"{path.relative_to(root)}:{line}: fn {name}: calls work_authority.admit( "
+                "without any .release_slot( in the same function body (capacity-slot leak "
+                "risk on an early-return path)"
+            )
 
 allowed_work_writers = {
     root / "crates/daemon/src/work_coordinator.rs",
@@ -93,12 +134,12 @@ required = {
 }
 missing = [name for name, present in required.items() if not present]
 if findings or missing:
-    print(f"A26 seeded detector: PASS ({len(seed_hits) + 2} forbidden categories)")
+    print(f"A26 seeded detector: PASS ({len(seed_hits) + 3} forbidden categories)")
     for finding in findings: print("A26 forbidden: " + finding)
     for item in missing: print("A26 missing authority edge: " + item)
     print(f"A26 FAIL: {len(findings)} forbidden matches, {len(missing)} missing edges")
     raise SystemExit(1)
 
-print(f"A26 seeded detector: PASS ({len(seed_hits) + 2} forbidden categories)")
+print(f"A26 seeded detector: PASS ({len(seed_hits) + 3} forbidden categories)")
 print("A26 production graph: PASS (zero forbidden authorities; canonical Work command/event path present)")
 PY

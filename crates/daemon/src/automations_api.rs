@@ -761,7 +761,10 @@ pub(crate) async fn execute_automation_run(
         .map(|record| record.revision)
     {
         Some(revision) => revision,
-        None => return,
+        None => {
+            state.work_authority.release_slot(&work_identity);
+            return;
+        }
     };
     let running_revision = match state.work_authority.transition(
         format!("automation-running:{}", run.id),
@@ -770,7 +773,10 @@ pub(crate) async fn execute_automation_run(
         WorkState::Running,
     ) {
         Ok(revision) => revision,
-        Err(_) => return,
+        Err(_) => {
+            state.work_authority.release_slot(&work_identity);
+            return;
+        }
     };
     let started_at = Utc::now();
     {

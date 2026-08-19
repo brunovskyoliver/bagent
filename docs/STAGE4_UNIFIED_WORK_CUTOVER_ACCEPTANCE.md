@@ -148,26 +148,69 @@ production call sequence, instead of calling `dispatch_next` directly:
 `admission_dispatcher_serializes_foreground_independent_of_automation`, and
 `admission_dispatcher_enforces_automation_capacity_of_two`.
 
-Corrected final exact run: `2026-08-19T13:45:00Z` through
-`2026-08-19T13:50:00Z`. `cargo test -p bagentd` (all targets): 251 top-level
-passed, 0 failed, 5 ignored (unchanged environment/fixture boundaries),
-nested restart child 1/1 not double-counted. `cargo test --workspace`: every
-crate 0 failed (see full run below). `swift test --package-path apps/macos`:
-52 passed, 0 failed. `cargo fmt --all -- --check`, `cargo clippy --workspace
+### Second correction pass: independent review, then a real slot-leak
+
+Independent Standards and Spec sub-agent reviews were run against this same
+fixed point after the first correction above was committed (`97e6539`).
+Standards reported no hard violations (some judgement-call duplication
+smells, noted and left as-is: minimal-diff terminal-transition boilerplate
+repeated across three handlers, not required by any gate). Spec reported two
+real findings, both repaired here:
+
+1. **A genuine slot leak on five call paths.** `admit()` grants a capacity
+   slot before the caller has confirmed the subsequent `current()`
+   lookup/`transition(..., Running)` actually succeeds. The chat handler,
+   `screen_intent_handler`, and `execute_automation_run` each had an
+   early-return branch on that lookup/transition failing which skipped
+   `release_slot`. Because `admit()` has no timeout and `dispatch_next`'s
+   foreground rule requires `foreground_running == 0`, a single leaked
+   foreground slot would permanently hang every later chat turn and
+   screen-intent call in `admit().await` — a daemon-wide deadlock, not a
+   capacity regression. Fixed by adding `release_slot` to all five early-return
+   branches (`main.rs` chat handler ×2, `screen_intent_handler` ×1 covering
+   both its Ok/Err arms, `automations_api.rs` ×2). The full span from the
+   successful `Running` transition through to the terminal transition in both
+   the chat handler and `execute_automation_run` was re-audited line by line
+   for any further `return`/`?` in between; none exists — `prompt_builder.build`'s
+   only fallible step falls through to `Vec::new()` rather than returning.
+   A structural (`Drop`-based `AdmissionGuard`) fix was considered and is
+   left as a deliberate non-requirement — see the code review discussion; the
+   explicit calls now cover every real path and are cheaper to verify.
+2. **A22's `ExecutionBoundaryAdapter` has no production caller** — disclosed
+   in the A22 row below rather than silently overclaimed.
+
+`scripts/acceptance/work-authority.sh` gained a static pairing check (own
+seeded red case): any function under `crates/daemon/src` calling
+`work_authority.admit(` must also call `.release_slot(` somewhere in its own
+body, so a sixth leaked call site cannot land silently again. This raised the
+detector from 10 to 11 forbidden/required categories, all still zero
+findings against production.
+
+Final exact run (supersedes both earlier timestamps in this document):
+`2026-08-19T13:58:00Z` through `2026-08-19T14:02:50Z`. `cargo test -p
+bagentd` (all targets): 251 top-level passed, 0 failed, 5 ignored (unchanged
+environment/fixture boundaries), nested restart child 1/1 not
+double-counted. `cargo test --workspace`: 452 test-result lines summed across
+every crate, 0 failed, 12 ignored. `swift test --package-path apps/macos`: 52
+passed, 0 failed. `cargo fmt --all -- --check`, `cargo clippy --workspace
 --all-targets --all-features -- -D warnings`, `cargo build --workspace
 --all-targets`, `cargo check -p bagentd --all-targets --features
 stage8-acceptance`, `swift build --package-path apps/macos`, `git diff
---check`: all exit 0. `bash scripts/acceptance/work-authority.sh`: PASS, 10
-forbidden categories seeded, zero forbidden matches against the full
+--check`, `bash -n scripts/acceptance/work-authority.sh
+scripts/acceptance/work-cutover-rollback.sh`: all exit 0.
+`bash scripts/acceptance/work-authority.sh`: PASS, 11 forbidden/required
+categories seeded, zero forbidden matches against the full
 `crates/daemon/src` tree. `bash scripts/acceptance/work-cutover-rollback.sh`:
 PASS, unchanged.
 
-Corrected artifact hashes:
+Final artifact hashes:
 
 | Artifact | SHA-256 |
 |---|---|
 | `crates/daemon/src/unified_work.rs` | `8416257d0c3f88c9c12aa6ecda6b10735fee60411db4dd07bfa11a45a7baf120` |
-| `scripts/acceptance/work-authority.sh` | `4eda47a0a33191fc33160ba1bc20ffea7777fdffbdc5e98f87fa36feed77c945` |
+| `crates/daemon/src/main.rs` | `0f7300fc101aa7015a23695579e8d1287e19aba47a10dc65bae09cba42f5ce96` |
+| `crates/daemon/src/automations_api.rs` | `2d95b13fec2d82177a62281a796ed21416779d9a1b7c68c11948f351c938473b` |
+| `scripts/acceptance/work-authority.sh` | `2c9c3153b53c971650cb4ef8154759529a2210cff3d1d9f36354f571c7eee255` |
 
 `crates/daemon/migrations/V16__unified_work_cutover.sql` and
 `scripts/acceptance/work-cutover-rollback.sh` are unchanged from the
@@ -186,8 +229,10 @@ run found seven legacy tests still treating scheduler claims as execution
 authority; those fixtures were retargeted to canonical Work and the final
 daemon run is green.
 
-Final exact run: `2026-08-18T20:12:46Z` through
-`2026-08-18T20:12:56Z`.
+Final exact run: `2026-08-19T13:58:00Z` through `2026-08-19T14:02:50Z`
+(supersedes the original `2026-08-18T20:12:46Z` run — see the two correction
+sections above; this table's per-gate commands and results reflect the
+corrected admission path).
 
 | Gate | Exact command | Exact result |
 |---|---|---|
@@ -195,12 +240,12 @@ Final exact run: `2026-08-18T20:12:46Z` through
 | A19 | `cargo test -p bagentd --test work_concurrency automation_capacity_two -- --exact`; `admission_dispatcher_enforces_automation_capacity_of_two` | PASS: 1 passed, 0 failed, 0 ignored, 6 filtered (each); exactly two distinct Automation executions, zero slot leak, verified against `dispatch_next` directly and against the real async admission path |
 | A20 | `cargo test -p bagentd --test work_concurrency approval_restart_capacity -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 3 filtered; same approval identity survives restart, capacity is free, one valid decision resumes, stale decision conflicts |
 | A21 | `cargo test -p bagentd --test work_concurrency cancellation_races -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 3 filtered; queued/loading/executing/approval/completion races, one terminal outcome, zero leases/slots |
-| A22 | `cargo test -p bagentd --test work_failure_injection` | PASS: 1 passed, 0 failed; admission, persistence, outbox, runtime, tool, approval, and completion failpoints close deterministically |
+| A22 | `cargo test -p bagentd --test work_failure_injection` | PASS: 1 passed, 0 failed; admission, persistence, outbox, runtime, tool, approval, and completion failpoints close deterministically. `ExecutionBoundaryAdapter`/`execute_with_adapter` (`unified_work.rs`) is a test-only harness seam with no production caller — it proves `UnifiedWorkAuthority`'s own recovery/invariant behavior at each named boundary, not that production's chat/automation handlers route execution through it (they call `transition`/`admit`/`release_slot` directly; see the correction section above). |
 | A23 | `cargo test -p bagentd --test persistence_migration legacy_run_records -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 1 filtered; bounded/idempotent privacy-safe records and safe active abandonment |
 | A24 | `cargo test -p bagentd --test privacy_contract work_surfaces -- --exact` | PASS: 1 passed, 0 failed; canaries absent from events, snapshots, projections, logs, and diagnostics; unknown fields rejected |
 | A25 | `cargo test -p bagentd --test persistence_migration cutover_boundary -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 1 filtered |
 | A25 rollback | `scripts/acceptance/work-cutover-rollback.sh` | PASS: checksum backup/restore, old-reader fixture, interruption boundaries, first-Work barrier, archive disclosure |
-| A26 | `scripts/acceptance/work-authority.sh` | PASS: seeded detector found 10 forbidden categories; zero forbidden production authorities; canonical command/event path present |
+| A26 | `scripts/acceptance/work-authority.sh` | PASS: seeded detector found 11 forbidden/required categories (adds a static admit/release-slot pairing check per function); zero forbidden production authorities; canonical command/event path present |
 
 No zero-test result is used as evidence for A18-A26.
 
@@ -215,9 +260,10 @@ fields. Unknown fields fail deserialization rather than passing through.
 after stripping only `#[cfg(test)]` items. Its seeded red capability covers the
 typed-origin adapter, synthetic Work IDs, semaphore authority, in-memory
 approval authority, startup denial, ad-hoc event senders, direct chat stop,
-duplicate Work Identity, direct canonical Work SQL writers, and caller-owned
-model demand. Final production findings are zero. The only canonical Work SQL
-writers are `work_coordinator.rs` and the bounded cutover module.
+duplicate Work Identity, direct canonical Work SQL writers, caller-owned
+model demand, and an admit-without-release capacity-slot leak. Final
+production findings are zero. The only canonical Work SQL writers are
+`work_coordinator.rs` and the bounded cutover module.
 
 ## Full verification
 
