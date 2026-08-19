@@ -111,6 +111,27 @@ final class EventConsumerRecoveryTests: XCTestCase {
         XCTAssertEqual(stats.events, 1)
     }
 
+    func testWorkEventPreservesLiveReduceMotionPreference() async throws {
+        let transport = FakeNotchEventTransport(
+            snapshots: [snapshot(cursor: 10, revision: 1, state: .queued)],
+            batches: [.events([.init(
+                schemaVersion: 1,
+                cursor: 11,
+                daemonGeneration: "daemon-a",
+                work: work(revision: 2, state: .running),
+                model: .ready
+            )])]
+        )
+        let consumer = NotchEventConsumer(transport: transport)
+
+        try await consumer.synchronize()
+        try consumer.setReduceMotion(true)
+        try await consumer.synchronize()
+
+        XCTAssertFalse(consumer.presentation.motion.iconMotionEnabled)
+        XCTAssertEqual(consumer.presentation.motion.surfaceDuration, 0)
+    }
+
     private func snapshot(cursor: UInt64, revision: UInt64, state: NotchWorkState) -> NotchWorkSnapshot {
         NotchWorkSnapshot(
             schemaVersion: 1,

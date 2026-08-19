@@ -18,6 +18,67 @@ fn dependencies(identities: &[&str]) -> CoordinatorDependencies {
 }
 
 #[test]
+fn notch_projection_snapshot_is_transactional_and_bounded() {
+    let (_temp, coordinator) = fixture("daemon-notch", 32, &["work-a", "work-b"]);
+    for (suffix, expected_identity) in [("a", "work-a"), ("b", "work-b")] {
+        let created = coordinator
+            .submit(create_conversation(
+                format!("create-{suffix}"),
+                format!("chat-{suffix}"),
+                format!("turn-{suffix}"),
+                "daemon-notch",
+            ))
+            .unwrap();
+        assert_eq!(created.receipt().work_identity.as_str(), expected_identity);
+        let work = created.receipt().work_identity.clone();
+        coordinator
+            .submit(work_transition(
+                format!("wait-{suffix}"),
+                work.clone(),
+                rev(1),
+                WorkState::WaitingForModel,
+                "daemon-notch",
+            ))
+            .unwrap();
+        coordinator
+            .submit(work_transition(
+                format!("run-{suffix}"),
+                work.clone(),
+                rev(2),
+                WorkState::Running,
+                "daemon-notch",
+            ))
+            .unwrap();
+        coordinator
+            .submit(work_transition(
+                format!("done-{suffix}"),
+                work,
+                rev(3),
+                WorkState::Completed,
+                "daemon-notch",
+            ))
+            .unwrap();
+    }
+
+    let (snapshot, work_count_in_same_transaction) = coordinator
+        .projected_snapshot(|connection, snapshot| {
+            let count = connection
+                .query_row("SELECT COUNT(*) FROM works", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .map_err(|error| CommandError::Storage(error.to_string()))?;
+            assert_eq!(snapshot.works.len(), 1);
+            Ok(count)
+        })
+        .unwrap();
+
+    assert_eq!(work_count_in_same_transaction, 2);
+    assert_eq!(snapshot.works.len(), 1);
+    assert!(snapshot.automation_runs.is_empty());
+    assert!(snapshot.interruptions.is_empty());
+}
+
+#[test]
 fn activity_updates_are_revisioned_ordered_and_current_only() {
     let (_temp, coordinator) = fixture("daemon-activity", 32, &["work-activity"]);
     let created = coordinator

@@ -1103,6 +1103,22 @@ impl WorkCoordinator {
         Ok(snapshot)
     }
 
+    /// Reads projection metadata from the same SQLite transaction as the Work
+    /// snapshot so a UI cannot observe mixed revisions across tables.
+    pub fn projected_snapshot<T>(
+        &self,
+        project: impl FnOnce(&Connection, &WorkSnapshot) -> Result<T, CommandError>,
+    ) -> Result<(WorkSnapshot, T), CommandError> {
+        let connection = self.connection.lock().expect("coordinator mutex poisoned");
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(CommandError::storage)?;
+        let snapshot = notch_snapshot_from(&transaction)?;
+        let projection = project(&transaction, &snapshot)?;
+        transaction.commit().map_err(CommandError::storage)?;
+        Ok((snapshot, projection))
+    }
+
     pub fn events(
         &self,
         after_cursor: Option<EventCursor>,
@@ -1475,7 +1491,7 @@ fn apply_command(
                 transaction
                     .execute(
                         "UPDATE work_automation_sessions
-                         SET attention_state = ?1, frozen = 1
+                         SET attention_state = ?1
                          WHERE automation_run_identity IN (
                            SELECT automation_run_identity FROM work_automation_runs
                            WHERE work_identity = ?2
@@ -2010,6 +2026,131 @@ fn snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandError> 
         automation_runs,
         approvals,
         interruptions,
+        model_runtime_generation: model_runtime_generation.map(ModelRuntimeGeneration::new),
+        model_runtime_trusted,
+    })
+}
+
+fn notch_snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandError> {
+    let daemon_generation = metadata(connection, "daemon_generation")?
+        .ok_or_else(|| CommandError::CorruptState("missing daemon generation".to_owned()))?;
+    let cursor = EventCursor::new(
+        metadata(connection, "event_cursor")?
+            .unwrap_or_else(|| "0".to_owned())
+            .parse::<u64>()
+            .map_err(CommandError::serialization)?,
+    );
+    let mut statement = connection
+        .prepare(
+            "WITH projected(identity) AS (
+                 SELECT identity FROM works
+                 WHERE state NOT IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
+                 UNION
+                 SELECT r.work_identity
+                 FROM work_automation_runs r
+                 JOIN work_automation_sessions s
+                   ON s.automation_session_identity = r.automation_session_identity
+                 WHERE s.attention_state = 'unread'
+                 UNION
+                 SELECT identity FROM (
+                     SELECT identity FROM works
+                     WHERE origin_kind = 'conversation'
+                       AND state IN ('completed', 'partial', 'failed')
+                     ORDER BY updated_at DESC, identity ASC LIMIT 1
+                 )
+             )
+             SELECT w.identity, w.origin_kind, w.origin_primary_identity,
+                    w.origin_secondary_identity, w.origin_historical_identity,
+                    w.origin_definition_revision, w.state, w.revision,
+                    p.category
+             FROM projected
+             JOIN works w ON w.identity = projected.identity
+             LEFT JOIN work_activity_projection p ON p.work_identity = w.identity
+             ORDER BY w.identity ASC",
+        )
+        .map_err(CommandError::storage)?;
+    let works = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<u64>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, u64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
+        .map_err(CommandError::storage)?
+        .map(|result| {
+            let (
+                identity,
+                kind,
+                primary,
+                secondary,
+                historical,
+                definition_revision,
+                state,
+                revision,
+                activity,
+            ) = result.map_err(CommandError::storage)?;
+            Ok(WorkRecord {
+                identity: WorkIdentity::new(identity),
+                origin: WorkOrigin::from_database(
+                    &kind,
+                    primary,
+                    secondary,
+                    historical,
+                    definition_revision,
+                )?,
+                state: WorkState::parse(&state)?,
+                revision: WorkRevision::new(revision),
+                activity: activity
+                    .as_deref()
+                    .map(WorkActivityCategory::parse)
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, CommandError>>()?;
+    let approvals = {
+        let mut statement = connection
+            .prepare(
+                "SELECT identity, work_identity, category, state
+                 FROM work_approvals WHERE state = 'pending' ORDER BY identity ASC",
+            )
+            .map_err(CommandError::storage)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ApprovalRecord {
+                    identity: ApprovalIdentity::new(row.get::<_, String>(0)?),
+                    work_identity: WorkIdentity::new(row.get::<_, String>(1)?),
+                    category: row.get(2)?,
+                    state: ApprovalState::Pending,
+                })
+            })
+            .map_err(CommandError::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CommandError::storage)?;
+        rows
+    };
+    let (model_runtime_generation, model_runtime_trusted) = connection
+        .query_row(
+            "SELECT model_runtime_generation, trusted
+             FROM work_model_runtime_recovery WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .map_err(CommandError::storage)?;
+    Ok(WorkSnapshot {
+        schema_version: SCHEMA_VERSION,
+        cursor,
+        daemon_generation: DaemonGeneration::new(daemon_generation),
+        works,
+        automation_runs: vec![],
+        approvals,
+        interruptions: vec![],
         model_runtime_generation: model_runtime_generation.map(ModelRuntimeGeneration::new),
         model_runtime_trusted,
     })

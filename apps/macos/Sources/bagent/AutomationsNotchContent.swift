@@ -207,8 +207,29 @@ struct AutomationsNotchContent: View {
                             Spacer(minLength: 0)
                         }
                         .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        .padding(.horizontal, 3)
+                        .background(
+                            "automation-session:\(run.id)" == viewModel.focusedAutomationSessionIdentity
+                                ? Color.white.opacity(0.06)
+                                : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 3)
+                        )
                         .accessibilityElement(children: .ignore)
                         .accessibilityLabel("Beh \(run.status), \(AutomationTimeFormat.shortLocal(run.finishedAt ?? run.scheduledFor) ?? "")")
+                        .accessibilityAddTraits(
+                            "automation-session:\(run.id)" == viewModel.focusedAutomationSessionIdentity
+                                ? .isSelected : []
+                        )
+                        .onAppear {
+                            viewModel.acknowledgeFocusedAutomationSessionIfPresented(
+                                runIdentity: run.id
+                            )
+                        }
+                        .onChange(of: viewModel.focusedAutomationSessionIdentity) {
+                            viewModel.acknowledgeFocusedAutomationSessionIfPresented(
+                                runIdentity: run.id
+                            )
+                        }
                     }
                 }
             }

@@ -97,7 +97,7 @@ struct InvariantNotchStatusPill: View {
 
     var body: some View {
         Group {
-            if activeAutomationCount > 0 {
+            if presentation.opensAutomations {
                 Button(action: action) { capsule }
                     .buttonStyle(.plain)
             } else {
@@ -165,7 +165,12 @@ private struct StageRailActivityIcon: View {
                 phase = !reduceMotion
             }
             .onChange(of: reduceMotion) { _, reduced in
-                phase = true
+                if reduced {
+                    phase = true
+                } else {
+                    phase = false
+                    DispatchQueue.main.async { phase = true }
+                }
             }
     }
 

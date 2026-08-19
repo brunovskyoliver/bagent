@@ -204,6 +204,10 @@ struct NotchStatusPillPresentation: Codable, Equatable, Sendable {
     let label: String?
     let accessibilityLabel: String
     let accessibilityValue: String
+
+    var opensAutomations: Bool {
+        label == "ACTIVE" || label?.hasSuffix(" ACTIVE") == true
+    }
 }
 
 struct NotchGeometry: Codable, Equatable, Sendable {
@@ -510,7 +514,9 @@ enum NotchProjection {
         let bridgeHeight: CGFloat = {
             if approval != nil { return 176 }
             if activeAutomations.count >= 2 { return 150 }
-            if foreground != nil, !activeAutomations.isEmpty { return 126 }
+            let foregroundOutput = (mode == .output || revealForegroundCompletion)
+                && snapshot.works.contains { $0.origin == .conversation && $0.state.isTerminal }
+            if (foreground != nil || foregroundOutput), !activeAutomations.isEmpty { return 126 }
             if terminal != nil, active.isEmpty { return 98 }
             if !active.isEmpty || snapshot.model.isTransitioning { return 78 }
             return mode == .collapsed ? 0 : 78
@@ -606,7 +612,7 @@ enum NotchProjection {
             else { return false }
             return previous.works.first(where: { $0.identity == nextWork.identity }).map {
                 $0.revision != nextWork.revision || ![.completed, .partial, .failed].contains($0.state)
-            } ?? true
+            } ?? false
         }
     }
 

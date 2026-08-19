@@ -51,21 +51,21 @@ final class NotchEventConsumer: ObservableObject {
         )
         switch batch {
         case .gap(let snapshot):
-            try install(snapshot, reduceMotion: reduceMotion)
+            try install(snapshot, reduceMotion: self.reduceMotion)
         case .events(let events):
             do {
                 for event in events {
                     presentation = try NotchProjection.reduce(
                         previous: presentation,
                         input: .event(event),
-                        reduceMotion: reduceMotion
+                        reduceMotion: self.reduceMotion
                     )
                 }
             } catch let error as NotchProjectionError {
                 switch error {
                 case .unsupportedSchema, .cursorGap, .daemonGenerationChanged, .revisionMismatch,
                      .missingSnapshot:
-                    try await replaceFromSnapshot(reduceMotion: reduceMotion)
+                    try await replaceFromSnapshot(reduceMotion: self.reduceMotion)
                 }
             }
         }

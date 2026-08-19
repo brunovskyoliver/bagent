@@ -478,15 +478,18 @@ final class ChatViewModel: ObservableObject {
         automationsSurface = .list
         automationsSelectionIndex = 0
         automationsError = nil
+        focusedAutomationSessionIdentity = nil
+        pendingTerminalAcknowledgement = nil
         applyNotchIntent(.openAutomations)
         Task { await refreshAutomations() }
     }
 
-    func openAutomationDetail(_ identity: String) {
+    func openAutomationDetail(_ identity: String, focusedSessionIdentity: String? = nil) {
         inputText = ""
         historyBrowseIndex = nil
         automationsSurface = .detail(identity)
         automationsError = nil
+        focusedAutomationSessionIdentity = focusedSessionIdentity
         applyNotchIntent(.openAutomations)
         Task { await refreshAutomations() }
     }
@@ -520,11 +523,50 @@ final class ChatViewModel: ObservableObject {
 
     /// Recent runs shown on the detail page (fetched on entry + on events).
     @Published var automationDetailRuns: [AutomationRunRecord] = []
+    @Published private(set) var focusedAutomationSessionIdentity: String?
+    private var pendingTerminalAcknowledgement: (
+        sessionIdentity: String,
+        workIdentity: String,
+        expectedRevision: UInt64
+    )?
 
     func loadAutomationDetailRuns(_ id: String) {
         Task {
-            automationDetailRuns = (try? await client.automationRuns(id: id, limit: 3)) ?? []
+            let requestedLimit = pendingTerminalAcknowledgement == nil ? 3 : 50
+            let runs = (try? await client.automationRuns(id: id, limit: requestedLimit)) ?? []
+            var visibleRuns = Array(runs.prefix(3))
+            if let pendingTerminalAcknowledgement,
+               let selected = runs.first(where: {
+                      "automation-session:\($0.id)" == pendingTerminalAcknowledgement.sessionIdentity
+               }), !visibleRuns.contains(where: { $0.id == selected.id }) {
+                visibleRuns.append(selected)
+            }
+            automationDetailRuns = visibleRuns
         }
+    }
+
+    func acknowledgeFocusedAutomationSessionIfPresented(runIdentity: String) {
+        guard let pendingTerminalAcknowledgement,
+              "automation-session:\(runIdentity)" == pendingTerminalAcknowledgement.sessionIdentity
+        else { return }
+        self.pendingTerminalAcknowledgement = nil
+        Task {
+            try? await client.acknowledgeWorkAttention(
+                workIdentity: pendingTerminalAcknowledgement.workIdentity,
+                expectedRevision: pendingTerminalAcknowledgement.expectedRevision,
+                consumerFence: notchEventConsumer.activeConsumerFence
+            )
+        }
+    }
+
+    private func openAutomationSession(
+        definitionIdentity: String,
+        sessionIdentity: String,
+        workIdentity: String,
+        expectedRevision: UInt64
+    ) {
+        pendingTerminalAcknowledgement = (sessionIdentity, workIdentity, expectedRevision)
+        openAutomationDetail(definitionIdentity, focusedSessionIdentity: sessionIdentity)
     }
 
     /// Show the full latest result through the existing output presentation.
@@ -1557,18 +1599,16 @@ final class ChatViewModel: ObservableObject {
             }
         case .terminalAutomation(
             let definitionIdentity,
-            _,
+            let sessionIdentity,
             let workIdentity,
             let expectedRevision
         ):
-            openAutomationDetail(definitionIdentity)
-            Task {
-                try? await client.acknowledgeWorkAttention(
-                    workIdentity: workIdentity,
-                    expectedRevision: expectedRevision,
-                    consumerFence: notchEventConsumer.activeConsumerFence
-                )
-            }
+            openAutomationSession(
+                definitionIdentity: definitionIdentity,
+                sessionIdentity: sessionIdentity,
+                workIdentity: workIdentity,
+                expectedRevision: expectedRevision
+            )
         case nil:
             break
         }

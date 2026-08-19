@@ -1242,7 +1242,7 @@ private struct NotchProjectionAccessibilityModifier: ViewModifier {
                             .accessibilityValue(presentation.rail.accessibilityValue)
                     }
                     if presentation.statusPill.label != nil {
-                        if presentation.activeAutomationCount > 0 {
+                        if presentation.statusPill.opensAutomations {
                             Button("Status", action: openAutomations)
                                 .accessibilityValue(presentation.statusPill.accessibilityValue)
                         } else {

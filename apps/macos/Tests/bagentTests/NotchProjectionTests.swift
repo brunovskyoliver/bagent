@@ -76,6 +76,53 @@ final class NotchProjectionTests: XCTestCase {
         XCTAssertEqual(presentation.geometry, .init(wingWidth: 248, bridgeHeight: 78))
     }
 
+    func testInitialTerminalConversationSnapshotEstablishesCollapsedBaseline() throws {
+        let snapshot = NotchWorkSnapshot(
+            schemaVersion: 1,
+            cursor: 8,
+            daemonGeneration: "daemon-a",
+            works: [work(
+                identity: "old-chat",
+                revision: 4,
+                origin: .conversation,
+                state: .completed
+            )],
+            pendingApprovals: [],
+            model: .ready
+        )
+
+        let presentation = try NotchProjection.reduce(previous: .idle, input: .snapshot(snapshot))
+
+        XCTAssertEqual(presentation.interactionMode, .collapsed)
+        XCTAssertEqual(presentation.geometry.bridgeHeight, 0)
+    }
+
+    func testForegroundCompletionWithBackgroundRunUsesOutputHeight() throws {
+        let initial = NotchWorkSnapshot(
+            schemaVersion: 1,
+            cursor: 10,
+            daemonGeneration: "daemon-a",
+            works: [
+                work(identity: "chat", revision: 1, origin: .conversation, state: .running),
+                work(identity: "run", revision: 1, origin: .automation, state: .running),
+            ],
+            pendingApprovals: [],
+            model: .ready
+        )
+        let running = try NotchProjection.reduce(previous: .idle, input: .snapshot(initial))
+        let completed = try NotchProjection.reduce(previous: running, input: .event(.init(
+            schemaVersion: 1,
+            cursor: 11,
+            daemonGeneration: "daemon-a",
+            work: work(identity: "chat", revision: 2, origin: .conversation, state: .completed),
+            model: .ready
+        )))
+
+        XCTAssertEqual(completed.interactionMode, .output)
+        XCTAssertEqual(completed.geometry.bridgeHeight, 126)
+        XCTAssertEqual(completed.statusPill.label, "ACTIVE")
+    }
+
     func testOrderedEventAdvancesRevisionAndDuplicateHasNoEffect() throws {
         let initial = NotchWorkSnapshot(
             schemaVersion: 1,

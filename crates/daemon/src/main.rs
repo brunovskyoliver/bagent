@@ -23,7 +23,7 @@ use bagent_skills::{selector as skill_selector, LoadedSkill};
 use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig, RuntimePhase};
 use bagentd::unified_work::UnifiedWorkAuthority;
 use bagentd::work_coordinator::{
-    ApprovalState, ConversationTurnIdentity, CoordinatorConfig, CurrentChatIdentity,
+    ApprovalState, CommandError, ConversationTurnIdentity, CoordinatorConfig, CurrentChatIdentity,
     DaemonGeneration, EventCursor, EventRead, WorkCoordinator, WorkIdentity, WorkOrigin,
     WorkRecord, WorkRevision, WorkSnapshot, WorkState,
 };
@@ -1995,17 +1995,11 @@ async fn work_snapshot(
         );
     }
     *state.ui_consumer_fence.lock().await = Some(query.consumer_fence);
-    match state.work_authority.coordinator().snapshot() {
-        Ok(snapshot) => match notch_projection_context(&state, &snapshot).await {
-            Ok(context) => (
-                StatusCode::OK,
-                Json(notch_snapshot_value(&snapshot, &context)),
-            ),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("{error}") })),
-            ),
-        },
+    match authoritative_notch_snapshot(&state) {
+        Ok((snapshot, context)) => (
+            StatusCode::OK,
+            Json(notch_snapshot_value(&snapshot, &context)),
+        ),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("{error}") })),
@@ -2035,77 +2029,77 @@ async fn work_events(
         Some(EventCursor::new(query.after)),
         &DaemonGeneration::new(query.daemon_generation),
     ) {
-        Ok(EventRead::Gap { snapshot }) => {
-            match notch_projection_context(&state, &snapshot).await {
-                Ok(context) => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "kind": "gap",
-                        "snapshot": notch_snapshot_value(&snapshot, &context),
-                    })),
-                ),
-                Err(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": format!("{error}") })),
-                ),
-            }
-        }
+        Ok(EventRead::Gap { .. }) => match authoritative_notch_snapshot(&state) {
+            Ok((snapshot, context)) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "kind": "gap",
+                    "snapshot": notch_snapshot_value(&snapshot, &context),
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{error}") })),
+            ),
+        },
         Ok(EventRead::Events(events)) if events.is_empty() => (
             StatusCode::OK,
             Json(serde_json::json!({ "kind": "events", "events": [] })),
         ),
-        Ok(EventRead::Events(events)) => match coordinator.snapshot() {
-            Ok(snapshot) => match notch_projection_context(&state, &snapshot).await {
-                Ok(context) => {
-                    let projected = events
-                        .iter()
-                        .filter_map(|event| {
-                            snapshot
-                                .works
-                                .iter()
-                                .enumerate()
-                                .find(|(_, work)| work.identity == event.work_identity)
-                                .map(|(index, work)| {
-                                    let mut value = notch_work_value(work, index as u64, &context);
-                                    let object =
-                                        value.as_object_mut().expect("work projection object");
-                                    object.insert(
-                                        "revision".to_owned(),
-                                        serde_json::json!(event.work_revision.value()),
-                                    );
-                                    object.insert(
-                                        "state".to_owned(),
-                                        serde_json::to_value(event.state)
-                                            .expect("serializable Work state"),
-                                    );
-                                    object.insert(
+        Ok(EventRead::Events(events)) => match authoritative_notch_snapshot(&state) {
+            Ok((snapshot, context)) => {
+                if event_batch_requires_snapshot(&events, &snapshot) {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "kind": "gap",
+                            "snapshot": notch_snapshot_value(&snapshot, &context),
+                        })),
+                    );
+                }
+                let projected = events
+                    .iter()
+                    .filter_map(|event| {
+                        snapshot
+                            .works
+                            .iter()
+                            .enumerate()
+                            .find(|(_, work)| work.identity == event.work_identity)
+                            .map(|(index, work)| {
+                                let mut value = notch_work_value(work, index as u64, &context);
+                                let object = value.as_object_mut().expect("work projection object");
+                                object.insert(
+                                    "revision".to_owned(),
+                                    serde_json::json!(event.work_revision.value()),
+                                );
+                                object.insert(
+                                    "state".to_owned(),
+                                    serde_json::to_value(event.state)
+                                        .expect("serializable Work state"),
+                                );
+                                object.insert(
                                     "activity".to_owned(),
                                     event
                                         .activity
                                         .map(|category| serde_json::json!({ "category": category }))
                                         .unwrap_or(serde_json::Value::Null),
                                 );
-                                    serde_json::json!({
-                                        "schemaVersion": event.schema_version,
-                                        "cursor": event.event_cursor.value(),
-                                        "daemonGeneration": event.daemon_generation.as_str(),
-                                        "work": value,
-                                        "pendingApprovals": notch_pending_approvals_value(&snapshot),
-                                        "model": context.model_phase,
-                                    })
+                                serde_json::json!({
+                                    "schemaVersion": event.schema_version,
+                                    "cursor": event.event_cursor.value(),
+                                    "daemonGeneration": event.daemon_generation.as_str(),
+                                    "work": value,
+                                    "pendingApprovals": notch_pending_approvals_value(&snapshot),
+                                    "model": context.model_phase,
                                 })
-                        })
-                        .collect::<Vec<_>>();
-                    (
-                        StatusCode::OK,
-                        Json(serde_json::json!({ "kind": "events", "events": projected })),
-                    )
-                }
-                Err(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": format!("{error}") })),
-                ),
-            },
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "kind": "events", "events": projected })),
+                )
+            }
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": format!("{error}") })),
@@ -2116,6 +2110,18 @@ async fn work_events(
             Json(serde_json::json!({ "error": format!("{error}") })),
         ),
     }
+}
+
+fn event_batch_requires_snapshot(
+    events: &[bagentd::work_coordinator::WorkEvent],
+    snapshot: &WorkSnapshot,
+) -> bool {
+    events.len() != 1
+        || events[0].event_cursor.value() != snapshot.cursor.value()
+        || !snapshot
+            .works
+            .iter()
+            .any(|work| work.identity == events[0].work_identity)
 }
 
 struct NotchProjectionContext {
@@ -2129,10 +2135,9 @@ struct NotchProjectionContext {
     claimed_orders: HashMap<String, u64>,
 }
 
-async fn notch_projection_context(
+fn authoritative_notch_snapshot(
     state: &AppState,
-    snapshot: &WorkSnapshot,
-) -> Result<NotchProjectionContext> {
+) -> Result<(WorkSnapshot, NotchProjectionContext)> {
     let model_phase = match state.model_runtime.snapshot().phase {
         RuntimePhase::Unavailable => "unavailable",
         RuntimePhase::Unloaded => "unloaded",
@@ -2143,7 +2148,21 @@ async fn notch_projection_context(
         RuntimePhase::Poisoned(_) => "poisoned",
         RuntimePhase::Restarting => "restarting",
     };
-    let db = state.db.lock().await;
+    state
+        .work_authority
+        .coordinator()
+        .projected_snapshot(|connection, snapshot| {
+            notch_projection_context(connection, snapshot, model_phase)
+                .map_err(|error| CommandError::Storage(error.to_string()))
+        })
+        .map_err(Into::into)
+}
+
+fn notch_projection_context(
+    db: &Connection,
+    snapshot: &WorkSnapshot,
+    model_phase: &'static str,
+) -> Result<NotchProjectionContext> {
     let mut automation_names = HashMap::new();
     let mut automation_definition_identities = HashMap::new();
     let mut automation_session_identities = HashMap::new();
@@ -2152,21 +2171,32 @@ async fn notch_projection_context(
     let mut queue_positions = HashMap::new();
     let mut claimed_orders = HashMap::new();
     let mut statement = db.prepare(
-        "SELECT w.identity, w.rowid, a.name, r.historical_automation_identity,
+        "WITH projected(identity) AS (
+             SELECT identity FROM works
+             WHERE state NOT IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
+             UNION
+             SELECT r.work_identity
+             FROM work_automation_runs r
+             JOIN work_automation_sessions s
+               ON s.automation_session_identity = r.automation_session_identity
+             WHERE s.attention_state = 'unread'
+             UNION
+             SELECT identity FROM (
+                 SELECT identity FROM works
+                 WHERE origin_kind = 'conversation'
+                   AND state IN ('completed', 'partial', 'failed')
+                 ORDER BY updated_at DESC, identity ASC LIMIT 1
+             )
+         )
+         SELECT w.identity, w.rowid, a.name, r.historical_automation_identity,
                 r.automation_session_identity, s.attention_state, w.state, w.updated_at
-         FROM works w
+         FROM projected
+         JOIN works w ON w.identity = projected.identity
          LEFT JOIN work_automation_runs r ON r.work_identity = w.identity
          LEFT JOIN automations a ON a.id = r.historical_automation_identity
          LEFT JOIN work_automation_sessions s
            ON s.automation_session_identity = r.automation_session_identity
-         WHERE w.state NOT IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
-            OR s.attention_state = 'unread'
-            OR w.identity = (
-                SELECT identity FROM works
-                WHERE origin_kind = 'conversation'
-                  AND state IN ('completed', 'partial', 'failed')
-                ORDER BY updated_at DESC, identity ASC LIMIT 1
-            )",
+         ORDER BY w.identity ASC",
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -4836,6 +4866,63 @@ async fn save_last_whatsapp_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_transition_batches_replace_with_one_current_snapshot() {
+        let snapshot = WorkSnapshot {
+            schema_version: 1,
+            cursor: EventCursor::new(22),
+            daemon_generation: DaemonGeneration::new("daemon-a"),
+            works: vec![WorkRecord {
+                identity: WorkIdentity::new("work-a"),
+                origin: WorkOrigin::Conversation {
+                    current_chat_identity: CurrentChatIdentity::new("chat-a"),
+                    conversation_turn_identity: ConversationTurnIdentity::new("turn-a"),
+                },
+                state: WorkState::Running,
+                revision: WorkRevision::new(3),
+                activity: None,
+            }],
+            automation_runs: vec![],
+            approvals: vec![],
+            interruptions: vec![],
+            model_runtime_generation: None,
+            model_runtime_trusted: true,
+        };
+        let transition = |cursor, state| bagentd::work_coordinator::WorkEvent {
+            schema_version: 1,
+            event_cursor: EventCursor::new(cursor),
+            daemon_generation: DaemonGeneration::new("daemon-a"),
+            committed_at: "2026-08-19T00:00:00Z".to_owned(),
+            event_kind: bagentd::work_coordinator::EventKind::WorkStateChanged,
+            work_identity: WorkIdentity::new("work-a"),
+            work_revision: WorkRevision::new(cursor - 19),
+            state,
+            activity: None,
+        };
+
+        let approval_requested_then_resolved = vec![
+            transition(21, WorkState::WaitingForApproval),
+            transition(22, WorkState::Running),
+        ];
+        let completed_then_acknowledged = vec![
+            transition(21, WorkState::Completed),
+            transition(22, WorkState::Completed),
+        ];
+
+        assert!(event_batch_requires_snapshot(
+            &approval_requested_then_resolved,
+            &snapshot
+        ));
+        assert!(event_batch_requires_snapshot(
+            &completed_then_acknowledged,
+            &snapshot
+        ));
+        assert!(!event_batch_requires_snapshot(
+            &[transition(22, WorkState::Running)],
+            &snapshot
+        ));
+    }
 
     #[test]
     fn notch_projection_is_a_strict_privacy_allowlist() {
