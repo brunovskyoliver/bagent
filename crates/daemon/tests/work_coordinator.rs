@@ -76,6 +76,12 @@ fn notch_projection_snapshot_is_transactional_and_bounded() {
     assert_eq!(snapshot.works.len(), 1);
     assert!(snapshot.automation_runs.is_empty());
     assert!(snapshot.interruptions.is_empty());
+    assert!(matches!(
+        coordinator
+            .notch_events(snapshot.cursor, &snapshot.daemon_generation)
+            .unwrap(),
+        EventRead::Events(events) if events.is_empty()
+    ));
 }
 
 #[test]

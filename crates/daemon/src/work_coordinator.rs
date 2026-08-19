@@ -8,6 +8,8 @@ use std::{collections::VecDeque, fmt, path::Path, sync::Mutex};
 const SCHEMA: &str = include_str!("../migrations/V15__work_coordinator_foundations.sql");
 const CUTOVER_SCHEMA: &str = include_str!("../migrations/V16__unified_work_cutover.sql");
 const ACTIVITY_SCHEMA: &str = include_str!("../migrations/V17__work_activity_projection.sql");
+const NOTCH_PROJECTION_INDEXES: &str =
+    include_str!("../migrations/V18__notch_projection_indexes.sql");
 const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -964,6 +966,9 @@ impl WorkCoordinator {
         connection
             .execute_batch(ACTIVITY_SCHEMA)
             .map_err(CommandError::storage)?;
+        connection
+            .execute_batch(NOTCH_PROJECTION_INDEXES)
+            .map_err(CommandError::storage)?;
         initialize_generation(
             &connection,
             &generation,
@@ -1152,6 +1157,58 @@ impl WorkCoordinator {
                     "SELECT cursor, schema_version, daemon_generation, committed_at, event_kind,
                         work_identity, work_revision, payload
                  FROM work_event_outbox WHERE cursor > ?1 ORDER BY cursor ASC",
+                )
+                .map_err(CommandError::storage)?;
+            let rows = statement
+                .query_map(params![after_cursor.value()], row_to_event)
+                .map_err(CommandError::storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(CommandError::storage)?;
+            rows
+        };
+        transaction.commit().map_err(CommandError::storage)?;
+        Ok(EventRead::Events(events))
+    }
+
+    /// Event polling seam for the compact notch. Empty reads touch only
+    /// metadata and the bounded outbox; gap snapshots use the bounded notch
+    /// projection instead of materializing retained history.
+    pub fn notch_events(
+        &self,
+        after_cursor: EventCursor,
+        expected_generation: &DaemonGeneration,
+    ) -> Result<EventRead, CommandError> {
+        let connection = self.connection.lock().expect("coordinator mutex poisoned");
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(CommandError::storage)?;
+        let daemon_generation = metadata(&transaction, "daemon_generation")?
+            .ok_or_else(|| CommandError::CorruptState("missing daemon generation".to_owned()))?;
+        let cursor = EventCursor::new(
+            metadata(&transaction, "event_cursor")?
+                .unwrap_or_else(|| "0".to_owned())
+                .parse::<u64>()
+                .map_err(CommandError::serialization)?,
+        );
+        let earliest = transaction
+            .query_row("SELECT MIN(cursor) FROM work_event_outbox", [], |row| {
+                row.get::<_, Option<u64>>(0)
+            })
+            .map_err(CommandError::storage)?;
+        if expected_generation.as_str() != daemon_generation
+            || after_cursor > cursor
+            || earliest.is_some_and(|value| after_cursor.value().saturating_add(1) < value)
+        {
+            let snapshot = notch_snapshot_from(&transaction)?;
+            transaction.commit().map_err(CommandError::storage)?;
+            return Ok(EventRead::Gap { snapshot });
+        }
+        let events = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT cursor, schema_version, daemon_generation, committed_at, event_kind,
+                            work_identity, work_revision, payload
+                     FROM work_event_outbox WHERE cursor > ?1 ORDER BY cursor ASC",
                 )
                 .map_err(CommandError::storage)?;
             let rows = statement

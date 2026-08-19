@@ -94,4 +94,27 @@ final class AutomationsSurfaceStateTests: XCTestCase {
         XCTAssertLessThanOrEqual(NotchWrapMetrics.automationsWingWidth, NotchWrapMetrics.maxWingWidth)
         XCTAssertLessThanOrEqual(NotchWrapMetrics.automationsBridgeHeight, NotchWrapMetrics.maxBridgeHeight)
     }
+
+    func testTerminalAcknowledgementIntentClearsWhenExactDestinationIsAbandoned() {
+        let vm = ChatViewModel(startMonitoring: false)
+        vm.pendingTerminalAcknowledgement = (
+            definitionIdentity: "definition-a",
+            sessionIdentity: "automation-session:run-a",
+            workIdentity: "work-a",
+            expectedRevision: 4
+        )
+        vm.automationsSurface = .detail("definition-a")
+
+        XCTAssertTrue(vm.automationsGoBack())
+        XCTAssertNil(vm.pendingTerminalAcknowledgement)
+
+        vm.pendingTerminalAcknowledgement = (
+            definitionIdentity: "definition-a",
+            sessionIdentity: "automation-session:run-a",
+            workIdentity: "work-a",
+            expectedRevision: 4
+        )
+        vm.openAutomationDetail("definition-a")
+        XCTAssertNil(vm.pendingTerminalAcknowledgement)
+    }
 }

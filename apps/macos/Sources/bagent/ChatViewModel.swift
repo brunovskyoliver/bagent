@@ -464,7 +464,18 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Automations surface (/automations)
 
-    @Published var automationsSurface: AutomationsSurfaceState = .list
+    @Published var automationsSurface: AutomationsSurfaceState = .list {
+        didSet {
+            guard let pendingTerminalAcknowledgement else { return }
+            guard case .detail(let identity) = automationsSurface,
+                  identity == pendingTerminalAcknowledgement.definitionIdentity
+            else {
+                focusedAutomationSessionIdentity = nil
+                self.pendingTerminalAcknowledgement = nil
+                return
+            }
+        }
+    }
     @Published var automations: [AutomationRecord] = []
     @Published var automationsSelectionIndex: Int = 0
     @Published var automationsError: String? = nil
@@ -489,6 +500,9 @@ final class ChatViewModel: ObservableObject {
         historyBrowseIndex = nil
         automationsSurface = .detail(identity)
         automationsError = nil
+        if focusedSessionIdentity == nil {
+            pendingTerminalAcknowledgement = nil
+        }
         focusedAutomationSessionIdentity = focusedSessionIdentity
         applyNotchIntent(.openAutomations)
         Task { await refreshAutomations() }
@@ -524,7 +538,8 @@ final class ChatViewModel: ObservableObject {
     /// Recent runs shown on the detail page (fetched on entry + on events).
     @Published var automationDetailRuns: [AutomationRunRecord] = []
     @Published private(set) var focusedAutomationSessionIdentity: String?
-    private var pendingTerminalAcknowledgement: (
+    var pendingTerminalAcknowledgement: (
+        definitionIdentity: String,
         sessionIdentity: String,
         workIdentity: String,
         expectedRevision: UInt64
@@ -532,14 +547,21 @@ final class ChatViewModel: ObservableObject {
 
     func loadAutomationDetailRuns(_ id: String) {
         Task {
-            let requestedLimit = pendingTerminalAcknowledgement == nil ? 3 : 50
-            let runs = (try? await client.automationRuns(id: id, limit: requestedLimit)) ?? []
+            let runs = (try? await client.automationRuns(id: id, limit: 3)) ?? []
             var visibleRuns = Array(runs.prefix(3))
             if let pendingTerminalAcknowledgement,
-               let selected = runs.first(where: {
-                      "automation-session:\($0.id)" == pendingTerminalAcknowledgement.sessionIdentity
-               }), !visibleRuns.contains(where: { $0.id == selected.id }) {
-                visibleRuns.append(selected)
+               pendingTerminalAcknowledgement.definitionIdentity == id,
+               pendingTerminalAcknowledgement.sessionIdentity.hasPrefix("automation-session:") {
+                let runIdentity = String(
+                    pendingTerminalAcknowledgement.sessionIdentity.dropFirst("automation-session:".count)
+                )
+                if !visibleRuns.contains(where: { $0.id == runIdentity }),
+                   let selected = try? await client.automationRun(
+                       id: id,
+                       runIdentity: runIdentity
+                   ) {
+                    visibleRuns.append(selected)
+                }
             }
             automationDetailRuns = visibleRuns
         }
@@ -549,13 +571,20 @@ final class ChatViewModel: ObservableObject {
         guard let pendingTerminalAcknowledgement,
               "automation-session:\(runIdentity)" == pendingTerminalAcknowledgement.sessionIdentity
         else { return }
-        self.pendingTerminalAcknowledgement = nil
         Task {
-            try? await client.acknowledgeWorkAttention(
-                workIdentity: pendingTerminalAcknowledgement.workIdentity,
-                expectedRevision: pendingTerminalAcknowledgement.expectedRevision,
-                consumerFence: notchEventConsumer.activeConsumerFence
-            )
+            do {
+                _ = try await client.acknowledgeWorkAttention(
+                    workIdentity: pendingTerminalAcknowledgement.workIdentity,
+                    expectedRevision: pendingTerminalAcknowledgement.expectedRevision,
+                    consumerFence: notchEventConsumer.activeConsumerFence
+                )
+                if self.pendingTerminalAcknowledgement?.sessionIdentity
+                    == pendingTerminalAcknowledgement.sessionIdentity {
+                    self.pendingTerminalAcknowledgement = nil
+                }
+            } catch {
+                // Keep the exact destination-bound command for a later retry.
+            }
         }
     }
 
@@ -565,7 +594,12 @@ final class ChatViewModel: ObservableObject {
         workIdentity: String,
         expectedRevision: UInt64
     ) {
-        pendingTerminalAcknowledgement = (sessionIdentity, workIdentity, expectedRevision)
+        pendingTerminalAcknowledgement = (
+            definitionIdentity,
+            sessionIdentity,
+            workIdentity,
+            expectedRevision
+        )
         openAutomationDetail(definitionIdentity, focusedSessionIdentity: sessionIdentity)
     }
 
@@ -594,6 +628,8 @@ final class ChatViewModel: ObservableObject {
             return true
         case .detail:
             automationsSurface = .list
+            focusedAutomationSessionIdentity = nil
+            pendingTerminalAcknowledgement = nil
             return true
         case .editorTask:
             // Leaving the editor discards the draft.

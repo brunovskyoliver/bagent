@@ -305,6 +305,19 @@ pub(crate) fn repo_recent_runs(
     Ok(rows)
 }
 
+pub(crate) fn repo_run(
+    conn: &Connection,
+    automation_id: &str,
+    run_id: &str,
+) -> Result<AutomationRun, RepoError> {
+    conn.query_row(
+        &format!("SELECT {RUN_COLS} FROM automation_runs WHERE automation_id=?1 AND id=?2"),
+        params![automation_id, run_id],
+        row_to_run,
+    )
+    .map_err(Into::into)
+}
+
 /// Insert a run row (skip records; claims go through repo_claim_run).
 pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<(), RepoError> {
     conn.execute(
@@ -617,6 +630,17 @@ pub(crate) async fn automation_runs(
     }
     match repo_recent_runs(&conn, &id, q.limit.min(50)) {
         Ok(runs) => (StatusCode::OK, Json(json!({"runs": runs}))),
+        Err(e) => repo_error_response(e),
+    }
+}
+
+pub(crate) async fn automation_run(
+    State(state): State<AppState>,
+    Path((id, run_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    match repo_run(&conn, &id, &run_id) {
+        Ok(run) => (StatusCode::OK, Json(json!({"run": run}))),
         Err(e) => repo_error_response(e),
     }
 }
@@ -1350,5 +1374,55 @@ mod tests {
         }
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 3).unwrap();
         assert_eq!(runs.len(), 3);
+    }
+
+    #[test]
+    fn targeted_run_lookup_reaches_beyond_recent_page() {
+        let conn = test_conn();
+        let automation = repo_create(
+            &conn,
+            "n",
+            "p",
+            "Europe/Bratislava",
+            &once_at(6),
+            true,
+            now(),
+        )
+        .unwrap();
+        let target = AutomationRun {
+            id: AutomationRunId::new(),
+            automation_id: automation.id,
+            scheduled_for: now(),
+            started_at: None,
+            finished_at: None,
+            status: AutomationRunStatus::Completed,
+            result_summary: None,
+            is_catch_up: false,
+            is_manual: false,
+        };
+        repo_insert_run(&conn, &target).unwrap();
+        for offset in 1..=50 {
+            let newer = AutomationRun {
+                id: AutomationRunId::new(),
+                automation_id: automation.id,
+                scheduled_for: now() + chrono::Duration::minutes(offset),
+                started_at: None,
+                finished_at: None,
+                status: AutomationRunStatus::Completed,
+                result_summary: None,
+                is_catch_up: false,
+                is_manual: false,
+            };
+            repo_insert_run(&conn, &newer).unwrap();
+        }
+
+        let recent = repo_recent_runs(&conn, &automation.id.to_string(), 50).unwrap();
+        assert!(!recent.iter().any(|run| run.id == target.id));
+        assert_eq!(
+            repo_run(&conn, &automation.id.to_string(), &target.id.to_string())
+                .unwrap()
+                .id,
+            target.id
+        );
     }
 }

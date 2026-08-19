@@ -73,6 +73,9 @@ final class NotchProjectionTests: XCTestCase {
         XCTAssertEqual(presentation.interactionMode, .thinking)
         XCTAssertEqual(presentation.rail.selectedStage, .model)
         XCTAssertEqual(presentation.statusPill.label, "ACTIVE")
+        XCTAssertFalse(presentation.statusPill.opensAutomations(
+            activeAutomationCount: presentation.activeAutomationCount
+        ))
         XCTAssertEqual(presentation.geometry, .init(wingWidth: 248, bridgeHeight: 78))
     }
 

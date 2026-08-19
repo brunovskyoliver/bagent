@@ -1010,7 +1010,7 @@ struct DaemonClient: Sendable, NotchEventTransport {
         workIdentity: String,
         expectedRevision: UInt64,
         consumerFence: String
-    ) async throws {
+    ) async throws -> Bool {
         let credentials = try await loadCreds()
         var request = authedRequest("/work/attention/acknowledge", creds: credentials)
         request.httpMethod = "POST"
@@ -1028,7 +1028,9 @@ struct DaemonClient: Sendable, NotchEventTransport {
             expectedRevision: expectedRevision
         ))
         let (data, response) = try await URLSession.shared.data(for: request)
+        if (response as? HTTPURLResponse)?.statusCode == 409 { return false }
         try validateOK(data: data, response: response)
+        return true
     }
 
     // MARK: - Automations
@@ -1116,6 +1118,19 @@ struct DaemonClient: Sendable, NotchEventTransport {
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
         struct Resp: Decodable { let runs: [AutomationRunRecord] }
         return try JSONDecoder().decode(Resp.self, from: data).runs
+    }
+
+    func automationRun(id: String, runIdentity: String) async throws -> AutomationRunRecord {
+        let credentials = try await loadCreds()
+        let path = "/automations/\(id)/runs/\(runIdentity)"
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest(path, creds: credentials)
+        )
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.badStatus
+        }
+        struct Response: Decodable { let run: AutomationRunRecord }
+        return try JSONDecoder().decode(Response.self, from: data).run
     }
 
     // MARK: - Approvals

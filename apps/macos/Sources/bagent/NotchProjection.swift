@@ -205,8 +205,9 @@ struct NotchStatusPillPresentation: Codable, Equatable, Sendable {
     let accessibilityLabel: String
     let accessibilityValue: String
 
-    var opensAutomations: Bool {
-        label == "ACTIVE" || label?.hasSuffix(" ACTIVE") == true
+    func opensAutomations(activeAutomationCount: Int) -> Bool {
+        activeAutomationCount > 0
+            && (label == "ACTIVE" || label?.hasSuffix(" ACTIVE") == true)
     }
 }
 

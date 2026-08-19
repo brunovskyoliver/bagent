@@ -46,7 +46,9 @@ final class StageRailTests: XCTestCase {
         var presentation = try NotchProjection.reduce(previous: .idle, input: .snapshot(snapshot))
         XCTAssertEqual(presentation.focusedWorkIdentity, "approval")
         XCTAssertEqual(presentation.statusPill.label, "APPROVE")
-        XCTAssertFalse(presentation.statusPill.opensAutomations)
+        XCTAssertFalse(presentation.statusPill.opensAutomations(
+            activeAutomationCount: presentation.activeAutomationCount
+        ))
 
         var withoutApproval = snapshot
         withoutApproval.pendingApprovals = []
@@ -55,7 +57,9 @@ final class StageRailTests: XCTestCase {
         XCTAssertEqual(presentation.focusedWorkIdentity, "foreground")
         XCTAssertEqual(presentation.rail.activityCategory, .mail)
         XCTAssertEqual(presentation.statusPill.label, "2 ACTIVE")
-        XCTAssertTrue(presentation.statusPill.opensAutomations)
+        XCTAssertTrue(presentation.statusPill.opensAutomations(
+            activeAutomationCount: presentation.activeAutomationCount
+        ))
 
         var automationOnly = withoutApproval
         automationOnly.works.removeAll { $0.origin == .conversation || $0.identity == "approval" }

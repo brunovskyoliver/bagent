@@ -764,6 +764,10 @@ async fn main() -> Result<()> {
             "/automations/:id/runs",
             get(automations_api::automation_runs),
         )
+        .route(
+            "/automations/:id/runs/:run_id",
+            get(automations_api::automation_run),
+        )
         // Phase 4B — Sessions
         .route("/sessions", post(session_create).get(sessions_list))
         .route("/sessions/:id/turns", get(session_turns))
@@ -2025,8 +2029,8 @@ async fn work_events(
     }
 
     let coordinator = state.work_authority.coordinator();
-    match coordinator.events(
-        Some(EventCursor::new(query.after)),
+    match coordinator.notch_events(
+        EventCursor::new(query.after),
         &DaemonGeneration::new(query.daemon_generation),
     ) {
         Ok(EventRead::Gap { .. }) => match authoritative_notch_snapshot(&state) {

@@ -97,7 +97,7 @@ struct InvariantNotchStatusPill: View {
 
     var body: some View {
         Group {
-            if presentation.opensAutomations {
+            if presentation.opensAutomations(activeAutomationCount: activeAutomationCount) {
                 Button(action: action) { capsule }
                     .buttonStyle(.plain)
             } else {
