@@ -77,6 +77,102 @@ post-cutover Work is unavailable to the older schema, then restores the
 verified backup. Interrupted migration and repeated conversion fixtures leave
 an integral, deterministic database.
 
+## Post-commit correction: dead admission queue and a competing semaphore
+
+An independent re-inspection after the candidate above found that
+`UnifiedWorkAuthority::dispatch_next` — the only code implementing A18's
+bounded foreground priority and Automation aging — had **no production
+caller**. `crates/daemon/src/main.rs` and `automations_api.rs` admitted Work
+by calling `submit_conversation`/`submit_automation` and then transitioning
+straight to `WaitingForModel`→`Running`, bypassing the fairness queue
+entirely. Foreground had no capacity gate at all; Automation admission held a
+second, independent `tokio::sync::Semaphore` (`automation_slots`) that
+happened to cap concurrency at two but never consulted `dispatch_next`'s
+aging logic. This is exactly the "competing semaphore" this document's own
+"Unified authority" section claims does not exist — it did, inside
+`unified_work.rs` itself. The A26 static detector did not catch it because
+its production-file allowlist never scanned `unified_work.rs`, and its
+semaphore pattern only matched the old `run_slots`/`MAX_CONCURRENT_RUNS`
+names from the pre-cutover code, not any `Semaphore::new(`.
+
+A18's PASS in the table below was therefore evidence against
+`dispatch_next` called directly by the test, not against the real admission
+path — a class of gap the acceptance harness could not see because nothing
+exercised production wiring end-to-end.
+
+Fix, in `crates/daemon/src/unified_work.rs`:
+
+- Removed `automation_slots`/`held_automation_slots`; capacity is now solely
+  the scheduler's `foreground_running`/`automation_running` counters,
+  attributed per Work via a `running_origin` map so `release_slot` and
+  `cancel` take a `WorkIdentity` (not a caller-asserted origin) and can never
+  double-account or mismatch.
+- Added `admit(work)` (async, notify-driven: blocks until `work` leaves the
+  queue) and `run_dispatcher(clock)` (background loop: drains
+  `dispatch_next` on every queue change, plus a 1s fallback tick so the
+  30-tick Automation aging boundary fires without new arrivals). Spawned once
+  in `main.rs` after `UnifiedWorkAuthority::new`.
+- Added `resume(work, origin)` for the approval-resume path: the coordinator
+  already moves `WaitingForApproval` → `Running` unconditionally inside
+  `resolve_approval` (both allow and deny), so resume only needs to wait for
+  a free capacity slot, not re-enter the Queued/WaitingForModel transition.
+- `request_approval`/`resolve_approval` no longer take an `origin`/`now`
+  parameter; callers already have `execution_origin` in scope and now call
+  `resume` explicitly after a successful resolve.
+- `cancel` now releases a dispatched Work's capacity slot (previously it only
+  pruned queue membership — a live leak for any Work cancelled after being
+  granted, masked because nothing dispatched Work in production to leak).
+
+Call sites (`main.rs` chat handler, `screen_intent_handler`,
+`automations_api.rs::execute_automation_run`, both approval-resolution paths
+in `request_approval_core` and `approval_decide`) were updated to
+`submit_*` → `admit().await` → transition to `Running`, and to call
+`release_slot(&work_identity)` at every terminal exit (Completed/Failed for
+chat and screen-intent; the existing terminal transition for automation).
+`enqueued_at`/dispatcher clock inputs were switched from
+`timestamp_millis()` to `timestamp()` (seconds) to match the
+`AUTOMATION_AGE_BOUNDARY = 30` unit; this was previously a dead mismatch
+since `dispatch_next` was never called with production timestamps.
+
+`scripts/acceptance/work-authority.sh` was corrected to scan every file
+under `crates/daemon/src` (not a fixed five-file allowlist that excluded
+`unified_work.rs`, `work_coordinator.rs`, and every connector), and to match
+any `Semaphore::new(` rather than only the old `run_slots`/
+`MAX_CONCURRENT_RUNS` names.
+
+Three new integration tests in `crates/daemon/tests/work_concurrency.rs`
+drive `submit_*` → `admit()` through a spawned `run_dispatcher`, the real
+production call sequence, instead of calling `dispatch_next` directly:
+`admission_dispatcher_grants_through_the_real_async_path` (regression guard:
+`admit` used to hang forever — nothing ever popped the queue),
+`admission_dispatcher_serializes_foreground_independent_of_automation`, and
+`admission_dispatcher_enforces_automation_capacity_of_two`.
+
+Corrected final exact run: `2026-08-19T13:45:00Z` through
+`2026-08-19T13:50:00Z`. `cargo test -p bagentd` (all targets): 251 top-level
+passed, 0 failed, 5 ignored (unchanged environment/fixture boundaries),
+nested restart child 1/1 not double-counted. `cargo test --workspace`: every
+crate 0 failed (see full run below). `swift test --package-path apps/macos`:
+52 passed, 0 failed. `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `cargo build --workspace
+--all-targets`, `cargo check -p bagentd --all-targets --features
+stage8-acceptance`, `swift build --package-path apps/macos`, `git diff
+--check`: all exit 0. `bash scripts/acceptance/work-authority.sh`: PASS, 10
+forbidden categories seeded, zero forbidden matches against the full
+`crates/daemon/src` tree. `bash scripts/acceptance/work-cutover-rollback.sh`:
+PASS, unchanged.
+
+Corrected artifact hashes:
+
+| Artifact | SHA-256 |
+|---|---|
+| `crates/daemon/src/unified_work.rs` | `8416257d0c3f88c9c12aa6ecda6b10735fee60411db4dd07bfa11a45a7baf120` |
+| `scripts/acceptance/work-authority.sh` | `4eda47a0a33191fc33160ba1bc20ffea7777fdffbdc5e98f87fa36feed77c945` |
+
+`crates/daemon/migrations/V16__unified_work_cutover.sql` and
+`scripts/acceptance/work-cutover-rollback.sh` are unchanged from the
+original candidate hashes above.
+
 ## Sequential red-green gates
 
 Red capability was established before production implementation. A18 first
@@ -95,8 +191,8 @@ Final exact run: `2026-08-18T20:12:46Z` through
 
 | Gate | Exact command | Exact result |
 |---|---|---|
-| A18 | `cargo test -p bagentd --test work_concurrency fairness_foreground -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 3 filtered; bounded foreground priority and aged Automation progress |
-| A19 | `cargo test -p bagentd --test work_concurrency automation_capacity_two -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 3 filtered; exactly two distinct Automation executions and zero slot leak |
+| A18 | `cargo test -p bagentd --test work_concurrency fairness_foreground -- --exact`; `admission_dispatcher_serializes_foreground_independent_of_automation` | PASS: 1 passed, 0 failed, 0 ignored, 6 filtered (each); bounded foreground priority and aged Automation progress against `dispatch_next` directly, and against the real `submit_*`→`admit()`→`run_dispatcher` production path |
+| A19 | `cargo test -p bagentd --test work_concurrency automation_capacity_two -- --exact`; `admission_dispatcher_enforces_automation_capacity_of_two` | PASS: 1 passed, 0 failed, 0 ignored, 6 filtered (each); exactly two distinct Automation executions, zero slot leak, verified against `dispatch_next` directly and against the real async admission path |
 | A20 | `cargo test -p bagentd --test work_concurrency approval_restart_capacity -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 3 filtered; same approval identity survives restart, capacity is free, one valid decision resumes, stale decision conflicts |
 | A21 | `cargo test -p bagentd --test work_concurrency cancellation_races -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 3 filtered; queued/loading/executing/approval/completion races, one terminal outcome, zero leases/slots |
 | A22 | `cargo test -p bagentd --test work_failure_injection` | PASS: 1 passed, 0 failed; admission, persistence, outbox, runtime, tool, approval, and completion failpoints close deterministically |
@@ -130,8 +226,8 @@ writers are `work_coordinator.rs` and the bounded cutover module.
 | A11-A16 exact Model Runtime commands | 6 independently exact tests passed, 0 failed |
 | `scripts/acceptance/model-runtime-authority.sh` | PASS: 13 seeded forbidden matches and zero forbidden production matches |
 | `cargo test -p basert-connector --test protocol` | 14 passed, 0 failed, 0 ignored |
-| `cargo test -p bagentd` | 248 top-level tests passed, 0 failed, 5 ignored; nested restart child passed 1/1 |
-| `cargo test --workspace` | 460 top-level tests discovered; 448 passed, 0 failed, 12 ignored; nested restart child passed 1/1 and is not double-counted |
+| `cargo test -p bagentd` | 251 top-level tests passed, 0 failed, 5 ignored; nested restart child passed 1/1 (superseded original candidate figures — see correction section above) |
+| `cargo test --workspace` | 452 test-result lines summed across every crate passed, 0 failed, 12 ignored; nested restart child passed 1/1 and is not a distinct test |
 | `swift test --package-path apps/macos` | 52 passed, 0 failed |
 | `cargo fmt --all -- --check` | exit 0 |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 |

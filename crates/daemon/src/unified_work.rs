@@ -4,6 +4,14 @@
 //! every lifecycle mutation is first committed through [`WorkCoordinator`],
 //! while this small actor owns the volatile execution slots reconstructed from
 //! the authoritative snapshot after restart.
+//!
+//! Admission is notify-driven rather than polled: [`Self::enqueue`] wakes a
+//! single shared [`tokio::sync::Notify`] on every state change (new arrival,
+//! grant, release, cancel), [`Self::run_dispatcher`] drains [`Self::dispatch_next`]
+//! whenever woken (plus a 1s fallback tick for the Automation aging boundary),
+//! and [`Self::admit`] blocks the caller until its own Work leaves the queue.
+//! This is the only path that grants foreground/Automation execution capacity;
+//! no caller may construct a competing semaphore or bypass it.
 
 use crate::work_coordinator::{
     ApprovalIdentity, AutomationDefinitionIdentity, AutomationDefinitionRevision,
@@ -58,14 +66,29 @@ struct SchedulerState {
     foreground_running: usize,
     automation_running: usize,
     consecutive_foreground: usize,
+    running_origin: HashMap<WorkIdentity, ExecutionOrigin>,
+}
+
+impl SchedulerState {
+    fn release(&mut self, work: &WorkIdentity) {
+        if let Some(origin) = self.running_origin.remove(work) {
+            match origin {
+                ExecutionOrigin::Foreground => {
+                    self.foreground_running = self.foreground_running.saturating_sub(1)
+                }
+                ExecutionOrigin::Automation => {
+                    self.automation_running = self.automation_running.saturating_sub(1)
+                }
+            }
+        }
+    }
 }
 
 pub struct UnifiedWorkAuthority {
     coordinator: Arc<WorkCoordinator>,
     generation: DaemonGeneration,
     scheduler: Mutex<SchedulerState>,
-    automation_slots: Arc<tokio::sync::Semaphore>,
-    held_automation_slots: Mutex<HashMap<WorkIdentity, tokio::sync::OwnedSemaphorePermit>>,
+    dispatch_notify: tokio::sync::Notify,
 }
 
 impl UnifiedWorkAuthority {
@@ -74,8 +97,7 @@ impl UnifiedWorkAuthority {
             coordinator,
             generation,
             scheduler: Mutex::new(SchedulerState::default()),
-            automation_slots: Arc::new(tokio::sync::Semaphore::new(AUTOMATION_CAPACITY)),
-            held_automation_slots: Mutex::new(HashMap::new()),
+            dispatch_notify: tokio::sync::Notify::new(),
         }
     }
 
@@ -125,7 +147,7 @@ impl UnifiedWorkAuthority {
             turn,
             self.generation.clone(),
         ))?;
-        self.enqueue(acknowledgement, ExecutionOrigin::Foreground, now)
+        Ok(self.enqueue(acknowledgement, ExecutionOrigin::Foreground, now))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -146,7 +168,7 @@ impl UnifiedWorkAuthority {
             definition_revision,
             self.generation.clone(),
         ))?;
-        self.enqueue(acknowledgement, ExecutionOrigin::Automation, now)
+        Ok(self.enqueue(acknowledgement, ExecutionOrigin::Automation, now))
     }
 
     fn enqueue(
@@ -154,7 +176,7 @@ impl UnifiedWorkAuthority {
         acknowledgement: CommandAcknowledgement,
         origin: ExecutionOrigin,
         now: u64,
-    ) -> Result<WorkIdentity, CommandError> {
+    ) -> WorkIdentity {
         let receipt = acknowledgement.receipt();
         let queued = Queued {
             work_identity: receipt.work_identity.clone(),
@@ -167,7 +189,43 @@ impl UnifiedWorkAuthority {
             .expect("scheduler mutex poisoned")
             .queue
             .push_back(queued);
-        Ok(receipt.work_identity.clone())
+        self.dispatch_notify.notify_waiters();
+        receipt.work_identity.clone()
+    }
+
+    /// Waits until `work` leaves the admission queue, i.e. until the
+    /// dispatcher has granted it execution capacity (or it was cancelled out
+    /// from under it, which the caller's subsequent `transition` call will
+    /// surface as a `CommandError`).
+    pub async fn admit(&self, work: WorkIdentity) {
+        loop {
+            let notified = self.dispatch_notify.notified();
+            let still_queued = self
+                .scheduler
+                .lock()
+                .expect("scheduler mutex poisoned")
+                .queue
+                .iter()
+                .any(|queued| queued.work_identity == work);
+            if !still_queued {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Background loop, spawned once per daemon: drains grantable Work
+    /// whenever the queue changes, and re-checks periodically so the
+    /// Automation aging boundary fires even without new arrivals.
+    pub async fn run_dispatcher(self: Arc<Self>, clock: impl Fn() -> u64 + Send + Sync + 'static) {
+        loop {
+            let notified = self.dispatch_notify.notified();
+            while matches!(self.dispatch_next(clock()), Ok(Some(_))) {}
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+        }
     }
 
     pub fn dispatch_next(&self, now: u64) -> Result<Option<DispatchGrant>, CommandError> {
@@ -208,6 +266,9 @@ impl UnifiedWorkAuthority {
                 state.consecutive_foreground = 0;
             }
         }
+        state
+            .running_origin
+            .insert(queued.work_identity.clone(), queued.origin);
         drop(state);
         self.coordinator.submit(Command::transition(
             format!(
@@ -220,22 +281,20 @@ impl UnifiedWorkAuthority {
             WorkState::WaitingForModel,
             self.generation.clone(),
         ))?;
+        self.dispatch_notify.notify_waiters();
         Ok(Some(DispatchGrant {
             work_identity: queued.work_identity,
             origin: queued.origin,
         }))
     }
 
-    pub fn release_slot(&self, origin: ExecutionOrigin) {
+    /// Releases the execution slot held by `work`, if any. Safe to call on
+    /// Work that never held a slot (approval-wait, cancel of a queued item).
+    pub fn release_slot(&self, work: &WorkIdentity) {
         let mut state = self.scheduler.lock().expect("scheduler mutex poisoned");
-        match origin {
-            ExecutionOrigin::Foreground => {
-                state.foreground_running = state.foreground_running.saturating_sub(1)
-            }
-            ExecutionOrigin::Automation => {
-                state.automation_running = state.automation_running.saturating_sub(1)
-            }
-        }
+        state.release(work);
+        drop(state);
+        self.dispatch_notify.notify_waiters();
     }
 
     pub fn capacity(&self) -> (usize, usize) {
@@ -243,24 +302,29 @@ impl UnifiedWorkAuthority {
         (state.foreground_running, state.automation_running)
     }
 
-    pub async fn acquire_automation_slot(&self, work: WorkIdentity) {
-        let permit = self
-            .automation_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("unified Work automation capacity remains open");
-        self.held_automation_slots
-            .lock()
-            .expect("slot mutex poisoned")
-            .insert(work, permit);
-    }
-
-    pub fn release_execution_slot(&self, work: &WorkIdentity) {
-        self.held_automation_slots
-            .lock()
-            .expect("slot mutex poisoned")
-            .remove(work);
+    /// Re-admits Work whose approval was just resolved (the coordinator
+    /// already moved it back to `Running`); waits for capacity without
+    /// re-entering the Queued/WaitingForModel transition.
+    pub async fn resume(&self, work: WorkIdentity, origin: ExecutionOrigin) {
+        loop {
+            let notified = self.dispatch_notify.notified();
+            {
+                let mut state = self.scheduler.lock().expect("scheduler mutex poisoned");
+                let has_capacity = match origin {
+                    ExecutionOrigin::Foreground => true,
+                    ExecutionOrigin::Automation => state.automation_running < AUTOMATION_CAPACITY,
+                };
+                if has_capacity {
+                    match origin {
+                        ExecutionOrigin::Foreground => state.foreground_running += 1,
+                        ExecutionOrigin::Automation => state.automation_running += 1,
+                    }
+                    state.running_origin.insert(work, origin);
+                    return;
+                }
+            }
+            notified.await;
+        }
     }
 
     pub fn transition(
@@ -327,6 +391,9 @@ impl UnifiedWorkAuthority {
         Ok(WorkState::Completed)
     }
 
+    /// Requests a durable approval and releases the requesting Work's
+    /// execution slot for the duration of the wait (capacity must not be
+    /// held while blocked on a human decision).
     pub fn request_approval(
         &self,
         command: impl Into<CommandIdentity>,
@@ -334,21 +401,19 @@ impl UnifiedWorkAuthority {
         revision: WorkRevision,
         approval: ApprovalIdentity,
         category: impl Into<String>,
-        origin: ExecutionOrigin,
     ) -> Result<WorkRevision, CommandError> {
         let acknowledgement = self.coordinator.submit(Command::request_approval(
             command,
-            work,
+            work.clone(),
             revision,
             approval,
             category,
             self.generation.clone(),
         ))?;
-        self.release_slot(origin);
+        self.release_slot(&work);
         Ok(acknowledgement.receipt().work_revision)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn resolve_approval(
         &self,
         command: impl Into<CommandIdentity>,
@@ -357,32 +422,17 @@ impl UnifiedWorkAuthority {
         approval: ApprovalIdentity,
         allow: bool,
         expected_decision_revision: u64,
-        origin: ExecutionOrigin,
-        now: u64,
     ) -> Result<WorkRevision, CommandError> {
         let acknowledgement = self.coordinator.submit(Command::resolve_approval(
             command,
-            work.clone(),
+            work,
             revision,
             approval,
             allow,
             expected_decision_revision,
             self.generation.clone(),
         ))?;
-        let receipt = acknowledgement.receipt();
-        if allow {
-            self.scheduler
-                .lock()
-                .expect("scheduler mutex poisoned")
-                .queue
-                .push_back(Queued {
-                    work_identity: work,
-                    revision: receipt.work_revision,
-                    origin,
-                    enqueued_at: now,
-                });
-        }
-        Ok(receipt.work_revision)
+        Ok(acknowledgement.receipt().work_revision)
     }
 
     pub fn cancel(
@@ -397,11 +447,11 @@ impl UnifiedWorkAuthority {
             revision,
             self.generation.clone(),
         ))?;
-        self.scheduler
-            .lock()
-            .expect("scheduler mutex poisoned")
-            .queue
-            .retain(|queued| queued.work_identity != work);
+        let mut state = self.scheduler.lock().expect("scheduler mutex poisoned");
+        state.queue.retain(|queued| queued.work_identity != work);
+        state.release(&work);
+        drop(state);
+        self.dispatch_notify.notify_waiters();
         Ok(acknowledgement.receipt().work_revision)
     }
 }

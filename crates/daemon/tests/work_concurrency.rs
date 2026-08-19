@@ -56,6 +56,162 @@ fn automation(authority: &UnifiedWorkAuthority, suffix: usize, now: u64) {
         .unwrap();
 }
 
+/// Proves the real admission entrypoint (`submit_*` + `admit`, driven by a
+/// spawned `run_dispatcher`) actually grants Work — not just `dispatch_next`
+/// called directly by a test. Before this was wired in, `admit` would hang
+/// forever: nothing in production ever called `dispatch_next`.
+#[tokio::test]
+async fn admission_dispatcher_grants_through_the_real_async_path() {
+    let (_dir, authority) = fixture(&["solo-turn"]);
+    let dispatcher_authority = authority.clone();
+    let dispatcher = tokio::spawn(dispatcher_authority.run_dispatcher(|| 0));
+
+    let identity = authority
+        .submit_conversation(
+            "solo-command",
+            CurrentChatIdentity::new("solo-chat"),
+            ConversationTurnIdentity::new("solo-turn"),
+            0,
+        )
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), authority.admit(identity))
+        .await
+        .expect("admit must return once the dispatcher grants the Work, not hang");
+    assert_eq!(authority.capacity(), (1, 0));
+    dispatcher.abort();
+}
+
+/// Two foreground turns never run concurrently (only one `foreground_running`
+/// slot exists) even though a concurrently-queued Automation run — a
+/// separate capacity pool — is admitted independently. Proves A18's
+/// foreground serialization/priority through the real async admission path,
+/// not only against `dispatch_next` in isolation.
+#[tokio::test]
+async fn admission_dispatcher_serializes_foreground_independent_of_automation() {
+    let (_dir, authority) = fixture(&["fg-1", "fg-2", "bg-run"]);
+    let dispatcher_authority = authority.clone();
+    let dispatcher = tokio::spawn(dispatcher_authority.run_dispatcher(|| 0));
+
+    let automation_identity = authority
+        .submit_automation(
+            "bg-command",
+            AutomationRunIdentity::new("bg-run"),
+            AutomationSessionIdentity::new("bg-session"),
+            AutomationDefinitionIdentity::new("bg-definition"),
+            AutomationDefinitionRevision::new(1),
+            0,
+        )
+        .unwrap();
+    let first_turn = authority
+        .submit_conversation(
+            "fg-command-1",
+            CurrentChatIdentity::new("fg-chat-1"),
+            ConversationTurnIdentity::new("fg-1"),
+            0,
+        )
+        .unwrap();
+    let second_turn = authority
+        .submit_conversation(
+            "fg-command-2",
+            CurrentChatIdentity::new("fg-chat-2"),
+            ConversationTurnIdentity::new("fg-2"),
+            0,
+        )
+        .unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        authority.admit(first_turn.clone()),
+    )
+    .await
+    .expect("first foreground turn must be admitted");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        authority.admit(automation_identity),
+    )
+    .await
+    .expect("Automation admits from its own capacity pool, independent of foreground");
+    assert_eq!(authority.capacity(), (1, 1));
+
+    let second_admitted = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        authority.admit(second_turn.clone()),
+    )
+    .await;
+    assert!(
+        second_admitted.is_err(),
+        "second foreground turn must not admit while the first is still running"
+    );
+
+    authority.release_slot(&first_turn);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        authority.admit(second_turn),
+    )
+    .await
+    .expect("second foreground turn admits once the first releases its slot");
+    dispatcher.abort();
+}
+
+/// Automation capacity of two is enforced through the real async path: a
+/// third Automation Run does not admit until a slot is released via
+/// `release_slot`, the same call production terminal handlers make.
+#[tokio::test]
+async fn admission_dispatcher_enforces_automation_capacity_of_two() {
+    let (_dir, authority) = fixture(&["run-1", "run-2", "run-3"]);
+    let dispatcher_authority = authority.clone();
+    let dispatcher = tokio::spawn(dispatcher_authority.run_dispatcher(|| 0));
+
+    let mut identities = Vec::new();
+    for suffix in 1..=3 {
+        let identity = authority
+            .submit_automation(
+                format!("run-command-{suffix}"),
+                AutomationRunIdentity::new(format!("run-{suffix}")),
+                AutomationSessionIdentity::new(format!("run-session-{suffix}")),
+                AutomationDefinitionIdentity::new(format!("run-definition-{suffix}")),
+                AutomationDefinitionRevision::new(1),
+                0,
+            )
+            .unwrap();
+        identities.push(identity);
+    }
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        authority.admit(identities[0].clone()),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        authority.admit(identities[1].clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(authority.capacity(), (0, 2));
+
+    let third_admitted = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        authority.admit(identities[2].clone()),
+    )
+    .await;
+    assert!(
+        third_admitted.is_err(),
+        "third Automation Run must not admit while two are already running"
+    );
+
+    authority.release_slot(&identities[0]);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        authority.admit(identities[2].clone()),
+    )
+    .await
+    .expect("third Automation Run admits once a slot is released");
+    dispatcher.abort();
+}
+
 #[test]
 fn fairness_foreground() {
     let (_dir, authority) = fixture(&["automation", "fg-1", "fg-2", "fg-3", "fg-4"]);
@@ -71,7 +227,7 @@ fn fairness_foreground() {
             .unwrap();
         assert_eq!(grant.origin, ExecutionOrigin::Foreground);
         assert_eq!(grant.work_identity.as_str(), expected);
-        authority.release_slot(grant.origin);
+        authority.release_slot(&grant.work_identity);
     }
     let aged = authority
         .dispatch_next(AUTOMATION_AGE_BOUNDARY)
@@ -94,10 +250,12 @@ fn automation_capacity_two() {
     assert_ne!(first.work_identity, second.work_identity);
     assert_eq!(authority.capacity(), (0, 2));
     assert!(authority.dispatch_next(0).unwrap().is_none());
-    authority.release_slot(first.origin);
-    assert!(authority.dispatch_next(0).unwrap().is_some());
-    authority.release_slot(second.origin);
-    authority.release_slot(ExecutionOrigin::Automation);
+    authority.release_slot(&first.work_identity);
+    let third = authority.dispatch_next(0).unwrap().unwrap();
+    authority.release_slot(&second.work_identity);
+    authority.release_slot(&third.work_identity);
+    // Releasing an unknown/already-released Work is a safe no-op.
+    authority.release_slot(&third.work_identity);
     assert_eq!(authority.capacity(), (0, 0));
 }
 
@@ -123,17 +281,16 @@ fn approval_restart_capacity() {
             running.receipt().work_revision,
             ApprovalIdentity::new("approval-stable"),
             "filesystem.write",
-            grant.origin,
         )
         .unwrap();
     assert_eq!(authority.capacity(), (0, 0));
 
     automation(&authority, 2, 1);
-    assert!(
-        authority.dispatch_next(1).unwrap().is_some(),
-        "approval wait releases capacity"
-    );
-    authority.release_slot(ExecutionOrigin::Automation);
+    let backfill = authority
+        .dispatch_next(1)
+        .unwrap()
+        .expect("approval wait releases capacity");
+    authority.release_slot(&backfill.work_identity);
     let before = authority.coordinator().snapshot().unwrap();
     assert_eq!(before.approvals[0].identity.as_str(), "approval-stable");
 
@@ -165,8 +322,6 @@ fn approval_restart_capacity() {
             ApprovalIdentity::new("approval-stable"),
             true,
             0,
-            ExecutionOrigin::Automation,
-            2,
         )
         .unwrap();
     assert_eq!(resumed, WorkRevision::new(5));
@@ -177,8 +332,6 @@ fn approval_restart_capacity() {
         ApprovalIdentity::new("approval-stable"),
         true,
         0,
-        ExecutionOrigin::Automation,
-        2,
     );
     assert!(stale.is_err(), "one stale decision cannot resume twice");
 }
@@ -281,7 +434,6 @@ fn cancellation_races() {
             WorkRevision::new(3),
             ApprovalIdentity::new("approval-race"),
             "side-effect",
-            ExecutionOrigin::Foreground,
         )
         .unwrap();
     let cancelling_approval = authority

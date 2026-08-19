@@ -21,7 +21,7 @@ use bagent_automations::{
 };
 use bagentd::work_coordinator::{
     AutomationDefinitionIdentity, AutomationDefinitionRevision, AutomationRunIdentity,
-    AutomationSessionIdentity, WorkRevision, WorkState,
+    AutomationSessionIdentity, WorkState,
 };
 
 use crate::{audit_fs, AppState};
@@ -744,7 +744,7 @@ pub(crate) async fn execute_automation_run(
         AutomationSessionIdentity::new(format!("automation-session:{}", run.id)),
         AutomationDefinitionIdentity::new(automation.id.to_string()),
         AutomationDefinitionRevision::new(0),
-        Utc::now().timestamp_millis().max(0) as u64,
+        Utc::now().timestamp().max(0) as u64,
     ) {
         Ok(identity) => identity,
         Err(error) => {
@@ -752,18 +752,16 @@ pub(crate) async fn execute_automation_run(
             return;
         }
     };
-    state
+    state.work_authority.admit(work_identity.clone()).await;
+    let waiting_revision = match state
         .work_authority
-        .acquire_automation_slot(work_identity.clone())
-        .await;
-    let waiting_revision = match state.work_authority.transition(
-        format!("automation-waiting:{}", run.id),
-        work_identity.clone(),
-        WorkRevision::new(1),
-        WorkState::WaitingForModel,
-    ) {
-        Ok(revision) => revision,
-        Err(_) => return,
+        .current(&work_identity)
+        .ok()
+        .flatten()
+        .map(|record| record.revision)
+    {
+        Some(revision) => revision,
+        None => return,
     };
     let running_revision = match state.work_authority.transition(
         format!("automation-running:{}", run.id),
@@ -885,13 +883,13 @@ pub(crate) async fn execute_automation_run(
         .flatten()
         .map(|record| record.revision)
         .unwrap_or(running_revision);
+    state.work_authority.release_slot(&work_identity);
     let _ = state.work_authority.transition(
         format!("automation-terminal:{}", run.id),
         work_identity.clone(),
         terminal_revision,
         terminal_state,
     );
-    state.work_authority.release_execution_slot(&work_identity);
     let now = Utc::now();
     {
         let conn = state.db.lock().await;

@@ -12,7 +12,7 @@ root = pathlib.Path(sys.argv[1])
 patterns = {
     "typed-origin adapter": r"\b(?:TypedOrigin|TypedModelRuntime)\b",
     "legacy synthetic Work identity": r"legacy:\{?session_id|legacy:screen-intent",
-    "semaphore admission authority": r"\brun_slots\b|Semaphore::new\([^)]*MAX_CONCURRENT_RUNS",
+    "semaphore admission authority": r"\brun_slots\b|Semaphore::new\(",
     "in-memory approval authority": r"pending_approvals\s*:\s*Arc|oneshot::Sender\s*<\s*bool",
     "startup approval denial": r"approvals_denied_on_restart|recover_on_startup",
     "ad-hoc event authority": r"\bpublish_event\b|\bevents_tx\b|\bpublish_automation_event\b",
@@ -55,13 +55,7 @@ def strip_tests(text: str) -> str:
             if (opened and depth == 0) or (not opened and ";" in lines[i-1]): break
     return "".join(out)
 
-production_paths = [
-    root / "crates/daemon/src/main.rs",
-    root / "crates/daemon/src/agent_exec.rs",
-    root / "crates/daemon/src/automations_api.rs",
-    root / "crates/daemon/src/scheduler.rs",
-    root / "crates/daemon/src/model_runtime.rs",
-]
+production_paths = sorted((root / "crates/daemon/src").rglob("*.rs"))
 findings=[]
 for path in production_paths:
     text = strip_tests(path.read_text())

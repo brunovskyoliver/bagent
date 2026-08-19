@@ -442,6 +442,11 @@ async fn main() -> Result<()> {
         ),
         daemon_generation,
     ));
+    tokio::spawn(
+        work_authority
+            .clone()
+            .run_dispatcher(|| chrono::Utc::now().timestamp().max(0) as u64),
+    );
     #[cfg(feature = "stage8-acceptance")]
     let acceptance = evidence::acceptance_runtime_enabled(
         std::env::var(evidence::STAGE8_ACCEPTANCE_FIXTURES_ENV)
@@ -1352,7 +1357,7 @@ async fn screen_intent_handler(
         format!("screen-intent-admit:{}", Uuid::new_v4()),
         CurrentChatIdentity::new(format!("screen-intent-chat:{}", Uuid::new_v4())),
         ConversationTurnIdentity::new(format!("screen-intent-turn:{}", Uuid::new_v4())),
-        chrono::Utc::now().timestamp_millis().max(0) as u64,
+        chrono::Utc::now().timestamp().max(0) as u64,
     ) {
         Ok(identity) => identity,
         Err(_) => {
@@ -1364,16 +1369,14 @@ async fn screen_intent_handler(
             )
         }
     };
-    let waiting = state
+    state.work_authority.admit(work_identity.clone()).await;
+    let waiting_revision = state
         .work_authority
-        .transition(
-            format!("screen-intent-waiting:{}", Uuid::new_v4()),
-            work_identity.clone(),
-            WorkRevision::new(1),
-            WorkState::WaitingForModel,
-        )
-        .ok();
-    let running = waiting.and_then(|revision| {
+        .current(&work_identity)
+        .ok()
+        .flatten()
+        .map(|record| record.revision);
+    let running = waiting_revision.and_then(|revision| {
         state
             .work_authority
             .transition(
@@ -1394,6 +1397,7 @@ async fn screen_intent_handler(
     match classifier.classify(&req.message, "").await {
         Ok(intent) => {
             if let Some(revision) = running {
+                state.work_authority.release_slot(&work_identity);
                 let _ = state.work_authority.transition(
                     format!("screen-intent-complete:{}", Uuid::new_v4()),
                     work_identity,
@@ -1408,6 +1412,7 @@ async fn screen_intent_handler(
         }
         Err(_) => {
             if let Some(revision) = running {
+                state.work_authority.release_slot(&work_identity);
                 let _ = state.work_authority.transition(
                     format!("screen-intent-failed:{}", Uuid::new_v4()),
                     work_identity,
@@ -2006,20 +2011,27 @@ async fn approval_decide(
         } else {
             bagentd::unified_work::ExecutionOrigin::Foreground
         };
-        if let Err(error) = state.work_authority.resolve_approval(
+        let work_identity = bagentd::work_coordinator::WorkIdentity::new(work);
+        match state.work_authority.resolve_approval(
             format!("approval-decision:{id}"),
-            bagentd::work_coordinator::WorkIdentity::new(work),
+            work_identity.clone(),
             WorkRevision::new(revision),
             bagentd::work_coordinator::ApprovalIdentity::new(id.clone()),
             req.allow,
             0,
-            execution_origin,
-            chrono::Utc::now().timestamp_millis().max(0) as u64,
         ) {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": error.to_string() })),
-            );
+            Ok(_) => {
+                state
+                    .work_authority
+                    .resume(work_identity, execution_origin)
+                    .await
+            }
+            Err(error) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                );
+            }
         }
     }
     let changed = {
@@ -2464,19 +2476,21 @@ async fn chat(
             format!("chat-admit:{}", Uuid::new_v4()),
             CurrentChatIdentity::new(session_id.clone()),
             ConversationTurnIdentity::new(Uuid::new_v4().to_string()),
-            chrono::Utc::now().timestamp_millis().max(0) as u64,
+            chrono::Utc::now().timestamp().max(0) as u64,
         ) {
             Ok(identity) => identity,
             Err(_) => return,
         };
-        let waiting_revision = match state.work_authority.transition(
-            format!("chat-waiting:{}", Uuid::new_v4()),
-            work_identity.clone(),
-            WorkRevision::new(1),
-            WorkState::WaitingForModel,
-        ) {
-            Ok(revision) => revision,
-            Err(_) => return,
+        state.work_authority.admit(work_identity.clone()).await;
+        let waiting_revision = match state
+            .work_authority
+            .current(&work_identity)
+            .ok()
+            .flatten()
+            .map(|record| record.revision)
+        {
+            Some(revision) => revision,
+            None => return,
         };
         let running_revision = match state.work_authority.transition(
             format!("chat-running:{}", Uuid::new_v4()),
@@ -2534,6 +2548,7 @@ async fn chat(
                     .flatten()
                     .map(|record| record.revision)
                     .unwrap_or(running_revision);
+                state.work_authority.release_slot(&work_identity);
                 let _ = state.work_authority.transition(
                     format!("chat-complete:{}", Uuid::new_v4()),
                     work_identity,
@@ -2551,6 +2566,7 @@ async fn chat(
                     .flatten()
                     .map(|record| record.revision)
                     .unwrap_or(running_revision);
+                state.work_authority.release_slot(&work_identity);
                 let _ = state.work_authority.transition(
                     format!("chat-failed:{}", Uuid::new_v4()),
                     work_identity,
@@ -3219,14 +3235,10 @@ async fn request_approval_core(
                 record.revision,
                 bagentd::work_coordinator::ApprovalIdentity::new(id.clone()),
                 tool_name,
-                execution_origin,
             )
             .ok()
             .map(|revision| (context.work_identity.clone(), revision, execution_origin))
     });
-    if let Some((work, _, _)) = canonical_approval.as_ref() {
-        state.work_authority.release_execution_slot(work);
-    }
 
     if let Ok(db) = db.try_lock() {
         let _ = db.execute(
@@ -3274,22 +3286,20 @@ async fn request_approval_core(
                     .flatten()
                     .is_some_and(|record| record.state == WorkState::WaitingForApproval)
                 {
-                    let _ = state.work_authority.resolve_approval(
+                    let resolved = state.work_authority.resolve_approval(
                         format!("approval-observed:{id}"),
                         work.clone(),
                         *revision,
                         bagentd::work_coordinator::ApprovalIdentity::new(id.clone()),
                         decision == "allow",
                         0,
-                        *execution_origin,
-                        chrono::Utc::now().timestamp_millis().max(0) as u64,
                     );
-                }
-                if *execution_origin == bagentd::unified_work::ExecutionOrigin::Automation {
-                    state
-                        .work_authority
-                        .acquire_automation_slot(work.clone())
-                        .await;
+                    if resolved.is_ok() {
+                        state
+                            .work_authority
+                            .resume(work.clone(), *execution_origin)
+                            .await;
+                    }
                 }
             }
             return decision == "allow";
@@ -3311,18 +3321,16 @@ async fn request_approval_core(
     );
     drop(db);
     if let Some((work, revision, execution_origin)) = canonical_approval {
-        let _ = state.work_authority.resolve_approval(
+        let resolved = state.work_authority.resolve_approval(
             format!("approval-expired:{id}"),
             work.clone(),
             revision,
             bagentd::work_coordinator::ApprovalIdentity::new(id),
             false,
             0,
-            execution_origin,
-            chrono::Utc::now().timestamp_millis().max(0) as u64,
         );
-        if execution_origin == bagentd::unified_work::ExecutionOrigin::Automation {
-            state.work_authority.acquire_automation_slot(work).await;
+        if resolved.is_ok() {
+            state.work_authority.resume(work, execution_origin).await;
         }
     }
     false
