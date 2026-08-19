@@ -11,3 +11,8 @@ CREATE INDEX IF NOT EXISTS idx_works_notch_terminal_conversation
 CREATE INDEX IF NOT EXISTS idx_work_automation_sessions_unread
     ON work_automation_sessions (automation_session_identity)
     WHERE attention_state = 'unread';
+
+CREATE INDEX IF NOT EXISTS idx_works_notch_terminal_automation
+    ON works (state, updated_at DESC, identity ASC)
+    WHERE origin_kind = 'automation'
+      AND state IN ('completed', 'partial', 'failed');

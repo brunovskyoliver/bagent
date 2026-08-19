@@ -1108,6 +1108,64 @@ impl WorkCoordinator {
         Ok(snapshot)
     }
 
+    pub fn work(&self, identity: &WorkIdentity) -> Result<Option<WorkRecord>, CommandError> {
+        let connection = self.connection.lock().expect("coordinator mutex poisoned");
+        connection
+            .query_row(
+                "SELECT w.origin_kind, w.origin_primary_identity, w.origin_secondary_identity,
+                        w.origin_historical_identity, w.origin_definition_revision, w.state,
+                        w.revision, p.category
+                 FROM works w
+                 LEFT JOIN work_activity_projection p ON p.work_identity = w.identity
+                 WHERE w.identity = ?1",
+                params![identity.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<u64>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, u64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(CommandError::storage)?
+            .map(
+                |(
+                    kind,
+                    primary,
+                    secondary,
+                    historical,
+                    definition_revision,
+                    state,
+                    revision,
+                    activity,
+                )| {
+                    Ok(WorkRecord {
+                        identity: identity.clone(),
+                        origin: WorkOrigin::from_database(
+                            &kind,
+                            primary,
+                            secondary,
+                            historical,
+                            definition_revision,
+                        )?,
+                        state: WorkState::parse(&state)?,
+                        revision: WorkRevision::new(revision),
+                        activity: activity
+                            .as_deref()
+                            .map(WorkActivityCategory::parse)
+                            .transpose()?,
+                    })
+                },
+            )
+            .transpose()
+    }
+
     /// Reads projection metadata from the same SQLite transaction as the Work
     /// snapshot so a UI cannot observe mixed revisions across tables.
     pub fn projected_snapshot<T>(
@@ -2103,11 +2161,38 @@ fn notch_snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandE
                  SELECT identity FROM works
                  WHERE state NOT IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
                  UNION
-                 SELECT r.work_identity
-                 FROM work_automation_runs r
-                 JOIN work_automation_sessions s
-                   ON s.automation_session_identity = r.automation_session_identity
-                 WHERE s.attention_state = 'unread'
+                 SELECT work_identity FROM (
+                     SELECT r.work_identity
+                     FROM works w
+                     JOIN work_automation_runs r ON r.work_identity = w.identity
+                     JOIN work_automation_sessions s
+                       ON s.automation_session_identity = r.automation_session_identity
+                     WHERE w.origin_kind = 'automation' AND w.state = 'failed'
+                       AND s.attention_state = 'unread'
+                     ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
+                 )
+                 UNION
+                 SELECT work_identity FROM (
+                     SELECT r.work_identity
+                     FROM works w
+                     JOIN work_automation_runs r ON r.work_identity = w.identity
+                     JOIN work_automation_sessions s
+                       ON s.automation_session_identity = r.automation_session_identity
+                     WHERE w.origin_kind = 'automation' AND w.state = 'partial'
+                       AND s.attention_state = 'unread'
+                     ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
+                 )
+                 UNION
+                 SELECT work_identity FROM (
+                     SELECT r.work_identity
+                     FROM works w
+                     JOIN work_automation_runs r ON r.work_identity = w.identity
+                     JOIN work_automation_sessions s
+                       ON s.automation_session_identity = r.automation_session_identity
+                     WHERE w.origin_kind = 'automation' AND w.state = 'completed'
+                       AND s.attention_state = 'unread'
+                     ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
+                 )
                  UNION
                  SELECT identity FROM (
                      SELECT identity FROM works

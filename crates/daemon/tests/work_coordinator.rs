@@ -85,6 +85,49 @@ fn notch_projection_snapshot_is_transactional_and_bounded() {
 }
 
 #[test]
+fn notch_projection_bounds_high_cardinality_unread_sessions_by_terminal_state() {
+    let identities = [
+        "work-00", "work-01", "work-02", "work-03", "work-04", "work-05", "work-06", "work-07",
+        "work-08", "work-09", "work-10", "work-11",
+    ];
+    let (_temp, coordinator) = fixture("daemon-unread", 128, &identities);
+    for index in 0..identities.len() {
+        let work = coordinator
+            .submit(create_automation(
+                format!("create-{index}"),
+                format!("run-{index}"),
+                format!("session-{index}"),
+                format!("definition-{index}"),
+                1,
+                "daemon-unread",
+            ))
+            .unwrap()
+            .receipt()
+            .work_identity
+            .clone();
+        for (revision, state) in [
+            (1, WorkState::WaitingForModel),
+            (2, WorkState::Running),
+            (3, WorkState::Completed),
+        ] {
+            coordinator
+                .submit(work_transition(
+                    format!("transition-{index}-{revision}"),
+                    work.clone(),
+                    rev(revision),
+                    state,
+                    "daemon-unread",
+                ))
+                .unwrap();
+        }
+    }
+
+    let (snapshot, ()) = coordinator.projected_snapshot(|_, _| Ok(())).unwrap();
+    assert_eq!(snapshot.works.len(), 1);
+    assert_eq!(snapshot.works[0].state, WorkState::Completed);
+}
+
+#[test]
 fn activity_updates_are_revisioned_ordered_and_current_only() {
     let (_temp, coordinator) = fixture("daemon-activity", 32, &["work-activity"]);
     let created = coordinator
@@ -136,7 +179,7 @@ fn activity_updates_are_revisioned_ordered_and_current_only() {
     coordinator
         .submit(Command::set_activity(
             "clear-activity",
-            work,
+            work.clone(),
             rev(5),
             None,
             DaemonGeneration::new("daemon-activity"),
@@ -146,6 +189,9 @@ fn activity_updates_are_revisioned_ordered_and_current_only() {
     let snapshot = coordinator.snapshot().unwrap();
     assert_eq!(snapshot.works[0].revision, rev(6));
     assert_eq!(snapshot.works[0].activity, None);
+    let targeted = coordinator.work(&work).unwrap().unwrap();
+    assert_eq!(targeted.revision, rev(6));
+    assert_eq!(targeted.activity, None);
     let events = match coordinator
         .events(
             Some(EventCursor::new(3)),

@@ -1425,5 +1425,27 @@ mod tests {
                 .id,
             target.id
         );
+        assert!(matches!(
+            repo_run(
+                &conn,
+                &automation.id.to_string(),
+                &AutomationRunId::new().to_string()
+            ),
+            Err(RepoError::NotFound)
+        ));
+        let other = repo_create(
+            &conn,
+            "other",
+            "p",
+            "Europe/Bratislava",
+            &once_at(7),
+            true,
+            now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            repo_run(&conn, &other.id.to_string(), &target.id.to_string()),
+            Err(RepoError::NotFound)
+        ));
     }
 }

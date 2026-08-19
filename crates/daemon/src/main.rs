@@ -2179,11 +2179,38 @@ fn notch_projection_context(
              SELECT identity FROM works
              WHERE state NOT IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
              UNION
-             SELECT r.work_identity
-             FROM work_automation_runs r
-             JOIN work_automation_sessions s
-               ON s.automation_session_identity = r.automation_session_identity
-             WHERE s.attention_state = 'unread'
+             SELECT work_identity FROM (
+                 SELECT r.work_identity
+                 FROM works w
+                 JOIN work_automation_runs r ON r.work_identity = w.identity
+                 JOIN work_automation_sessions s
+                   ON s.automation_session_identity = r.automation_session_identity
+                 WHERE w.origin_kind = 'automation' AND w.state = 'failed'
+                   AND s.attention_state = 'unread'
+                 ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
+             )
+             UNION
+             SELECT work_identity FROM (
+                 SELECT r.work_identity
+                 FROM works w
+                 JOIN work_automation_runs r ON r.work_identity = w.identity
+                 JOIN work_automation_sessions s
+                   ON s.automation_session_identity = r.automation_session_identity
+                 WHERE w.origin_kind = 'automation' AND w.state = 'partial'
+                   AND s.attention_state = 'unread'
+                 ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
+             )
+             UNION
+             SELECT work_identity FROM (
+                 SELECT r.work_identity
+                 FROM works w
+                 JOIN work_automation_runs r ON r.work_identity = w.identity
+                 JOIN work_automation_sessions s
+                   ON s.automation_session_identity = r.automation_session_identity
+                 WHERE w.origin_kind = 'automation' AND w.state = 'completed'
+                   AND s.attention_state = 'unread'
+                 ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
+             )
              UNION
              SELECT identity FROM (
                  SELECT identity FROM works

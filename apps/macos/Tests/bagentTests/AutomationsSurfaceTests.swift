@@ -117,4 +117,42 @@ final class AutomationsSurfaceStateTests: XCTestCase {
         vm.openAutomationDetail("definition-a")
         XCTAssertNil(vm.pendingTerminalAcknowledgement)
     }
+
+    func testTerminalAcknowledgementClearsOnlyForAuthoritativeOutcomes() {
+        let vm = ChatViewModel(startMonitoring: false)
+        let install = {
+            vm.pendingTerminalAcknowledgement = (
+                definitionIdentity: "definition-a",
+                sessionIdentity: "automation-session:run-a",
+                workIdentity: "work-a",
+                expectedRevision: 4
+            )
+        }
+
+        install()
+        vm.resolvePendingTerminalAcknowledgement(
+            sessionIdentity: "automation-session:run-a",
+            outcome: .acknowledged
+        )
+        XCTAssertNil(vm.pendingTerminalAcknowledgement)
+
+        install()
+        vm.resolvePendingTerminalAcknowledgement(
+            sessionIdentity: "automation-session:run-a",
+            outcome: .authoritativeConflict
+        )
+        XCTAssertNil(vm.pendingTerminalAcknowledgement)
+
+        install()
+        XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
+            statusCode: 409,
+            data: Data(#"{"error":"stale consumer fence"}"#.utf8)
+        ))
+        XCTAssertNotNil(vm.pendingTerminalAcknowledgement)
+        XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
+            statusCode: 503,
+            data: Data()
+        ))
+        XCTAssertNotNil(vm.pendingTerminalAcknowledgement)
+    }
 }

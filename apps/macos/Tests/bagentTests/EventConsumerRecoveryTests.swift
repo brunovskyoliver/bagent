@@ -132,6 +132,30 @@ final class EventConsumerRecoveryTests: XCTestCase {
         XCTAssertEqual(consumer.presentation.motion.surfaceDuration, 0)
     }
 
+    func testAttentionAcknowledgementClassifiesAllTransportOutcomes() throws {
+        XCTAssertEqual(
+            try DaemonClient.decodeWorkAttentionAcknowledgement(statusCode: 200, data: Data()),
+            .acknowledged
+        )
+        XCTAssertEqual(
+            try DaemonClient.decodeWorkAttentionAcknowledgement(
+                statusCode: 409,
+                data: Data(#"{"error":"revision conflict"}"#.utf8)
+            ),
+            .authoritativeConflict
+        )
+        XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
+            statusCode: 409,
+            data: Data(#"{"error":"stale consumer fence"}"#.utf8)
+        )) { error in
+            XCTAssertEqual(error as? NotchEventTransportError, .consumerFenced)
+        }
+        XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
+            statusCode: 503,
+            data: Data()
+        ))
+    }
+
     private func snapshot(cursor: UInt64, revision: UInt64, state: NotchWorkState) -> NotchWorkSnapshot {
         NotchWorkSnapshot(
             schemaVersion: 1,

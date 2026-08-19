@@ -1006,11 +1006,32 @@ struct DaemonClient: Sendable, NotchEventTransport {
         }
     }
 
+    enum WorkAttentionAcknowledgement: Equatable {
+        case acknowledged
+        case authoritativeConflict
+    }
+
+    static func decodeWorkAttentionAcknowledgement(
+        statusCode: Int,
+        data: Data
+    ) throws -> WorkAttentionAcknowledgement {
+        if (200..<300).contains(statusCode) { return .acknowledged }
+        if statusCode == 409 {
+            struct ErrorResponse: Decodable { let error: String }
+            let message = try? JSONDecoder().decode(ErrorResponse.self, from: data).error
+            if message == "stale consumer fence" {
+                throw NotchEventTransportError.consumerFenced
+            }
+            return .authoritativeConflict
+        }
+        throw DaemonError.badStatus
+    }
+
     func acknowledgeWorkAttention(
         workIdentity: String,
         expectedRevision: UInt64,
         consumerFence: String
-    ) async throws -> Bool {
+    ) async throws -> WorkAttentionAcknowledgement {
         let credentials = try await loadCreds()
         var request = authedRequest("/work/attention/acknowledge", creds: credentials)
         request.httpMethod = "POST"
@@ -1028,9 +1049,10 @@ struct DaemonClient: Sendable, NotchEventTransport {
             expectedRevision: expectedRevision
         ))
         let (data, response) = try await URLSession.shared.data(for: request)
-        if (response as? HTTPURLResponse)?.statusCode == 409 { return false }
-        try validateOK(data: data, response: response)
-        return true
+        guard let statusCode = (response as? HTTPURLResponse)?.statusCode else {
+            throw DaemonError.badResponse
+        }
+        return try Self.decodeWorkAttentionAcknowledgement(statusCode: statusCode, data: data)
     }
 
     // MARK: - Automations

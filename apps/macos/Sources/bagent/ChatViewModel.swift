@@ -573,19 +573,27 @@ final class ChatViewModel: ObservableObject {
         else { return }
         Task {
             do {
-                _ = try await client.acknowledgeWorkAttention(
+                let outcome = try await client.acknowledgeWorkAttention(
                     workIdentity: pendingTerminalAcknowledgement.workIdentity,
                     expectedRevision: pendingTerminalAcknowledgement.expectedRevision,
                     consumerFence: notchEventConsumer.activeConsumerFence
                 )
-                if self.pendingTerminalAcknowledgement?.sessionIdentity
-                    == pendingTerminalAcknowledgement.sessionIdentity {
-                    self.pendingTerminalAcknowledgement = nil
-                }
+                resolvePendingTerminalAcknowledgement(
+                    sessionIdentity: pendingTerminalAcknowledgement.sessionIdentity,
+                    outcome: outcome
+                )
             } catch {
                 // Keep the exact destination-bound command for a later retry.
             }
         }
+    }
+
+    func resolvePendingTerminalAcknowledgement(
+        sessionIdentity: String,
+        outcome _: DaemonClient.WorkAttentionAcknowledgement
+    ) {
+        guard pendingTerminalAcknowledgement?.sessionIdentity == sessionIdentity else { return }
+        pendingTerminalAcknowledgement = nil
     }
 
     private func openAutomationSession(
