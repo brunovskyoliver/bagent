@@ -191,13 +191,12 @@ struct TurnActivity: Identifiable, Equatable {
 }
 
 enum AgentStatus {
-    case ready, thinking, error, awaitingApproval
+    case ready, thinking, awaitingApproval
 
     var color: Color {
         switch self {
         case .ready:            return Color(red: 0.18, green: 0.80, blue: 0.44)
         case .thinking:         return Color(red: 0.20, green: 0.60, blue: 1.00)
-        case .error:            return Color(red: 0.95, green: 0.27, blue: 0.27)
         case .awaitingApproval: return Color(red: 1.00, green: 0.78, blue: 0.15)
         }
     }
@@ -206,17 +205,9 @@ enum AgentStatus {
         switch self {
         case .ready:            return "Pripravený"
         case .thinking:         return "Spracováva"
-        case .error:            return "Chyba"
         case .awaitingApproval: return "Čaká na schválenie"
         }
     }
-}
-
-enum ChatSurfaceMode: Equatable {
-    case collapsed
-    case inputOnly
-    case thinkingHidden
-    case outputExpanded
 }
 
 /// Step-based state of the `/automations` surface (single source of truth
@@ -431,16 +422,12 @@ final class ChatViewModel: ObservableObject {
     var notchInteractionMode: NotchInteractionMode { notchPresentation.interactionMode }
     var isThinking: Bool { notchPresentation.isThinking }
     var isExpanded: Bool { notchPresentation.isExpanded }
-    var chatSurfaceMode: ChatSurfaceMode {
-        switch notchInteractionMode {
-        case .collapsed: .collapsed
-        case .input: .inputOnly
-        case .thinking: .thinkingHidden
-        case .output, .settings, .automations: .outputExpanded
-        }
-    }
     var toolStatus: String? {
         notchPresentation.rail.selectedStage == .tool ? notchPresentation.rail.caption : nil
+    }
+    var authoritativePendingApproval: ApprovalItem? {
+        guard let identity = notchPresentation.pendingApprovalIdentity else { return nil }
+        return pendingApprovals.first(where: { $0.id == identity })
     }
     @Published var notchHoverResetID = UUID()
     @Published var selectedSourceMode: SourceMode? = nil
@@ -490,6 +477,15 @@ final class ChatViewModel: ObservableObject {
         historyBrowseIndex = nil
         automationsSurface = .list
         automationsSelectionIndex = 0
+        automationsError = nil
+        applyNotchIntent(.openAutomations)
+        Task { await refreshAutomations() }
+    }
+
+    func openAutomationDetail(_ identity: String) {
+        inputText = ""
+        historyBrowseIndex = nil
+        automationsSurface = .detail(identity)
         automationsError = nil
         applyNotchIntent(.openAutomations)
         Task { await refreshAutomations() }
@@ -850,9 +846,8 @@ final class ChatViewModel: ObservableObject {
     var savedScrollWasAtBottom: Bool = true
 
     var agentStatus: AgentStatus {
-        if !pendingApprovals.isEmpty { return .awaitingApproval }
+        if notchPresentation.pendingApprovalIdentity != nil { return .awaitingApproval }
         if isThinking { return .thinking }
-        if let h = daemonHealth, (!h.daemonUp || !h.baseRTUp) { return .error }
         return .ready
     }
 
@@ -1318,7 +1313,6 @@ final class ChatViewModel: ObservableObject {
     var onInputOnlySubmitted: (() -> Void)?
     /// Invoked when output becomes displayable, or completion must recover a
     /// missed first-token transition, so AppKit can reveal the output surface.
-    var onFirstAssistantToken: (() -> Void)?
 
     // MARK: - cmux notifications
 
@@ -1543,35 +1537,46 @@ final class ChatViewModel: ObservableObject {
         try? notchEventConsumer.applyLocalIntent(intent)
     }
 
+    func setNotchReduceMotion(_ enabled: Bool) {
+        try? notchEventConsumer.setReduceMotion(enabled)
+    }
+
     func applyAuthoritativeSnapshot(_ snapshot: NotchWorkSnapshot) throws {
         try notchEventConsumer.replace(with: snapshot)
     }
 
     func activateFocusedNotchActivity() {
-        if notchPresentation.activeAutomationCount > 1 {
-            applyNotchIntent(.cycleAutomation)
-        } else if notchPresentation.activeAutomationCount == 1 {
-            openAutomations()
-        } else if notchPresentation.canOpenFocusedDestination {
+        switch notchPresentation.focusedDestination {
+        case .currentChat:
             applyNotchIntent(.openOutput)
+        case .activeAutomation(let definitionIdentity):
+            if notchPresentation.activeAutomationCount > 1 {
+                applyNotchIntent(.cycleAutomation)
+            } else {
+                openAutomationDetail(definitionIdentity)
+            }
+        case .terminalAutomation(
+            let definitionIdentity,
+            _,
+            let workIdentity,
+            let expectedRevision
+        ):
+            openAutomationDetail(definitionIdentity)
+            Task {
+                try? await client.acknowledgeWorkAttention(
+                    workIdentity: workIdentity,
+                    expectedRevision: expectedRevision,
+                    consumerFence: notchEventConsumer.activeConsumerFence
+                )
+            }
+        case nil:
+            break
         }
     }
 
     func openActiveAutomations() {
         guard notchPresentation.activeAutomationCount > 0 else { return }
         openAutomations()
-    }
-
-    func ensureCompletedTurnOutputPresented() {
-        if notchInteractionMode != .output {
-            onFirstAssistantToken?()
-        }
-        // Tests and non-window consumers may not install the AppKit callback.
-        // Completion is authoritative even if click-away collapsed the thinking
-        // surface before the first token reached the main actor.
-        if notchInteractionMode != .output {
-            applyNotchIntent(.openOutput)
-        }
     }
 
     // MARK: - Actions
@@ -1799,7 +1804,6 @@ final class ChatViewModel: ObservableObject {
                 }
 
                 let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds, screenContext: screenCtx, sourceMode: sourceMode, history: history)
-                var first = true
                 var didAutoOpen = false
                 let presenter = AdaptiveStreamPresenter { [weak self] edit in
                     guard let self, messages.indices.contains(idx) else { return }
@@ -1821,10 +1825,6 @@ final class ChatViewModel: ObservableObject {
                     case .token(let t):
                         messages[idx].content += t
                         presenter.enqueue(t)
-                        if first {
-                            first = false
-                            ensureCompletedTurnOutputPresented()
-                        }
                         // toolStatus intentionally NOT cleared here — the action chip
                         // stays visible while the answer streams; cleared on .done.
                         // Auto-open Mail after the first sentence has appeared in the response.
@@ -1921,7 +1921,6 @@ final class ChatViewModel: ObservableObject {
                     case .actionTaken(let message):
                         streamingAssistantMessageId = nil
                         messages[idx].content = message
-                        ensureCompletedTurnOutputPresented()
                     case .taskRating(let level, let score, let reasons, let privacyRisk):
                         messages[idx].taskRating = (level: level, score: score, reasons: reasons, privacyRisk: privacyRisk)
                     case .done(let returnedSessionId):
@@ -1932,25 +1931,20 @@ final class ChatViewModel: ObservableObject {
                         }
                         if let sid = returnedSessionId { sessionId = sid }
                         streamingAssistantMessageId = nil
-                        ensureCompletedTurnOutputPresented()
                         Task { await loadDebugTrace(for: messages[idx].id) }
                     }
                 }
                 await presenter.finish()
                 streamingAssistantMessageId = nil
-                ensureCompletedTurnOutputPresented()
             } catch {
                 streamingAssistantMessageId = nil
                 messages[idx].content = "Chyba: \(error.localizedDescription)"
-                ensureCompletedTurnOutputPresented()
             }
         }
     }
 
     // MARK: - Authoritative Work projection
 
-    /// Set by AppDelegate — opens the notch when a background approval arrives.
-    var onApprovalArrived: (() -> Void)?
     /// Bumped after an authoritative Work revision advances; the Automations
     /// content projection then refetches its authorized records.
     @Published var automationsRefreshID = UUID()
@@ -1999,11 +1993,7 @@ final class ChatViewModel: ObservableObject {
     /// approvals exist and nothing is being shown.
     func refreshPendingApprovals() async {
         guard let items = try? await client.pendingApprovals() else { return }
-        let hadNone = pendingApprovals.isEmpty
         pendingApprovals = items
-        if hadNone && !items.isEmpty {
-            onApprovalArrived?()
-        }
     }
 
     func startApprovalPolling() {
@@ -2025,6 +2015,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func decideApproval(_ item: ApprovalItem, allow: Bool) {
+        guard item.id == notchPresentation.pendingApprovalIdentity else { return }
         pendingApprovals.removeAll { $0.id == item.id }
         Task {
             try? await client.decideApproval(id: item.id, allow: allow)

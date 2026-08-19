@@ -24,8 +24,8 @@ use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig, RuntimePhase};
 use bagentd::unified_work::UnifiedWorkAuthority;
 use bagentd::work_coordinator::{
     ApprovalState, ConversationTurnIdentity, CoordinatorConfig, CurrentChatIdentity,
-    DaemonGeneration, EventCursor, EventRead, WorkCoordinator, WorkOrigin, WorkRecord,
-    WorkRevision, WorkSnapshot, WorkState,
+    DaemonGeneration, EventCursor, EventRead, WorkCoordinator, WorkIdentity, WorkOrigin,
+    WorkRecord, WorkRevision, WorkSnapshot, WorkState,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use basert_connector::{Message, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL};
@@ -36,7 +36,7 @@ use filesystem_connector::{
     self, open as fs_open, search as fs_search, FileSearchRequest, FsConnector, ReadTextRequest,
 };
 use odoo_connector::{OdooConfig, OdooConnector, OdooError, OdooRecordRef};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, convert::Infallible, io::Write, path::PathBuf, sync::Arc};
@@ -727,6 +727,10 @@ async fn main() -> Result<()> {
         .route("/events", get(events_stream))
         .route("/work/snapshot", get(work_snapshot))
         .route("/work/events", get(work_events))
+        .route(
+            "/work/attention/acknowledge",
+            post(acknowledge_work_attention),
+        )
         .route("/models", get(models))
         .route("/chat", post(chat))
         .route("/embeddings", post(embeddings))
@@ -1939,6 +1943,47 @@ struct WorkEventsQuery {
     consumer_fence: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AcknowledgeWorkAttentionRequest {
+    command_identity: String,
+    consumer_fence: String,
+    work_identity: String,
+    expected_revision: u64,
+}
+
+async fn acknowledge_work_attention(
+    State(state): State<AppState>,
+    Json(request): Json<AcknowledgeWorkAttentionRequest>,
+) -> impl IntoResponse {
+    let fence_matches = state
+        .ui_consumer_fence
+        .lock()
+        .await
+        .as_deref()
+        .is_some_and(|active| active == request.consumer_fence);
+    if !fence_matches {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "stale consumer fence" })),
+        );
+    }
+    match state.work_authority.acknowledge_attention(
+        request.command_identity,
+        WorkIdentity::new(request.work_identity),
+        WorkRevision::new(request.expected_revision),
+    ) {
+        Ok(revision) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "revision": revision.value() })),
+        ),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("{error}") })),
+        ),
+    }
+}
+
 async fn work_snapshot(
     State(state): State<AppState>,
     Query(query): Query<WorkSnapshotQuery>,
@@ -2005,6 +2050,10 @@ async fn work_events(
                 ),
             }
         }
+        Ok(EventRead::Events(events)) if events.is_empty() => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "kind": "events", "events": [] })),
+        ),
         Ok(EventRead::Events(events)) => match coordinator.snapshot() {
             Ok(snapshot) => match notch_projection_context(&state, &snapshot).await {
                 Ok(context) => {
@@ -2041,6 +2090,7 @@ async fn work_events(
                                         "cursor": event.event_cursor.value(),
                                         "daemonGeneration": event.daemon_generation.as_str(),
                                         "work": value,
+                                        "pendingApprovals": notch_pending_approvals_value(&snapshot),
                                         "model": context.model_phase,
                                     })
                                 })
@@ -2071,6 +2121,10 @@ async fn work_events(
 struct NotchProjectionContext {
     model_phase: &'static str,
     automation_names: HashMap<String, String>,
+    automation_definition_identities: HashMap<String, String>,
+    automation_session_identities: HashMap<String, String>,
+    terminal_attention: HashMap<String, &'static str>,
+    terminal_orders: HashMap<String, u64>,
     queue_positions: HashMap<String, u64>,
     claimed_orders: HashMap<String, u64>,
 }
@@ -2091,37 +2145,104 @@ async fn notch_projection_context(
     };
     let db = state.db.lock().await;
     let mut automation_names = HashMap::new();
+    let mut automation_definition_identities = HashMap::new();
+    let mut automation_session_identities = HashMap::new();
+    let mut terminal_attention = HashMap::new();
+    let mut terminal_orders = HashMap::new();
     let mut queue_positions = HashMap::new();
     let mut claimed_orders = HashMap::new();
-    let mut queued_automations = Vec::new();
-    for work in &snapshot.works {
-        let claimed_order = db.query_row(
-            "SELECT rowid FROM works WHERE identity = ?1",
-            [work.identity.as_str()],
-            |row| row.get::<_, u64>(0),
-        )?;
-        claimed_orders.insert(work.identity.as_str().to_owned(), claimed_order);
-        let WorkOrigin::Automation {
-            historical_automation_identity,
-            ..
-        } = &work.origin
-        else {
-            continue;
-        };
-        if work.state == WorkState::Queued {
-            queued_automations.push((claimed_order, work.identity.as_str().to_owned()));
+    let mut statement = db.prepare(
+        "SELECT w.identity, w.rowid, a.name, r.historical_automation_identity,
+                r.automation_session_identity, s.attention_state, w.state, w.updated_at
+         FROM works w
+         LEFT JOIN work_automation_runs r ON r.work_identity = w.identity
+         LEFT JOIN automations a ON a.id = r.historical_automation_identity
+         LEFT JOIN work_automation_sessions s
+           ON s.automation_session_identity = r.automation_session_identity
+         WHERE w.state NOT IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
+            OR s.attention_state = 'unread'
+            OR w.identity = (
+                SELECT identity FROM works
+                WHERE origin_kind = 'conversation'
+                  AND state IN ('completed', 'partial', 'failed')
+                ORDER BY updated_at DESC, identity ASC LIMIT 1
+            )",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+        ))
+    })?;
+    let mut terminal_candidates = Vec::new();
+    for row in rows {
+        let (
+            identity,
+            claimed_order,
+            automation_name,
+            definition_identity,
+            session_identity,
+            attention_state,
+            state,
+            updated_at,
+        ) = row?;
+        claimed_orders.insert(identity.clone(), claimed_order);
+        if let Some(name) = automation_name {
+            automation_names.insert(identity.clone(), name);
         }
-        let name = db
-            .query_row(
-                "SELECT name FROM automations WHERE id = ?1",
-                [historical_automation_identity.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(name) = name {
-            automation_names.insert(work.identity.as_str().to_owned(), name);
+        if let Some(definition_identity) = definition_identity {
+            automation_definition_identities.insert(identity.clone(), definition_identity);
+        }
+        if let Some(session_identity) = session_identity {
+            automation_session_identities.insert(identity.clone(), session_identity);
+        }
+        if attention_state.as_deref() == Some("unread") {
+            let attention = match state.as_str() {
+                "failed" => Some("failed"),
+                "partial" => Some("partial"),
+                "completed" => Some("unread"),
+                _ => None,
+            };
+            if let Some(attention) = attention {
+                terminal_attention.insert(identity.clone(), attention);
+            }
+        }
+        if matches!(state.as_str(), "completed" | "partial" | "failed") {
+            terminal_candidates.push((updated_at, identity));
         }
     }
+    terminal_candidates.sort();
+    let mut terminal_order = 0;
+    let mut previous_timestamp = None;
+    for (timestamp, identity) in terminal_candidates {
+        if previous_timestamp.as_deref() != Some(timestamp.as_str()) {
+            terminal_order += 1;
+            previous_timestamp = Some(timestamp);
+        }
+        terminal_orders.insert(identity, terminal_order);
+    }
+    let mut queued_automations = snapshot
+        .works
+        .iter()
+        .filter(|work| {
+            work.state == WorkState::Queued && matches!(work.origin, WorkOrigin::Automation { .. })
+        })
+        .map(|work| {
+            (
+                claimed_orders
+                    .get(work.identity.as_str())
+                    .copied()
+                    .unwrap_or(u64::MAX),
+                work.identity.as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
     queued_automations.sort_by_key(|(claimed_order, _)| *claimed_order);
     for (index, (_, identity)) in queued_automations.into_iter().enumerate() {
         queue_positions.insert(identity, index as u64 + 1);
@@ -2129,6 +2250,10 @@ async fn notch_projection_context(
     Ok(NotchProjectionContext {
         model_phase,
         automation_names,
+        automation_definition_identities,
+        automation_session_identities,
+        terminal_attention,
+        terminal_orders,
         queue_positions,
         claimed_orders,
     })
@@ -2142,19 +2267,10 @@ fn notch_snapshot_value(
         .works
         .iter()
         .enumerate()
+        .filter(|(_, work)| context.claimed_orders.contains_key(work.identity.as_str()))
         .map(|(index, work)| notch_work_value(work, index as u64, context))
         .collect::<Vec<_>>();
-    let pending_approvals = snapshot
-        .approvals
-        .iter()
-        .filter(|approval| approval.state == ApprovalState::Pending)
-        .map(|approval| {
-            serde_json::json!({
-                "identity": approval.identity.as_str(),
-                "workIdentity": approval.work_identity.as_str(),
-            })
-        })
-        .collect::<Vec<_>>();
+    let pending_approvals = notch_pending_approvals_value(snapshot);
     serde_json::json!({
         "schemaVersion": snapshot.schema_version,
         "cursor": snapshot.cursor.value(),
@@ -2163,6 +2279,22 @@ fn notch_snapshot_value(
         "pendingApprovals": pending_approvals,
         "model": context.model_phase,
     })
+}
+
+fn notch_pending_approvals_value(snapshot: &WorkSnapshot) -> serde_json::Value {
+    serde_json::Value::Array(
+        snapshot
+            .approvals
+            .iter()
+            .filter(|approval| approval.state == ApprovalState::Pending)
+            .map(|approval| {
+                serde_json::json!({
+                    "identity": approval.identity.as_str(),
+                    "workIdentity": approval.work_identity.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn notch_work_value(
@@ -2182,7 +2314,10 @@ fn notch_work_value(
         "activity": work.activity.map(|category| serde_json::json!({ "category": category })),
         "queuePosition": context.queue_positions.get(work.identity.as_str()),
         "automationDisplayName": context.automation_names.get(work.identity.as_str()),
-        "terminalAttention": null,
+        "automationDefinitionIdentity": context.automation_definition_identities.get(work.identity.as_str()),
+        "automationSessionIdentity": context.automation_session_identities.get(work.identity.as_str()),
+        "terminalAttention": context.terminal_attention.get(work.identity.as_str()),
+        "terminalOrder": context.terminal_orders.get(work.identity.as_str()),
         "claimedOrder": context.claimed_orders.get(work.identity.as_str()).copied().unwrap_or(claimed_order),
     })
 }
@@ -4727,8 +4862,12 @@ mod tests {
         let context = NotchProjectionContext {
             model_phase: "ready",
             automation_names: HashMap::new(),
+            automation_definition_identities: HashMap::new(),
+            automation_session_identities: HashMap::new(),
+            terminal_attention: HashMap::new(),
+            terminal_orders: HashMap::new(),
             queue_positions: HashMap::new(),
-            claimed_orders: HashMap::new(),
+            claimed_orders: HashMap::from([("opaque-work".to_owned(), 1)]),
         };
 
         let value = notch_snapshot_value(&snapshot, &context);
@@ -4745,7 +4884,10 @@ mod tests {
             "activity",
             "queuePosition",
             "automationDisplayName",
+            "automationDefinitionIdentity",
+            "automationSessionIdentity",
             "terminalAttention",
+            "terminalOrder",
             "claimedOrder",
         ]
         .into_iter()
@@ -4767,6 +4909,72 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn notch_projection_emits_revisioned_terminal_attention_and_destination() {
+        let snapshot = WorkSnapshot {
+            schema_version: 1,
+            cursor: EventCursor::new(12),
+            daemon_generation: DaemonGeneration::new("daemon-terminal"),
+            works: vec![WorkRecord {
+                identity: WorkIdentity::new("work-terminal"),
+                origin: WorkOrigin::Automation {
+                    automation_run_identity: bagentd::work_coordinator::AutomationRunIdentity::new(
+                        "run-terminal",
+                    ),
+                    automation_session_identity:
+                        bagentd::work_coordinator::AutomationSessionIdentity::new(
+                            "session-terminal",
+                        ),
+                    historical_automation_identity:
+                        bagentd::work_coordinator::AutomationDefinitionIdentity::new(
+                            "definition-terminal",
+                        ),
+                    frozen_definition_revision:
+                        bagentd::work_coordinator::AutomationDefinitionRevision::new(3),
+                },
+                state: WorkState::Failed,
+                revision: WorkRevision::new(4),
+                activity: None,
+            }],
+            automation_runs: vec![],
+            approvals: vec![],
+            interruptions: vec![],
+            model_runtime_generation: None,
+            model_runtime_trusted: true,
+        };
+        let context = NotchProjectionContext {
+            model_phase: "ready",
+            automation_names: HashMap::from([(
+                "work-terminal".to_owned(),
+                "Saved name".to_owned(),
+            )]),
+            automation_definition_identities: HashMap::from([(
+                "work-terminal".to_owned(),
+                "definition-terminal".to_owned(),
+            )]),
+            automation_session_identities: HashMap::from([(
+                "work-terminal".to_owned(),
+                "session-terminal".to_owned(),
+            )]),
+            terminal_attention: HashMap::from([("work-terminal".to_owned(), "failed")]),
+            terminal_orders: HashMap::from([("work-terminal".to_owned(), 12)]),
+            queue_positions: HashMap::new(),
+            claimed_orders: HashMap::from([("work-terminal".to_owned(), 1)]),
+        };
+
+        let value = notch_snapshot_value(&snapshot, &context);
+        assert_eq!(value["works"][0]["terminalAttention"], "failed");
+        assert_eq!(value["works"][0]["terminalOrder"], 12);
+        assert_eq!(
+            value["works"][0]["automationDefinitionIdentity"],
+            "definition-terminal"
+        );
+        assert_eq!(
+            value["works"][0]["automationSessionIdentity"],
+            "session-terminal"
+        );
     }
 
     #[test]

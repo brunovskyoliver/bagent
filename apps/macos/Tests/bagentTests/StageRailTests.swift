@@ -183,7 +183,10 @@ final class StageRailTests: XCTestCase {
             activity: nil,
             queuePosition: nil,
             automationDisplayName: "Saved automation",
+            automationDefinitionIdentity: "definition-\(identity)",
+            automationSessionIdentity: "session-\(identity)",
             terminalAttention: attention,
+            terminalOrder: order,
             claimedOrder: order
         )
     }

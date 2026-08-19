@@ -94,4 +94,36 @@ final class ProjectionPrivacyTests: XCTestCase {
         XCTAssertFalse(presentation.rail.caption.contains("CANARY"))
         XCTAssertFalse(presentation.statusPill.accessibilityValue.contains("CANARY"))
     }
+
+    func testReflectionDiagnosticsAndCaptureMetadataHideRetainedOpaqueIdentities() throws {
+        let snapshot = NotchWorkSnapshot(
+            schemaVersion: 1,
+            cursor: 9,
+            daemonGeneration: "daemon-CANARY-PRIVATE",
+            works: [NotchWork(
+                identity: "work-CANARY-PRIVATE",
+                revision: 1,
+                origin: .automation,
+                state: .running,
+                activity: .init(category: .genericTool),
+                queuePosition: nil,
+                automationDisplayName: nil,
+                automationDefinitionIdentity: "definition-CANARY-PRIVATE",
+                automationSessionIdentity: "session-CANARY-PRIVATE",
+                terminalAttention: nil
+            )],
+            pendingApprovals: [],
+            model: .ready
+        )
+
+        let presentation = try NotchProjection.reduce(previous: .idle, input: .snapshot(snapshot))
+        let diagnostic = String(reflecting: presentation)
+        let reflectedChildren = presentation.customMirror.children.map { String(describing: $0.value) }
+        let captureMetadata = presentation.privacySafeCaptureMetadata.description
+
+        XCTAssertFalse(diagnostic.contains("CANARY-PRIVATE"))
+        XCTAssertFalse(reflectedChildren.joined().contains("CANARY-PRIVATE"))
+        XCTAssertFalse(captureMetadata.contains("CANARY-PRIVATE"))
+        XCTAssertFalse(presentation.rail.accessibilityValue.contains("CANARY-PRIVATE"))
+    }
 }

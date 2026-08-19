@@ -25,6 +25,9 @@ final class NotchEventConsumer: ObservableObject {
     private let consumerFence: String
     @Published private(set) var presentation: NotchPresentation = .idle
     private var hasAuthoritativeSnapshot = false
+    private var reduceMotion = false
+
+    var activeConsumerFence: String { consumerFence }
 
     init(
         transport: any NotchEventTransport,
@@ -35,6 +38,7 @@ final class NotchEventConsumer: ObservableObject {
     }
 
     func synchronize(reduceMotion: Bool = false) async throws {
+        self.reduceMotion = reduceMotion || self.reduceMotion
         guard hasAuthoritativeSnapshot else {
             try await replaceFromSnapshot(reduceMotion: reduceMotion)
             return
@@ -69,12 +73,22 @@ final class NotchEventConsumer: ObservableObject {
 
     func applyLocalIntent(
         _ intent: NotchLocalIntent,
-        reduceMotion: Bool = false
+        reduceMotion: Bool? = nil
     ) throws {
+        if let reduceMotion { self.reduceMotion = reduceMotion }
         presentation = try NotchProjection.reduce(
             previous: presentation,
             input: .localIntent(intent),
-            reduceMotion: reduceMotion
+            reduceMotion: self.reduceMotion
+        )
+    }
+
+    func setReduceMotion(_ enabled: Bool) throws {
+        reduceMotion = enabled
+        presentation = try NotchProjection.reduce(
+            previous: presentation,
+            input: .localIntent(.motionPreferenceChanged),
+            reduceMotion: enabled
         )
     }
 
@@ -96,10 +110,11 @@ final class NotchEventConsumer: ObservableObject {
     }
 
     private func install(_ snapshot: NotchWorkSnapshot, reduceMotion: Bool) throws {
+        self.reduceMotion = reduceMotion || self.reduceMotion
         presentation = try NotchProjection.reduce(
             previous: presentation,
             input: .snapshot(snapshot),
-            reduceMotion: reduceMotion
+            reduceMotion: self.reduceMotion
         )
         hasAuthoritativeSnapshot = true
     }

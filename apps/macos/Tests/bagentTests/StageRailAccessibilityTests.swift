@@ -1,9 +1,68 @@
 import AppKit
+import ApplicationServices
 import SwiftUI
 import XCTest
 @testable import bagent
 
 final class StageRailAccessibilityTests: XCTestCase {
+    @MainActor
+    func testHostedNotchPreservesRailAndPillButtonsInAccessibilityTree() throws {
+        let viewModel = ChatViewModel(startMonitoring: false)
+        try viewModel.applyAuthoritativeSnapshot(.init(
+            schemaVersion: 1,
+            cursor: 1,
+            daemonGeneration: "accessibility-host",
+            works: [automation("automation-a", order: 1, category: .web)],
+            pendingApprovals: [],
+            model: .ready
+        ))
+        let host = NSHostingView(rootView: NotchWrapView(
+            notchWidth: 221,
+            notchHeight: 38,
+            viewModel: viewModel,
+            onTap: {},
+            onHoverChanged: { _ in }
+        ))
+        host.setAccessibilityElement(false)
+        host.frame = CGRect(x: 0, y: 0, width: 741, height: 318)
+        let panel = NSPanel(
+            contentRect: host.frame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentView = host
+        panel.orderFrontRegardless()
+        host.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+        host.layoutSubtreeIfNeeded()
+        defer { panel.close() }
+
+        let applicationElement = AXUIElementCreateApplication(getpid())
+        guard accessibilityString(applicationElement, attribute: kAXRoleAttribute) != nil else {
+            throw XCTSkip("The test runner has no Accessibility API permission")
+        }
+        let elements = accessibilityTree(from: applicationElement)
+        let labels = elements.compactMap { accessibilityString($0, attribute: kAXDescriptionAttribute) }
+            + elements.compactMap { accessibilityString($0, attribute: kAXTitleAttribute) }
+        let buttonLabels = elements.compactMap { element -> String? in
+            guard accessibilityString(element, attribute: kAXRoleAttribute) == kAXButtonRole else {
+                return nil
+            }
+            return accessibilityString(element, attribute: kAXDescriptionAttribute)
+                ?? accessibilityString(element, attribute: kAXTitleAttribute)
+        }
+        let description = elements.map {
+            "\(accessibilityString($0, attribute: kAXRoleAttribute) ?? "nil"): "
+                + "\(accessibilityString($0, attribute: kAXDescriptionAttribute) ?? "nil")"
+        }.joined(separator: ", ")
+
+        XCTAssertTrue(labels.contains("Activity"), "Stage Rail must survive the hosting hierarchy: \(description)")
+        XCTAssertTrue(labels.contains("Status"), "status pill must survive the hosting hierarchy: \(description)")
+        XCTAssertTrue(buttonLabels.contains("Activity"), "the rail must expose its Return-capable Button: \(description)")
+        XCTAssertTrue(buttonLabels.contains("Status"), "the active-count pill must expose its Button: \(description)")
+    }
+
     func testRailAndPillExposeCompleteStableAccessibilityValues() throws {
         let snapshot = NotchWorkSnapshot(
             schemaVersion: 1,
@@ -68,6 +127,8 @@ final class StageRailAccessibilityTests: XCTestCase {
             activity: .init(category: category),
             queuePosition: nil,
             automationDisplayName: "Saved Automation",
+            automationDefinitionIdentity: "definition-\(identity)",
+            automationSessionIdentity: "session-\(identity)",
             terminalAttention: nil,
             claimedOrder: order
         )
@@ -78,5 +139,33 @@ final class StageRailAccessibilityTests: XCTestCase {
             ? component / 12.92
             : pow((component + 0.055) / 1.055, 2.4)
         return (linear + 0.05) / 0.05
+    }
+
+    private func accessibilityTree(from root: AXUIElement) -> [AXUIElement] {
+        var result: [AXUIElement] = []
+        var pending = [root]
+        var visited = Set<CFHashCode>()
+        while let element = pending.popLast() {
+            let identifier = CFHash(element)
+            guard visited.insert(identifier).inserted else { continue }
+            result.append(element)
+            if let children = accessibilityValue(element, attribute: kAXChildrenAttribute)
+                as? [AXUIElement] {
+                pending.append(contentsOf: children)
+            }
+        }
+        return result
+    }
+
+    private func accessibilityString(_ element: AXUIElement, attribute: String) -> String? {
+        accessibilityValue(element, attribute: attribute) as? String
+    }
+
+    private func accessibilityValue(_ element: AXUIElement, attribute: String) -> Any? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value
     }
 }

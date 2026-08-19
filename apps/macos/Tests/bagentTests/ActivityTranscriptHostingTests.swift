@@ -51,7 +51,6 @@ final class ActivityTranscriptHostingTests: XCTestCase {
 
         viewModel.messages[0].content = "Verified fixture answer"
         viewModel.messages[0].displayedContent = "Verified fixture answer"
-        viewModel.ensureCompletedTurnOutputPresented()
         for index in 0..<40 {
             let chunk = " final-\(index)"
             viewModel.messages[0].content += chunk
@@ -64,7 +63,6 @@ final class ActivityTranscriptHostingTests: XCTestCase {
         drainMainRunLoop()
 
         XCTAssertEqual(viewModel.notchInteractionMode, .output)
-        XCTAssertEqual(viewModel.chatSurfaceMode, .outputExpanded)
         XCTAssertTrue(viewModel.isActivityTranscriptExpanded)
         XCTAssertTrue(panel.isVisible)
         XCTAssertTrue(controller.isNotchInteractionShowing)
@@ -130,11 +128,10 @@ final class ActivityTranscriptHostingTests: XCTestCase {
 
         viewModel.messages[0].content = "Verified answer"
         viewModel.messages[0].displayedContent = "Verified answer"
-        viewModel.ensureCompletedTurnOutputPresented()
+        try viewModel.installCompletedFixture()
         drainMainRunLoop()
 
         XCTAssertEqual(viewModel.notchInteractionMode, .output)
-        XCTAssertEqual(viewModel.chatSurfaceMode, .outputExpanded)
         XCTAssertEqual(descendants(of: hosted).filter { $0 is NSScrollView }.count, 1)
 
         // Stress the real output-sizing path. Each chunk used to advance a

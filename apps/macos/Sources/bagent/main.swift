@@ -16,6 +16,10 @@ if arguments.count == 6, arguments[1] == "--stage8-acceptance-case" {
         exit(status)
     }
     RunLoop.main.run()
+} else if (2...3).contains(arguments.count),
+          arguments[1] == "--stage5-notch-fixture",
+          ProcessInfo.processInfo.environment["BAGENT_STAGE5_ACCEPTANCE_FIXTURE"] == "1" {
+    Stage5AcceptanceFixture.run(variant: arguments.count == 3 ? arguments[2] : "default")
 } else {
     // Retain delegate for the lifetime of the process.
     let delegate = AppDelegate()

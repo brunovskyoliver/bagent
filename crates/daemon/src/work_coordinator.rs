@@ -432,6 +432,10 @@ enum CommandKind {
         expected_revision: WorkRevision,
         category: Option<WorkActivityCategory>,
     },
+    AcknowledgeAttention {
+        work_identity: WorkIdentity,
+        expected_revision: WorkRevision,
+    },
     RequestApproval {
         work_identity: WorkIdentity,
         expected_revision: WorkRevision,
@@ -563,6 +567,23 @@ impl Command {
                 work_identity: work_identity.into(),
                 expected_revision,
                 category,
+            },
+        }
+    }
+
+    pub fn acknowledge_attention(
+        command_identity: impl Into<CommandIdentity>,
+        work_identity: impl Into<WorkIdentity>,
+        expected_revision: WorkRevision,
+        generation: DaemonGeneration,
+    ) -> Self {
+        Self {
+            command_schema_version: SCHEMA_VERSION,
+            command_identity: command_identity.into(),
+            expected_daemon_generation: generation,
+            kind: CommandKind::AcknowledgeAttention {
+                work_identity: work_identity.into(),
+                expected_revision,
             },
         }
     }
@@ -793,6 +814,7 @@ pub enum EventKind {
     WorkStateChanged,
     WorkRecovered,
     WorkActivityChanged,
+    CompletionAttentionAcknowledged,
 }
 
 impl EventKind {
@@ -802,6 +824,7 @@ impl EventKind {
             Self::WorkStateChanged => "work_state_changed",
             Self::WorkRecovered => "work_recovered",
             Self::WorkActivityChanged => "work_activity_changed",
+            Self::CompletionAttentionAcknowledged => "completion_attention_acknowledged",
         }
     }
 
@@ -811,6 +834,7 @@ impl EventKind {
             "work_state_changed" => Ok(Self::WorkStateChanged),
             "work_recovered" => Ok(Self::WorkRecovered),
             "work_activity_changed" => Ok(Self::WorkActivityChanged),
+            "completion_attention_acknowledged" => Ok(Self::CompletionAttentionAcknowledged),
             other => Err(CommandError::CorruptState(other.to_owned())),
         }
     }
@@ -1442,6 +1466,23 @@ fn apply_command(
                         params![work_identity.as_str()],
                     )
                     .map_err(CommandError::storage)?;
+                let attention_state = matches!(
+                    *next_state,
+                    WorkState::Completed | WorkState::Partial | WorkState::Failed
+                )
+                .then_some("unread")
+                .unwrap_or("none");
+                transaction
+                    .execute(
+                        "UPDATE work_automation_sessions
+                         SET attention_state = ?1, frozen = 1
+                         WHERE automation_run_identity IN (
+                           SELECT automation_run_identity FROM work_automation_runs
+                           WHERE work_identity = ?2
+                         )",
+                        params![attention_state, work_identity.as_str()],
+                    )
+                    .map_err(CommandError::storage)?;
             }
             if let Some(model_runtime_generation) = model_runtime_generation {
                 transaction
@@ -1457,6 +1498,65 @@ fn apply_command(
                 revision,
                 *next_state,
                 EventKind::WorkStateChanged,
+            ))
+        }
+        CommandKind::AcknowledgeAttention {
+            work_identity,
+            expected_revision,
+        } => {
+            let (current_state, current_revision) =
+                load_work_state_revision(transaction, work_identity)?;
+            if current_revision != *expected_revision {
+                return Err(CommandError::Conflict {
+                    current_revision: Some(current_revision),
+                });
+            }
+            if !matches!(
+                current_state,
+                WorkState::Completed | WorkState::Partial | WorkState::Failed
+            ) {
+                return Err(CommandError::TerminalTarget);
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE work_automation_sessions
+                     SET attention_state = 'viewed'
+                     WHERE attention_state = 'unread' AND automation_run_identity IN (
+                       SELECT automation_run_identity FROM work_automation_runs
+                       WHERE work_identity = ?1
+                     )",
+                    params![work_identity.as_str()],
+                )
+                .map_err(CommandError::storage)?;
+            if changed != 1 {
+                return Err(CommandError::Conflict {
+                    current_revision: Some(current_revision),
+                });
+            }
+            let revision = WorkRevision::new(current_revision.value() + 1);
+            transaction
+                .execute(
+                    "UPDATE works SET revision = ?1, updated_at = ?2
+                     WHERE identity = ?3 AND revision = ?4",
+                    params![
+                        revision.value(),
+                        committed_at,
+                        work_identity.as_str(),
+                        current_revision.value(),
+                    ],
+                )
+                .map_err(CommandError::storage)?;
+            transaction
+                .execute(
+                    "UPDATE work_projections SET revision = ?1 WHERE work_identity = ?2",
+                    params![revision.value(), work_identity.as_str()],
+                )
+                .map_err(CommandError::storage)?;
+            Ok((
+                work_identity.clone(),
+                revision,
+                current_state,
+                EventKind::CompletionAttentionAcknowledged,
             ))
         }
         CommandKind::SetActivity {

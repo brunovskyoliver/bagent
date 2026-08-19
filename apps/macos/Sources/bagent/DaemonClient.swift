@@ -1006,6 +1006,31 @@ struct DaemonClient: Sendable, NotchEventTransport {
         }
     }
 
+    func acknowledgeWorkAttention(
+        workIdentity: String,
+        expectedRevision: UInt64,
+        consumerFence: String
+    ) async throws {
+        let credentials = try await loadCreds()
+        var request = authedRequest("/work/attention/acknowledge", creds: credentials)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable {
+            let commandIdentity: String
+            let consumerFence: String
+            let workIdentity: String
+            let expectedRevision: UInt64
+        }
+        request.httpBody = try JSONEncoder().encode(Body(
+            commandIdentity: UUID().uuidString,
+            consumerFence: consumerFence,
+            workIdentity: workIdentity,
+            expectedRevision: expectedRevision
+        ))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateOK(data: data, response: response)
+    }
+
     // MARK: - Automations
 
     func listAutomations() async throws -> [AutomationRecord] {

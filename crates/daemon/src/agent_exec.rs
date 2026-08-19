@@ -4055,11 +4055,18 @@ pub(crate) async fn run_agent_loop(
             tool_calls_used += 1;
             let fn_name = &call.function.name;
             let args = &call.function.arguments;
-            let _ = state.work_authority.set_activity(
-                format!("tool-activity-start:{}", call.id),
+            if let Err(error) = state.work_authority.set_activity(
+                notch_activity_command_identity("start", &work_identity, tool_calls_used, &call.id),
                 work_identity.clone(),
                 Some(notch_activity_category(fn_name)),
-            );
+            ) {
+                tracing::warn!(
+                    work_identity = work_identity.as_str(),
+                    tool_call_id = call.id,
+                    %error,
+                    "failed to publish notch tool activity"
+                );
+            }
             tracing::info!("tool loop call {}: {} {:?}", tool_calls_used, fn_name, args);
             let activity_id = format!("tool:{}", call.id);
             let _ = sink
@@ -4667,11 +4674,23 @@ pub(crate) async fn run_agent_loop(
                     "duration_ms": activity_started.elapsed().as_millis() as u64,
                 }))
                 .await;
-            let _ = state.work_authority.set_activity(
-                format!("tool-activity-complete:{}", call.id),
+            if let Err(error) = state.work_authority.set_activity(
+                notch_activity_command_identity(
+                    "complete",
+                    &work_identity,
+                    tool_calls_used,
+                    &call.id,
+                ),
                 work_identity.clone(),
                 None,
-            );
+            ) {
+                tracing::warn!(
+                    work_identity = work_identity.as_str(),
+                    tool_call_id = call.id,
+                    %error,
+                    "failed to clear notch tool activity"
+                );
+            }
             messages.push(Message::tool_result(&call.id, fn_name, tool_result));
         }
         if let Some(guidance) = batch_followup_guidance {
@@ -4767,6 +4786,18 @@ fn notch_activity_category(tool: &str) -> WorkActivityCategory {
     }
 }
 
+fn notch_activity_command_identity(
+    transition: &str,
+    work_identity: &WorkIdentity,
+    occurrence: usize,
+    tool_call_identity: &str,
+) -> String {
+    format!(
+        "tool-activity-{transition}:{}:{occurrence}:{tool_call_identity}",
+        work_identity.as_str()
+    )
+}
+
 fn activity_title(tool: &str) -> &'static str {
     match tool {
         "web_search" => "Searching the web",
@@ -4841,6 +4872,25 @@ fn should_publish_model_delta_live(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notch_activity_commands_are_unique_across_work_and_call_occurrences() {
+        let first_work = WorkIdentity::new("work-a");
+        let second_work = WorkIdentity::new("work-b");
+
+        assert_ne!(
+            notch_activity_command_identity("start", &first_work, 1, "call-1"),
+            notch_activity_command_identity("start", &second_work, 1, "call-1")
+        );
+        assert_ne!(
+            notch_activity_command_identity("start", &first_work, 1, "call-1"),
+            notch_activity_command_identity("start", &first_work, 2, "call-1")
+        );
+        assert_ne!(
+            notch_activity_command_identity("start", &first_work, 1, "call-1"),
+            notch_activity_command_identity("complete", &first_work, 1, "call-1")
+        );
+    }
 
     #[test]
     fn legacy_model_error_codes_are_normalized_and_fail_closed() {

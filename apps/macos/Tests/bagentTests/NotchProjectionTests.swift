@@ -110,6 +110,52 @@ final class NotchProjectionTests: XCTestCase {
         XCTAssertEqual(duplicate, running)
     }
 
+    func testApprovalEntryAndExitProjectThroughEventsWithoutSnapshotReconciliation() throws {
+        let initial = NotchWorkSnapshot(
+            schemaVersion: 1,
+            cursor: 20,
+            daemonGeneration: "daemon-a",
+            works: [work(identity: "conversation-a", revision: 1, origin: .conversation, state: .running)],
+            pendingApprovals: [],
+            model: .ready
+        )
+        let running = try NotchProjection.reduce(previous: .idle, input: .snapshot(initial))
+        let awaitingApproval = try NotchProjection.reduce(
+            previous: running,
+            input: .event(.init(
+                schemaVersion: 1,
+                cursor: 21,
+                daemonGeneration: "daemon-a",
+                work: work(
+                    identity: "conversation-a",
+                    revision: 2,
+                    origin: .conversation,
+                    state: .waitingForApproval
+                ),
+                pendingApprovals: [.init(identity: "approval-a", workIdentity: "conversation-a")],
+                model: .ready
+            ))
+        )
+
+        XCTAssertEqual(awaitingApproval.statusPill.label, "APPROVE")
+        XCTAssertEqual(awaitingApproval.geometry.bridgeHeight, 176)
+
+        let resumed = try NotchProjection.reduce(
+            previous: awaitingApproval,
+            input: .event(.init(
+                schemaVersion: 1,
+                cursor: 22,
+                daemonGeneration: "daemon-a",
+                work: work(identity: "conversation-a", revision: 3, origin: .conversation, state: .running),
+                pendingApprovals: [],
+                model: .ready
+            ))
+        )
+
+        XCTAssertEqual(resumed.statusPill.label, "ACTIVE")
+        XCTAssertEqual(resumed.geometry.bridgeHeight, 78)
+    }
+
     func testOutOfOrderAndRevisionSkippingEventsAreRejected() throws {
         let snapshot = NotchWorkSnapshot(
             schemaVersion: 1,
@@ -149,6 +195,86 @@ final class NotchProjectionTests: XCTestCase {
                 .revisionMismatch(workIdentity: "automation-a", expected: 2, actual: 3)
             )
         }
+    }
+
+    func testForegroundDestinationPreemptsTwoBackgroundRuns() throws {
+        let snapshot = NotchWorkSnapshot(
+            schemaVersion: 1,
+            cursor: 30,
+            daemonGeneration: "daemon-a",
+            works: [
+                work(identity: "chat", revision: 1, origin: .conversation, state: .running),
+                work(identity: "run-a", revision: 1, origin: .automation, state: .running),
+                work(identity: "run-b", revision: 1, origin: .automation, state: .running),
+            ],
+            pendingApprovals: [],
+            model: .ready
+        )
+
+        let presentation = try NotchProjection.reduce(previous: .idle, input: .snapshot(snapshot))
+
+        XCTAssertEqual(presentation.focusedDestination, .currentChat)
+        XCTAssertEqual(presentation.activeAutomationCount, 2)
+        XCTAssertEqual(presentation.statusPill.label, "2 ACTIVE")
+        XCTAssertEqual(presentation.geometry.bridgeHeight, 150)
+    }
+
+    func testNewestTerminalDestinationUsesFinishOrderAndDoneMarkerSurvivesActiveWork() throws {
+        var active = work(identity: "run-active", revision: 1, origin: .automation, state: .running)
+        active.automationDefinitionIdentity = "definition-active"
+        var older = work(
+            identity: "run-older",
+            revision: 4,
+            origin: .automation,
+            state: .completed,
+            terminalAttention: .unread
+        )
+        older.automationDefinitionIdentity = "definition-older"
+        older.automationSessionIdentity = "session-older"
+        older.terminalOrder = 50
+        var newer = work(
+            identity: "run-newer",
+            revision: 4,
+            origin: .automation,
+            state: .failed,
+            terminalAttention: .failed
+        )
+        newer.automationDefinitionIdentity = "definition-newer"
+        newer.automationSessionIdentity = "session-newer"
+        newer.terminalOrder = 60
+        let withActive = NotchWorkSnapshot(
+            schemaVersion: 1,
+            cursor: 60,
+            daemonGeneration: "daemon-a",
+            works: [active, older, newer],
+            pendingApprovals: [],
+            model: .ready
+        )
+
+        let activePresentation = try NotchProjection.reduce(
+            previous: .idle,
+            input: .snapshot(withActive)
+        )
+        XCTAssertEqual(activePresentation.rail.terminalAttentionMarker, .failed)
+        XCTAssertEqual(activePresentation.rail.selectedStage, .think)
+
+        var terminalOnly = withActive
+        terminalOnly.works.removeFirst()
+        let terminalPresentation = try NotchProjection.reduce(
+            previous: .idle,
+            input: .snapshot(terminalOnly)
+        )
+        XCTAssertEqual(
+            terminalPresentation.focusedDestination,
+            .terminalAutomation(
+                definitionIdentity: "definition-newer",
+                sessionIdentity: "session-newer",
+                workIdentity: "run-newer",
+                expectedRevision: 4
+            )
+        )
+        XCTAssertEqual(terminalPresentation.rail.selectedStage, .done)
+        XCTAssertEqual(terminalPresentation.statusPill.label, "FAILED")
     }
 
     private func work(

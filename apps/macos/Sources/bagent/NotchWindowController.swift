@@ -22,7 +22,7 @@ private func sourceModeCommandDigitIndex(for event: NSEvent) -> Int? {
 // Borderless NSPanel by default returns canBecomeKey = false, which silently
 // prevents makeKeyAndOrderFront from making the panel a key window, so keyboard
 // events never reach the text field. Subclass to fix.
-private final class BagentPanel: NSPanel {
+final class BagentPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
@@ -60,7 +60,6 @@ final class NotchWindowController: NSObject {
     private var menuBarBottomY: CGFloat = 0
 
     private var visibilityCancellable: AnyCancellable?
-    private var approvalCancellable: AnyCancellable?
     private var previousApp: NSRunningApplication?
 
 #if DEBUG
@@ -82,10 +81,6 @@ final class NotchWindowController: NSObject {
         chatViewModel.onInputOnlySubmitted = { [weak self] in
             self?.collapseInputForThinking()
         }
-        chatViewModel.onFirstAssistantToken = { [weak self] in
-            self?.presentOutputChat()
-        }
-
         // cmux agent event: transient banner in the collapsed notch for 5s, then
         // collapse back to the persistent left icon (still jiggling) + right corner
         // dot, which linger until the event clears. Latest event wins the banner.
@@ -100,17 +95,6 @@ final class NotchWindowController: NSObject {
             self.cmuxBannerDismissWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: work)
         }
-
-        // A gated write auto-denies after 60 s, so an arriving approval has to open
-        // the notch on its own — the user may never look at the pill in time.
-        approvalCancellable = chatViewModel.$pendingApprovals
-            .map { !$0.isEmpty }
-            .removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] hasPending in
-                guard hasPending else { return }
-                self?.presentOutputChat()
-            }
 
         visibilityCancellable = chatViewModel.notchPresentationPublisher
             .dropFirst()

@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 sources="$root/apps/macos/Sources/bagent"
 
-forbidden='@Published[[:space:]]+var[[:space:]]+(isThinking|isExpanded|chatSurfaceMode|toolStatus)|@Published[[:space:]]+var[[:space:]]+notchInteractionMode|globalEvents\(|authedRequest\("/events"'
+forbidden='@(Published|State)[[:space:]]+(private[[:space:]]+)?var[[:space:]]+(isThinking|isExpanded|chatSurfaceMode|toolStatus|notchInteractionMode|previousNotchInteractionMode)|globalEvents\(|authedRequest\("/events"|onFirstAssistantToken|ensureCompletedTurnOutputPresented'
 
 if rg -n "$forbidden" "$sources"; then
     echo "FAIL: writable parallel notch authority or legacy event consumer remains" >&2

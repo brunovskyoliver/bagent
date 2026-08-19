@@ -236,6 +236,7 @@ struct NotchWrapView: View {
     @ObservedObject var viewModel: ChatViewModel
     let onTap: () -> Void
     let onHoverChanged: (Bool) -> Void
+    var acceptanceReduceMotionOverride: Bool? = nil
 
     // Explicit @State so withAnimation directly tweens the shape's animatableData.
     @State private var wingWidth: CGFloat    = NotchWrapMetrics.idleWingWidth
@@ -257,7 +258,6 @@ struct NotchWrapView: View {
     @State private var hoverIconRevealID = UUID()
     @State private var inlineRevealID = UUID()
     @State private var borderPulseOpacity: CGFloat = 0.35
-    @State private var previousNotchInteractionMode: NotchInteractionMode = .collapsed
     @State private var returningStatusDotFromOutput = false
     /// Content-fit output wing — grow-only per assistant message so the panel
     /// never pumps narrower mid-stream; reset when a new message starts.
@@ -267,7 +267,11 @@ struct NotchWrapView: View {
     /// Multiple left-wing icons rest as an overlapped deck; hover fans them out.
     @State private var leftWingFanned = false
     @State private var leftWingRestackWork: DispatchWorkItem?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+
+    private var reduceMotion: Bool {
+        acceptanceReduceMotionOverride ?? systemReduceMotion
+    }
 
     // Panel is sized for voice mode (the widest/tallest state) so the frame never needs
     // AppKit resizing. notchOffset = voiceWingWidth = left edge of the physical notch.
@@ -450,10 +454,6 @@ struct NotchWrapView: View {
     }
 
     private func refreshSurface() {
-        // Captured before updateStatusDotTravelState() mutates previousNotchInteractionMode.
-        let previousModeWasOutput = previousNotchInteractionMode == .output
-        updateStatusDotTravelState()
-
         let hoverExpanded = isHovered || isDragTargeted || viewModel.pillHovered
         var targetWing: CGFloat
         let targetBridge: CGFloat
@@ -481,7 +481,7 @@ struct NotchWrapView: View {
         // Width/height growth while already in output mode must not replay the
         // inline reveal — only the initial transition into output resets it.
         let outputContentOnlyResize = viewModel.notchInteractionMode == .output
-            && previousModeWasOutput
+            && inlineContentOpacity > 0
         var instantTargetUpdate = Transaction()
         instantTargetUpdate.disablesAnimations = true
         withTransaction(instantTargetUpdate) {
@@ -549,9 +549,11 @@ struct NotchWrapView: View {
         }
     }
 
-    private func updateStatusDotTravelState() {
-        let currentMode = viewModel.notchInteractionMode
-        if previousNotchInteractionMode == .output && currentMode != .output {
+    private func updateStatusDotTravelState(
+        previousMode: NotchInteractionMode,
+        currentMode: NotchInteractionMode
+    ) {
+        if previousMode == .output && currentMode != .output {
             outputStatusReturnStartPos = outputStatusTargetPos
             outputStatusReturnStartBridgeHeight = max(1, targetBridgeHeight)
             returningStatusDotFromOutput = !reduceMotion
@@ -560,7 +562,6 @@ struct NotchWrapView: View {
         } else if returningStatusDotFromOutput && bridgeHeight <= NotchWrapMetrics.idleBridgeHeight + 0.5 {
             returningStatusDotFromOutput = false
         }
-        previousNotchInteractionMode = currentMode
     }
 
     private func updateInlineOpacity(active: Bool) {
@@ -643,7 +644,7 @@ struct NotchWrapView: View {
                 y: collapsedStatusPos.y + (outputStatusTargetPos.y - collapsedStatusPos.y) * progress
             )
         }
-        if returningStatusDotFromOutput || (previousNotchInteractionMode == .output && viewModel.notchInteractionMode != .output) {
+        if returningStatusDotFromOutput {
             let startPos = returningStatusDotFromOutput ? outputStatusReturnStartPos : outputStatusTargetPos
             let startBridgeHeight = returningStatusDotFromOutput
                 ? outputStatusReturnStartBridgeHeight
@@ -1136,7 +1137,8 @@ struct NotchWrapView: View {
             refreshSurface()
             updateWheelOpacity(active: active)
         }
-        .onChange(of: viewModel.notchInteractionMode) { _, mode in
+        .onChange(of: viewModel.notchInteractionMode) { previousMode, mode in
+            updateStatusDotTravelState(previousMode: previousMode, currentMode: mode)
             if mode != .output { outputWingRatchet = NotchWrapMetrics.outputMinWingWidth }
             refreshSurface()
         }
@@ -1188,6 +1190,12 @@ struct NotchWrapView: View {
         }
         .onAppear {
             pulsing = (status == .thinking)
+            viewModel.setNotchReduceMotion(reduceMotion)
+            refreshSurface()
+        }
+        .onChange(of: reduceMotion) { _, enabled in
+            viewModel.setNotchReduceMotion(enabled)
+            refreshSurface()
         }
         .onReceive(NotificationCenter.default.publisher(for: .bagentCodeCopied)) { _ in
             guard !reduceMotion else { return }
@@ -1196,10 +1204,57 @@ struct NotchWrapView: View {
                 withAnimation(.easeInOut(duration: 0.3)) { copyFlashed = false }
             }
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("bagent — \(status.accessibilityLabel)")
-        .accessibilityHint("Otvoriť chat")
-        .accessibilityAddTraits(.isButton)
+        .modifier(NotchProjectionAccessibilityModifier(
+            enabled: isProjectionSurfaceActive,
+            presentation: viewModel.notchPresentation,
+            approval: viewModel.authoritativePendingApproval,
+            activateActivity: viewModel.activateFocusedNotchActivity,
+            openAutomations: viewModel.openActiveAutomations,
+            allowApproval: { item in viewModel.decideApproval(item, allow: true) },
+            denyApproval: { item in viewModel.decideApproval(item, allow: false) }
+        ))
+    }
+}
+
+private struct NotchProjectionAccessibilityModifier: ViewModifier {
+    let enabled: Bool
+    let presentation: NotchPresentation
+    let approval: ApprovalItem?
+    let activateActivity: () -> Void
+    let openAutomations: () -> Void
+    let allowApproval: (ApprovalItem) -> Void
+    let denyApproval: (ApprovalItem) -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.accessibilityRepresentation {
+                VStack {
+                    if let approval {
+                        Text("Approval required")
+                            .accessibilityValue(approval.description ?? "Pending action")
+                        Button("Allow") { allowApproval(approval) }
+                        Button("Deny") { denyApproval(approval) }
+                    } else if presentation.geometry.bridgeHeight > 0 {
+                        Button("Activity", action: activateActivity)
+                            .disabled(!presentation.canOpenFocusedDestination)
+                            .keyboardShortcut(.return, modifiers: [])
+                            .accessibilityValue(presentation.rail.accessibilityValue)
+                    }
+                    if presentation.statusPill.label != nil {
+                        if presentation.activeAutomationCount > 0 {
+                            Button("Status", action: openAutomations)
+                                .accessibilityValue(presentation.statusPill.accessibilityValue)
+                        } else {
+                            Text("Status")
+                                .accessibilityValue(presentation.statusPill.accessibilityValue)
+                        }
+                    }
+                }
+            }
+        } else {
+            content
+        }
     }
 }
 
@@ -1266,7 +1321,7 @@ struct InlineNotchContent: View {
         VStack(alignment: .leading, spacing: 9) {
             // A pending approval preempts every other mode — it is the only place
             // a gated write can be allowed, and it auto-denies after 60 s.
-            if let approval = viewModel.pendingApprovals.first {
+            if let approval = viewModel.authoritativePendingApproval {
                 ApprovalModalOverlay(approval: approval, viewModel: viewModel)
             } else if viewModel.notchPresentation.statusPill.label == "APPROVE" {
                 ActivityPeekStageRailView(

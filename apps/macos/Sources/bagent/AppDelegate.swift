@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -20,13 +19,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let nc = NotchWindowController(chatViewModel: vm)
         notchController = nc
 
-        // Background automation approvals preempt everything: open the notch
-        // as soon as one arrives (the approval overlay renders before any
-        // ordinary mode inside InlineNotchContent).
-        vm.onApprovalArrived = { [weak nc] in
-            guard let nc, !nc.isNotchInteractionShowing else { return }
-            nc.presentInputOnly()
-        }
         vm.startEventsMonitor()
 
         GlobalHotkey.register { [weak self] in

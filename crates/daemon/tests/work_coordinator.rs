@@ -102,6 +102,60 @@ fn activity_updates_are_revisioned_ordered_and_current_only() {
     );
 }
 
+#[test]
+fn terminal_automation_attention_is_acknowledged_once_at_expected_revision() {
+    let (_temp, coordinator) = fixture("daemon-attention", 32, &["work-attention"]);
+    let work = coordinator
+        .submit(create_automation(
+            "create-attention",
+            "run-attention",
+            "session-attention",
+            "definition-attention",
+            1,
+            "daemon-attention",
+        ))
+        .unwrap()
+        .receipt()
+        .work_identity
+        .clone();
+    for (command, revision, state) in [
+        ("wait-attention", 1, WorkState::WaitingForModel),
+        ("run-attention", 2, WorkState::Running),
+        ("complete-attention", 3, WorkState::Completed),
+    ] {
+        coordinator
+            .submit(work_transition(
+                command,
+                work.clone(),
+                rev(revision),
+                state,
+                "daemon-attention",
+            ))
+            .unwrap();
+    }
+
+    let acknowledgement = coordinator
+        .submit(Command::acknowledge_attention(
+            "ack-attention",
+            work.clone(),
+            rev(4),
+            DaemonGeneration::new("daemon-attention"),
+        ))
+        .unwrap();
+    assert_eq!(acknowledgement.receipt().work_revision, rev(5));
+    assert_eq!(acknowledgement.receipt().state, WorkState::Completed);
+
+    assert!(matches!(
+        coordinator.submit(Command::acknowledge_attention(
+            "ack-attention-again",
+            work,
+            rev(5),
+            DaemonGeneration::new("daemon-attention"),
+        )),
+        Err(CommandError::Conflict { current_revision: Some(revision) }) if revision == rev(5)
+    ));
+}
+
 fn rev(value: u64) -> WorkRevision {
     WorkRevision::new(value)
 }

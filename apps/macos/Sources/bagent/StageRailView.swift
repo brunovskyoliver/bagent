@@ -70,15 +70,23 @@ struct ActivityPeekStageRailView: View {
     }
 
     private func stageLabel(_ stage: StageRailStage) -> some View {
-        Text(stage.rawValue)
-            .font(.caption2.weight(stage == presentation.rail.selectedStage ? .semibold : .regular))
-            .foregroundStyle(
-                stage == presentation.rail.selectedStage
-                    ? NotchWrapMetrics.notchTextPrimary
-                    : NotchWrapMetrics.notchTextSecondary
-            )
-            .opacity(stage == presentation.rail.selectedStage ? 1 : 0.86)
-            .animation(.easeInOut(duration: 0.16), value: presentation.rail.selectedStage)
+        HStack(spacing: 3) {
+            Text(stage.rawValue)
+            if stage == .done, presentation.rail.terminalAttentionMarker != nil {
+                Circle()
+                    .fill(NotchWrapMetrics.notchTextPrimary)
+                    .frame(width: 4, height: 4)
+                    .accessibilityHidden(true)
+            }
+        }
+        .font(.caption2.weight(stage == presentation.rail.selectedStage ? .semibold : .regular))
+        .foregroundStyle(
+            stage == presentation.rail.selectedStage
+                ? NotchWrapMetrics.notchTextPrimary
+                : NotchWrapMetrics.notchTextSecondary
+        )
+        .opacity(stage == presentation.rail.selectedStage ? 1 : 0.86)
+        .animation(.easeInOut(duration: 0.16), value: presentation.rail.selectedStage)
     }
 }
 
@@ -144,20 +152,20 @@ private struct StageRailActivityIcon: View {
             .font(.system(size: 13, weight: .semibold))
             .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
             .frame(width: 18, height: 18)
-            .rotationEffect(rotation)
+            .rotationEffect(rotation, anchor: category == .mail ? .top : .center)
             .offset(y: verticalOffset)
             .scaleEffect(scale)
             .opacity(opacity)
             .animation(animation, value: phase)
             .accessibilityLabel(accessibilityLabel)
-            .onAppear { phase = !reduceMotion }
+            .onAppear { phase = true }
             .onDisappear { phase = false }
             .onChange(of: category) {
                 phase = false
                 phase = !reduceMotion
             }
             .onChange(of: reduceMotion) { _, reduced in
-                phase = !reduced
+                phase = true
             }
     }
 

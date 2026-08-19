@@ -118,7 +118,10 @@ struct NotchWork: Codable, Equatable, Identifiable, Sendable {
     let activity: NotchActivity?
     let queuePosition: Int?
     let automationDisplayName: String?
+    var automationDefinitionIdentity: String? = nil
+    var automationSessionIdentity: String? = nil
     let terminalAttention: NotchTerminalAttention?
+    var terminalOrder: UInt64? = nil
     var claimedOrder: UInt64 = 0
 
     var id: String { identity }
@@ -144,6 +147,7 @@ struct NotchWorkEvent: Codable, Equatable, Sendable {
     let cursor: UInt64
     let daemonGeneration: String
     let work: NotchWork
+    var pendingApprovals: [NotchApproval] = []
     let model: NotchModelPhase
 }
 
@@ -155,6 +159,7 @@ enum NotchLocalIntent: Equatable, Sendable {
     case openAutomations
     case selectAutomation(String)
     case cycleAutomation
+    case motionPreferenceChanged
 }
 
 enum NotchProjectionInput: Equatable, Sendable {
@@ -180,7 +185,19 @@ struct StageRailPresentation: Codable, Equatable, Sendable {
     let activityCategory: NotchActivityCategory?
     let caption: String
     let secondaryCaption: String?
+    let terminalAttentionMarker: NotchTerminalAttention?
     let accessibilityValue: String
+}
+
+enum NotchFocusedDestination: Equatable, Sendable {
+    case currentChat
+    case activeAutomation(definitionIdentity: String)
+    case terminalAutomation(
+        definitionIdentity: String,
+        sessionIdentity: String,
+        workIdentity: String,
+        expectedRevision: UInt64
+    )
 }
 
 struct NotchStatusPillPresentation: Codable, Equatable, Sendable {
@@ -227,7 +244,7 @@ struct NotchMotionPresentation: Codable, Equatable, Sendable {
     }
 }
 
-struct NotchPresentation: Equatable, Sendable {
+struct NotchPresentation: Equatable, Sendable, CustomDebugStringConvertible, CustomReflectable {
     var revision: NotchProjectionRevision
     var interactionMode: NotchInteractionMode
     var rail: StageRailPresentation
@@ -237,7 +254,8 @@ struct NotchPresentation: Equatable, Sendable {
     var focusedWorkIdentity: String?
     var activeAutomationCount: Int
     var runPosition: Int?
-    var canOpenFocusedDestination: Bool
+    var focusedDestination: NotchFocusedDestination?
+    var pendingApprovalIdentity: String?
     var hasActiveForegroundWork: Bool
     fileprivate var snapshot: NotchWorkSnapshot
     fileprivate var selectedAutomationIdentity: String?
@@ -264,6 +282,31 @@ struct NotchPresentation: Equatable, Sendable {
     }
 
     var isExpanded: Bool { interactionMode != .collapsed && interactionMode != .thinking }
+
+    var canOpenFocusedDestination: Bool { focusedDestination != nil }
+
+    var debugDescription: String {
+        "NotchPresentation(cursor: \(revision.cursor), mode: \(interactionMode.rawValue), "
+            + "stage: \(rail.selectedStage?.rawValue ?? "idle"), active: \(activeAutomationCount))"
+    }
+
+    var customMirror: Mirror {
+        Mirror(self, children: [
+            "cursor": revision.cursor,
+            "mode": interactionMode.rawValue,
+            "stage": rail.selectedStage?.rawValue ?? "idle",
+            "activeAutomationCount": activeAutomationCount,
+        ])
+    }
+
+    var privacySafeCaptureMetadata: [String: String] {
+        [
+            "mode": interactionMode.rawValue,
+            "stage": rail.selectedStage?.rawValue ?? "idle",
+            "status": statusPill.label ?? "hidden",
+            "activeCount": String(activeAutomationCount),
+        ]
+    }
 }
 
 enum NotchProjectionError: Error, Equatable {
@@ -289,9 +332,13 @@ enum NotchProjection {
             }
             return render(
                 snapshot: snapshot,
-                mode: resolvedMode(previous.interactionMode, snapshot: snapshot),
+                mode: previous.interactionMode,
                 selectedAutomationIdentity: previous.selectedAutomationIdentity,
-                reduceMotion: reduceMotion
+                reduceMotion: reduceMotion,
+                revealForegroundCompletion: shouldRevealForegroundCompletion(
+                    previous: previous.snapshot,
+                    next: snapshot
+                )
             )
 
         case .event(let event):
@@ -338,14 +385,16 @@ enum NotchProjection {
                 cursor: event.cursor,
                 daemonGeneration: snapshot.daemonGeneration,
                 works: snapshot.works,
-                pendingApprovals: snapshot.pendingApprovals,
+                pendingApprovals: event.pendingApprovals,
                 model: event.model
             )
             return render(
                 snapshot: snapshot,
-                mode: resolvedMode(previous.interactionMode, snapshot: snapshot),
+                mode: previous.interactionMode,
                 selectedAutomationIdentity: previous.selectedAutomationIdentity,
-                reduceMotion: reduceMotion
+                reduceMotion: reduceMotion,
+                revealForegroundCompletion: event.work.origin == .conversation
+                    && [.completed, .partial, .failed].contains(event.work.state)
             )
 
         case .localIntent(let intent):
@@ -367,12 +416,15 @@ enum NotchProjection {
                 } else {
                     selection = active.first?.identity
                 }
+            case .motionPreferenceChanged:
+                break
             }
             return render(
                 snapshot: previous.snapshot,
                 mode: mode,
                 selectedAutomationIdentity: selection,
-                reduceMotion: reduceMotion
+                reduceMotion: reduceMotion,
+                revealForegroundCompletion: false
             )
         }
     }
@@ -381,7 +433,8 @@ enum NotchProjection {
         snapshot: NotchWorkSnapshot,
         mode: NotchInteractionMode,
         selectedAutomationIdentity: String?,
-        reduceMotion: Bool
+        reduceMotion: Bool,
+        revealForegroundCompletion: Bool = false
     ) -> NotchPresentation {
         let active = snapshot.works.filter { !$0.state.isTerminal }
         let activeAutomations = orderedActiveAutomations(snapshot)
@@ -390,11 +443,28 @@ enum NotchProjection {
             .flatMap { selected in activeAutomations.first(where: { $0.identity == selected }) }
             ?? activeAutomations.first
         let terminal = terminalAttentionWork(snapshot)
+        let terminalMarker = highestPriorityTerminalAttention(snapshot)
         let approval = snapshot.pendingApprovals.first
 
         let focused: NotchWork? = approval.flatMap { pending in
             snapshot.works.first(where: { $0.identity == pending.workIdentity })
         } ?? foreground ?? focusedAutomation ?? terminal
+
+        let focusedDestination: NotchFocusedDestination? = {
+            guard approval == nil, let focused else { return nil }
+            if focused.origin == .conversation { return .currentChat }
+            guard let definitionIdentity = focused.automationDefinitionIdentity else { return nil }
+            if focused.terminalAttention != nil,
+               let sessionIdentity = focused.automationSessionIdentity {
+                return .terminalAutomation(
+                    definitionIdentity: definitionIdentity,
+                    sessionIdentity: sessionIdentity,
+                    workIdentity: focused.identity,
+                    expectedRevision: focused.revision
+                )
+            }
+            return .activeAutomation(definitionIdentity: definitionIdentity)
+        }()
 
         let focusedActivityCategory: NotchActivityCategory? = {
             if let category = focused?.activity?.category { return category }
@@ -469,12 +539,19 @@ enum NotchProjection {
         let queueText = focused?.queuePosition.map { "queue position \($0)" }
         let accessibilityParts = [stage?.rawValue, focusedActivityCategory?.label, caption,
                                   focused == nil ? nil : originLabel, runText, activeText, queueText,
-                                  focused?.terminalAttention.map(terminalLabel)]
+                                  focused?.terminalAttention.map(terminalLabel),
+                                  terminalMarker.map { "Done marker: \(terminalLabel($0))" }]
             .compactMap { $0 }
 
         return .init(
             revision: .init(cursor: snapshot.cursor, daemonGeneration: snapshot.daemonGeneration),
-            interactionMode: approval != nil ? .output : resolvedMode(mode, snapshot: snapshot),
+            interactionMode: approval != nil
+                ? .output
+                : resolvedMode(
+                    mode,
+                    snapshot: snapshot,
+                    revealForegroundCompletion: revealForegroundCompletion
+                ),
             rail: .init(
                 selectedStage: stage,
                 activityCategory: focusedActivityCategory,
@@ -482,6 +559,7 @@ enum NotchProjection {
                 secondaryCaption: foreground != nil && !activeAutomations.isEmpty
                     ? "Background work continues"
                     : runText,
+                terminalAttentionMarker: terminalMarker,
                 accessibilityValue: accessibilityParts.joined(separator: ", ")
             ),
             statusPill: .init(
@@ -494,7 +572,8 @@ enum NotchProjection {
             focusedWorkIdentity: focused?.identity,
             activeAutomationCount: activeAutomations.count,
             runPosition: position,
-            canOpenFocusedDestination: focused != nil,
+            focusedDestination: focusedDestination,
+            pendingApprovalIdentity: approval?.identity,
             hasActiveForegroundWork: foreground != nil,
             snapshot: snapshot,
             selectedAutomationIdentity: focusedAutomation?.identity
@@ -503,14 +582,32 @@ enum NotchProjection {
 
     private static func resolvedMode(
         _ requested: NotchInteractionMode,
-        snapshot: NotchWorkSnapshot
+        snapshot: NotchWorkSnapshot,
+        revealForegroundCompletion: Bool
     ) -> NotchInteractionMode {
         if !snapshot.pendingApprovals.isEmpty { return .output }
         if snapshot.works.contains(where: { !$0.state.isTerminal && $0.origin == .conversation }) {
             return requested == .output ? .output : .thinking
         }
+        if revealForegroundCompletion {
+            return .output
+        }
         if requested == .thinking { return .collapsed }
         return requested
+    }
+
+    private static func shouldRevealForegroundCompletion(
+        previous: NotchWorkSnapshot,
+        next: NotchWorkSnapshot
+    ) -> Bool {
+        next.works.contains { nextWork in
+            guard nextWork.origin == .conversation,
+                  [.completed, .partial, .failed].contains(nextWork.state)
+            else { return false }
+            return previous.works.first(where: { $0.identity == nextWork.identity }).map {
+                $0.revision != nextWork.revision || ![.completed, .partial, .failed].contains($0.state)
+            } ?? true
+        }
     }
 
     private static func orderedActiveAutomations(_ snapshot: NotchWorkSnapshot) -> [NotchWork] {
@@ -526,10 +623,21 @@ enum NotchProjection {
         return snapshot.works
             .filter { $0.terminalAttention != nil }
             .sorted {
-                if $0.claimedOrder != $1.claimedOrder { return $0.claimedOrder > $1.claimedOrder }
-                return $0.identity > $1.identity
+                let lhsOrder = $0.terminalOrder ?? 0
+                let rhsOrder = $1.terminalOrder ?? 0
+                if lhsOrder != rhsOrder { return lhsOrder > rhsOrder }
+                return $0.identity < $1.identity
             }
             .first
+    }
+
+    private static func highestPriorityTerminalAttention(
+        _ snapshot: NotchWorkSnapshot
+    ) -> NotchTerminalAttention? {
+        if snapshot.works.contains(where: { $0.terminalAttention == .failed }) { return .failed }
+        if snapshot.works.contains(where: { $0.terminalAttention == .partial }) { return .partial }
+        if snapshot.works.contains(where: { $0.terminalAttention == .unread }) { return .unread }
+        return nil
     }
 
     private static func terminalLabel(_ attention: NotchTerminalAttention?) -> String {
@@ -605,13 +713,24 @@ enum NotchProjectionDecoder {
         }
         try requireOnly(
             dictionary,
-            allowed: ["schemaVersion", "cursor", "daemonGeneration", "work", "model"],
+            allowed: [
+                "schemaVersion", "cursor", "daemonGeneration", "work", "pendingApprovals", "model",
+            ],
             path: "event"
         )
-        guard let work = dictionary["work"] as? [String: Any] else {
+        guard let work = dictionary["work"] as? [String: Any],
+              let approvals = dictionary["pendingApprovals"] as? [[String: Any]]
+        else {
             throw NotchProjectionDecodingError.malformedObject
         }
         try validate(work: work, path: "event.work")
+        for (index, approval) in approvals.enumerated() {
+            try requireOnly(
+                approval,
+                allowed: ["identity", "workIdentity"],
+                path: "event.pendingApprovals[\(index)]"
+            )
+        }
         return try JSONDecoder().decode(NotchWorkEvent.self, from: data)
     }
 
@@ -620,7 +739,8 @@ enum NotchProjectionDecoder {
             work,
             allowed: [
                 "identity", "revision", "origin", "state", "activity", "queuePosition",
-                "automationDisplayName", "terminalAttention", "claimedOrder",
+                "automationDisplayName", "automationDefinitionIdentity", "automationSessionIdentity",
+                "terminalAttention", "terminalOrder", "claimedOrder",
             ],
             path: path
         )

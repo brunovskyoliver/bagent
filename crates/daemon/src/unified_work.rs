@@ -380,6 +380,24 @@ impl UnifiedWorkAuthority {
             .work_revision)
     }
 
+    pub fn acknowledge_attention(
+        &self,
+        command: impl Into<CommandIdentity>,
+        work: WorkIdentity,
+        expected_revision: WorkRevision,
+    ) -> Result<WorkRevision, CommandError> {
+        Ok(self
+            .coordinator
+            .submit(Command::acknowledge_attention(
+                command,
+                work,
+                expected_revision,
+                self.generation.clone(),
+            ))?
+            .receipt()
+            .work_revision)
+    }
+
     pub fn execute_with_adapter(
         &self,
         work: WorkIdentity,
