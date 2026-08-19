@@ -182,12 +182,43 @@ real findings, both repaired here:
 `scripts/acceptance/work-authority.sh` gained a static pairing check (own
 seeded red case): any function under `crates/daemon/src` calling
 `work_authority.admit(` must also call `.release_slot(` somewhere in its own
-body, so a sixth leaked call site cannot land silently again. This raised the
-detector from 10 to 11 forbidden/required categories, all still zero
-findings against production.
+body. This is a co-presence heuristic, not branch coverage or
+cancellation-safety proof — it would not, by itself, have caught the two
+defects below, only a function that calls `admit` and never mentions
+`release_slot` anywhere at all. It still raised the detector from 10 to 11
+forbidden/required categories, all zero findings against production, and is
+worth keeping as a coarse tripwire.
 
-Final exact run (supersedes both earlier timestamps in this document):
-`2026-08-19T13:58:00Z` through `2026-08-19T14:02:50Z`. `cargo test -p
+### Third correction pass: a second independent re-review found a real gap
+
+A second round of Standards/Spec sub-agent review was run against the fixed
+point after the slot-leak fix above (`de1b7fd`). Standards confirmed no new
+hard violations. Spec found the fix above was **incomplete**: `admit()`'s
+five newly-patched early-return branches were correctly fixed, but
+`screen_intent_handler` was — unlike the `chat` handler and
+`execute_automation_run` — a bare axum route handler, not run inside a
+`tokio::spawn`. Axum drops a handler's future mid-flight on client
+disconnect; a disconnect while `classifier.classify(...).await` was pending
+(after `admit()` had already granted the foreground slot) would skip both
+its Ok/Err arms entirely, leaking the slot — the exact deadlock class this
+correction pass set out to close, on a path neither the fix nor its own
+line-by-line re-audit had examined (the audit only searched for
+`return`/`?`, and future-cancellation is neither).
+
+Fixed by wrapping `screen_intent_handler`'s post-admission body in
+`tokio::spawn`, matching the pattern `chat` and `execute_automation_run`
+already use: a spawned task is detached from the connection's future, so
+the client disconnecting cannot cancel it mid-flight; the handler awaits the
+`JoinHandle` and falls back to the existing graceful-degrade response only
+if the task panics (never from the caller side being dropped). `chat`
+(`tokio::spawn` at `main.rs:2161`, wrapping every `admit`/`release_slot`
+call) and `execute_automation_run`'s two callers (`automations_api.rs:953`,
+already inside `tokio::spawn`; `scheduler.rs:247`, itself inside a spawned
+task) were re-confirmed already immune to this vector — `screen_intent_handler`
+was the only one of the three admission call sites that was not.
+
+Final exact run (supersedes all earlier timestamps in this document):
+`2026-08-19T14:04:00Z` through `2026-08-19T14:09:39Z`. `cargo test -p
 bagentd` (all targets): 251 top-level passed, 0 failed, 5 ignored (unchanged
 environment/fixture boundaries), nested restart child 1/1 not
 double-counted. `cargo test --workspace`: 452 test-result lines summed across
@@ -208,7 +239,7 @@ Final artifact hashes:
 | Artifact | SHA-256 |
 |---|---|
 | `crates/daemon/src/unified_work.rs` | `8416257d0c3f88c9c12aa6ecda6b10735fee60411db4dd07bfa11a45a7baf120` |
-| `crates/daemon/src/main.rs` | `0f7300fc101aa7015a23695579e8d1287e19aba47a10dc65bae09cba42f5ce96` |
+| `crates/daemon/src/main.rs` | `80c8f8035131e6d1c1a350d0e1c880fad34677822dbee8bf2b4fc2c1269cc3b0` |
 | `crates/daemon/src/automations_api.rs` | `2d95b13fec2d82177a62281a796ed21416779d9a1b7c68c11948f351c938473b` |
 | `scripts/acceptance/work-authority.sh` | `2c9c3153b53c971650cb4ef8154759529a2210cff3d1d9f36354f571c7eee255` |
 

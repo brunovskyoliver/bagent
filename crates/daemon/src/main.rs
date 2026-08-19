@@ -1349,6 +1349,18 @@ struct ScreenIntentRequest {
 /// Uses `ContextPlanner` as the single source of truth: returns
 /// `{ wants_screen, wants_ocr, wants_selection, task_type }` so the Swift
 /// side can decide what to capture before sending the `/chat` request.
+fn screen_intent_degraded() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "action": "none",
+            "wants_screen": false,
+            "wants_ocr": false,
+            "wants_selection": false
+        })),
+    )
+}
+
 async fn screen_intent_handler(
     State(state): State<AppState>,
     Json(req): Json<ScreenIntentRequest>,
@@ -1369,73 +1381,85 @@ async fn screen_intent_handler(
             )
         }
     };
-    state.work_authority.admit(work_identity.clone()).await;
-    let waiting_revision = state
-        .work_authority
-        .current(&work_identity)
-        .ok()
-        .flatten()
-        .map(|record| record.revision);
-    let running = waiting_revision.and_then(|revision| {
-        state
+    // Runs detached in a spawned task so a client disconnect (axum drops this
+    // handler's future on the response side) cannot cancel execution between
+    // `admit` granting a capacity slot and the terminal `release_slot` — a
+    // dropped future here would otherwise leak the slot forever (`admit` has
+    // no timeout, and the foreground dispatch rule requires
+    // `foreground_running == 0`).
+    let task_state = state.clone();
+    let task_work_identity = work_identity.clone();
+    let task = tokio::spawn(async move {
+        let state = task_state;
+        let work_identity = task_work_identity;
+        state.work_authority.admit(work_identity.clone()).await;
+        let waiting_revision = state
             .work_authority
-            .transition(
-                format!("screen-intent-running:{}", Uuid::new_v4()),
-                work_identity.clone(),
-                revision,
-                WorkState::Running,
-            )
+            .current(&work_identity)
             .ok()
+            .flatten()
+            .map(|record| record.revision);
+        let running = waiting_revision.and_then(|revision| {
+            state
+                .work_authority
+                .transition(
+                    format!("screen-intent-running:{}", Uuid::new_v4()),
+                    work_identity.clone(),
+                    revision,
+                    WorkState::Running,
+                )
+                .ok()
+        });
+        if running.is_none() {
+            // admit() already granted this Work its execution slot; a failed
+            // WaitingForModel/Running lookup or transition still owes a release.
+            state.work_authority.release_slot(&work_identity);
+        }
+        let classifier_runtime: Arc<dyn AgentInference> =
+            Arc::new(state.work_authority.model_runtime(
+                state.model_runtime.clone(),
+                work_identity.clone(),
+                bagentd::unified_work::ExecutionOrigin::Foreground,
+            ));
+        let classifier =
+            ScreenIntentClassifier::new(classifier_runtime, state.classifier_model.clone());
+        match classifier.classify(&req.message, "").await {
+            Ok(intent) => {
+                if let Some(revision) = running {
+                    state.work_authority.release_slot(&work_identity);
+                    let _ = state.work_authority.transition(
+                        format!("screen-intent-complete:{}", Uuid::new_v4()),
+                        work_identity,
+                        revision,
+                        WorkState::Completed,
+                    );
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(&intent).unwrap_or_default()),
+                )
+            }
+            Err(_) => {
+                if let Some(revision) = running {
+                    state.work_authority.release_slot(&work_identity);
+                    let _ = state.work_authority.transition(
+                        format!("screen-intent-failed:{}", Uuid::new_v4()),
+                        work_identity,
+                        revision,
+                        WorkState::Failed,
+                    );
+                }
+                // Graceful degrade — caller treats unknown as "no screen needed"
+                screen_intent_degraded()
+            }
+        }
     });
-    if running.is_none() {
-        // admit() already granted this Work its execution slot; a failed
-        // WaitingForModel/Running lookup or transition still owes a release.
-        state.work_authority.release_slot(&work_identity);
-    }
-    let classifier_runtime: Arc<dyn AgentInference> = Arc::new(state.work_authority.model_runtime(
-        state.model_runtime.clone(),
-        work_identity.clone(),
-        bagentd::unified_work::ExecutionOrigin::Foreground,
-    ));
-    let classifier =
-        ScreenIntentClassifier::new(classifier_runtime, state.classifier_model.clone());
-    match classifier.classify(&req.message, "").await {
-        Ok(intent) => {
-            if let Some(revision) = running {
-                state.work_authority.release_slot(&work_identity);
-                let _ = state.work_authority.transition(
-                    format!("screen-intent-complete:{}", Uuid::new_v4()),
-                    work_identity,
-                    revision,
-                    WorkState::Completed,
-                );
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(&intent).unwrap_or_default()),
-            )
-        }
-        Err(_) => {
-            if let Some(revision) = running {
-                state.work_authority.release_slot(&work_identity);
-                let _ = state.work_authority.transition(
-                    format!("screen-intent-failed:{}", Uuid::new_v4()),
-                    work_identity,
-                    revision,
-                    WorkState::Failed,
-                );
-            }
-            // Graceful degrade — caller treats unknown as "no screen needed"
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "action": "none",
-                    "wants_screen": false,
-                    "wants_ocr": false,
-                    "wants_selection": false
-                })),
-            )
-        }
+    match task.await {
+        Ok(response) => response,
+        // The spawned task already released its slot on every one of its own
+        // exit paths before this join could fail (join only fails on panic,
+        // never on the caller side dropping this outer future).
+        Err(_) => screen_intent_degraded(),
     }
 }
 
