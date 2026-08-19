@@ -350,6 +350,23 @@ impl UnifiedWorkAuthority {
         Ok(revision)
     }
 
+    pub fn terminalize_automation_session(
+        &self,
+        command: impl Into<CommandIdentity>,
+        work: WorkIdentity,
+        revision: WorkRevision,
+        next: WorkState,
+        input: crate::automation_sessions::AutomationTerminalization,
+    ) -> Result<WorkRevision, CommandError> {
+        self.scheduler
+            .lock()
+            .expect("scheduler mutex poisoned")
+            .queue
+            .retain(|queued| queued.work_identity != work);
+        self.coordinator
+            .terminalize_automation_session(command, work, revision, next, input)
+    }
+
     pub fn set_activity(
         &self,
         command: impl Into<CommandIdentity>,

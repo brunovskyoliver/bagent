@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use bagent_automations::{
@@ -33,6 +34,7 @@ pub(crate) enum RepoError {
     NotFound,
     /// Deletion/patch attempted while a run of this automation is active.
     ActiveRun,
+    Immutable,
     Invalid(ScheduleError),
     Db(String),
 }
@@ -63,6 +65,7 @@ fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation> {
     let last_run_status: Option<String> = row.get(10)?;
     Ok(Automation {
         id: AutomationId(Uuid::parse_str(&id).unwrap_or_default()),
+        definition_revision: row.get(12)?,
         name: row.get(1)?,
         prompt: row.get(2)?,
         enabled: row.get::<_, i64>(3)? != 0,
@@ -80,7 +83,7 @@ fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation> {
 }
 
 const AUTOMATION_COLS: &str = "id, name, prompt, enabled, timezone, schedule_json, next_run_at, \
-     created_at, updated_at, last_run_at, last_run_status, last_result_summary";
+     created_at, updated_at, last_run_at, last_run_status, last_result_summary, definition_revision";
 
 /// Validate fields, compute the first occurrence, insert.
 pub(crate) fn repo_create(
@@ -100,6 +103,7 @@ pub(crate) fn repo_create(
     }
     let automation = Automation {
         id: AutomationId::new(),
+        definition_revision: 1,
         name: name.trim().to_string(),
         prompt: prompt.trim().to_string(),
         enabled,
@@ -113,8 +117,8 @@ pub(crate) fn repo_create(
         last_result_summary: None,
     };
     conn.execute(
-        "INSERT INTO automations (id, name, prompt, enabled, timezone, schedule_json, next_run_at, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO automations (id, name, prompt, enabled, timezone, schedule_json, next_run_at, created_at, updated_at, definition_revision) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             automation.id.to_string(),
             automation.name,
@@ -125,8 +129,13 @@ pub(crate) fn repo_create(
             automation.next_run_at.map(ts),
             ts(now),
             ts(now),
+            automation.definition_revision,
         ],
     )?;
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO automation_definitions (automation_identity) VALUES (?1)",
+        params![automation.id.to_string()],
+    );
     Ok(automation)
 }
 
@@ -196,9 +205,10 @@ pub(crate) fn repo_update(
         }
     }
     a.updated_at = now;
+    a.definition_revision += 1;
     let changed = conn.execute(
         "UPDATE automations SET name=?2, prompt=?3, enabled=?4, timezone=?5, schedule_json=?6, \
-         next_run_at=?7, updated_at=?8 WHERE id=?1",
+         next_run_at=?7, updated_at=?8, definition_revision=?9 WHERE id=?1",
         params![
             id,
             a.name,
@@ -208,6 +218,7 @@ pub(crate) fn repo_update(
             serde_json::to_string(&a.schedule).map_err(|e| RepoError::Db(e.to_string()))?,
             a.next_run_at.map(ts),
             ts(now),
+            a.definition_revision,
         ],
     )?;
     if changed == 0 {
@@ -232,7 +243,8 @@ pub(crate) fn repo_set_enabled(
         a.next_run_at
     };
     conn.execute(
-        "UPDATE automations SET enabled=?2, next_run_at=?3, updated_at=?4 WHERE id=?1",
+        "UPDATE automations SET enabled=?2, next_run_at=?3, updated_at=?4,
+         definition_revision=definition_revision + 1 WHERE id=?1",
         params![id, enabled as i64, next_run_at.map(ts), ts(now)],
     )?;
     repo_get(conn, id)
@@ -253,15 +265,13 @@ pub(crate) fn repo_delete(conn: &Connection, id: &str) -> Result<(), RepoError> 
         return Err(RepoError::ActiveRun);
     }
     let changed = conn.execute("DELETE FROM automations WHERE id=?1", params![id])?;
-    // ON DELETE CASCADE needs foreign_keys=ON; enforce manually so run rows
-    // never orphan regardless of connection pragmas.
-    conn.execute(
-        "DELETE FROM automation_runs WHERE automation_id=?1",
-        params![id],
-    )?;
     if changed == 0 {
         return Err(RepoError::NotFound);
     }
+    let _ = conn.execute(
+        "DELETE FROM automation_definitions WHERE automation_identity=?1",
+        params![id],
+    );
     Ok(())
 }
 
@@ -323,7 +333,7 @@ pub(crate) fn repo_run(
 pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<(), RepoError> {
     conn.execute(
         &format!(
-            "INSERT INTO automation_runs ({RUN_COLS}, created_at) \
+            "INSERT OR IGNORE INTO automation_runs ({RUN_COLS}, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
         ),
         params![
@@ -352,6 +362,19 @@ pub(crate) fn repo_finish_run(
     result_summary: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<(), RepoError> {
+    let current_status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM automation_runs WHERE id=?1 AND automation_id=?2",
+            params![run_id, automation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(current_status) = current_status else {
+        return Err(RepoError::NotFound);
+    };
+    if current_status != AutomationRunStatus::Running.as_str() {
+        return Err(RepoError::Immutable);
+    }
     let summary = result_summary.map(policy::clamp_result_summary);
     conn.execute(
         "UPDATE automation_runs SET status=?2, finished_at=?3, result_summary=?4 WHERE id=?1",
@@ -370,9 +393,19 @@ pub(crate) fn repo_finish_run(
 /// pruned here.
 pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<(), RepoError> {
     let deleted = conn.execute(
-        "DELETE FROM automation_runs WHERE automation_id=?1 AND id NOT IN (\
-             SELECT id FROM automation_runs WHERE automation_id=?1 \
-             ORDER BY created_at DESC LIMIT ?2)",
+        "DELETE FROM automation_runs
+         WHERE automation_id=?1
+           AND status <> 'running'
+           AND (julianday(finished_at) < julianday('now', '-90 days') OR id NOT IN (
+             SELECT id FROM automation_runs WHERE automation_id=?1
+             ORDER BY created_at DESC LIMIT ?2
+           ))
+           AND NOT EXISTS (
+             SELECT 1 FROM work_automation_runs wr
+             JOIN work_approvals wa ON wa.work_identity = wr.work_identity
+             WHERE wr.automation_run_identity = automation_runs.id
+               AND wa.state = 'pending'
+           )",
         params![automation_id, policy::RUN_HISTORY_RETAINED as i64],
     )?;
     if deleted > 0 {
@@ -412,6 +445,10 @@ fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
         RepoError::ActiveRun => (
             StatusCode::CONFLICT,
             Json(json!({"error": "automation has an active run"})),
+        ),
+        RepoError::Immutable => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "automation session content is immutable"})),
         ),
         RepoError::Invalid(e) => (
             StatusCode::BAD_REQUEST,
@@ -646,10 +683,118 @@ pub(crate) async fn automation_run(
     }
 }
 
+pub(crate) async fn automation_session_get(
+    State(state): State<AppState>,
+    Path(automation_session_identity): Path<String>,
+) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match read_automation_session(&connection, &automation_session_identity) {
+        Ok(Some(automation_session)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(automation_session).unwrap_or_default()),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "automation session not found" })),
+        ),
+        Err(error) => {
+            tracing::error!(%error, "automation session read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AutomationSessionContinueRequest {
+    current_chat_identity: String,
+    seed: String,
+    confirmed_replacement: bool,
+    command_identity: String,
+}
+
+pub(crate) async fn automation_session_continue(
+    State(state): State<AppState>,
+    Path(automation_session_identity): Path<String>,
+    Json(request): Json<AutomationSessionContinueRequest>,
+) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match continue_automation_session_in_new_chat(
+        &connection,
+        &automation_session_identity,
+        &request.current_chat_identity,
+        &request.seed,
+        request.confirmed_replacement,
+        &request.command_identity,
+    ) {
+        Ok(provenance) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(provenance).unwrap_or_default()),
+        ),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AutomationSessionOpenRequest {
+    command_identity: String,
+    expected_revision: u64,
+}
+
+pub(crate) async fn automation_session_open(
+    State(state): State<AppState>,
+    Path(automation_session_identity): Path<String>,
+    Json(request): Json<AutomationSessionOpenRequest>,
+) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match open_automation_session(
+        &connection,
+        &automation_session_identity,
+        &request.command_identity,
+        request.expected_revision,
+    ) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "viewed": true, "commandIdentity": request.command_identity })),
+        ),
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
+pub(crate) async fn automation_session_delete(
+    State(state): State<AppState>,
+    Path(automation_session_identity): Path<String>,
+) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match delete_automation_session(&connection, &automation_session_identity) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "deleted": true }))),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
 // ── Execution (run-now; the scheduler reuses these in issue #8) ───────────────
 
 use crate::agent_exec::{self, EventSink, ExecError, ExecOrigin, ExecOutcome};
 use bagent_automations::AutomationExecutionContext;
+use bagentd::automation_sessions::{
+    continue_automation_session_in_new_chat, delete_automation_session, open_automation_session,
+    read_automation_session, register_work as register_automation_session_work,
+    AutomationRunOutcome as SessionRunOutcome, AutomationTaskSnapshot, AutomationTerminalization,
+    SafeActivity,
+};
 use basert_connector::Message;
 
 fn is_evidence_event(event: &serde_json::Value) -> bool {
@@ -664,6 +809,23 @@ fn is_evidence_event(event: &serde_json::Value) -> bool {
                 | "evidence_outcome"
         )
     )
+}
+
+fn safe_activity_from_event(event: &serde_json::Value) -> Option<SafeActivity> {
+    let category = match event.get("type").and_then(serde_json::Value::as_str)? {
+        "evidence_phase" => "evidence_phase",
+        "logical_activity_started" => "activity_started",
+        "logical_activity_completed" => "activity_completed",
+        "evidence_validation" => "evidence_validation",
+        "evidence_polish" => "evidence_polish",
+        "evidence_outcome" => "evidence_outcome",
+        _ => return None,
+    };
+    Some(SafeActivity {
+        category: category.to_owned(),
+        caption: "Bezpečná aktivita automatizácie".to_owned(),
+        safety_relevant: category == "activity_completed" || category == "evidence_outcome",
+    })
 }
 
 /// Prepare an occurrence for authoritative admission by Work Coordinator.
@@ -689,7 +851,38 @@ pub(crate) fn repo_claim_run(
     if repo_has_active_run(conn, &automation.id.to_string())? {
         return Err(RepoError::ActiveRun);
     }
+    capture_task_snapshot(conn, automation, &run)?;
+    repo_insert_run(conn, &run)?;
     Ok(run)
+}
+
+/// Freeze the historical definition data before an Automation Run can start.
+/// The snapshot is deliberately keyed by the Automation Session identity so
+/// deleting or editing the live Definition cannot change its history.
+pub(crate) fn capture_task_snapshot(
+    conn: &Connection,
+    automation: &Automation,
+    run: &AutomationRun,
+) -> Result<(), RepoError> {
+    let schedule_json = serde_json::to_string(&automation.schedule)
+        .map_err(|error| RepoError::Db(error.to_string()))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO automation_task_snapshots
+         (automation_session_identity, automation_run_identity, automation_identity,
+          display_name, task_text, schedule_json, timezone, definition_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            format!("automation-session:{}", run.id),
+            run.id.to_string(),
+            automation.id.to_string(),
+            automation.name,
+            automation.prompt,
+            schedule_json,
+            automation.timezone,
+            automation.definition_revision,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Trusted execution context rendered as a system layer. Safety guarantees
@@ -745,9 +938,9 @@ pub(crate) fn outcome_to_status(
                 (AutomationRunStatus::Completed, summary)
             }
         }
-        Err(ExecError::Model(e)) => (
+        Err(ExecError::Model(_)) => (
             AutomationRunStatus::Failed,
-            format!("Model error: {}", e.chars().take(200).collect::<String>()),
+            "Model execution failed.".to_string(),
         ),
         Err(ExecError::SinkClosed) => (
             AutomationRunStatus::Failed,
@@ -768,7 +961,7 @@ pub(crate) async fn execute_automation_run(
         AutomationRunIdentity::new(run.id.to_string()),
         AutomationSessionIdentity::new(format!("automation-session:{}", run.id)),
         AutomationDefinitionIdentity::new(automation.id.to_string()),
-        AutomationDefinitionRevision::new(0),
+        AutomationDefinitionRevision::new(automation.definition_revision.max(0) as u64),
         Utc::now().timestamp().max(0) as u64,
     ) {
         Ok(identity) => identity,
@@ -807,6 +1000,11 @@ pub(crate) async fn execute_automation_run(
     {
         let conn = state.db.lock().await;
         let _ = repo_insert_run(&conn, &run);
+        if let Err(error) =
+            register_automation_session_work(&conn, work_identity.as_str(), &run.id.to_string())
+        {
+            tracing::warn!(%error, "automation session work registration failed");
+        }
     }
     let ctx = AutomationExecutionContext {
         automation_id: automation.id,
@@ -878,8 +1076,15 @@ pub(crate) async fn execute_automation_run(
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
     let sink = EventSink::with_diagnostics(ev_tx, state.evidence_diagnostics.clone());
     let event_state = state.clone();
+    let activity_timeline = Arc::new(Mutex::new(Vec::<SafeActivity>::new()));
+    let activity_timeline_for_drain = activity_timeline.clone();
     let drain = tokio::spawn(async move {
         while let Some(event) = ev_rx.recv().await {
+            if let Some(activity) = safe_activity_from_event(&event) {
+                if let Ok(mut timeline) = activity_timeline_for_drain.lock() {
+                    timeline.push(activity);
+                }
+            }
             if is_evidence_event(&event) {
                 event_state.project_legacy_event(event);
             }
@@ -915,24 +1120,61 @@ pub(crate) async fn execute_automation_run(
         .map(|record| record.revision)
         .unwrap_or(running_revision);
     state.work_authority.release_slot(&work_identity);
-    let _ = state.work_authority.transition(
+    let now = Utc::now();
+    let session_outcome = match status {
+        AutomationRunStatus::Completed => SessionRunOutcome::Completed,
+        AutomationRunStatus::Partial => SessionRunOutcome::Partial,
+        AutomationRunStatus::Failed => SessionRunOutcome::Failed,
+        AutomationRunStatus::Abandoned => SessionRunOutcome::Abandoned,
+        AutomationRunStatus::SkippedOverlap | AutomationRunStatus::SkippedStale => {
+            SessionRunOutcome::Skipped
+        }
+        AutomationRunStatus::Running => SessionRunOutcome::Failed,
+    };
+    let final_output = match &result {
+        Ok(outcome) if !outcome.final_text.trim().is_empty() => Some(outcome.final_text.clone()),
+        _ => None,
+    };
+    let terminalization = AutomationTerminalization {
+        snapshot: AutomationTaskSnapshot {
+            automation_identity: automation.id.to_string(),
+            automation_run_identity: run.id.to_string(),
+            automation_session_identity: format!("automation-session:{}", run.id),
+            display_name: automation.name.clone(),
+            task_text: automation.prompt.clone(),
+            schedule_json: serde_json::to_string(&automation.schedule).unwrap_or_default(),
+            timezone: automation.timezone.clone(),
+            definition_revision: automation.definition_revision,
+        },
+        work_identity: work_identity.to_string(),
+        outcome: session_outcome,
+        finished_at: now.to_rfc3339(),
+        result_summary: Some(summary.clone()),
+        final_output,
+        activity_timeline: activity_timeline
+            .lock()
+            .map(|timeline| timeline.clone())
+            .unwrap_or_default(),
+        validated_sources: Vec::new(),
+        connector_references: Vec::new(),
+        historical_approvals: Vec::new(),
+        truncation_disclosures: Vec::new(),
+    };
+    if let Err(error) = state.work_authority.terminalize_automation_session(
         format!("automation-terminal:{}", run.id),
         work_identity.clone(),
         terminal_revision,
         terminal_state,
-    );
-    let now = Utc::now();
+        terminalization,
+    ) {
+        tracing::error!(%error, "automation Work and session terminalization failed");
+        state.work_authority.release_slot(&work_identity);
+        return;
+    }
     {
         let conn = state.db.lock().await;
-        if let Err(e) = repo_finish_run(
-            &conn,
-            &run.id.to_string(),
-            &automation.id.to_string(),
-            status,
-            Some(&summary),
-            now,
-        ) {
-            tracing::error!("automation run finish persist failed: {e:?}");
+        if let Err(error) = repo_prune_runs(&conn, &automation.id.to_string()) {
+            tracing::warn!(?error, "legacy automation run retention cleanup failed");
         }
     }
     audit_fs(
@@ -1239,12 +1481,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count as usize, policy::RUN_HISTORY_RETAINED);
-        // Deleting after the run finished works and clears history.
+        // Deleting after the run finished detaches the definition but keeps
+        // historical run data for the Automation Session history surface.
         repo_delete(&conn, &id).unwrap();
         let left: i64 = conn
             .query_row("SELECT COUNT(*) FROM automation_runs", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(left, 0);
+        assert_eq!(left, policy::RUN_HISTORY_RETAINED as i64);
     }
 
     #[test]
@@ -1307,7 +1550,7 @@ mod tests {
         let (s, _) = outcome_to_status(&failed);
         assert_eq!(s, AutomationRunStatus::Failed);
 
-        // Persisted summaries are clamped to the 2000-char policy cap.
+        // Persisted summaries are clamped to the 500-character policy cap.
         let long = "x".repeat(5000);
         assert_eq!(
             policy::clamp_result_summary(&long).chars().count(),

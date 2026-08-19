@@ -13,28 +13,12 @@ struct AutomationsNotchContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            header
             switch viewModel.automationsSurface {
-            case .list:
-                listView.transition(.opacity)
-            case .detail:
-                if let a = viewModel.selectedAutomation {
-                    detailView(a).transition(contentTransition)
-                }
-            case .deleteConfirmation:
-                if let a = viewModel.selectedAutomation {
-                    deleteConfirmView(a).transition(contentTransition)
-                }
-            case .editorTask:
-                editorTaskView.transition(contentTransition)
-            case .editorSchedule:
-                editorScheduleView.transition(contentTransition)
-            case .editorRecurrence:
-                editorRecurrenceView.transition(contentTransition)
-            case .editorReview:
-                editorReviewView.transition(contentTransition)
-            case .editorSaving:
-                editorSavingView.transition(.opacity)
+            case .list, .detail, .deleteConfirmation:
+                AutomationSessionSplitView(viewModel: viewModel)
+            case .editorTask, .editorSchedule, .editorRecurrence, .editorReview, .editorSaving:
+                header
+                editorSurface
             }
             if let error = viewModel.automationsError {
                 Text(error)
@@ -46,6 +30,24 @@ struct AutomationsNotchContent: View {
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: viewModel.automationsSurface)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    @ViewBuilder
+    private var editorSurface: some View {
+        switch viewModel.automationsSurface {
+            case .editorTask:
+                editorTaskView.transition(contentTransition)
+            case .editorSchedule:
+                editorScheduleView.transition(contentTransition)
+            case .editorRecurrence:
+                editorRecurrenceView.transition(contentTransition)
+            case .editorReview:
+                editorReviewView.transition(contentTransition)
+            case .editorSaving:
+                editorSavingView.transition(.opacity)
+            case .list, .detail, .deleteConfirmation:
+                EmptyView()
+            }
     }
 
     private var header: some View {
@@ -82,210 +84,6 @@ struct AutomationsNotchContent: View {
         case .editorReview: return "Zhrnutie"
         case .editorSaving: return "Ukladám…"
         }
-    }
-
-    // MARK: List
-
-    private var listView: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            if viewModel.automations.isEmpty {
-                Text("Žiadne automatizácie — pridaj cez +")
-                    .font(.system(size: 11))
-                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                    .padding(.top, 6)
-            } else {
-                // A one-second surface: the next few enabled automations first.
-                ForEach(Array(viewModel.automations.prefix(4).enumerated()), id: \.element.id) { index, a in
-                    listRow(a, selected: index == viewModel.automationsSelectionIndex)
-                        .onTapGesture {
-                            viewModel.automationsSelectionIndex = index
-                            _ = viewModel.openSelectedAutomationDetail()
-                        }
-                }
-            }
-        }
-    }
-
-    private func listRow(_ a: AutomationRecord, selected: Bool) -> some View {
-        HStack(spacing: 7) {
-            Circle()
-                .fill(a.enabled ? Color.white.opacity(0.75) : Color.white.opacity(0.22))
-                .frame(width: 5, height: 5)
-                .accessibilityHidden(true)
-            Text(a.name)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
-                .lineLimit(1)
-            Spacer(minLength: 4)
-            if let glyph = AutomationTimeFormat.statusGlyph(a.lastRunStatus) {
-                Image(systemName: glyph)
-                    .font(.system(size: 9))
-                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                    .accessibilityHidden(true)
-            }
-            Text(a.nextRunLabel ?? a.scheduleLabel)
-                .font(.system(size: 11))
-                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 8)
-        .frame(height: 24)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color.white.opacity(selected ? 0.12 : 0.06))
-        )
-        .contentShape(Rectangle())
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(
-            "Automatizácia \(a.name), \(a.enabled ? "zapnutá" : "vypnutá"), ďalší beh \(a.nextRunLabel ?? "žiadny")")
-        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
-    }
-
-    // MARK: Detail
-
-    private func detailView(_ a: AutomationRecord) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Label(a.scheduleLabel, systemImage: "calendar")
-                    .font(.system(size: 11))
-                Spacer()
-                Text(a.timezone)
-                    .font(.system(size: 9))
-                    .foregroundStyle(NotchWrapMetrics.notchTextFaint)
-                    .accessibilityLabel("Časové pásmo \(a.timezone)")
-            }
-            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-
-            if let next = a.nextRunLabel {
-                Label("ďalší beh \(next)", systemImage: "arrow.forward.circle")
-                    .font(.system(size: 11))
-                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-            }
-
-            if let status = a.lastRunStatus {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 5) {
-                        if let glyph = AutomationTimeFormat.statusGlyph(status) {
-                            Image(systemName: glyph).font(.system(size: 10))
-                        }
-                        Text(lastRunLabel(status: status, at: a.lastRunAt))
-                            .font(.system(size: 11, weight: .medium))
-                    }
-                    .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
-                    if let summary = a.lastResultSummary, !summary.isEmpty {
-                        Text(summary)
-                            .font(.system(size: 11))
-                            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                            .lineLimit(2)
-                            .accessibilityLabel("Posledný výsledok: \(summary)")
-                    }
-                }
-                .padding(6)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
-                .contentShape(Rectangle())
-                // Long results don't belong in the notch — tap reuses the
-                // existing output presentation.
-                .onTapGesture { viewModel.showAutomationResult(a) }
-                .accessibilityAddTraits(.isButton)
-                .accessibilityHint("Zobrazí celý výsledok")
-            }
-
-            if !viewModel.automationDetailRuns.isEmpty {
-                VStack(alignment: .leading, spacing: 1) {
-                    ForEach(viewModel.automationDetailRuns) { run in
-                        HStack(spacing: 5) {
-                            if let glyph = AutomationTimeFormat.statusGlyph(run.status) {
-                                Image(systemName: glyph).font(.system(size: 8))
-                            }
-                            Text(AutomationTimeFormat.shortLocal(run.finishedAt ?? run.scheduledFor) ?? "—")
-                                .font(.system(size: 9))
-                            if run.isManual {
-                                Text("manuálne").font(.system(size: 8))
-                                    .foregroundStyle(NotchWrapMetrics.notchTextFaint)
-                            }
-                            Spacer(minLength: 0)
-                        }
-                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                        .padding(.horizontal, 3)
-                        .background(
-                            "automation-session:\(run.id)" == viewModel.focusedAutomationSessionIdentity
-                                ? Color.white.opacity(0.06)
-                                : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 3)
-                        )
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel("Beh \(run.status), \(AutomationTimeFormat.shortLocal(run.finishedAt ?? run.scheduledFor) ?? "")")
-                        .accessibilityAddTraits(
-                            "automation-session:\(run.id)" == viewModel.focusedAutomationSessionIdentity
-                                ? .isSelected : []
-                        )
-                        .onAppear {
-                            viewModel.acknowledgeFocusedAutomationSessionIfPresented(
-                                runIdentity: run.id
-                            )
-                        }
-                        .onChange(of: viewModel.focusedAutomationSessionIdentity) {
-                            viewModel.acknowledgeFocusedAutomationSessionIfPresented(
-                                runIdentity: run.id
-                            )
-                        }
-                    }
-                }
-            }
-
-            Spacer(minLength: 0)
-
-            HStack(spacing: 6) {
-                detailButton(
-                    a.enabled ? "Vypnúť" : "Zapnúť",
-                    symbol: a.enabled ? "pause" : "play"
-                ) {
-                    viewModel.setAutomationEnabled(a, enabled: !a.enabled)
-                }
-                detailButton("Spustiť", symbol: "bolt") {
-                    viewModel.runAutomationNow(a)
-                }
-                detailButton("Upraviť", symbol: "pencil") {
-                    viewModel.startAutomationEdit(a)
-                }
-                detailButton("Vymazať", symbol: "trash") {
-                    viewModel.automationsSurface = .deleteConfirmation(a.id)
-                }
-            }
-            .disabled(viewModel.automationsBusy)
-        }
-    }
-
-    private func lastRunLabel(status: String, at: String?) -> String {
-        let when = AutomationTimeFormat.shortLocal(at).map { " · \($0)" } ?? ""
-        let name: String
-        switch status {
-        case "completed": name = "dokončené"
-        case "partial": name = "čiastočné"
-        case "failed": name = "zlyhalo"
-        case "abandoned": name = "prerušené"
-        case "running": name = "beží"
-        case "skipped_overlap": name = "preskočené (beh aktívny)"
-        case "skipped_stale": name = "preskočené (zmeškané)"
-        default: name = status
-        }
-        return name + when
-    }
-
-    private func detailButton(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 2) {
-                Image(systemName: symbol).font(.system(size: 10, weight: .medium))
-                Text(title).font(.system(size: 9))
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 5)
-            .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
-        .accessibilityLabel(title)
     }
 
     // MARK: Editor
@@ -594,21 +392,4 @@ struct AutomationsNotchContent: View {
         }
     }
 
-    // MARK: Delete confirmation
-
-    private func deleteConfirmView(_ a: AutomationRecord) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Naozaj vymazať „\(a.name)“?")
-                .font(.system(size: 12))
-                .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
-            HStack(spacing: 8) {
-                pillButton("Zrušiť", accessibility: "Zrušiť vymazanie") {
-                    viewModel.automationsSurface = .detail(a.id)
-                }
-                pillButton("Vymazať", prominent: true, accessibility: "Potvrdiť vymazanie") {
-                    viewModel.deleteAutomation(a)
-                }
-            }
-        }
-    }
 }

@@ -24,8 +24,11 @@ enum NotchWrapMetrics {
     static let cmuxBridgeHeight: CGFloat  = 19   // single caption line, minimal growth
     static let settingsWingWidth: CGFloat   = 205  // /settings surface
     static let settingsBridgeHeight: CGFloat = 252
-    static let automationsWingWidth: CGFloat = 205   // /automations surface
-    static let automationsBridgeHeight: CGFloat = 214
+    /// Automation Session split view: 190 pt master + divider/gutters inside
+    /// the 252 pt bridge. The accepted status pill remains at its Stage 5
+    /// origin because the outer panel geometry is unchanged.
+    static let automationsWingWidth: CGFloat = 248
+    static let automationsBridgeHeight: CGFloat = 252
     /// The setup page carries credentials + the rules editor — it needs the full bridge.
     static let setupBridgeHeight: CGFloat   = 280
     static let slashSuggestionRowHeight: CGFloat = 24  // one command suggestion row

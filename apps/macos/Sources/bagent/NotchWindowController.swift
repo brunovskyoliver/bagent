@@ -383,6 +383,10 @@ final class NotchWindowController: NSObject {
             // advances the editor one step (keyboard equivalent of "Ďalej").
             if self.chatViewModel.notchInteractionMode == .automations {
                 switch event.keyCode {
+                case 123:
+                    if self.chatViewModel.automationsGoBack() { return nil }
+                case 124:
+                    if self.chatViewModel.openSelectedAutomationDetail() { return nil }
                 case 126: if self.chatViewModel.moveAutomationsSelection(by: -1) { return nil }
                 case 125: if self.chatViewModel.moveAutomationsSelection(by: 1) { return nil }
                 case 36:

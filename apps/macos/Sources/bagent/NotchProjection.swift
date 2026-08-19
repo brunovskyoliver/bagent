@@ -119,12 +119,70 @@ struct NotchWork: Codable, Equatable, Identifiable, Sendable {
     let queuePosition: Int?
     let automationDisplayName: String?
     var automationDefinitionIdentity: String? = nil
+    var automationDefinitionDetached: Bool = false
     var automationSessionIdentity: String? = nil
     let terminalAttention: NotchTerminalAttention?
+    var terminalFinishedAt: String? = nil
     var terminalOrder: UInt64? = nil
     var claimedOrder: UInt64 = 0
 
     var id: String { identity }
+
+    enum CodingKeys: String, CodingKey {
+        case identity, revision, origin, state, activity, queuePosition
+        case automationDisplayName, automationDefinitionIdentity, automationDefinitionDetached
+        case automationSessionIdentity, terminalAttention, terminalFinishedAt, terminalOrder, claimedOrder
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        identity = try values.decode(String.self, forKey: .identity)
+        revision = try values.decode(UInt64.self, forKey: .revision)
+        origin = try values.decode(NotchWorkOrigin.self, forKey: .origin)
+        state = try values.decode(NotchWorkState.self, forKey: .state)
+        activity = try values.decodeIfPresent(NotchActivity.self, forKey: .activity)
+        queuePosition = try values.decodeIfPresent(Int.self, forKey: .queuePosition)
+        automationDisplayName = try values.decodeIfPresent(String.self, forKey: .automationDisplayName)
+        automationDefinitionIdentity = try values.decodeIfPresent(String.self, forKey: .automationDefinitionIdentity)
+        automationDefinitionDetached = try values.decodeIfPresent(Bool.self, forKey: .automationDefinitionDetached) ?? false
+        automationSessionIdentity = try values.decodeIfPresent(String.self, forKey: .automationSessionIdentity)
+        terminalAttention = try values.decodeIfPresent(NotchTerminalAttention.self, forKey: .terminalAttention)
+        terminalFinishedAt = try values.decodeIfPresent(String.self, forKey: .terminalFinishedAt)
+        terminalOrder = try values.decodeIfPresent(UInt64.self, forKey: .terminalOrder)
+        claimedOrder = try values.decodeIfPresent(UInt64.self, forKey: .claimedOrder) ?? 0
+    }
+
+    init(
+        identity: String,
+        revision: UInt64,
+        origin: NotchWorkOrigin,
+        state: NotchWorkState,
+        activity: NotchActivity?,
+        queuePosition: Int?,
+        automationDisplayName: String?,
+        automationDefinitionIdentity: String? = nil,
+        automationDefinitionDetached: Bool = false,
+        automationSessionIdentity: String? = nil,
+        terminalAttention: NotchTerminalAttention?,
+        terminalFinishedAt: String? = nil,
+        terminalOrder: UInt64? = nil,
+        claimedOrder: UInt64 = 0
+    ) {
+        self.identity = identity
+        self.revision = revision
+        self.origin = origin
+        self.state = state
+        self.activity = activity
+        self.queuePosition = queuePosition
+        self.automationDisplayName = automationDisplayName
+        self.automationDefinitionIdentity = automationDefinitionIdentity
+        self.automationDefinitionDetached = automationDefinitionDetached
+        self.automationSessionIdentity = automationSessionIdentity
+        self.terminalAttention = terminalAttention
+        self.terminalFinishedAt = terminalFinishedAt
+        self.terminalOrder = terminalOrder
+        self.claimedOrder = claimedOrder
+    }
 }
 
 struct NotchApproval: Codable, Equatable, Identifiable, Sendable {
@@ -262,7 +320,7 @@ struct NotchPresentation: Equatable, Sendable, CustomDebugStringConvertible, Cus
     var focusedDestination: NotchFocusedDestination?
     var pendingApprovalIdentity: String?
     var hasActiveForegroundWork: Bool
-    fileprivate var snapshot: NotchWorkSnapshot
+    var snapshot: NotchWorkSnapshot
     fileprivate var selectedAutomationIdentity: String?
 
     static let idle: Self = {
@@ -747,7 +805,8 @@ enum NotchProjectionDecoder {
             allowed: [
                 "identity", "revision", "origin", "state", "activity", "queuePosition",
                 "automationDisplayName", "automationDefinitionIdentity", "automationSessionIdentity",
-                "terminalAttention", "terminalOrder", "claimedOrder",
+                "automationDefinitionDetached",
+                "terminalAttention", "terminalFinishedAt", "terminalOrder", "claimedOrder",
             ],
             path: path
         )

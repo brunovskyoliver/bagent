@@ -24,8 +24,14 @@ use bagent_automations::{
     MissedRunDecision,
 };
 
-use crate::automations_api::{repo_claim_run, repo_get, repo_insert_run, RepoError};
+use crate::automations_api::{
+    capture_task_snapshot, repo_claim_run, repo_get, repo_insert_run, RepoError,
+};
 use crate::AppState;
+use bagentd::automation_sessions::{
+    register_work as register_automation_session_work, terminalize_automation_session,
+    AutomationRunOutcome as SessionRunOutcome, AutomationTaskSnapshot, AutomationTerminalization,
+};
 
 /// Considered a catch-up when the scheduled instant is further in the past
 /// than this (restart / wake), as opposed to normal dispatch latency.
@@ -34,6 +40,7 @@ const CATCH_UP_LATENCY: ChronoDuration = ChronoDuration::minutes(5);
 const MAX_SLEEP_CHUNK_SECS: u64 = 60;
 /// Idle sleep when nothing is scheduled (Notify still wakes immediately).
 const IDLE_SLEEP_SECS: u64 = 3600;
+const RETENTION_MAINTENANCE_SECS: u64 = 3600;
 
 fn audit(conn: &Connection, action: &str, meta: serde_json::Value) {
     let _ = conn.execute(
@@ -80,7 +87,52 @@ fn record_skip(
         is_catch_up: false,
         is_manual: false,
     };
-    let _ = repo_insert_run(conn, &run);
+    if repo_insert_run(conn, &run).is_ok() {
+        let _ = capture_task_snapshot(conn, a, &run);
+        let work_identity = format!("automation-scheduler-skip:{}", run.id);
+        if register_automation_session_work(conn, &work_identity, &run.id.to_string()).is_ok() {
+            let reason = status.as_str().to_owned();
+            let terminalization = AutomationTerminalization {
+                snapshot: AutomationTaskSnapshot {
+                    automation_identity: a.id.to_string(),
+                    automation_run_identity: run.id.to_string(),
+                    automation_session_identity: format!("automation-session:{}", run.id),
+                    display_name: a.name.clone(),
+                    task_text: a.prompt.clone(),
+                    schedule_json: serde_json::to_string(&a.schedule).unwrap_or_default(),
+                    timezone: a.timezone.clone(),
+                    definition_revision: a.definition_revision,
+                },
+                work_identity,
+                outcome: SessionRunOutcome::Skipped,
+                finished_at: now.to_rfc3339(),
+                result_summary: Some(format!("Scheduler: {reason}")),
+                final_output: None,
+                activity_timeline: Vec::new(),
+                validated_sources: Vec::new(),
+                connector_references: Vec::new(),
+                historical_approvals: Vec::new(),
+                truncation_disclosures: Vec::new(),
+            };
+            match terminalize_automation_session(conn, terminalization) {
+                Ok(()) => {
+                    let _ = conn.execute(
+                        "UPDATE automations SET last_run_at=?1, last_run_status=?2,
+                         last_result_summary=?3 WHERE id=?4",
+                        params![
+                            now.to_rfc3339(),
+                            reason,
+                            format!("Scheduler: {reason}"),
+                            a.id.to_string()
+                        ],
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(?error, "scheduler skip session terminalization failed")
+                }
+            }
+        }
+    }
 }
 
 /// Outcome of one scheduling pass: work to execute plus prebuilt daemon
@@ -231,10 +283,32 @@ fn next_due_at(conn: &Connection) -> Option<DateTime<Utc>> {
 /// The scheduler task. Runs until the daemon exits; a run in flight at
 /// shutdown is recovered as `abandoned` on the next start.
 pub(crate) async fn run_scheduler(state: AppState) {
+    {
+        let conn = state.db.lock().await;
+        if let Err(error) = bagentd::automation_sessions::prune_all_automation_sessions(
+            &conn,
+            &Utc::now().to_rfc3339(),
+        ) {
+            tracing::warn!(
+                ?error,
+                "Automation Session startup retention cleanup failed"
+            );
+        }
+    }
     loop {
         let pass = {
             let conn = state.db.lock().await;
-            scheduler_step(&conn, Utc::now())
+            let pass = scheduler_step(&conn, Utc::now());
+            if let Err(error) = bagentd::automation_sessions::prune_all_automation_sessions(
+                &conn,
+                &Utc::now().to_rfc3339(),
+            ) {
+                tracing::warn!(
+                    ?error,
+                    "Automation Session periodic retention cleanup failed"
+                );
+            }
+            pass
         };
         for event in pass.events {
             state.project_legacy_event(event);
@@ -253,9 +327,9 @@ pub(crate) async fn run_scheduler(state: AppState) {
             match next_due_at(&conn) {
                 Some(t) => {
                     let until = (t - Utc::now()).num_seconds().max(0) as u64;
-                    until.clamp(1, MAX_SLEEP_CHUNK_SECS)
+                    until.clamp(1, MAX_SLEEP_CHUNK_SECS.min(RETENTION_MAINTENANCE_SECS))
                 }
-                None => IDLE_SLEEP_SECS,
+                None => IDLE_SLEEP_SECS.min(RETENTION_MAINTENANCE_SECS),
             }
         };
         tokio::select! {
@@ -352,6 +426,29 @@ mod tests {
         assert_eq!(
             repo_get(&conn, &a.id.to_string()).unwrap().next_run_at,
             None
+        );
+        let skipped_session: (String, String) = conn
+            .query_row(
+                "SELECT s.outcome, s.result_summary
+                 FROM automation_sessions s
+                 JOIN automation_task_snapshots t
+                   ON t.automation_session_identity=s.automation_session_identity
+                 WHERE t.automation_identity=?1",
+                params![a.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(skipped_session.0, "skipped");
+        assert!(skipped_session.1.contains("skipped_stale"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT attention_state FROM automation_session_attention
+                 WHERE automation_session_identity LIKE 'automation-session:%'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "none"
         );
     }
 

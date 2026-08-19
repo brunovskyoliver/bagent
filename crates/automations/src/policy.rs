@@ -47,7 +47,7 @@ pub const FAILURE_POLICY: FailurePolicy = FailurePolicy::AdvanceToNextOccurrence
 pub const MAX_CONCURRENT_RUNS: usize = 2;
 
 /// Result summaries are truncated to this many characters before persistence.
-pub const MAX_RESULT_SUMMARY_CHARS: usize = 2000;
+pub const MAX_RESULT_SUMMARY_CHARS: usize = 500;
 
 /// Terminal runs kept per automation; older rows are pruned (audit log rows
 /// are append-only and never pruned).

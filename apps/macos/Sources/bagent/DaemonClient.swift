@@ -1156,6 +1156,84 @@ struct DaemonClient: Sendable, NotchEventTransport {
         return try JSONDecoder().decode(Response.self, from: data).run
     }
 
+    func automationSession(identity: String) async throws -> AutomationSessionRecord {
+        let c = try await loadCreds()
+        let path = "/automation-sessions/\(identity)"
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest(path, creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.badStatus
+        }
+        return try JSONDecoder().decode(AutomationSessionRecord.self, from: data)
+    }
+
+    func openAutomationSession(
+        identity: String,
+        commandIdentity: String,
+        expectedRevision: UInt64
+    ) async throws {
+        struct Body: Encodable {
+            let commandIdentity: String
+            let expectedRevision: UInt64
+        }
+        let credentials = try await loadCreds()
+        var request = authedRequest("/automation-sessions/\(identity)/open", creds: credentials)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(commandIdentity: commandIdentity, expectedRevision: expectedRevision))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            throw DaemonError.serverError(serverErrorMessage(from: data))
+        }
+    }
+
+    func continueAutomationSession(
+        identity: String,
+        currentChatIdentity: String,
+        seed: String,
+        confirmedReplacement: Bool,
+        commandIdentity: String
+    ) async throws -> AutomationContinuationProvenance {
+        let body = ContinueAutomationSessionBody(
+            currentChatIdentity: currentChatIdentity,
+            seed: seed,
+            confirmedReplacement: confirmedReplacement,
+            commandIdentity: commandIdentity)
+        let c = try await loadCreds()
+        var request = authedRequest(
+            "/automation-sessions/\(identity)/continue", creds: c)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            throw DaemonError.serverError(serverErrorMessage(from: data))
+        }
+        return try JSONDecoder().decode(AutomationContinuationProvenance.self, from: data)
+    }
+
+    func deleteAutomationSession(identity: String) async throws {
+        try await automationAction(
+            path: "/automation-sessions/\(identity)", method: "DELETE")
+    }
+
+    private struct ContinueAutomationSessionBody: Encodable {
+        let currentChatIdentity: String
+        let seed: String
+        let confirmedReplacement: Bool
+        let commandIdentity: String
+
+        enum CodingKeys: String, CodingKey {
+            case currentChatIdentity = "currentChatIdentity"
+            case seed
+            case confirmedReplacement = "confirmedReplacement"
+            case commandIdentity = "commandIdentity"
+        }
+    }
+
     // MARK: - Approvals
 
     func pendingApprovals() async throws -> [ApprovalItem] {

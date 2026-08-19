@@ -5,11 +5,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::VecDeque, fmt, path::Path, sync::Mutex};
 
+use crate::automation_sessions::{
+    terminalize_automation_session_in_transaction, AutomationRunOutcome, AutomationTaskSnapshot,
+    AutomationTerminalization,
+};
+
 const SCHEMA: &str = include_str!("../migrations/V15__work_coordinator_foundations.sql");
 const CUTOVER_SCHEMA: &str = include_str!("../migrations/V16__unified_work_cutover.sql");
 const ACTIVITY_SCHEMA: &str = include_str!("../migrations/V17__work_activity_projection.sql");
 const NOTCH_PROJECTION_INDEXES: &str =
     include_str!("../migrations/V18__notch_projection_indexes.sql");
+const AUTOMATION_SESSION_SCHEMA: &str =
+    include_str!("../migrations/V19__automation_session_contract.sql");
 const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -969,6 +976,9 @@ impl WorkCoordinator {
         connection
             .execute_batch(NOTCH_PROJECTION_INDEXES)
             .map_err(CommandError::storage)?;
+        connection
+            .execute_batch(AUTOMATION_SESSION_SCHEMA)
+            .map_err(CommandError::storage)?;
         initialize_generation(
             &connection,
             &generation,
@@ -984,6 +994,80 @@ impl WorkCoordinator {
 
     pub fn submit(&self, command: Command) -> Result<CommandAcknowledgement, CommandError> {
         self.submit_with_optional_failure(command, None)
+    }
+
+    /// Terminalize an Automation Session and its Work in one SQLite
+    /// transaction. The ordinary transition command is intentionally not
+    /// used here: session content and the Work terminal mutation have one
+    /// rollback boundary.
+    pub fn terminalize_automation_session(
+        &self,
+        command_identity: impl Into<CommandIdentity>,
+        work: WorkIdentity,
+        revision: WorkRevision,
+        next_state: WorkState,
+        input: crate::automation_sessions::AutomationTerminalization,
+    ) -> Result<WorkRevision, CommandError> {
+        if !next_state.is_terminal() {
+            return Err(CommandError::IllegalTransition {
+                from: WorkState::Running,
+                to: next_state,
+            });
+        }
+        let mut connection = self.connection.lock().expect("coordinator mutex poisoned");
+        let generation = metadata(&connection, "daemon_generation")?
+            .ok_or_else(|| CommandError::CorruptState("missing daemon generation".to_owned()))?;
+        let committed_at = self
+            .dependencies
+            .lock()
+            .expect("dependency mutex poisoned")
+            .clock
+            .now();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(CommandError::storage)?;
+        let command = Command::transition(
+            command_identity,
+            work.clone(),
+            revision,
+            next_state,
+            DaemonGeneration::new(generation.clone()),
+        );
+        let (work_identity, next_revision, state, event_kind) =
+            apply_command(&transaction, &command, None, &committed_at)?;
+        if input.work_identity != work_identity.as_str() {
+            return Err(CommandError::Conflict {
+                current_revision: Some(next_revision),
+            });
+        }
+        crate::automation_sessions::terminalize_automation_session_in_transaction(
+            &transaction,
+            input,
+        )
+        .map_err(|error| CommandError::Storage(error.to_string()))?;
+        let activity = load_work_activity(&transaction, &work_identity)?;
+        let payload = serde_json::json!({ "state": state, "activity": activity });
+        transaction
+            .execute(
+                "INSERT INTO work_event_outbox
+                    (schema_version, daemon_generation, committed_at, event_kind, work_identity, work_revision, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    SCHEMA_VERSION,
+                    generation,
+                    committed_at,
+                    event_kind.as_str(),
+                    work_identity.as_str(),
+                    next_revision.value(),
+                    payload.to_string()
+                ],
+            )
+            .map_err(CommandError::storage)?;
+        let cursor = EventCursor::new(transaction.last_insert_rowid() as u64);
+        set_metadata(&transaction, "event_cursor", &cursor.value().to_string())?;
+        prune_events(&transaction, self.config.max_events)?;
+        transaction.commit().map_err(CommandError::storage)?;
+        Ok(next_revision)
     }
 
     pub fn submit_with_failure(
@@ -1368,6 +1452,115 @@ fn initialize_generation(
                     params![work_identity],
                 )
                 .map_err(CommandError::storage)?;
+            if origin_kind == "automation" {
+                let session = transaction
+                    .query_row(
+                        "SELECT r.automation_run_identity, r.automation_session_identity,
+                                r.historical_automation_identity,
+                                COALESCE(t.display_name, a.name),
+                                t.task_text, t.schedule_json, t.timezone,
+                                COALESCE(t.definition_revision, r.frozen_definition_revision)
+                         FROM work_automation_runs r
+                         LEFT JOIN automation_task_snapshots t
+                           ON t.automation_session_identity=r.automation_session_identity
+                         LEFT JOIN automations a
+                           ON a.id=r.historical_automation_identity
+                         WHERE r.work_identity=?1",
+                        params![work_identity],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, Option<String>>(5)?,
+                                row.get::<_, Option<String>>(6)?,
+                                row.get::<_, i64>(7)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(CommandError::storage)?
+                    .ok_or_else(|| {
+                        CommandError::CorruptState(
+                            "automation Work is missing its Run linkage".to_owned(),
+                        )
+                    })?;
+                let (
+                    run_identity,
+                    session_identity,
+                    definition_identity,
+                    display_name,
+                    task_text,
+                    schedule_json,
+                    timezone,
+                    definition_revision,
+                ) = session;
+                let display_name = display_name.ok_or_else(|| {
+                    CommandError::CorruptState(
+                        "automation Work is missing its historical display name".to_owned(),
+                    )
+                })?;
+                let task_text = task_text.ok_or_else(|| {
+                    CommandError::CorruptState(
+                        "automation Work is missing its immutable Task Snapshot".to_owned(),
+                    )
+                })?;
+                let schedule_json = schedule_json.ok_or_else(|| {
+                    CommandError::CorruptState(
+                        "automation Work is missing its immutable schedule snapshot".to_owned(),
+                    )
+                })?;
+                let timezone = timezone.ok_or_else(|| {
+                    CommandError::CorruptState(
+                        "automation Work is missing its immutable time zone snapshot".to_owned(),
+                    )
+                })?;
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO automation_work_states
+                            (work_identity, automation_run_identity, state)
+                         VALUES (?1, ?2, 'running')",
+                        params![work_identity, run_identity],
+                    )
+                    .map_err(CommandError::storage)?;
+                terminalize_automation_session_in_transaction(
+                    &transaction,
+                    AutomationTerminalization {
+                        snapshot: AutomationTaskSnapshot {
+                            automation_identity: definition_identity,
+                            automation_run_identity: run_identity,
+                            automation_session_identity: session_identity.clone(),
+                            display_name,
+                            task_text,
+                            schedule_json,
+                            timezone,
+                            definition_revision,
+                        },
+                        work_identity: work_identity.clone(),
+                        outcome: AutomationRunOutcome::Abandoned,
+                        finished_at: committed_at.clone(),
+                        result_summary: Some(
+                            "Daemon sa reštartoval pred dokončením Automation Run.".to_owned(),
+                        ),
+                        final_output: None,
+                        activity_timeline: Vec::new(),
+                        validated_sources: Vec::new(),
+                        connector_references: Vec::new(),
+                        historical_approvals: Vec::new(),
+                        truncation_disclosures: Vec::new(),
+                    },
+                )
+                .map_err(|error| CommandError::Storage(error.to_string()))?;
+                transaction
+                    .execute(
+                        "UPDATE work_automation_sessions SET attention_state='unread'
+                         WHERE automation_session_identity=?1",
+                        params![session_identity],
+                    )
+                    .map_err(CommandError::storage)?;
+            }
             if origin_kind == "conversation" {
                 transaction
                     .execute(
@@ -1599,7 +1792,11 @@ fn apply_command(
                     .map_err(CommandError::storage)?;
                 let attention_state = matches!(
                     *next_state,
-                    WorkState::Completed | WorkState::Partial | WorkState::Failed
+                    WorkState::Completed
+                        | WorkState::Partial
+                        | WorkState::Failed
+                        | WorkState::Cancelled
+                        | WorkState::Abandoned
                 )
                 .then_some("unread")
                 .unwrap_or("none");
@@ -1644,7 +1841,11 @@ fn apply_command(
             }
             if !matches!(
                 current_state,
-                WorkState::Completed | WorkState::Partial | WorkState::Failed
+                WorkState::Completed
+                    | WorkState::Partial
+                    | WorkState::Failed
+                    | WorkState::Cancelled
+                    | WorkState::Abandoned
             ) {
                 return Err(CommandError::TerminalTarget);
             }
@@ -2161,38 +2362,14 @@ fn notch_snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandE
                  SELECT identity FROM works
                  WHERE state NOT IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
                  UNION
-                 SELECT work_identity FROM (
-                     SELECT r.work_identity
-                     FROM works w
-                     JOIN work_automation_runs r ON r.work_identity = w.identity
-                     JOIN work_automation_sessions s
-                       ON s.automation_session_identity = r.automation_session_identity
-                     WHERE w.origin_kind = 'automation' AND w.state = 'failed'
-                       AND s.attention_state = 'unread'
-                     ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
-                 )
-                 UNION
-                 SELECT work_identity FROM (
-                     SELECT r.work_identity
-                     FROM works w
-                     JOIN work_automation_runs r ON r.work_identity = w.identity
-                     JOIN work_automation_sessions s
-                       ON s.automation_session_identity = r.automation_session_identity
-                     WHERE w.origin_kind = 'automation' AND w.state = 'partial'
-                       AND s.attention_state = 'unread'
-                     ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
-                 )
-                 UNION
-                 SELECT work_identity FROM (
-                     SELECT r.work_identity
-                     FROM works w
-                     JOIN work_automation_runs r ON r.work_identity = w.identity
-                     JOIN work_automation_sessions s
-                       ON s.automation_session_identity = r.automation_session_identity
-                     WHERE w.origin_kind = 'automation' AND w.state = 'completed'
-                       AND s.attention_state = 'unread'
-                     ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
-                 )
+                 SELECT r.work_identity
+                 FROM works w
+                 JOIN work_automation_runs r ON r.work_identity = w.identity
+                 JOIN work_automation_sessions s
+                   ON s.automation_session_identity = r.automation_session_identity
+                 WHERE w.origin_kind = 'automation'
+                   AND w.state IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
+                   AND s.attention_state = 'unread'
                  UNION
                  SELECT identity FROM (
                      SELECT identity FROM works

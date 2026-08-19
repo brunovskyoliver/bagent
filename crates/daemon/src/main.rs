@@ -768,6 +768,19 @@ async fn main() -> Result<()> {
             "/automations/:id/runs/:run_id",
             get(automations_api::automation_run),
         )
+        .route(
+            "/automation-sessions/:automation_session_identity",
+            get(automations_api::automation_session_get)
+                .delete(automations_api::automation_session_delete),
+        )
+        .route(
+            "/automation-sessions/:automation_session_identity/open",
+            post(automations_api::automation_session_open),
+        )
+        .route(
+            "/automation-sessions/:automation_session_identity/continue",
+            post(automations_api::automation_session_continue),
+        )
         // Phase 4B — Sessions
         .route("/sessions", post(session_create).get(sessions_list))
         .route("/sessions/:id/turns", get(session_turns))
@@ -2157,7 +2170,9 @@ struct NotchProjectionContext {
     automation_names: HashMap<String, String>,
     automation_definition_identities: HashMap<String, String>,
     automation_session_identities: HashMap<String, String>,
+    automation_detached: HashMap<String, bool>,
     terminal_attention: HashMap<String, &'static str>,
+    terminal_finished_at: HashMap<String, String>,
     terminal_orders: HashMap<String, u64>,
     queue_positions: HashMap<String, u64>,
     claimed_orders: HashMap<String, u64>,
@@ -2187,12 +2202,16 @@ fn authoritative_notch_snapshot(
 }
 
 const NOTCH_PROJECTION_CONTEXT_SQL: &str =
-    "SELECT w.identity, w.rowid, a.name, r.historical_automation_identity,
-            r.automation_session_identity, s.attention_state, w.state, w.updated_at
+    "SELECT w.identity, w.rowid, COALESCE(a.name, t.display_name),
+            a.id IS NULL AND t.display_name IS NOT NULL,
+            r.historical_automation_identity, r.automation_session_identity,
+            s.attention_state, w.state, w.updated_at
      FROM json_each(?1) projected
      JOIN works w ON w.identity = projected.value
      LEFT JOIN work_automation_runs r ON r.work_identity = w.identity
      LEFT JOIN automations a ON a.id = r.historical_automation_identity
+     LEFT JOIN automation_task_snapshots t
+       ON t.automation_session_identity = r.automation_session_identity
      LEFT JOIN work_automation_sessions s
        ON s.automation_session_identity = r.automation_session_identity
      ORDER BY w.identity ASC";
@@ -2205,7 +2224,9 @@ fn notch_projection_context(
     let mut automation_names = HashMap::new();
     let mut automation_definition_identities = HashMap::new();
     let mut automation_session_identities = HashMap::new();
+    let mut automation_detached = HashMap::new();
     let mut terminal_attention = HashMap::new();
+    let mut terminal_finished_at = HashMap::new();
     let mut terminal_orders = HashMap::new();
     let mut queue_positions = HashMap::new();
     let mut claimed_orders = HashMap::new();
@@ -2221,11 +2242,12 @@ fn notch_projection_context(
             row.get::<_, String>(0)?,
             row.get::<_, u64>(1)?,
             row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
+            row.get::<_, bool>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
-            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(6)?,
             row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
         ))
     })?;
     let mut terminal_candidates = Vec::new();
@@ -2234,6 +2256,7 @@ fn notch_projection_context(
             identity,
             claimed_order,
             automation_name,
+            detached,
             definition_identity,
             session_identity,
             attention_state,
@@ -2244,24 +2267,36 @@ fn notch_projection_context(
         if let Some(name) = automation_name {
             automation_names.insert(identity.clone(), name);
         }
+        automation_detached.insert(identity.clone(), detached);
         if let Some(definition_identity) = definition_identity {
             automation_definition_identities.insert(identity.clone(), definition_identity);
         }
         if let Some(session_identity) = session_identity {
             automation_session_identities.insert(identity.clone(), session_identity);
         }
+        if state.as_str() == "completed"
+            || state.as_str() == "partial"
+            || state.as_str() == "failed"
+            || state.as_str() == "cancelled"
+            || state.as_str() == "abandoned"
+        {
+            terminal_finished_at.insert(identity.clone(), updated_at.clone());
+        }
         if attention_state.as_deref() == Some("unread") {
             let attention = match state.as_str() {
                 "failed" => Some("failed"),
                 "partial" => Some("partial"),
-                "completed" => Some("unread"),
+                "completed" | "cancelled" | "abandoned" => Some("unread"),
                 _ => None,
             };
             if let Some(attention) = attention {
                 terminal_attention.insert(identity.clone(), attention);
             }
         }
-        if matches!(state.as_str(), "completed" | "partial" | "failed") {
+        if matches!(
+            state.as_str(),
+            "completed" | "partial" | "failed" | "cancelled" | "abandoned"
+        ) {
             terminal_candidates.push((updated_at, identity));
         }
     }
@@ -2300,7 +2335,9 @@ fn notch_projection_context(
         automation_names,
         automation_definition_identities,
         automation_session_identities,
+        automation_detached,
         terminal_attention,
+        terminal_finished_at,
         terminal_orders,
         queue_positions,
         claimed_orders,
@@ -2363,8 +2400,10 @@ fn notch_work_value(
         "queuePosition": context.queue_positions.get(work.identity.as_str()),
         "automationDisplayName": context.automation_names.get(work.identity.as_str()),
         "automationDefinitionIdentity": context.automation_definition_identities.get(work.identity.as_str()),
+        "automationDefinitionDetached": context.automation_detached.get(work.identity.as_str()).copied().unwrap_or(false),
         "automationSessionIdentity": context.automation_session_identities.get(work.identity.as_str()),
         "terminalAttention": context.terminal_attention.get(work.identity.as_str()),
+        "terminalFinishedAt": context.terminal_finished_at.get(work.identity.as_str()),
         "terminalOrder": context.terminal_orders.get(work.identity.as_str()),
         "claimedOrder": context.claimed_orders.get(work.identity.as_str()).copied().unwrap_or(claimed_order),
     })
@@ -4928,6 +4967,10 @@ mod tests {
                  automation_session_identity TEXT
              );
              CREATE TABLE automations (id TEXT PRIMARY KEY, name TEXT);
+             CREATE TABLE automation_task_snapshots (
+                 automation_session_identity TEXT PRIMARY KEY,
+                 display_name TEXT
+             );
              CREATE TABLE work_automation_sessions (
                  automation_session_identity TEXT,
                  attention_state TEXT
@@ -5023,7 +5066,9 @@ mod tests {
             automation_names: HashMap::new(),
             automation_definition_identities: HashMap::new(),
             automation_session_identities: HashMap::new(),
+            automation_detached: HashMap::new(),
             terminal_attention: HashMap::new(),
+            terminal_finished_at: HashMap::new(),
             terminal_orders: HashMap::new(),
             queue_positions: HashMap::new(),
             claimed_orders: HashMap::from([("opaque-work".to_owned(), 1)]),
@@ -5044,8 +5089,10 @@ mod tests {
             "queuePosition",
             "automationDisplayName",
             "automationDefinitionIdentity",
+            "automationDefinitionDetached",
             "automationSessionIdentity",
             "terminalAttention",
+            "terminalFinishedAt",
             "terminalOrder",
             "claimedOrder",
         ]
@@ -5117,7 +5164,9 @@ mod tests {
                 "work-terminal".to_owned(),
                 "session-terminal".to_owned(),
             )]),
+            automation_detached: HashMap::new(),
             terminal_attention: HashMap::from([("work-terminal".to_owned(), "failed")]),
+            terminal_finished_at: HashMap::new(),
             terminal_orders: HashMap::from([("work-terminal".to_owned(), 12)]),
             queue_positions: HashMap::new(),
             claimed_orders: HashMap::from([("work-terminal".to_owned(), 1)]),

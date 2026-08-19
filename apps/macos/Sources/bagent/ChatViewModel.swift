@@ -481,6 +481,10 @@ final class ChatViewModel: ObservableObject {
         }
     }
     @Published var automations: [AutomationRecord] = []
+    @Published var automationSessionNavigator = AutomationSplitViewNavigator(
+        projection: AutomationSplitViewProjection.make(active: [], unreadTerminal: []))
+    @Published var automationSessionDetail: AutomationSessionRecord?
+    @Published var automationContinuationConfirmation: AutomationContinuationConfirmation?
     @Published var automationsSelectionIndex: Int = 0
     @Published var automationsError: String? = nil
     /// True while a run-now/enable/delete request is in flight.
@@ -495,6 +499,9 @@ final class ChatViewModel: ObservableObject {
         automationsError = nil
         focusedAutomationSessionIdentity = nil
         pendingTerminalAcknowledgement = nil
+        automationContinuationConfirmation = nil
+        automationSessionNavigator.resetToSplit()
+        refreshAutomationSessionProjection()
         applyNotchIntent(.openAutomations)
         Task { await refreshAutomations() }
     }
@@ -523,11 +530,10 @@ final class ChatViewModel: ObservableObject {
             }
             switch automationsSurface {
             case .detail(let id), .deleteConfirmation(let id):
-                if !automations.contains(where: { $0.id == id }) {
-                    automationsSurface = .list
-                } else if case .detail = automationsSurface {
-                    loadAutomationDetailRuns(id)
-                }
+                // The split view's detail identity is an Automation Session,
+                // not an Automation Definition. Keep it open while the
+                // definition list refreshes.
+                _ = id
             case .list, .editorTask, .editorSchedule, .editorRecurrence, .editorReview,
                  .editorSaving:
                 // Editor keeps its draft through concurrent SSE updates; an
@@ -537,10 +543,33 @@ final class ChatViewModel: ObservableObject {
         } catch {
             automationsError = "Daemon nedostupný"
         }
+        refreshAutomationSessionProjection()
     }
 
-    /// Recent runs shown on the detail page (fetched on entry + on events).
-    @Published var automationDetailRuns: [AutomationRunRecord] = []
+    func refreshAutomationSessionProjection() {
+        guard automationSessionNavigator.depth == .split else { return }
+        let next = AutomationSplitViewNavigator(
+            projection: AutomationSplitViewProjection.from(notchPresentation.snapshot))
+        let currentHasSessionRows = automationSessionNavigator.rows.contains { $0.kind != .history }
+        guard currentHasSessionRows else {
+            automationSessionNavigator = next
+            return
+        }
+        let selected = automationSessionNavigator.selectedRow
+        let matchingRow = next.rows.first {
+            $0.id == selected?.id || (
+                selected?.workIdentity != nil && $0.workIdentity == selected?.workIdentity
+            )
+        }
+        if next.rows != automationSessionNavigator.rows {
+            var updated = next
+            if let matchingRow {
+                _ = updated.select(rowID: matchingRow.id)
+            }
+            automationSessionNavigator = updated
+        }
+    }
+
     @Published private(set) var focusedAutomationSessionIdentity: String?
     var pendingTerminalAcknowledgement: (
         definitionIdentity: String,
@@ -548,28 +577,6 @@ final class ChatViewModel: ObservableObject {
         workIdentity: String,
         expectedRevision: UInt64
     )?
-
-    func loadAutomationDetailRuns(_ id: String) {
-        Task {
-            let runs = (try? await client.automationRuns(id: id, limit: 3)) ?? []
-            var visibleRuns = Array(runs.prefix(3))
-            if let pendingTerminalAcknowledgement,
-               pendingTerminalAcknowledgement.definitionIdentity == id,
-               pendingTerminalAcknowledgement.sessionIdentity.hasPrefix("automation-session:") {
-                let runIdentity = String(
-                    pendingTerminalAcknowledgement.sessionIdentity.dropFirst("automation-session:".count)
-                )
-                if !visibleRuns.contains(where: { $0.id == runIdentity }),
-                   let selected = try? await client.automationRun(
-                       id: id,
-                       runIdentity: runIdentity
-                   ) {
-                    visibleRuns.append(selected)
-                }
-            }
-            automationDetailRuns = visibleRuns
-        }
-    }
 
     func acknowledgeFocusedAutomationSessionIfPresented(runIdentity: String) {
         guard let pendingTerminalAcknowledgement,
@@ -618,14 +625,116 @@ final class ChatViewModel: ObservableObject {
             expectedRevision
         )
         openAutomationDetail(definitionIdentity, focusedSessionIdentity: sessionIdentity)
+        acknowledgeFocusedAutomationSessionIfPresented(runIdentity: String(sessionIdentity.dropFirst("automation-session:".count)))
     }
 
-    /// Show the full latest result through the existing output presentation.
-    func showAutomationResult(_ automation: AutomationRecord) {
-        guard let summary = automation.lastResultSummary, !summary.isEmpty else { return }
-        messages.append(ChatMessage(role: .assistant, content: "**\(automation.name)**\n\(summary)"))
-        historyBrowseIndex = nil
-        applyNotchIntent(.openOutput)
+    /// Explicit opening from the Automation Session split view. Preview rows
+    /// never call this path, so selection and passive projection updates do not
+    /// acknowledge Completion Attention.
+    func openTerminalAutomationSession(_ row: AutomationMasterRow) {
+        guard let sessionIdentity = row.sessionIdentity,
+              let workIdentity = row.workIdentity,
+              let runIdentity = row.runIdentity
+        else { return }
+        pendingTerminalAcknowledgement = (
+            definitionIdentity: row.definitionIdentity ?? "detached",
+            sessionIdentity: sessionIdentity,
+            workIdentity: workIdentity,
+            expectedRevision: row.workRevision
+        )
+        openAutomationDetail(
+            row.definitionIdentity ?? "detached",
+            focusedSessionIdentity: sessionIdentity
+        )
+        acknowledgeFocusedAutomationSessionIfPresented(runIdentity: runIdentity)
+        Task {
+            try? await client.openAutomationSession(
+                identity: sessionIdentity,
+                commandIdentity: "open-\(sessionIdentity)-\(row.workRevision)",
+                expectedRevision: row.workRevision)
+            automationSessionDetail = try? await client.automationSession(identity: sessionIdentity)
+        }
+    }
+
+    func continueAutomationSessionFromDetail() {
+        guard let detail = automationSessionDetail else { return }
+        let sessionIdentity = detail.taskSnapshot.automationSessionIdentity
+        let currentChatIdentity = "current-chat-" + UUID().uuidString
+        let seed = detail.finalOutput ?? detail.resultSummary ?? detail.taskSnapshot.taskText
+        if !messages.isEmpty {
+            automationContinuationConfirmation = AutomationContinuationConfirmation(
+                sessionIdentity: sessionIdentity,
+                currentChatIdentity: sessionId ?? currentChatIdentity,
+                seed: seed)
+            return
+        }
+        performAutomationContinuation(
+            sessionIdentity: sessionIdentity,
+            currentChatIdentity: currentChatIdentity,
+            seed: seed,
+            confirmedReplacement: false,
+            displayName: detail.taskSnapshot.displayName)
+    }
+
+    func confirmAutomationContinuation() {
+        guard let confirmation = automationContinuationConfirmation,
+              let detail = automationSessionDetail
+        else { return }
+        automationContinuationConfirmation = nil
+        performAutomationContinuation(
+            sessionIdentity: confirmation.sessionIdentity,
+            currentChatIdentity: confirmation.currentChatIdentity,
+            seed: confirmation.seed,
+            confirmedReplacement: true,
+            displayName: detail.taskSnapshot.displayName)
+    }
+
+    func cancelAutomationContinuation() {
+        automationContinuationConfirmation = nil
+        _ = automationSessionNavigator.goBack()
+    }
+
+    private func performAutomationContinuation(
+        sessionIdentity: String,
+        currentChatIdentity: String,
+        seed: String,
+        confirmedReplacement: Bool,
+        displayName: String
+    ) {
+        let visibleSeed = "Automation Session · \(displayName)\n\n\(seed)"
+        Task {
+            do {
+                let provenance = try await client.continueAutomationSession(
+                    identity: sessionIdentity,
+                    currentChatIdentity: currentChatIdentity,
+                    seed: seed,
+                    confirmedReplacement: confirmedReplacement,
+                    commandIdentity: "continue-" + UUID().uuidString)
+                await MainActor.run {
+                    messages = [ChatMessage(
+                        role: .assistant,
+                        content: "\(visibleSeed)\n\nProveniencia: \(provenance.identity)")]
+                    sessionId = currentChatIdentity
+                    historyBrowseIndex = nil
+                    automationSessionDetail = nil
+                    automationSessionNavigator.resetToSplit()
+                    applyNotchIntent(.openInput)
+                }
+            } catch {
+                await MainActor.run { automationsError = "Pokračovanie zlyhalo" }
+            }
+        }
+    }
+
+    func deleteAutomationSessionFromDetail() {
+        guard let detail = automationSessionDetail else { return }
+        Task {
+            if (try? await client.deleteAutomationSession(
+                identity: detail.taskSnapshot.automationSessionIdentity)) != nil {
+                automationSessionDetail = nil
+                refreshAutomationSessionProjection()
+            }
+        }
     }
 
     var selectedAutomation: AutomationRecord? {
@@ -639,6 +748,16 @@ final class ChatViewModel: ObservableObject {
 
     /// Escape steps back one level; returns false at the list (caller collapses).
     func automationsGoBack() -> Bool {
+        if automationSessionNavigator.depth != .split {
+            if automationContinuationConfirmation != nil {
+                automationContinuationConfirmation = nil
+            }
+            let didGoBack = automationSessionNavigator.goBack()
+            if didGoBack, automationSessionNavigator.depth == .split {
+                refreshAutomationSessionProjection()
+            }
+            return didGoBack
+        }
         switch automationsSurface {
         case .deleteConfirmation(let id):
             automationsSurface = .detail(id)
@@ -669,18 +788,41 @@ final class ChatViewModel: ObservableObject {
     }
 
     func moveAutomationsSelection(by delta: Int) -> Bool {
-        guard notchInteractionMode == .automations, automationsSurface == .list,
-              !automations.isEmpty else { return false }
+        guard notchInteractionMode == .automations, automationsSurface == .list else {
+            return false
+        }
+        if automationSessionNavigator.rows.contains(where: { $0.kind != .history }) {
+            return automationSessionNavigator.moveSelection(by: delta)
+        }
+        guard !automations.isEmpty else { return false }
         let count = automations.count
         automationsSelectionIndex = (automationsSelectionIndex + delta + count) % count
         return true
     }
 
     func openSelectedAutomationDetail() -> Bool {
-        guard notchInteractionMode == .automations, automationsSurface == .list,
-              let a = automations[safe: automationsSelectionIndex] else { return false }
+        guard notchInteractionMode == .automations, automationsSurface == .list else {
+            return false
+        }
+        let hasSessionRows = automationSessionNavigator.rows.contains { $0.kind != .history }
+        if hasSessionRows,
+           let row = automationSessionNavigator.selectedRow,
+           row.kind != .history {
+            if row.kind == .unreadTerminal {
+                guard automationSessionNavigator.openSelectedTerminal() else { return false }
+                openTerminalAutomationSession(row)
+            } else {
+                guard automationSessionNavigator.openSelectedActive() else { return false }
+                automationsSurface = .detail("automation-session-split")
+            }
+            return true
+        }
+        if hasSessionRows, automationSessionNavigator.selectedRow?.kind == .history {
+            automationSessionNavigator.openChild("history")
+            return true
+        }
+        guard let a = automations[safe: automationsSelectionIndex] else { return false }
         automationsSurface = .detail(a.id)
-        loadAutomationDetailRuns(a.id)
         return true
     }
 
@@ -737,10 +879,12 @@ final class ChatViewModel: ObservableObject {
     func startAutomationCreation() {
         automationDraft = AutomationDraft()
         automationsError = nil
+        automationSessionNavigator.resetToSplit()
         automationsSurface = .editorTask
     }
 
     func startAutomationEdit(_ automation: AutomationRecord) {
+        automationSessionNavigator.resetToSplit()
         var draft = AutomationDraft()
         draft.editingID = automation.id
         draft.name = automation.name
@@ -2061,6 +2205,7 @@ final class ChatViewModel: ObservableObject {
                     let cursor = notchPresentation.revision.cursor
                     if cursor != lastCursor {
                         lastCursor = cursor
+                        refreshAutomationSessionProjection()
                         await refreshPendingApprovals()
                         automationsRefreshID = UUID()
                         if notchInteractionMode == .automations {

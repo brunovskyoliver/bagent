@@ -81,6 +81,7 @@ struct RecurrenceRuleWire: Codable, Equatable, Sendable {
 
 struct AutomationRecord: Decodable, Identifiable, Equatable, Sendable {
     let id: String
+    let definitionRevision: Int?
     let name: String
     let prompt: String
     let enabled: Bool
@@ -93,6 +94,7 @@ struct AutomationRecord: Decodable, Identifiable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, prompt, enabled, timezone, schedule
+        case definitionRevision = "definition_revision"
         case nextRunAt = "next_run_at"
         case lastRunAt = "last_run_at"
         case lastRunStatus = "last_run_status"
@@ -130,6 +132,135 @@ struct AutomationRunRecord: Decodable, Identifiable, Equatable, Sendable {
         case resultSummary = "result_summary"
         case isCatchUp = "is_catch_up"
         case isManual = "is_manual"
+    }
+}
+
+struct AutomationSessionRecord: Decodable, Sendable, Equatable {
+    struct TaskSnapshot: Decodable, Sendable, Equatable {
+        let automationIdentity: String
+        let automationRunIdentity: String
+        let automationSessionIdentity: String
+        let displayName: String
+        let taskText: String
+        let scheduleJSON: String
+        let timezone: String
+        let definitionRevision: Int64
+
+        enum CodingKeys: String, CodingKey {
+            case automationIdentity = "automation_identity"
+            case automationRunIdentity = "automation_run_identity"
+            case automationSessionIdentity = "automation_session_identity"
+            case displayName = "display_name"
+            case taskText = "task_text"
+            case scheduleJSON = "schedule_json"
+            case timezone
+            case definitionRevision = "definition_revision"
+        }
+    }
+
+    struct Activity: Decodable, Sendable, Equatable {
+        let category: String
+        let caption: String
+        let safetyRelevant: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case category, caption
+            case safetyRelevant = "safety_relevant"
+        }
+    }
+
+    struct ValidatedSource: Decodable, Sendable, Equatable {
+        let sourceIdentity: String
+        let label: String
+
+        enum CodingKeys: String, CodingKey {
+            case sourceIdentity = "source_identity"
+            case label
+        }
+    }
+
+    struct ConnectorReference: Decodable, Sendable, Equatable {
+        let connectorKind: String
+        let availability: String
+
+        enum CodingKeys: String, CodingKey {
+            case connectorKind = "connector_kind"
+            case availability
+        }
+    }
+
+    struct HistoricalApproval: Decodable, Sendable, Equatable {
+        let category: String
+        let sideEffectClass: String
+        let occurredAt: String
+        let resolution: String
+        let origin: String
+        let sessionScopedFingerprint: String
+
+        enum CodingKeys: String, CodingKey {
+            case category
+            case sideEffectClass = "side_effect_class"
+            case occurredAt = "occurred_at"
+            case resolution, origin
+            case sessionScopedFingerprint = "session_scoped_fingerprint"
+        }
+    }
+
+    struct TruncationDisclosure: Decodable, Sendable, Equatable {
+        let section: String
+        let originalExtent: Int
+        let retainedExtent: Int
+        let reason: String
+
+        enum CodingKeys: String, CodingKey {
+            case section
+            case originalExtent = "original_extent"
+            case retainedExtent = "retained_extent"
+            case reason
+        }
+    }
+
+    let taskSnapshot: TaskSnapshot
+    let outcome: String
+    let finishedAt: String
+    let resultSummary: String?
+    let finalOutput: String?
+    let finalOutputAvailable: Bool
+    let activityTimeline: [Activity]
+    let validatedSources: [ValidatedSource]
+    let connectorReferences: [ConnectorReference]
+    let historicalApprovals: [HistoricalApproval]
+    let truncationDisclosures: [TruncationDisclosure]
+    let attention: String
+
+    enum CodingKeys: String, CodingKey {
+        case taskSnapshot = "task_snapshot"
+        case outcome
+        case finishedAt = "finished_at"
+        case resultSummary = "result_summary"
+        case finalOutput = "final_output"
+        case finalOutputAvailable = "final_output_available"
+        case activityTimeline = "activity_timeline"
+        case validatedSources = "validated_sources"
+        case connectorReferences = "connector_references"
+        case historicalApprovals = "historical_approvals"
+        case truncationDisclosures = "truncation_disclosures"
+        case attention
+    }
+}
+
+struct AutomationContinuationProvenance: Decodable, Sendable, Equatable {
+    let identity: String
+    let sourceAutomationSessionIdentity: String
+    let targetCurrentChatIdentity: String
+    let seed: String
+    let sourceDeleted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case identity, seed
+        case sourceAutomationSessionIdentity = "source_automation_session_identity"
+        case targetCurrentChatIdentity = "target_current_chat_identity"
+        case sourceDeleted = "source_deleted"
     }
 }
 
