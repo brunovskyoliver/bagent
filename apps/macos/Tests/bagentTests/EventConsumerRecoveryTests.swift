@@ -140,19 +140,27 @@ final class EventConsumerRecoveryTests: XCTestCase {
         XCTAssertEqual(
             try DaemonClient.decodeWorkAttentionAcknowledgement(
                 statusCode: 409,
-                data: Data(#"{"error":"revision conflict"}"#.utf8)
+                data: Data(#"{"code":"work_conflict","error":"revision conflict"}"#.utf8)
             ),
             .authoritativeConflict
         )
         XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
             statusCode: 409,
-            data: Data(#"{"error":"stale consumer fence"}"#.utf8)
+            data: Data(#"{"code":"stale_consumer_fence","error":"changed wording"}"#.utf8)
         )) { error in
             XCTAssertEqual(error as? NotchEventTransportError, .consumerFenced)
         }
         XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
             statusCode: 503,
             data: Data()
+        ))
+        XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
+            statusCode: 409,
+            data: Data(#"{"code":"unknown_conflict"}"#.utf8)
+        ))
+        XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
+            statusCode: 409,
+            data: Data("not-json".utf8)
         ))
     }
 

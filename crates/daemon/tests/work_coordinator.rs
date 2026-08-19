@@ -92,6 +92,11 @@ fn notch_projection_bounds_high_cardinality_unread_sessions_by_terminal_state() 
     ];
     let (_temp, coordinator) = fixture("daemon-unread", 128, &identities);
     for index in 0..identities.len() {
+        let terminal_state = match index % 3 {
+            0 => WorkState::Completed,
+            1 => WorkState::Partial,
+            _ => WorkState::Failed,
+        };
         let work = coordinator
             .submit(create_automation(
                 format!("create-{index}"),
@@ -108,7 +113,7 @@ fn notch_projection_bounds_high_cardinality_unread_sessions_by_terminal_state() 
         for (revision, state) in [
             (1, WorkState::WaitingForModel),
             (2, WorkState::Running),
-            (3, WorkState::Completed),
+            (3, terminal_state),
         ] {
             coordinator
                 .submit(work_transition(
@@ -123,8 +128,19 @@ fn notch_projection_bounds_high_cardinality_unread_sessions_by_terminal_state() 
     }
 
     let (snapshot, ()) = coordinator.projected_snapshot(|_, _| Ok(())).unwrap();
-    assert_eq!(snapshot.works.len(), 1);
-    assert_eq!(snapshot.works[0].state, WorkState::Completed);
+    assert_eq!(snapshot.works.len(), 3);
+    assert_eq!(
+        snapshot
+            .works
+            .iter()
+            .map(|work| (work.identity.as_str(), work.state))
+            .collect::<Vec<_>>(),
+        vec![
+            ("work-00", WorkState::Completed),
+            ("work-01", WorkState::Partial),
+            ("work-02", WorkState::Failed),
+        ]
+    );
 }
 
 #[test]

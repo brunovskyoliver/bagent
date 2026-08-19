@@ -1969,7 +1969,10 @@ async fn acknowledge_work_attention(
     if !fence_matches {
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "stale consumer fence" })),
+            Json(serde_json::json!({
+                "code": "stale_consumer_fence",
+                "error": "stale consumer fence"
+            })),
         );
     }
     match state.work_authority.acknowledge_attention(
@@ -1983,7 +1986,10 @@ async fn acknowledge_work_attention(
         ),
         Err(error) => (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": format!("{error}") })),
+            Json(serde_json::json!({
+                "code": "work_conflict",
+                "error": format!("{error}")
+            })),
         ),
     }
 }
@@ -2174,62 +2180,29 @@ fn notch_projection_context(
     let mut terminal_orders = HashMap::new();
     let mut queue_positions = HashMap::new();
     let mut claimed_orders = HashMap::new();
-    let mut statement = db.prepare(
-        "WITH projected(identity) AS (
-             SELECT identity FROM works
-             WHERE state NOT IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
-             UNION
-             SELECT work_identity FROM (
-                 SELECT r.work_identity
-                 FROM works w
-                 JOIN work_automation_runs r ON r.work_identity = w.identity
-                 JOIN work_automation_sessions s
-                   ON s.automation_session_identity = r.automation_session_identity
-                 WHERE w.origin_kind = 'automation' AND w.state = 'failed'
-                   AND s.attention_state = 'unread'
-                 ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
-             )
-             UNION
-             SELECT work_identity FROM (
-                 SELECT r.work_identity
-                 FROM works w
-                 JOIN work_automation_runs r ON r.work_identity = w.identity
-                 JOIN work_automation_sessions s
-                   ON s.automation_session_identity = r.automation_session_identity
-                 WHERE w.origin_kind = 'automation' AND w.state = 'partial'
-                   AND s.attention_state = 'unread'
-                 ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
-             )
-             UNION
-             SELECT work_identity FROM (
-                 SELECT r.work_identity
-                 FROM works w
-                 JOIN work_automation_runs r ON r.work_identity = w.identity
-                 JOIN work_automation_sessions s
-                   ON s.automation_session_identity = r.automation_session_identity
-                 WHERE w.origin_kind = 'automation' AND w.state = 'completed'
-                   AND s.attention_state = 'unread'
-                 ORDER BY w.updated_at DESC, w.identity ASC LIMIT 1
-             )
-             UNION
-             SELECT identity FROM (
-                 SELECT identity FROM works
-                 WHERE origin_kind = 'conversation'
-                   AND state IN ('completed', 'partial', 'failed')
-                 ORDER BY updated_at DESC, identity ASC LIMIT 1
-             )
-         )
-         SELECT w.identity, w.rowid, a.name, r.historical_automation_identity,
+    let identities = snapshot
+        .works
+        .iter()
+        .map(|work| work.identity.as_str())
+        .collect::<Vec<_>>();
+    let identity_predicate = if identities.is_empty() {
+        "0".to_owned()
+    } else {
+        format!("w.identity IN ({})", vec!["?"; identities.len()].join(","))
+    };
+    let query = format!(
+        "SELECT w.identity, w.rowid, a.name, r.historical_automation_identity,
                 r.automation_session_identity, s.attention_state, w.state, w.updated_at
-         FROM projected
-         JOIN works w ON w.identity = projected.identity
+         FROM works w
          LEFT JOIN work_automation_runs r ON r.work_identity = w.identity
          LEFT JOIN automations a ON a.id = r.historical_automation_identity
          LEFT JOIN work_automation_sessions s
            ON s.automation_session_identity = r.automation_session_identity
-         ORDER BY w.identity ASC",
-    )?;
-    let rows = statement.query_map([], |row| {
+         WHERE {identity_predicate}
+         ORDER BY w.identity ASC"
+    );
+    let mut statement = db.prepare(&query)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(identities), |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, u64>(1)?,

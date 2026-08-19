@@ -356,14 +356,25 @@ impl UnifiedWorkAuthority {
         work: WorkIdentity,
         category: Option<WorkActivityCategory>,
     ) -> Result<WorkRevision, CommandError> {
+        self.set_activity_with_hook(command, work, category, |_, _| {})
+    }
+
+    fn set_activity_with_hook(
+        &self,
+        command: impl Into<CommandIdentity>,
+        work: WorkIdentity,
+        category: Option<WorkActivityCategory>,
+        mut before_submit: impl FnMut(usize, WorkRevision),
+    ) -> Result<WorkRevision, CommandError> {
         let command = command.into();
-        for _ in 0..3 {
+        for attempt in 0..3 {
             let revision = self
                 .current(&work)?
                 .ok_or(CommandError::Conflict {
                     current_revision: None,
                 })?
                 .revision;
+            before_submit(attempt, revision);
             match self.coordinator.submit(Command::set_activity(
                 command.clone(),
                 work.clone(),
@@ -497,5 +508,120 @@ impl UnifiedWorkAuthority {
         drop(state);
         self.dispatch_notify.notify_waiters();
         Ok(acknowledgement.receipt().work_revision)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::work_coordinator::{
+        CoordinatorConfig, CoordinatorDependencies, DeterministicWorkIdentitySource,
+        FixedCoordinatorClock,
+    };
+
+    fn authority() -> (
+        tempfile::TempDir,
+        Arc<WorkCoordinator>,
+        UnifiedWorkAuthority,
+        WorkIdentity,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let generation = DaemonGeneration::new("activity-retry");
+        let coordinator = Arc::new(
+            WorkCoordinator::open_with_dependencies(
+                temp.path().join("work.sqlite3"),
+                CoordinatorConfig { max_events: 32 },
+                generation.clone(),
+                CoordinatorDependencies {
+                    identity_source: Box::new(DeterministicWorkIdentitySource::new(["work-a"])),
+                    clock: Box::new(FixedCoordinatorClock::new("2026-08-19T00:00:00Z")),
+                },
+            )
+            .unwrap(),
+        );
+        let authority = UnifiedWorkAuthority::new(coordinator.clone(), generation);
+        let work = authority
+            .submit_conversation(
+                "create",
+                CurrentChatIdentity::new("chat"),
+                ConversationTurnIdentity::new("turn"),
+                0,
+            )
+            .unwrap();
+        authority
+            .transition(
+                "waiting",
+                work.clone(),
+                WorkRevision::new(1),
+                WorkState::WaitingForModel,
+            )
+            .unwrap();
+        authority
+            .transition(
+                "running",
+                work.clone(),
+                WorkRevision::new(2),
+                WorkState::Running,
+            )
+            .unwrap();
+        (temp, coordinator, authority, work)
+    }
+
+    #[test]
+    fn activity_update_retries_a_revision_race_without_full_snapshot() {
+        let (_temp, coordinator, authority, work) = authority();
+        let competing = coordinator.clone();
+        let competing_work = work.clone();
+        let revision = authority
+            .set_activity_with_hook(
+                "target",
+                work.clone(),
+                Some(WorkActivityCategory::Mail),
+                move |attempt, revision| {
+                    if attempt == 0 {
+                        competing
+                            .submit(Command::set_activity(
+                                "competing",
+                                competing_work.clone(),
+                                revision,
+                                Some(WorkActivityCategory::Web),
+                                DaemonGeneration::new("activity-retry"),
+                            ))
+                            .unwrap();
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(revision, WorkRevision::new(5));
+        assert_eq!(
+            coordinator.work(&work).unwrap().unwrap().activity,
+            Some(WorkActivityCategory::Mail)
+        );
+    }
+
+    #[test]
+    fn activity_update_bounds_revision_conflict_retries() {
+        let (_temp, coordinator, authority, work) = authority();
+        let competing = coordinator.clone();
+        let competing_work = work.clone();
+        let result = authority.set_activity_with_hook(
+            "target",
+            work,
+            Some(WorkActivityCategory::Mail),
+            move |attempt, revision| {
+                competing
+                    .submit(Command::set_activity(
+                        format!("competing-{attempt}"),
+                        competing_work.clone(),
+                        revision,
+                        Some(WorkActivityCategory::Web),
+                        DaemonGeneration::new("activity-retry"),
+                    ))
+                    .unwrap();
+            },
+        );
+
+        assert!(matches!(result, Err(CommandError::Conflict { .. })));
     }
 }

@@ -411,6 +411,10 @@ enum SourceMode: String, CaseIterable, Equatable, Identifiable {
 
 @MainActor
 final class ChatViewModel: ObservableObject {
+    enum TerminalAcknowledgementDelivery {
+        case authoritative(DaemonClient.WorkAttentionAcknowledgement)
+        case retryableFailure
+    }
     @Published var messages: [ChatMessage] = []
     @Published var inputText: String = "" {
         didSet { updateSlashSuggestions() }
@@ -578,22 +582,27 @@ final class ChatViewModel: ObservableObject {
                     expectedRevision: pendingTerminalAcknowledgement.expectedRevision,
                     consumerFence: notchEventConsumer.activeConsumerFence
                 )
-                resolvePendingTerminalAcknowledgement(
+                handlePendingTerminalAcknowledgement(
                     sessionIdentity: pendingTerminalAcknowledgement.sessionIdentity,
-                    outcome: outcome
+                    delivery: .authoritative(outcome)
                 )
             } catch {
-                // Keep the exact destination-bound command for a later retry.
+                handlePendingTerminalAcknowledgement(
+                    sessionIdentity: pendingTerminalAcknowledgement.sessionIdentity,
+                    delivery: .retryableFailure
+                )
             }
         }
     }
 
-    func resolvePendingTerminalAcknowledgement(
+    func handlePendingTerminalAcknowledgement(
         sessionIdentity: String,
-        outcome _: DaemonClient.WorkAttentionAcknowledgement
+        delivery: TerminalAcknowledgementDelivery
     ) {
         guard pendingTerminalAcknowledgement?.sessionIdentity == sessionIdentity else { return }
-        pendingTerminalAcknowledgement = nil
+        if case .authoritative = delivery {
+            pendingTerminalAcknowledgement = nil
+        }
     }
 
     private func openAutomationSession(

@@ -1017,12 +1017,13 @@ struct DaemonClient: Sendable, NotchEventTransport {
     ) throws -> WorkAttentionAcknowledgement {
         if (200..<300).contains(statusCode) { return .acknowledged }
         if statusCode == 409 {
-            struct ErrorResponse: Decodable { let error: String }
-            let message = try? JSONDecoder().decode(ErrorResponse.self, from: data).error
-            if message == "stale consumer fence" {
+            struct ErrorResponse: Decodable { let code: String }
+            let code = try JSONDecoder().decode(ErrorResponse.self, from: data).code
+            if code == "stale_consumer_fence" {
                 throw NotchEventTransportError.consumerFenced
             }
-            return .authoritativeConflict
+            if code == "work_conflict" { return .authoritativeConflict }
+            throw DaemonError.badResponse
         }
         throw DaemonError.badStatus
     }

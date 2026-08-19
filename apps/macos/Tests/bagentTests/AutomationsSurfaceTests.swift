@@ -130,29 +130,24 @@ final class AutomationsSurfaceStateTests: XCTestCase {
         }
 
         install()
-        vm.resolvePendingTerminalAcknowledgement(
+        vm.handlePendingTerminalAcknowledgement(
             sessionIdentity: "automation-session:run-a",
-            outcome: .acknowledged
+            delivery: .authoritative(.acknowledged)
         )
         XCTAssertNil(vm.pendingTerminalAcknowledgement)
 
         install()
-        vm.resolvePendingTerminalAcknowledgement(
+        vm.handlePendingTerminalAcknowledgement(
             sessionIdentity: "automation-session:run-a",
-            outcome: .authoritativeConflict
+            delivery: .authoritative(.authoritativeConflict)
         )
         XCTAssertNil(vm.pendingTerminalAcknowledgement)
 
         install()
-        XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
-            statusCode: 409,
-            data: Data(#"{"error":"stale consumer fence"}"#.utf8)
-        ))
-        XCTAssertNotNil(vm.pendingTerminalAcknowledgement)
-        XCTAssertThrowsError(try DaemonClient.decodeWorkAttentionAcknowledgement(
-            statusCode: 503,
-            data: Data()
-        ))
+        vm.handlePendingTerminalAcknowledgement(
+            sessionIdentity: "automation-session:run-a",
+            delivery: .retryableFailure
+        )
         XCTAssertNotNil(vm.pendingTerminalAcknowledgement)
     }
 }
