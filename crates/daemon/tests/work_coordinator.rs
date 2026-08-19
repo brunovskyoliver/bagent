@@ -1,10 +1,11 @@
 use bagentd::work_coordinator::{
     ApprovalIdentity, AutomationDefinitionIdentity, AutomationDefinitionRevision,
     AutomationRunIdentity, AutomationSessionIdentity, Command, CommandAcknowledgement,
-    CommandError, ConversationTurnIdentity, CoordinatorConfig, CoordinatorDependencies,
-    CurrentChatIdentity, DaemonGeneration, DeterministicWorkIdentitySource, EventCursor, EventRead,
-    FailurePoint, FixedCoordinatorClock, ModelRuntimeGeneration, WorkActivityCategory,
-    WorkCoordinator, WorkIdentity, WorkRevision, WorkState,
+    CommandError, ConversationTurnIdentity, CoordinatorClock, CoordinatorConfig,
+    CoordinatorDependencies, CurrentChatIdentity, DaemonGeneration,
+    DeterministicWorkIdentitySource, EventCursor, EventRead, FailurePoint, FixedCoordinatorClock,
+    ModelRuntimeGeneration, WorkActivityCategory, WorkCoordinator, WorkIdentity, WorkRevision,
+    WorkState,
 };
 use tempfile::TempDir;
 
@@ -14,6 +15,18 @@ fn dependencies(identities: &[&str]) -> CoordinatorDependencies {
             identities.iter().copied(),
         )),
         clock: Box::new(FixedCoordinatorClock::new("2026-08-18T16:00:00Z")),
+    }
+}
+
+struct IncrementingCoordinatorClock {
+    tick: u64,
+}
+
+impl CoordinatorClock for IncrementingCoordinatorClock {
+    fn now(&mut self) -> String {
+        let now = format!("2026-08-18T16:{:02}:{:02}Z", self.tick / 60, self.tick % 60);
+        self.tick += 1;
+        now
     }
 }
 
@@ -90,7 +103,19 @@ fn notch_projection_bounds_high_cardinality_unread_sessions_by_terminal_state() 
         "work-00", "work-01", "work-02", "work-03", "work-04", "work-05", "work-06", "work-07",
         "work-08", "work-09", "work-10", "work-11",
     ];
-    let (_temp, coordinator) = fixture("daemon-unread", 128, &identities);
+    let temp = tempfile::tempdir().expect("temporary database directory");
+    let coordinator = WorkCoordinator::open_with_dependencies(
+        temp.path().join("work.sqlite3"),
+        CoordinatorConfig { max_events: 128 },
+        DaemonGeneration::new("daemon-unread"),
+        CoordinatorDependencies {
+            identity_source: Box::new(DeterministicWorkIdentitySource::new(
+                identities.iter().copied(),
+            )),
+            clock: Box::new(IncrementingCoordinatorClock { tick: 0 }),
+        },
+    )
+    .expect("open coordinator");
     for index in 0..identities.len() {
         let terminal_state = match index % 3 {
             0 => WorkState::Completed,
@@ -136,9 +161,9 @@ fn notch_projection_bounds_high_cardinality_unread_sessions_by_terminal_state() 
             .map(|work| (work.identity.as_str(), work.state))
             .collect::<Vec<_>>(),
         vec![
-            ("work-00", WorkState::Completed),
-            ("work-01", WorkState::Partial),
-            ("work-02", WorkState::Failed),
+            ("work-09", WorkState::Completed),
+            ("work-10", WorkState::Partial),
+            ("work-11", WorkState::Failed),
         ]
     );
 }

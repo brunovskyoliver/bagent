@@ -1984,13 +1984,31 @@ async fn acknowledge_work_attention(
             StatusCode::OK,
             Json(serde_json::json!({ "revision": revision.value() })),
         ),
-        Err(error) => (
+        Err(error) => acknowledge_attention_error_response(error),
+    }
+}
+
+fn acknowledge_attention_error_response(
+    error: CommandError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        error @ (CommandError::Conflict { .. } | CommandError::TerminalTarget) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "code": "work_conflict",
                 "error": format!("{error}")
             })),
         ),
+        error => {
+            tracing::error!(%error, "failed to acknowledge Work attention");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": "internal_error",
+                    "error": "failed to acknowledge Work attention"
+                })),
+            )
+        }
     }
 }
 
@@ -2168,6 +2186,17 @@ fn authoritative_notch_snapshot(
         .map_err(Into::into)
 }
 
+const NOTCH_PROJECTION_CONTEXT_SQL: &str =
+    "SELECT w.identity, w.rowid, a.name, r.historical_automation_identity,
+            r.automation_session_identity, s.attention_state, w.state, w.updated_at
+     FROM json_each(?1) projected
+     JOIN works w ON w.identity = projected.value
+     LEFT JOIN work_automation_runs r ON r.work_identity = w.identity
+     LEFT JOIN automations a ON a.id = r.historical_automation_identity
+     LEFT JOIN work_automation_sessions s
+       ON s.automation_session_identity = r.automation_session_identity
+     ORDER BY w.identity ASC";
+
 fn notch_projection_context(
     db: &Connection,
     snapshot: &WorkSnapshot,
@@ -2185,24 +2214,9 @@ fn notch_projection_context(
         .iter()
         .map(|work| work.identity.as_str())
         .collect::<Vec<_>>();
-    let identity_predicate = if identities.is_empty() {
-        "0".to_owned()
-    } else {
-        format!("w.identity IN ({})", vec!["?"; identities.len()].join(","))
-    };
-    let query = format!(
-        "SELECT w.identity, w.rowid, a.name, r.historical_automation_identity,
-                r.automation_session_identity, s.attention_state, w.state, w.updated_at
-         FROM works w
-         LEFT JOIN work_automation_runs r ON r.work_identity = w.identity
-         LEFT JOIN automations a ON a.id = r.historical_automation_identity
-         LEFT JOIN work_automation_sessions s
-           ON s.automation_session_identity = r.automation_session_identity
-         WHERE {identity_predicate}
-         ORDER BY w.identity ASC"
-    );
-    let mut statement = db.prepare(&query)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(identities), |row| {
+    let projected_identities = serde_json::to_string(&identities)?;
+    let mut statement = db.prepare(NOTCH_PROJECTION_CONTEXT_SQL)?;
+    let rows = statement.query_map(rusqlite::params![projected_identities], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, u64>(1)?,
@@ -4870,6 +4884,60 @@ async fn save_last_whatsapp_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acknowledgement_errors_distinguish_authoritative_conflicts_from_server_failures() {
+        for error in [
+            CommandError::Conflict {
+                current_revision: Some(WorkRevision::new(7)),
+            },
+            CommandError::TerminalTarget,
+        ] {
+            let (status, Json(body)) = acknowledge_attention_error_response(error);
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["code"], "work_conflict");
+        }
+
+        for error in [
+            CommandError::Storage("disk unavailable".to_owned()),
+            CommandError::CorruptState("bad state".to_owned()),
+            CommandError::InjectedFailure(
+                bagentd::work_coordinator::FailurePoint::BeforeTransaction,
+            ),
+        ] {
+            let (status, Json(body)) = acknowledge_attention_error_response(error);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body["code"], "internal_error");
+            assert_eq!(body["error"], "failed to acknowledge Work attention");
+            assert!(!body.to_string().contains("disk unavailable"));
+        }
+    }
+
+    #[test]
+    fn notch_projection_context_uses_one_structured_identity_parameter() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE works (
+                 identity TEXT PRIMARY KEY,
+                 state TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE work_automation_runs (
+                 work_identity TEXT,
+                 historical_automation_identity TEXT,
+                 automation_session_identity TEXT
+             );
+             CREATE TABLE automations (id TEXT PRIMARY KEY, name TEXT);
+             CREATE TABLE work_automation_sessions (
+                 automation_session_identity TEXT,
+                 attention_state TEXT
+             );",
+        )
+        .unwrap();
+
+        let statement = db.prepare(NOTCH_PROJECTION_CONTEXT_SQL).unwrap();
+        assert_eq!(statement.parameter_count(), 1);
+    }
 
     #[test]
     fn retained_transition_batches_replace_with_one_current_snapshot() {
