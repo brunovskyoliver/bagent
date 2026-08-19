@@ -328,6 +328,7 @@ pub struct ProductionBaseRtAdapter {
     config: ProductionModelConfig,
     restart_pids: AsyncMutex<Option<(u32, u32)>>,
     chat_preload_available: AsyncMutex<Option<u64>>,
+    externally_managed: bool,
 }
 
 impl ProductionBaseRtAdapter {
@@ -337,6 +338,18 @@ impl ProductionBaseRtAdapter {
             config,
             restart_pids: AsyncMutex::new(None),
             chat_preload_available: AsyncMutex::new(None),
+            externally_managed: false,
+        })
+    }
+
+    #[cfg(feature = "stage7a-acceptance")]
+    pub fn new_external_fixture(client: BaseRtClient, config: ProductionModelConfig) -> Arc<Self> {
+        Arc::new(Self {
+            client,
+            config,
+            restart_pids: AsyncMutex::new(None),
+            chat_preload_available: AsyncMutex::new(None),
+            externally_managed: true,
         })
     }
 
@@ -649,6 +662,11 @@ impl ModelRuntimeAdapter for ProductionBaseRtAdapter {
                         path: path.to_string_lossy().into_owned(),
                     })
                     .await?;
+            }
+            RuntimeAction::EnsureService if self.externally_managed => {
+                if !self.client.is_up().await {
+                    return Err(anyhow!("external BaseRT fixture is unavailable"));
+                }
             }
             RuntimeAction::EnsureService => self.ensure_managed_service().await?,
             RuntimeAction::VerifyReady(class) => {
@@ -1004,6 +1022,34 @@ impl ModelRuntime {
             BaseRtClient::new(base_url, api_key),
             config,
         ))
+    }
+
+    #[cfg(feature = "stage7a-acceptance")]
+    pub fn external_fixture_from_endpoint(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        config: ProductionModelConfig,
+    ) -> Arc<Self> {
+        Self::production(ProductionBaseRtAdapter::new_external_fixture(
+            BaseRtClient::new(base_url, api_key),
+            config,
+        ))
+    }
+
+    #[cfg(feature = "stage7a-acceptance")]
+    pub async fn initialize_external_fixture(&self, allow_retained_chat_model: bool) -> Result<()> {
+        let _transition = self.transition.lock().await;
+        self.adapter.perform(RuntimeAction::EnsureService).await?;
+        if allow_retained_chat_model {
+            self.state.lock().expect("model runtime state").phase =
+                RuntimePhase::Ready(ModelClass::Chat4B);
+            return Ok(());
+        }
+        self.adapter
+            .perform(RuntimeAction::VerifyZeroLoadedWeights)
+            .await?;
+        self.state.lock().expect("model runtime state").phase = RuntimePhase::Unloaded;
+        Ok(())
     }
 
     pub async fn initialize(&self) -> Result<()> {

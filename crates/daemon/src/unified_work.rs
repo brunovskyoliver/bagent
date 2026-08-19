@@ -16,8 +16,9 @@
 use crate::work_coordinator::{
     ApprovalIdentity, AutomationDefinitionIdentity, AutomationDefinitionRevision,
     AutomationRunIdentity, AutomationSessionIdentity, Command, CommandAcknowledgement,
-    CommandError, CommandIdentity, ConversationTurnIdentity, CurrentChatIdentity, DaemonGeneration,
-    WorkActivityCategory, WorkCoordinator, WorkIdentity, WorkRevision, WorkState,
+    CommandError, CommandIdentity, ConversationTurnIdentity, CurrentChatIdentity,
+    CurrentChatTerminalOutcome, DaemonGeneration, WorkActivityCategory, WorkCoordinator,
+    WorkIdentity, WorkRevision, WorkState,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -143,6 +144,56 @@ impl UnifiedWorkAuthority {
             self.generation.clone(),
         ))?;
         Ok(self.enqueue(acknowledgement, ExecutionOrigin::Foreground, now))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_current_chat_turn(
+        &self,
+        command: impl Into<CommandIdentity>,
+        chat: CurrentChatIdentity,
+        expected_revision: u64,
+        user_message: &str,
+        attachments: &[crate::current_chat::SubmittedAttachmentMetadata],
+        submitted_at: chrono::DateTime<chrono::Utc>,
+        now: u64,
+    ) -> Result<(WorkIdentity, crate::current_chat::BegunConversationTurn), CommandError> {
+        let (acknowledgement, begun) = self.coordinator.submit_current_chat_turn(
+            command,
+            chat,
+            expected_revision,
+            user_message,
+            attachments,
+            submitted_at,
+            self.generation.clone(),
+        )?;
+        Ok((
+            self.enqueue(acknowledgement, ExecutionOrigin::Foreground, now),
+            begun,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn terminalize_current_chat_turn(
+        &self,
+        command: impl Into<CommandIdentity>,
+        work: WorkIdentity,
+        revision: WorkRevision,
+        current_chat_identity: &str,
+        conversation_turn_identity: &str,
+        assistant_output: Option<&str>,
+        validated_sources: &[crate::current_chat::ValidatedSourceMetadata],
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(WorkRevision, CurrentChatTerminalOutcome), CommandError> {
+        self.coordinator.terminalize_current_chat_turn(
+            command,
+            work,
+            revision,
+            current_chat_identity,
+            conversation_turn_identity,
+            assistant_output,
+            validated_sources,
+            terminal_at,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

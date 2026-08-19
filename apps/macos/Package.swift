@@ -14,6 +14,7 @@ let package = Package(
                 .product(name: "Markdown", package: "swift-markdown"),
             ],
             path: "Sources/bagent",
+            resources: [.process("Resources")],
             linkerSettings: [
                 .linkedFramework("Carbon"),
                 .linkedFramework("ScreenCaptureKit"),

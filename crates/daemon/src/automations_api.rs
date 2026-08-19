@@ -34,6 +34,7 @@ pub(crate) enum RepoError {
     NotFound,
     /// Deletion/patch attempted while a run of this automation is active.
     ActiveRun,
+    #[cfg(test)]
     Immutable,
     Invalid(ScheduleError),
     Db(String),
@@ -354,6 +355,7 @@ pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<
 
 /// Finish a run and mirror the outcome onto the automation row, then prune
 /// history past the retention cap. Audit entries are untouched (append-only).
+#[cfg(test)]
 pub(crate) fn repo_finish_run(
     conn: &Connection,
     run_id: &str,
@@ -446,6 +448,7 @@ fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
             StatusCode::CONFLICT,
             Json(json!({"error": "automation has an active run"})),
         ),
+        #[cfg(test)]
         RepoError::Immutable => (
             StatusCode::CONFLICT,
             Json(json!({"error": "automation session content is immutable"})),
@@ -710,7 +713,6 @@ pub(crate) async fn automation_session_get(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AutomationSessionContinueRequest {
-    current_chat_identity: String,
     seed: String,
     confirmed_replacement: bool,
     command_identity: String,
@@ -725,7 +727,6 @@ pub(crate) async fn automation_session_continue(
     match continue_automation_session_in_new_chat(
         &connection,
         &automation_session_identity,
-        &request.current_chat_identity,
         &request.seed,
         request.confirmed_replacement,
         &request.command_identity,
@@ -945,6 +946,10 @@ pub(crate) fn outcome_to_status(
         Err(ExecError::SinkClosed) => (
             AutomationRunStatus::Failed,
             "Execution aborted.".to_string(),
+        ),
+        Err(ExecError::DurableState) => (
+            AutomationRunStatus::Failed,
+            "Durable state update failed.".to_string(),
         ),
     }
 }
@@ -1531,6 +1536,7 @@ mod tests {
             final_text: "Hotovo, 3 maily.".into(),
             tool_calls_used: 2,
             approvals_denied: 0,
+            validated_sources: Vec::new(),
         });
         let (s, sum) = outcome_to_status(&ok);
         assert_eq!(s, AutomationRunStatus::Completed);
@@ -1540,6 +1546,7 @@ mod tests {
             final_text: "Čiastočne.".into(),
             tool_calls_used: 2,
             approvals_denied: 1,
+            validated_sources: Vec::new(),
         });
         let (s, sum) = outcome_to_status(&denied);
         assert_eq!(s, AutomationRunStatus::Partial);

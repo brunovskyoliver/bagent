@@ -204,6 +204,7 @@ pub(crate) struct ExecOutcome {
     pub tool_calls_used: usize,
     /// Gated actions the user denied (or that timed out) during this run.
     pub approvals_denied: usize,
+    pub validated_sources: Vec<TranscriptSource>,
 }
 
 #[derive(Debug)]
@@ -212,6 +213,18 @@ pub(crate) enum ExecError {
     SinkClosed,
     /// The model stream failed.
     Model(String),
+    /// A chat-scoped reference could not join the daemon's durable authority.
+    DurableState,
+}
+
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SinkClosed => formatter.write_str("event sink closed"),
+            Self::Model(message) => write!(formatter, "model execution failed: {message}"),
+            Self::DurableState => formatter.write_str("durable Current Chat update failed"),
+        }
+    }
 }
 
 /// Whether a tool only reads local/remote data or has side effects.
@@ -2390,6 +2403,7 @@ async fn run_evidence_synthesis_with_limits(
         final_text: full_response,
         tool_calls_used,
         approvals_denied,
+        validated_sources: Vec::new(),
     })
 }
 
@@ -3485,6 +3499,7 @@ async fn run_web_evidence_synthesis(
         final_text: full_response,
         tool_calls_used,
         approvals_denied,
+        validated_sources: Vec::new(),
     })
 }
 
@@ -3518,6 +3533,7 @@ async fn run_shared_synthesis(
         final_text: outcome.text,
         tool_calls_used,
         approvals_denied,
+        validated_sources: Vec::new(),
     })
 }
 
@@ -3624,6 +3640,7 @@ pub(crate) async fn run_agent_loop(
     let notes = &state.notes;
     let fs_exec = &state.fs;
     let runtime_refs = &state.runtime_refs;
+    let durable_current_chat_refs = matches!(origin, ExecOrigin::Chat);
     let demand_origin = if origin.unattended() {
         WorkExecutionOrigin::Automation
     } else {
@@ -3724,6 +3741,7 @@ pub(crate) async fn run_agent_loop(
                         final_text,
                         tool_calls_used,
                         approvals_denied,
+                        validated_sources: Vec::new(),
                     });
                 }
                 if matches!(
@@ -3773,6 +3791,7 @@ pub(crate) async fn run_agent_loop(
                     final_text,
                     tool_calls_used,
                     approvals_denied,
+                    validated_sources: Vec::new(),
                 });
             }
             ValidationOutcome::Clarification { prompt, .. } => {
@@ -3785,6 +3804,7 @@ pub(crate) async fn run_agent_loop(
                     final_text: prompt,
                     tool_calls_used,
                     approvals_denied,
+                    validated_sources: Vec::new(),
                 });
             }
         }
@@ -3894,7 +3914,15 @@ pub(crate) async fn run_agent_loop(
                 if mail_tool_succeeded("mail_read", &content) && mail_read_rowids.insert(rowid) {
                     mail_reads_completed += 1;
                     if let Some(ref mail_ref) = mail_ref {
-                        save_last_mail_ref(runtime_refs, session_id, mail_ref).await;
+                        save_last_mail_ref(
+                            db,
+                            runtime_refs,
+                            session_id,
+                            mail_ref,
+                            durable_current_chat_refs,
+                        )
+                        .await
+                        .map_err(|_| ExecError::DurableState)?;
                     }
                     read_messages.push(json!({
                         "rowid": rowid,
@@ -3981,6 +4009,7 @@ pub(crate) async fn run_agent_loop(
             final_text: full_response,
             tool_calls_used,
             approvals_denied,
+            validated_sources: Vec::new(),
         });
     }
 
@@ -4148,8 +4177,15 @@ pub(crate) async fn run_agent_loop(
                                                         "auto_open": false,
                                                     }))
                                                     .await;
-                                                save_last_mail_ref(runtime_refs, session_id, r)
-                                                    .await;
+                                                save_last_mail_ref(
+                                                    db,
+                                                    runtime_refs,
+                                                    session_id,
+                                                    r,
+                                                    durable_current_chat_refs,
+                                                )
+                                                .await
+                                                .map_err(|_| ExecError::DurableState)?;
                                             }
                                             result
                                         }
@@ -4157,8 +4193,15 @@ pub(crate) async fn run_agent_loop(
                                         "mail_read" => {
                                             let (result, mail_ref) = tool_mail_read(m, args).await;
                                             if let Some(ref r) = mail_ref {
-                                                save_last_mail_ref(runtime_refs, session_id, r)
-                                                    .await;
+                                                save_last_mail_ref(
+                                                    db,
+                                                    runtime_refs,
+                                                    session_id,
+                                                    r,
+                                                    durable_current_chat_refs,
+                                                )
+                                                .await
+                                                .map_err(|_| ExecError::DurableState)?;
                                             }
                                             result
                                         }
@@ -4192,7 +4235,15 @@ pub(crate) async fn run_agent_loop(
                         let (result, wa_ref) =
                             tool_whatsapp_chat_messages(&state.whatsapp, args).await;
                         if let Some(ref r) = wa_ref {
-                            save_last_whatsapp_ref(runtime_refs, session_id, r).await;
+                            save_last_whatsapp_ref(
+                                db,
+                                runtime_refs,
+                                session_id,
+                                r,
+                                durable_current_chat_refs,
+                            )
+                            .await
+                            .map_err(|_| ExecError::DurableState)?;
                         }
                         result
                     }
@@ -4249,7 +4300,15 @@ pub(crate) async fn run_agent_loop(
                                             "url": r.url,
                                         }))
                                         .await;
-                                    save_last_odoo_ref(runtime_refs, session_id, r).await;
+                                    save_last_odoo_ref(
+                                        db,
+                                        runtime_refs,
+                                        session_id,
+                                        r,
+                                        durable_current_chat_refs,
+                                    )
+                                    .await
+                                    .map_err(|_| ExecError::DurableState)?;
                                 }
                                 result
                             }
@@ -4699,13 +4758,22 @@ pub(crate) async fn run_agent_loop(
     } // end 'agent loop
 
     if let Some(ref fref) = found_file_ref {
-        save_last_file_ref(runtime_refs, session_id, fref).await;
+        save_last_file_ref(
+            db,
+            runtime_refs,
+            session_id,
+            fref,
+            durable_current_chat_refs,
+        )
+        .await
+        .map_err(|_| ExecError::DurableState)?;
     }
 
     Ok(ExecOutcome {
         final_text: full_response,
         tool_calls_used,
         approvals_denied,
+        validated_sources: transcript_sources,
     })
 }
 
@@ -4754,11 +4822,11 @@ fn normalized_legacy_model_error_event(error: &str) -> serde_json::Value {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptSource {
-    id: String,
-    title: String,
-    url: String,
-    domain: String,
+pub(crate) struct TranscriptSource {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    pub domain: String,
 }
 
 fn activity_kind(tool: &str) -> &'static str {

@@ -2,9 +2,10 @@ use bagentd::automation_sessions::{
     continue_automation_session_in_new_chat, delete_automation_definition, initialize_schema,
     mark_automation_session_viewed, open_automation_session, prune_automation_sessions,
     read_automation_session, read_continuation_provenance, register_definition, register_work,
-    start_current_chat, terminalize_automation_session, AutomationRunOutcome,
-    AutomationTaskSnapshot, AutomationTerminalization, SafeActivity,
+    terminalize_automation_session, AutomationRunOutcome, AutomationTaskSnapshot,
+    AutomationTerminalization, SafeActivity,
 };
+use chrono::Utc;
 use rusqlite::{params, Connection};
 
 fn connection() -> Connection {
@@ -197,14 +198,22 @@ fn retention() {
 #[test]
 fn continue_in_new_chat() {
     let connection = connection();
+    let original = bagentd::current_chat::open_or_create_current_chat(&connection).unwrap();
+    bagentd::current_chat::save_draft(
+        &connection,
+        &original.identity,
+        original.revision,
+        "occupied",
+        &[],
+        Utc::now(),
+    )
+    .unwrap();
     register_work(&connection, "work-a", "run-a").unwrap();
     terminalize_automation_session(&connection, terminalization()).unwrap();
-    start_current_chat(&connection, "chat-a", false).unwrap();
 
     assert!(continue_automation_session_in_new_chat(
         &connection,
         "automation-session-a",
-        "chat-a",
         "continuation seed",
         false,
         "continue-command-a",
@@ -213,7 +222,6 @@ fn continue_in_new_chat() {
     let provenance = continue_automation_session_in_new_chat(
         &connection,
         "automation-session-a",
-        "chat-a",
         "continuation seed",
         true,
         "continue-command-a",
@@ -234,15 +242,56 @@ fn continue_in_new_chat() {
     assert!(continue_automation_session_in_new_chat(
         &connection,
         "automation-session-a",
-        "chat-a",
         "continuation seed",
         true,
         "continue-command-a",
     )
     .is_ok());
     assert_eq!(
-        read_continuation_provenance(&connection, "chat-a").unwrap(),
+        read_continuation_provenance(&connection, &provenance.target_current_chat_identity)
+            .unwrap(),
         Some(provenance)
+    );
+}
+
+#[test]
+fn interrupted_current_chat_requires_continuation_confirmation() {
+    let connection = connection();
+    let original = bagentd::current_chat::open_or_create_current_chat(&connection).unwrap();
+    let begun = bagentd::current_chat::begin_conversation_turn(
+        &connection,
+        &original.identity,
+        original.revision,
+        "retained interrupted user message",
+        &[],
+        Utc::now(),
+    )
+    .unwrap();
+    bagentd::current_chat::interrupt_conversation_turn(
+        &connection,
+        &original.identity,
+        &begun.identity,
+        Utc::now(),
+    )
+    .unwrap();
+    register_work(&connection, "work-a", "run-a").unwrap();
+    terminalize_automation_session(&connection, terminalization()).unwrap();
+
+    let error = continue_automation_session_in_new_chat(
+        &connection,
+        "automation-session-a",
+        "continuation seed",
+        false,
+        "continue-interrupted",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("replacement confirmation"));
+    assert_eq!(
+        bagentd::current_chat::read_current_chat(&connection)
+            .unwrap()
+            .turns[0]
+            .user_message,
+        "retained interrupted user message"
     );
 }
 

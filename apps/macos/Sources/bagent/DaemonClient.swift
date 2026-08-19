@@ -104,6 +104,11 @@ struct ScreenIntentResponse: Decodable, Sendable {
 // MARK: - Client
 
 struct DaemonClient: Sendable, NotchEventTransport {
+    enum CurrentChatMutationError: Error {
+        case conflict
+        case bound
+        case unavailable
+    }
 
     enum TavilyConfigurationStatus: String, Codable, Sendable, Equatable {
         case pending
@@ -112,10 +117,16 @@ struct DaemonClient: Sendable, NotchEventTransport {
         case configurationFailed = "configuration_failed"
     }
 
-    private static let dataDir = FileManager.default
-        .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-        .first!
-        .appendingPathComponent("bagent")
+    private static let dataDir: URL = {
+        if ProcessInfo.processInfo.environment["BAGENT_STAGE7A_ACCEPTANCE_FIXTURE"] == "1",
+           let path = ProcessInfo.processInfo.environment["BAGENT_DATA_DIR"] {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        return FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!
+            .appendingPathComponent("bagent")
+    }()
 
     private struct Creds {
         let port: Int
@@ -452,7 +463,7 @@ struct DaemonClient: Sendable, NotchEventTransport {
         case odooFound(OdooRef)
         /// Phase 11: WhatsApp chat found.
         case whatsappFound(WhatsappRef)
-        case done(sessionId: String?)
+        case done
     }
 
     static func evidenceChatEvent(from event: SSEEvent) -> ChatEvent? {
@@ -613,8 +624,42 @@ struct DaemonClient: Sendable, NotchEventTransport {
             kind: kind,
             localURL: url,
             sizeBytes: resp.size,
+            availability: .available,
             thumbnail: thumbnail
         )
+    }
+
+    /// Refetch daemon-owned metadata for a pending attachment reference.
+    func attachment(id: String) async throws -> ChatAttachment {
+        let c = try await loadCreds()
+        let encodedID = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/attachments/\(encodedID)", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.badStatus
+        }
+        struct Response: Decodable {
+            let id: String
+            let filename: String
+            let mime: String
+            let size: Int
+        }
+        let metadata = try JSONDecoder().decode(Response.self, from: data)
+        return ChatAttachment(
+            id: metadata.id,
+            filename: metadata.filename,
+            mime: metadata.mime,
+            kind: Self.attachmentKind(for: metadata.mime),
+            localURL: nil,
+            sizeBytes: metadata.size,
+            availability: .available)
+    }
+
+    private static func attachmentKind(for mime: String) -> ChatAttachmentKind {
+        if mime.hasPrefix("image/") { return .image }
+        if mime == "application/pdf" { return .pdf }
+        if mime.hasPrefix("text/") { return .text }
+        return .other
     }
 
     private func mimeType(for url: URL) -> String {
@@ -635,9 +680,99 @@ struct DaemonClient: Sendable, NotchEventTransport {
         }
     }
 
-    struct HistoryTurn: Encodable {
-        let role: String
-        let content: String
+    struct CurrentChatSnapshot: Codable, Sendable, Equatable {
+        let identity: String
+        let revision: UInt64
+        let turnCount: UInt64
+        let contentBytes: UInt64
+        let turns: [CurrentChatTurn]
+        let draft: CurrentChatDraft?
+        let continuation: CurrentChatContinuation?
+        let submittedAttachments: [SubmittedAttachment]
+        let validatedSources: [CurrentChatAvailability]
+        let connectorReferences: [CurrentChatAvailability]
+        let completedApprovalPresentations: [CompletedApprovalPresentation]
+
+        enum CodingKeys: String, CodingKey {
+            case identity, revision, turns, draft, continuation
+            case turnCount = "turn_count"
+            case contentBytes = "content_bytes"
+            case submittedAttachments = "submitted_attachments"
+            case validatedSources = "validated_sources"
+            case connectorReferences = "connector_references"
+            case completedApprovalPresentations = "completed_approval_presentations"
+        }
+    }
+
+    struct CurrentChatTurn: Codable, Sendable, Equatable {
+        let identity: String
+        let userMessage: String
+        let assistantOutput: String?
+        let state: String
+        let interruptionReason: String?
+        let submittedAt: String
+        let completedAt: String?
+
+        enum CodingKeys: String, CodingKey {
+            case identity, state
+            case userMessage = "user_message"
+            case assistantOutput = "assistant_output"
+            case interruptionReason = "interruption_reason"
+            case submittedAt = "submitted_at"
+            case completedAt = "completed_at"
+        }
+    }
+
+    struct CurrentChatDraft: Codable, Sendable, Equatable {
+        let text: String
+        let editedAt: String
+        let pendingAttachmentReferences: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case text
+            case editedAt = "edited_at"
+            case pendingAttachmentReferences = "pending_attachment_references"
+        }
+    }
+
+    struct CurrentChatContinuation: Codable, Sendable, Equatable {
+        let identity: String
+        let sourceAutomationSessionIdentity: String
+        let seed: String
+        let sourceDeleted: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case identity, seed
+            case sourceAutomationSessionIdentity = "source_automation_session_identity"
+            case sourceDeleted = "source_deleted"
+        }
+    }
+
+    struct SubmittedAttachment: Codable, Sendable, Equatable {
+        let conversationTurnIdentity: String
+        let identity: String
+        let filename: String
+        let mime: String
+        let sizeBytes: UInt64
+        let available: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case identity, filename, mime, available
+            case conversationTurnIdentity = "conversation_turn_identity"
+            case sizeBytes = "size_bytes"
+        }
+    }
+
+    struct CurrentChatAvailability: Codable, Sendable, Equatable {
+        let identity: String
+        let label: String
+        let availability: String
+    }
+
+    struct CompletedApprovalPresentation: Codable, Sendable, Equatable {
+        let identity: String
+        let category: String
+        let outcome: String
     }
 
     func configureStage8Acceptance(acquisition: String?, polish: String?) async throws {
@@ -664,12 +799,12 @@ struct DaemonClient: Sendable, NotchEventTransport {
 
     func chatStream(
         text: String,
-        sessionId: String?,
+        currentChatIdentity: String,
+        expectedRevision: UInt64,
         model: String,
         attachmentIds: [String] = [],
         screenContext: ScreenContextFields? = nil,
-        sourceMode: SourceMode? = nil,
-        history: [HistoryTurn] = []
+        sourceMode: SourceMode? = nil
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -683,10 +818,9 @@ struct DaemonClient: Sendable, NotchEventTransport {
                     struct Body: Encodable {
                         let message: String
                         let model: String
-                        let session_id: String?
+                        let current_chat_identity: String
+                        let expected_revision: UInt64
                         let attachment_ids: [String]
-                        // Sliding-window conversation history (oldest first)
-                        let history: [HistoryTurn]
                         // OCR/selection context — ephemeral, never persisted
                         let screen_ocr_text: String?
                         let active_app: String?
@@ -696,9 +830,9 @@ struct DaemonClient: Sendable, NotchEventTransport {
                     req.httpBody = try JSONEncoder().encode(Body(
                         message: text,
                         model: model,
-                        session_id: sessionId,
+                        current_chat_identity: currentChatIdentity,
+                        expected_revision: expectedRevision,
                         attachment_ids: attachmentIds,
-                        history: history,
                         screen_ocr_text: screenContext?.ocrText.isEmpty == false ? screenContext?.ocrText : nil,
                         active_app: screenContext?.activeApp,
                         selected_text: screenContext?.selectedText,
@@ -855,7 +989,7 @@ struct DaemonClient: Sendable, NotchEventTransport {
                                 ))
                             }
                         case "done":
-                            continuation.yield(.done(sessionId: event.session_id))
+                            continuation.yield(.done)
                             continuation.finish(); return
                         case "error":
                             throw DaemonError.serverError(event.message ?? "unknown")
@@ -870,15 +1004,64 @@ struct DaemonClient: Sendable, NotchEventTransport {
         }
     }
 
-    // MARK: Sessions
+    // MARK: Current Chat
 
-    func createSession() async throws -> String {
+    func currentChat() async throws -> CurrentChatSnapshot {
         let c = try await loadCreds()
-        var req = authedRequest("/sessions", creds: c)
-        req.httpMethod = "POST"
-        let (data, _) = try await URLSession.shared.data(for: req)
-        struct Resp: Decodable { let session_id: String }
-        return try JSONDecoder().decode(Resp.self, from: data).session_id
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/current-chat", creds: c))
+        try validateOK(data: data, response: response)
+        return try JSONDecoder().decode(CurrentChatSnapshot.self, from: data)
+    }
+
+    func saveCurrentChatDraft(identity: String, expectedRevision: UInt64, text: String,
+                              pendingAttachmentReferences: [String]) async throws -> CurrentChatSnapshot {
+        struct Body: Encodable {
+            let current_chat_identity: String
+            let expected_revision: UInt64
+            let text: String
+            let pending_attachment_references: [String]
+        }
+        return try await currentChatMutation(path: "/current-chat/draft", body: Body(
+            current_chat_identity: identity, expected_revision: expectedRevision, text: text,
+            pending_attachment_references: pendingAttachmentReferences))
+    }
+
+    func clearCurrentChat(identity: String, expectedRevision: UInt64, commandIdentity: String,
+                          confirmedNonEmpty: Bool) async throws -> CurrentChatSnapshot {
+        struct Body: Encodable {
+            let current_chat_identity: String
+            let expected_revision: UInt64
+            let command_identity: String
+            let confirmed_non_empty: Bool
+        }
+        return try await currentChatMutation(path: "/current-chat/clear", body: Body(
+            current_chat_identity: identity, expected_revision: expectedRevision,
+            command_identity: commandIdentity, confirmed_non_empty: confirmedNonEmpty))
+    }
+
+    private func currentChatMutation<Body: Encodable>(path: String, body: Body) async throws -> CurrentChatSnapshot {
+        let c = try await loadCreds()
+        var request = authedRequest(path, creds: c)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CurrentChatMutationError.unavailable
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String
+            switch code {
+            case "current_chat_conflict", "current_chat_invalid":
+                throw CurrentChatMutationError.conflict
+            case "current_chat_bound":
+                throw CurrentChatMutationError.bound
+            default:
+                throw CurrentChatMutationError.unavailable
+            }
+        }
+        return try JSONDecoder().decode(CurrentChatSnapshot.self, from: data)
     }
 
     // MARK: Memory
@@ -1191,13 +1374,11 @@ struct DaemonClient: Sendable, NotchEventTransport {
 
     func continueAutomationSession(
         identity: String,
-        currentChatIdentity: String,
         seed: String,
         confirmedReplacement: Bool,
         commandIdentity: String
     ) async throws -> AutomationContinuationProvenance {
         let body = ContinueAutomationSessionBody(
-            currentChatIdentity: currentChatIdentity,
             seed: seed,
             confirmedReplacement: confirmedReplacement,
             commandIdentity: commandIdentity)
@@ -1221,13 +1402,11 @@ struct DaemonClient: Sendable, NotchEventTransport {
     }
 
     private struct ContinueAutomationSessionBody: Encodable {
-        let currentChatIdentity: String
         let seed: String
         let confirmedReplacement: Bool
         let commandIdentity: String
 
         enum CodingKeys: String, CodingKey {
-            case currentChatIdentity = "currentChatIdentity"
             case seed
             case confirmedReplacement = "confirmedReplacement"
             case commandIdentity = "commandIdentity"

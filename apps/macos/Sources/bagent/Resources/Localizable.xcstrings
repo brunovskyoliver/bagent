@@ -1,0 +1,114 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "currentChat.attachment.remove" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Remove attachment" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "添付ファイルを削除" } }
+      }
+    },
+    "currentChat.attachment.unavailable" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Attachment unavailable" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "添付ファイルを利用できません" } }
+      }
+    },
+    "currentChat.clear.active" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Finish the active turn or approval before clearing Current Chat" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットを消去する前に、進行中のターンまたは承認を完了してください" } }
+      }
+    },
+    "currentChat.clear.announcement" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Current Chat cleared" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットを消去しました" } }
+      }
+    },
+    "currentChat.clear.cancel" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Cancel" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "キャンセル" } }
+      }
+    },
+    "currentChat.clear.confirm" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Clear Current Chat" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットを消去" } }
+      }
+    },
+    "currentChat.clear.explanation" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Clears completed and interrupted turns, the draft, attachments, sources, Connector References, approvals, and any Continuation Seed and Provenance. No hidden archive is kept. Automation Sessions, Runs and Definitions, Saved Long-Term Memory, external side effects, and source-session viewed state remain; no Automation Work is cancelled." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "完了・中断したターン、下書き、添付ファイル、ソース、コネクタ参照、承認、継続シードと来歴を消去します。非表示のアーカイブは残りません。自動化セッション、実行、定義、保存済み長期記憶、外部の副作用、元セッションの閲覧状態は残り、自動化作業はキャンセルされません。" } }
+      }
+    },
+    "currentChat.clear.changed" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Current Chat changed in another window. Review it before clearing." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "別のウインドウで現在のチャットが変更されました。消去する前に確認してください。" } }
+      }
+    },
+    "currentChat.clear.failure" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Current Chat could not be cleared. Try again." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットを消去できませんでした。もう一度お試しください。" } }
+      }
+    },
+    "currentChat.clear.title" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Clear Current Chat?" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットを消去しますか？" } }
+      }
+    },
+    "currentChat.draft.limit" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Current Chat Draft is limited to 16 KiB" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットの下書きは16 KiBまでです" } }
+      }
+    },
+    "currentChat.draft.saveFailure" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Current Chat Draft could not be saved" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットの下書きを保存できませんでした" } }
+      }
+    },
+    "currentChat.loading" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Current Chat is still loading" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットを読み込み中です" } }
+      }
+    },
+    "currentChat.restore.failure" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Current Chat could not be restored" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットを復元できませんでした" } }
+      }
+    },
+    "currentChat.restoredRecords.accessibilityLabel" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Restored Current Chat records" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "復元された現在のチャット記録" } }
+      }
+    },
+    "currentChat.turn.interrupted" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "This response was interrupted. Submit a new message to continue." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "この応答は中断されました。続けるには新しいメッセージを送信してください。" } }
+      }
+    },
+    "slashCommand.clear.subtitle" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Clear Current Chat" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "現在のチャットを消去" } }
+      }
+    },
+    "slashCommand.suggestion.accessibilityLabel" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Command %@, %@" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "コマンド %@、%@" } }
+      }
+    }
+  },
+  "version" : "1.0"
+}

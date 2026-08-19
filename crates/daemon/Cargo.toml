@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 stage8-acceptance = []
+stage7a-acceptance = []
 
 [[bin]]
 name = "bagentd"

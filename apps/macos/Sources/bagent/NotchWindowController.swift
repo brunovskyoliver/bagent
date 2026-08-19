@@ -81,6 +81,15 @@ final class NotchWindowController: NSObject {
         chatViewModel.onInputOnlySubmitted = { [weak self] in
             self?.collapseInputForThinking()
         }
+        chatViewModel.onSlashSuggestionCompletion = { [weak self] command in
+            guard let self,
+                  let editor = self.statusPanel.firstResponder as? NSTextView,
+                  SlashCommandTextCompletion.replaceDraft(in: editor, with: command)
+            else { return false }
+            self.chatViewModel.inputText = editor.string
+            self.statusPanel.makeFirstResponder(editor)
+            return true
+        }
         // cmux agent event: transient banner in the collapsed notch for 5s, then
         // collapse back to the persistent left icon (still jiggling) + right corner
         // dot, which linger until the event clears. Latest event wins the banner.
@@ -360,7 +369,26 @@ final class NotchWindowController: NSObject {
                 }
                 return event
             }
+            let markedTextActive = (NSApp.keyWindow?.firstResponder as? NSTextView)?
+                .hasMarkedText() == true
+            self.chatViewModel.hasUncommittedMarkedText = markedTextActive
+            if self.chatViewModel.authoritativePendingApproval != nil || markedTextActive {
+                return event
+            }
+            let commandModifiers = event.modifierFlags
+                .intersection(.deviceIndependentFlagsMask)
+                .intersection([.command, .option, .control, .shift])
+            let isPlainKey = commandModifiers.isEmpty
+            if [36, 76].contains(event.keyCode),
+               !isPlainKey,
+               self.chatViewModel.notchInteractionMode == .input {
+                self.chatViewModel.preserveModifiedReturnForNativeEditing()
+            }
             if event.keyCode == 53 {
+                if self.chatViewModel.clearCurrentChatConfirmationPresented {
+                    self.chatViewModel.cancelCurrentChatClear()
+                    return nil
+                }
                 // Esc dismisses slash suggestions first, then steps back in
                 // the automations surface, then exits response-history
                 // browsing, then collapses the notch.
@@ -401,16 +429,24 @@ final class NotchWindowController: NSObject {
                 default: break
                 }
             }
-            // Slash-command suggestions consume ↑/↓ (selection), Tab and
-            // Return (accept) while visible.
+            // Slash suggestions own plain arrows and Tab. Return evaluates the
+            // untouched draft through ChatViewModel.send().
             if !self.chatViewModel.slashSuggestions.isEmpty {
                 switch event.keyCode {
-                case 126: if self.chatViewModel.moveSlashSelection(by: -1) { return nil }
-                case 125: if self.chatViewModel.moveSlashSelection(by: 1) { return nil }
-                case 48, 36:
-                    if self.chatViewModel.acceptSlashSuggestion() { return nil }
+                case 126 where isPlainKey:
+                    if self.chatViewModel.moveSlashSelection(by: -1) { return nil }
+                case 125 where isPlainKey:
+                    if self.chatViewModel.moveSlashSelection(by: 1) { return nil }
+                case 48 where isPlainKey:
+                    if self.chatViewModel.completeSlashSuggestion() { return nil }
                 default: break
                 }
+            }
+            if event.keyCode == 76,
+               isPlainKey,
+               self.chatViewModel.notchInteractionMode == .input {
+                self.chatViewModel.send()
+                return nil
             }
             // ←/→ switch settings pages while the /settings surface is open.
             if self.chatViewModel.notchInteractionMode == .settings {

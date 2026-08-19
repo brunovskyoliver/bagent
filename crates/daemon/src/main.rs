@@ -20,12 +20,19 @@ use bagent_attachments::extract as extract_attachment;
 use bagent_memory::MemoryStore;
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
 use bagent_skills::{selector as skill_selector, LoadedSkill};
+#[cfg(feature = "stage7a-acceptance")]
+use bagentd::current_chat::seed_stage7a_acceptance_records;
+use bagentd::current_chat::{
+    capture_recovered_approval_presentations, clear_current_chat, open_or_create_current_chat,
+    read_current_chat, recover_after_daemon_restart, save_draft, upsert_connector_reference,
+    ClearCurrentChatCommand, SubmittedAttachmentMetadata, ValidatedSourceMetadata,
+};
 use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig, RuntimePhase};
 use bagentd::unified_work::UnifiedWorkAuthority;
 use bagentd::work_coordinator::{
     ApprovalState, CommandError, ConversationTurnIdentity, CoordinatorConfig, CurrentChatIdentity,
-    DaemonGeneration, EventCursor, EventRead, WorkCoordinator, WorkIdentity, WorkOrigin,
-    WorkRecord, WorkRevision, WorkSnapshot, WorkState,
+    CurrentChatTerminalOutcome, DaemonGeneration, EventCursor, EventRead, WorkCoordinator,
+    WorkIdentity, WorkOrigin, WorkRecord, WorkRevision, WorkSnapshot, WorkState,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use basert_connector::{Message, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL};
@@ -99,7 +106,8 @@ struct AppState {
     /// Bridge can autostart when a prior LocalAuth session exists, and is also
     /// controlled explicitly via `/whatsapp/start` and `/whatsapp/stop`.
     whatsapp: Arc<WhatsappConnector>,
-    /// Ephemeral connector refs for current daemon run only. Never persisted.
+    /// Hot cache for durable chat-scoped Connector References. SQLite remains
+    /// authoritative; restart invalidates cached payloads before reuse.
     runtime_refs: Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     /// Pinged whenever an automation is created/edited/enabled/disabled/deleted
     /// so the scheduler recomputes its next wake-up immediately.
@@ -131,12 +139,9 @@ struct RuntimeRefs {
 #[derive(Deserialize)]
 struct ChatRequest {
     message: String,
-    /// Sliding-window conversation history (user/assistant turns, oldest first).
-    /// Clamped server-side to 10 turns / 8k chars.
-    #[serde(default)]
-    history: Vec<Message>,
+    current_chat_identity: String,
+    expected_revision: u64,
     model: Option<String>,
-    session_id: Option<String>,
     /// IDs returned by POST /attachments — empty when no files attached.
     #[serde(default)]
     attachment_ids: Vec<String>,
@@ -378,7 +383,12 @@ async fn main() -> Result<()> {
         bagentd::cutover::record_pre_cutover_backup(&db_path, hash)
             .map_err(|error| anyhow::anyhow!("record Stage 4 backup: {error}"))?;
     }
-    purge_legacy_context_data(&data_dir, &mut conn);
+    bagentd::current_chat::initialize_schema(&conn)
+        .map_err(|error| anyhow::anyhow!("initialize Current Chat: {error}"))?;
+    recover_after_daemon_restart(&conn, chrono::Utc::now())
+        .map_err(|error| anyhow::anyhow!("recover Current Chat: {error}"))?;
+    open_or_create_current_chat(&conn)
+        .map_err(|error| anyhow::anyhow!("open Current Chat: {error}"))?;
     let db = Arc::new(Mutex::new(conn));
 
     let token_path = data_dir.join("daemon.token");
@@ -419,15 +429,37 @@ async fn main() -> Result<()> {
     let classifier_model =
         std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
     let synthesis_config = evidence::SynthesisConfig::from_environment();
-    let model_runtime = ModelRuntime::production_from_endpoint(
-        basert_base_url,
+    let model_config = ProductionModelConfig::from_environment(
+        default_model.clone(),
+        synthesis_config.preferred_model.clone(),
         basert_api_key.clone(),
-        ProductionModelConfig::from_environment(
-            default_model.clone(),
-            synthesis_config.preferred_model.clone(),
-            basert_api_key,
-        ),
     );
+    #[cfg(feature = "stage7a-acceptance")]
+    let stage7a_fixture = std::env::var("BAGENT_STAGE7A_ACCEPTANCE_FIXTURE").as_deref() == Ok("1");
+    #[cfg(feature = "stage7a-acceptance")]
+    let model_runtime = if stage7a_fixture {
+        ModelRuntime::external_fixture_from_endpoint(basert_base_url, basert_api_key, model_config)
+    } else {
+        ModelRuntime::production_from_endpoint(basert_base_url, basert_api_key, model_config)
+    };
+    #[cfg(not(feature = "stage7a-acceptance"))]
+    let model_runtime =
+        ModelRuntime::production_from_endpoint(basert_base_url, basert_api_key, model_config);
+    #[cfg(feature = "stage7a-acceptance")]
+    if stage7a_fixture {
+        let allow_retained_chat_model =
+            std::env::var("BAGENT_STAGE7A_ACCEPTANCE_RESTART").as_deref() == Ok("1");
+        model_runtime
+            .initialize_external_fixture(allow_retained_chat_model)
+            .await
+            .context("initialize external Stage 7A Model Runtime fixture")?;
+    } else {
+        model_runtime
+            .initialize()
+            .await
+            .context("initialize daemon-owned Model Runtime")?;
+    }
+    #[cfg(not(feature = "stage7a-acceptance"))]
     model_runtime
         .initialize()
         .await
@@ -446,6 +478,12 @@ async fn main() -> Result<()> {
         ),
         daemon_generation,
     ));
+    {
+        let connection = db.lock().await;
+        capture_recovered_approval_presentations(&connection, chrono::Utc::now()).map_err(
+            |error| anyhow::anyhow!("capture recovered Current Chat approvals: {error}"),
+        )?;
+    }
     tokio::spawn(
         work_authority
             .clone()
@@ -733,6 +771,9 @@ async fn main() -> Result<()> {
         )
         .route("/models", get(models))
         .route("/chat", post(chat))
+        .route("/current-chat", get(current_chat_get))
+        .route("/current-chat/draft", post(current_chat_draft_save))
+        .route("/current-chat/clear", post(current_chat_clear))
         .route("/embeddings", post(embeddings))
         .route("/approvals/pending", get(approvals_pending))
         .route("/approvals/:id/decide", post(approval_decide))
@@ -781,10 +822,6 @@ async fn main() -> Result<()> {
             "/automation-sessions/:automation_session_identity/continue",
             post(automations_api::automation_session_continue),
         )
-        // Phase 4B — Sessions
-        .route("/sessions", post(session_create).get(sessions_list))
-        .route("/sessions/:id/turns", get(session_turns))
-        .route("/sessions/:id", delete(session_delete))
         // Phase 4B — Memory
         .route("/memory", post(memory_insert).get(memory_list))
         .route("/memory/search", get(memory_search))
@@ -879,6 +916,15 @@ async fn main() -> Result<()> {
             post(stage8_acceptance_not_found_handler),
         );
     }
+    #[cfg(feature = "stage7a-acceptance")]
+    if std::env::var("BAGENT_STAGE7A_ACCEPTANCE_FIXTURE").as_deref() == Ok("1") {
+        app = app
+            .route("/acceptance/stage7a/state", get(stage7a_acceptance_state))
+            .route(
+                "/acceptance/stage7a/seed-retained",
+                post(stage7a_acceptance_seed),
+            );
+    }
     let app = app
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
@@ -894,28 +940,6 @@ async fn main() -> Result<()> {
     let _ = std::fs::remove_file(data_dir.join("daemon.pid"));
     let _ = std::fs::remove_file(data_dir.join("daemon.port"));
     Ok(())
-}
-
-fn purge_legacy_context_data(data_dir: &std::path::Path, conn: &mut Connection) {
-    let cleanup_sql = [
-        "DELETE FROM memory_items",
-        "DELETE FROM chat_turn_attachments",
-        "DELETE FROM chat_turns",
-        "DELETE FROM embeddings WHERE source IN ('memory_item','chat_turn')",
-        "UPDATE sessions SET summary = NULL, metadata_json = NULL",
-    ];
-    for sql in cleanup_sql {
-        if let Err(e) = conn.execute(sql, []) {
-            tracing::debug!("legacy context purge skipped `{sql}`: {e}");
-        }
-    }
-
-    let memories_dir = data_dir.join("memories");
-    if memories_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&memories_dir) {
-            tracing::debug!("legacy memory mirror purge skipped: {e}");
-        }
-    }
 }
 
 // ── Filesystem handlers ───────────────────────────────────────────────────────
@@ -1509,9 +1533,68 @@ fn sha256_str(s: &str) -> String {
 }
 
 fn app_data_dir() -> PathBuf {
+    #[cfg(feature = "stage7a-acceptance")]
+    if std::env::var("BAGENT_STAGE7A_ACCEPTANCE_FIXTURE").as_deref() == Ok("1") {
+        if let Some(path) = std::env::var_os("BAGENT_DATA_DIR") {
+            return PathBuf::from(path);
+        }
+    }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("bagent")
+}
+
+#[cfg(feature = "stage7a-acceptance")]
+async fn stage7a_acceptance_state(State(state): State<AppState>) -> impl IntoResponse {
+    let snapshot = state
+        .work_authority
+        .coordinator()
+        .snapshot()
+        .map_err(|error| error.to_string());
+    let current_chat = {
+        let connection = state.db.lock().await;
+        read_current_chat(&connection).map_err(|error| error.to_string())
+    };
+    match (snapshot, current_chat) {
+        (Ok(work), Ok(chat)) => {
+            let runtime = state.model_runtime.snapshot();
+            let active_work = work
+                .works
+                .into_iter()
+                .filter(|record| !record.state.is_terminal())
+                .collect::<Vec<_>>();
+            Json(serde_json::json!({
+                "daemon_pid": std::process::id(),
+                "active_work": active_work,
+                "lease_count": runtime.lease_count,
+                "runtime_phase": format!("{:?}", runtime.phase),
+                "runtime_queued_demand_count": runtime.queued_demand_count,
+                "runtime_generation": runtime.generation,
+                "current_chat_identity": chat.identity,
+                "current_chat_revision": chat.revision,
+                "current_chat_content_sha256": sha256_str(
+                    &serde_json::to_string(&chat).unwrap_or_default()),
+            }))
+            .into_response()
+        }
+        (Err(error), _) | (_, Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "stage7a-acceptance")]
+async fn stage7a_acceptance_seed(State(state): State<AppState>) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match seed_stage7a_acceptance_records(&connection, chrono::Utc::now()) {
+        Ok(snapshot) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(snapshot).unwrap_or_default()),
+        ),
+        Err(error) => current_chat_error_response(error),
+    }
 }
 
 // ── Disk usage ────────────────────────────────────────────────────────────────
@@ -2649,38 +2732,132 @@ async fn chat(
 
     tokio::spawn(async move {
         let t0 = std::time::Instant::now();
-        // Ensure session exists
-        let session_id = match req.session_id.clone() {
-            Some(id) => id,
-            None => {
-                let id = Uuid::new_v4().to_string();
-                let now = chrono::Utc::now().to_rfc3339();
-                if let Ok(db) = db.try_lock() {
-                    let _ = db.execute(
-                        "INSERT OR IGNORE INTO sessions (id, started_at) VALUES (?1, ?2)",
-                        rusqlite::params![id, now],
-                    );
+        // The daemon owns Current Chat identity, history, and turn admission.
+        let (session_id, conversation_turn_identity, work_identity, mut history) = {
+            let connection = db.lock().await;
+            let snapshot = match read_current_chat(&connection) {
+                Ok(snapshot)
+                    if snapshot.identity == req.current_chat_identity
+                        && snapshot.revision == req.expected_revision =>
+                {
+                    snapshot
                 }
-                id
+                Ok(_) => {
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "stale_current_chat",
+                                "message": "Current Chat changed; refetch and retry."
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_unavailable",
+                                "message": error.to_string()
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let attachments = req
+                .attachment_ids
+                .iter()
+                .filter_map(|identity| {
+                    connection
+                        .query_row(
+                            "SELECT filename, mime, size_bytes FROM attachments WHERE id=?1",
+                            rusqlite::params![identity],
+                            |row| {
+                                Ok(SubmittedAttachmentMetadata {
+                                    identity: identity.clone(),
+                                    filename: row.get(0)?,
+                                    mime: row.get(1)?,
+                                    size_bytes: row.get(2)?,
+                                    available: true,
+                                })
+                            },
+                        )
+                        .ok()
+                })
+                .collect::<Vec<_>>();
+            if attachments.len() != req.attachment_ids.len() {
+                let _ = tx
+                    .send(Ok(Event::default().data(
+                        serde_json::json!({
+                            "type": "error",
+                            "code": "attachment_not_found",
+                            "message": "A pending attachment is no longer available."
+                        })
+                        .to_string(),
+                    )))
+                    .await;
+                return;
             }
+            let (work_identity, begun) = match state.work_authority.submit_current_chat_turn(
+                format!("chat-admit:{}", Uuid::new_v4()),
+                CurrentChatIdentity::new(snapshot.identity.clone()),
+                snapshot.revision,
+                &user_message,
+                &attachments,
+                chrono::Utc::now(),
+                chrono::Utc::now().timestamp().max(0) as u64,
+            ) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_rejected",
+                                "message": error.to_string()
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let history = snapshot
+                .turns
+                .iter()
+                .rev()
+                .take(5)
+                .rev()
+                .flat_map(|turn| {
+                    let mut messages = vec![Message::user(&turn.user_message)];
+                    if let Some(output) = turn.assistant_output.as_deref() {
+                        messages.push(Message::assistant(output));
+                    }
+                    messages
+                })
+                .collect::<Vec<_>>();
+            (snapshot.identity, begun.identity, work_identity, history)
         };
 
-        // Sliding-window conversation history supplied by the client so
-        // follow-ups ("what other options do I have?") resolve. Clamped here —
-        // the client is trusted UI but the caps are the contract.
         const HISTORY_MAX_TURNS: usize = 10;
         const HISTORY_MAX_TURN_CHARS: usize = 1_500;
         const HISTORY_MAX_TOTAL_CHARS: usize = 8_000;
-        let mut history: Vec<Message> = req
-            .history
-            .iter()
+        history = history
+            .into_iter()
             .rev()
-            .filter(|m| (m.role == "user" || m.role == "assistant") && !m.content.trim().is_empty())
             .take(HISTORY_MAX_TURNS)
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.chars().take(HISTORY_MAX_TURN_CHARS).collect(),
-                ..Message::user("")
+            .map(|mut message| {
+                message.content = message
+                    .content
+                    .chars()
+                    .take(HISTORY_MAX_TURN_CHARS)
+                    .collect();
+                message
             })
             .collect();
         history.reverse();
@@ -2794,6 +2971,13 @@ async fn chat(
         };
 
         if att_data.has_unsupported_image {
+            let _ = fail_current_chat_work(
+                &state,
+                &session_id,
+                &conversation_turn_identity,
+                &work_identity,
+                "unsupported-image",
+            );
             let _ = tx
                 .send(Ok(Event::default().data(
                     serde_json::json!({
@@ -2990,15 +3174,6 @@ async fn chat(
         // ── Agentic tool loop (shared execution service) ─────────────────────
         // One loop for chat and automations lives in agent_exec. Guardrails
         // live in its dispatcher: rules engine verdicts on the actual args,
-        let work_identity = match state.work_authority.submit_conversation(
-            format!("chat-admit:{}", Uuid::new_v4()),
-            CurrentChatIdentity::new(session_id.clone()),
-            ConversationTurnIdentity::new(Uuid::new_v4().to_string()),
-            chrono::Utc::now().timestamp().max(0) as u64,
-        ) {
-            Ok(identity) => identity,
-            Err(_) => return,
-        };
         state.work_authority.admit(work_identity.clone()).await;
         let waiting_revision = match state
             .work_authority
@@ -3009,7 +3184,15 @@ async fn chat(
         {
             Some(revision) => revision,
             None => {
-                state.work_authority.release_slot(&work_identity);
+                if let Err(error) = fail_current_chat_work(
+                    &state,
+                    &session_id,
+                    &conversation_turn_identity,
+                    &work_identity,
+                    "missing-waiting-revision",
+                ) {
+                    tracing::error!(%error, "could not durably fail Current Chat Work");
+                }
                 return;
             }
         };
@@ -3021,14 +3204,29 @@ async fn chat(
         ) {
             Ok(revision) => revision,
             Err(_) => {
-                state.work_authority.release_slot(&work_identity);
+                if let Err(error) = fail_current_chat_work(
+                    &state,
+                    &session_id,
+                    &conversation_turn_identity,
+                    &work_identity,
+                    "running-transition",
+                ) {
+                    tracing::error!(%error, "could not durably fail Current Chat Work");
+                }
                 return;
             }
         };
 
         // PathPolicy (inside the fs connector), approval modal for writes,
         // per-turn budgets, and an audit entry per call.
-        let tools = agent_exec::build_tools(&state, false).await;
+        // The signed Stage 7A fixture proves model Work continuity and never
+        // exercises connectors. Avoid discovering host connectors in the
+        // disposable process so the fixture remains isolated and deterministic.
+        let tools = if acceptance_fixture_active {
+            Vec::new()
+        } else {
+            agent_exec::build_tools(&state, false).await
+        };
 
         // Forward execution events onto this request's SSE stream.
         let (ev_tx, mut ev_rx) = mpsc::channel::<serde_json::Value>(64);
@@ -3065,6 +3263,15 @@ async fn chat(
         let _ = forwarder.await;
         let full_response = match loop_result {
             Ok(outcome) => {
+                let sources = outcome
+                    .validated_sources
+                    .iter()
+                    .map(|source| ValidatedSourceMetadata {
+                        identity: source.id.clone(),
+                        title: source.title.clone(),
+                        domain: source.domain.clone(),
+                    })
+                    .collect::<Vec<_>>();
                 let terminal_revision = state
                     .work_authority
                     .current(&work_identity)
@@ -3072,31 +3279,82 @@ async fn chat(
                     .flatten()
                     .map(|record| record.revision)
                     .unwrap_or(running_revision);
-                state.work_authority.release_slot(&work_identity);
-                let _ = state.work_authority.transition(
+                let durable_completion = state.work_authority.terminalize_current_chat_turn(
                     format!("chat-complete:{}", Uuid::new_v4()),
-                    work_identity,
+                    work_identity.clone(),
                     terminal_revision,
-                    WorkState::Completed,
+                    &session_id,
+                    &conversation_turn_identity,
+                    Some(&outcome.final_text),
+                    &sources,
+                    chrono::Utc::now(),
                 );
+                if durable_completion.is_ok() {
+                    state.work_authority.release_slot(&work_identity);
+                }
+                let terminal_outcome = match durable_completion {
+                    Ok((_, terminal_outcome)) => terminal_outcome,
+                    Err(error) => {
+                        let interruption_error = fail_current_chat_work(
+                            &state,
+                            &session_id,
+                            &conversation_turn_identity,
+                            &work_identity,
+                            "completion-commit",
+                        )
+                        .err();
+                        let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_commit_failed",
+                                "message": interruption_error.map_or_else(
+                                    || error.to_string(),
+                                    |durable| format!("{error}; durable interruption failed: {durable}"))
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                        return;
+                    }
+                };
+                if terminal_outcome == CurrentChatTerminalOutcome::InterruptedContentBound {
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_bound",
+                                "message": "assistant output would exceed the 16 MiB Current Chat bound"
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
                 outcome.final_text
             }
             // Error already emitted to the stream / client gone.
-            Err(_) => {
-                let terminal_revision = state
-                    .work_authority
-                    .current(&work_identity)
-                    .ok()
-                    .flatten()
-                    .map(|record| record.revision)
-                    .unwrap_or(running_revision);
-                state.work_authority.release_slot(&work_identity);
-                let _ = state.work_authority.transition(
-                    format!("chat-failed:{}", Uuid::new_v4()),
-                    work_identity,
-                    terminal_revision,
-                    WorkState::Failed,
-                );
+            Err(error) => {
+                tracing::warn!(%error, "Current Chat execution failed");
+                if let Err(durable_error) = fail_current_chat_work(
+                    &state,
+                    &session_id,
+                    &conversation_turn_identity,
+                    &work_identity,
+                    "execution",
+                ) {
+                    tracing::error!(%durable_error, "Current Chat interruption was not durable; Work remains nonterminal");
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_interrupt_failed",
+                                "message": durable_error.to_string()
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                }
                 return;
             }
         };
@@ -3150,57 +3408,124 @@ async fn chat(
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
-// ── Session handlers ──────────────────────────────────────────────────────────
+fn fail_current_chat_work(
+    state: &AppState,
+    current_chat_identity: &str,
+    conversation_turn_identity: &str,
+    work_identity: &WorkIdentity,
+    reason: &str,
+) -> std::result::Result<(), CommandError> {
+    let record = state
+        .work_authority
+        .current(work_identity)?
+        .ok_or(CommandError::Conflict {
+            current_revision: None,
+        })?;
+    state.work_authority.terminalize_current_chat_turn(
+        format!("chat-failed-{reason}:{}", Uuid::new_v4()),
+        work_identity.clone(),
+        record.revision,
+        current_chat_identity,
+        conversation_turn_identity,
+        None,
+        &[],
+        chrono::Utc::now(),
+    )?;
+    state.work_authority.release_slot(work_identity);
+    Ok(())
+}
 
-async fn session_create(State(state): State<AppState>) -> impl IntoResponse {
-    let id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let db = state.db.lock().await;
-    match db.execute(
-        "INSERT INTO sessions (id, started_at) VALUES (?1, ?2)",
-        rusqlite::params![id, now],
-    ) {
-        Ok(_) => (
+async fn current_chat_get(State(state): State<AppState>) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match open_or_create_current_chat(&connection) {
+        Ok(snapshot) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "session_id": id })),
+            Json(serde_json::to_value(snapshot).unwrap_or_default()),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
+        Err(error) => current_chat_error_response(error),
     }
 }
 
-async fn sessions_list(State(_state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({ "sessions": [] })))
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentChatDraftSaveRequest {
+    current_chat_identity: String,
+    expected_revision: u64,
+    text: String,
+    #[serde(default)]
+    pending_attachment_references: Vec<String>,
 }
 
-async fn session_turns(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
-) -> impl IntoResponse {
-    (
-        StatusCode::GONE,
-        Json(serde_json::json!({ "error": "session history is disabled", "turns": [] })),
-    )
-}
-
-async fn session_delete(
+async fn current_chat_draft_save(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Json(request): Json<CurrentChatDraftSaveRequest>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().await;
-    match db.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id]) {
-        Ok(n) if n > 0 => (StatusCode::OK, Json(serde_json::json!({ "deleted": true }))),
-        Ok(_) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "session not found" })),
+    let connection = state.db.lock().await;
+    match save_draft(
+        &connection,
+        &request.current_chat_identity,
+        request.expected_revision,
+        &request.text,
+        &request.pending_attachment_references,
+        chrono::Utc::now(),
+    ) {
+        Ok(snapshot) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(snapshot).unwrap_or_default()),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
+        Err(error) => current_chat_error_response(error),
     }
+}
+
+async fn current_chat_clear(
+    State(state): State<AppState>,
+    Json(command): Json<ClearCurrentChatCommand>,
+) -> impl IntoResponse {
+    let old_identity = command.current_chat_identity.clone();
+    let connection = state.db.lock().await;
+    match clear_current_chat(&connection, command, None) {
+        Ok(snapshot) => {
+            drop(connection);
+            state.runtime_refs.lock().await.remove(&old_identity);
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(snapshot).unwrap_or_default()),
+            )
+        }
+        Err(error) => current_chat_error_response(error),
+    }
+}
+
+fn current_chat_error_response(
+    error: bagentd::current_chat::CurrentChatError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, code, message) = match &error {
+        bagentd::current_chat::CurrentChatError::Bound(_) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "current_chat_bound",
+            "Current Chat has reached its retained-content limit.",
+        ),
+        bagentd::current_chat::CurrentChatError::Conflict(_) => (
+            StatusCode::CONFLICT,
+            "current_chat_conflict",
+            "Current Chat changed; refetch and retry.",
+        ),
+        bagentd::current_chat::CurrentChatError::Invalid(_) => (
+            StatusCode::CONFLICT,
+            "current_chat_invalid",
+            "The Current Chat request is invalid.",
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "current_chat_unavailable",
+            "Current Chat is temporarily unavailable.",
+        ),
+    };
+    tracing::warn!(%error, code, "Current Chat mutation rejected");
+    (
+        status,
+        Json(serde_json::json!({ "code": code, "error": message })),
+    )
 }
 
 // ── Memory handlers ───────────────────────────────────────────────────────────
@@ -4873,51 +5198,96 @@ async fn load_runtime_refs(
 }
 
 async fn save_last_mail_ref(
+    db: &Arc<Mutex<Connection>>,
     refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     mail_ref: &MailRef,
-) {
+    durable_current_chat: bool,
+) -> anyhow::Result<()> {
+    if durable_current_chat {
+        persist_runtime_ref(db, session_id, "mail", mail_ref).await?;
+    }
     refs.lock()
         .await
         .entry(session_id.to_string())
         .or_default()
         .mail = Some(mail_ref.clone());
+    Ok(())
 }
 
 async fn save_last_file_ref(
+    db: &Arc<Mutex<Connection>>,
     refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     file_ref: &FileRef,
-) {
+    durable_current_chat: bool,
+) -> anyhow::Result<()> {
+    if durable_current_chat {
+        persist_runtime_ref(db, session_id, "files", file_ref).await?;
+    }
     refs.lock()
         .await
         .entry(session_id.to_string())
         .or_default()
         .file = Some(file_ref.clone());
+    Ok(())
 }
 
 async fn save_last_odoo_ref(
+    db: &Arc<Mutex<Connection>>,
     refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     odoo_ref: &OdooRecordRef,
-) {
+    durable_current_chat: bool,
+) -> anyhow::Result<()> {
+    if durable_current_chat {
+        persist_runtime_ref(db, session_id, "odoo", odoo_ref).await?;
+    }
     refs.lock()
         .await
         .entry(session_id.to_string())
         .or_default()
         .odoo = Some(odoo_ref.clone());
+    Ok(())
 }
 
 async fn save_last_whatsapp_ref(
+    db: &Arc<Mutex<Connection>>,
     refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     whatsapp_ref: &WhatsappRef,
-) {
+    durable_current_chat: bool,
+) -> anyhow::Result<()> {
+    if durable_current_chat {
+        persist_runtime_ref(db, session_id, "whatsapp", whatsapp_ref).await?;
+    }
     refs.lock()
         .await
         .entry(session_id.to_string())
         .or_default()
         .whatsapp = Some(whatsapp_ref.clone());
+    Ok(())
+}
+
+async fn persist_runtime_ref<T: Serialize>(
+    db: &Arc<Mutex<Connection>>,
+    current_chat_identity: &str,
+    connector_kind: &str,
+    reference: &T,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_string(reference)
+        .map_err(|_| anyhow::anyhow!("failed to encode Connector Reference"))?;
+    let reference_identity = format!("{connector_kind}:{}", &sha256_str(&payload)[..24]);
+    let connection = db.lock().await;
+    upsert_connector_reference(
+        &connection,
+        current_chat_identity,
+        &reference_identity,
+        connector_kind,
+        &payload,
+        chrono::Utc::now(),
+    )
+    .map_err(|_| anyhow::anyhow!("failed to persist Connector Reference"))
 }
 
 #[cfg(test)]
@@ -5224,52 +5594,51 @@ mod tests {
     }
 
     #[test]
-    fn purge_legacy_context_data_clears_memory_chat_and_mirror() {
-        let mut conn = Connection::open_in_memory().unwrap();
+    fn current_chat_initialization_preserves_saved_memory_and_legacy_records() {
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "
             CREATE TABLE memory_items (id TEXT);
             CREATE TABLE chat_turns (id TEXT);
-            CREATE TABLE chat_turn_attachments (chat_turn_id TEXT, attachment_id TEXT);
-            CREATE TABLE embeddings (item_id TEXT, source TEXT);
-            CREATE TABLE sessions (id TEXT, summary TEXT, metadata_json TEXT);
             INSERT INTO memory_items VALUES ('m1');
             INSERT INTO chat_turns VALUES ('t1');
-            INSERT INTO chat_turn_attachments VALUES ('t1', 'a1');
-            INSERT INTO embeddings VALUES ('m1', 'memory_item');
-            INSERT INTO embeddings VALUES ('t1', 'chat_turn');
-            INSERT INTO embeddings VALUES ('wa1', 'whatsapp');
-            INSERT INTO sessions VALUES ('s1', 'old summary', '{\"last_mail_ref\":{}}');
             ",
         )
         .unwrap();
-
-        let data_dir = std::env::temp_dir().join(format!("bagent-purge-test-{}", Uuid::new_v4()));
-        let memories_dir = data_dir.join("memories");
-        std::fs::create_dir_all(&memories_dir).unwrap();
-        std::fs::write(memories_dir.join("old.md"), "old memory").unwrap();
-
-        purge_legacy_context_data(&data_dir, &mut conn);
-
-        for table in ["memory_items", "chat_turns", "chat_turn_attachments"] {
+        bagentd::current_chat::initialize_schema(&conn).unwrap();
+        open_or_create_current_chat(&conn).unwrap();
+        for table in ["memory_items", "chat_turns"] {
             let count: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(count, 0, "{table} should be empty");
+            assert_eq!(count, 1, "{table} must be preserved");
         }
-        let embeddings: i64 = conn
-            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(embeddings, 1, "non memory/chat embeddings must remain");
-        let cleared: (Option<String>, Option<String>) = conn
-            .query_row("SELECT summary, metadata_json FROM sessions", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(cleared, (None, None));
-        assert!(!memories_dir.exists());
+    }
 
-        let _ = std::fs::remove_dir_all(data_dir);
+    #[tokio::test]
+    async fn connector_reference_bound_failure_never_installs_memory_only_authority() {
+        let connection = Connection::open_in_memory().unwrap();
+        bagentd::current_chat::initialize_schema(&connection).unwrap();
+        let chat = open_or_create_current_chat(&connection).unwrap();
+        let db = Arc::new(Mutex::new(connection));
+        let refs = Arc::new(Mutex::new(HashMap::<String, RuntimeRefs>::new()));
+        let reference = FileRef {
+            path: "x".repeat(bagentd::current_chat::MAX_RETAINED_CONTENT_BYTES as usize),
+            display_name: "bounded".to_owned(),
+            kind: "file".to_owned(),
+        };
+
+        assert!(
+            save_last_file_ref(&db, &refs, &chat.identity, &reference, true)
+                .await
+                .is_err()
+        );
+        assert!(refs.lock().await.get(&chat.identity).is_none());
+        let connection = db.lock().await;
+        assert!(read_current_chat(&connection)
+            .unwrap()
+            .connector_references
+            .is_empty());
     }
 }
 

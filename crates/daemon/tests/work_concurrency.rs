@@ -274,7 +274,7 @@ fn approval_restart_capacity() {
             DaemonGeneration::new("stage4-generation"),
         ))
         .unwrap();
-    let approval_revision = authority
+    let _approval_revision = authority
         .request_approval(
             "approval-request",
             grant.work_identity.clone(),
@@ -311,29 +311,32 @@ fn approval_restart_capacity() {
     assert_eq!(after.approvals[0].identity.as_str(), "approval-stable");
     assert_eq!(
         after.approvals[0].state,
-        bagentd::work_coordinator::ApprovalState::Pending
+        bagentd::work_coordinator::ApprovalState::Abandoned
     );
+    let abandoned_revision = after
+        .works
+        .iter()
+        .find(|work| work.identity == grant.work_identity)
+        .unwrap()
+        .revision;
 
-    let resumed = restarted
+    let abandoned_decision = restarted
         .resolve_approval(
             "approval-resolve",
             grant.work_identity.clone(),
-            approval_revision,
+            abandoned_revision,
             ApprovalIdentity::new("approval-stable"),
             true,
             0,
         )
-        .unwrap();
-    assert_eq!(resumed, WorkRevision::new(5));
-    let stale = restarted.resolve_approval(
-        "approval-stale",
-        grant.work_identity,
-        approval_revision,
-        ApprovalIdentity::new("approval-stable"),
-        true,
-        0,
-    );
-    assert!(stale.is_err(), "one stale decision cannot resume twice");
+        .unwrap_err();
+    assert!(matches!(
+        abandoned_decision,
+        bagentd::work_coordinator::CommandError::IllegalTransition {
+            from: WorkState::Abandoned,
+            to: WorkState::Running
+        }
+    ));
 }
 
 #[test]

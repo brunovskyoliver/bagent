@@ -85,9 +85,9 @@ final class AutomationsSurfaceStateTests: XCTestCase {
     func testSlashCommandOpensAutomations() {
         let vm = ChatViewModel()
         vm.inputText = "/automations"
-        XCTAssertTrue(vm.acceptSlashSuggestion())
-        XCTAssertEqual(vm.notchInteractionMode, .automations)
-        XCTAssertEqual(vm.automationsSurface, .list)
+        XCTAssertTrue(vm.completeSlashSuggestion())
+        XCTAssertEqual(vm.inputText, "/automations")
+        XCTAssertNotEqual(vm.notchInteractionMode, .automations)
     }
 
     func testGeometryStaysWithinCeilings() {

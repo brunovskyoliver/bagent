@@ -1,7 +1,15 @@
 import AppKit
 
 let arguments = CommandLine.arguments
-if arguments.count == 6, arguments[1] == "--stage8-acceptance-case" {
+if (arguments.count == 3 || arguments.count == 4),
+   arguments[1] == "--stage7a-relaunch-fixture" {
+    let outputURL = URL(fileURLWithPath: arguments[2])
+    let sentinelURL = arguments.count == 4 ? URL(fileURLWithPath: arguments[3]) : nil
+    Task {
+        exit(await Stage7AAcceptanceCLI.run(outputURL: outputURL, sentinelURL: sentinelURL))
+    }
+    RunLoop.main.run()
+} else if arguments.count == 6, arguments[1] == "--stage8-acceptance-case" {
     let acquisition = arguments[2]
     let polish = arguments[3]
     let prompt = arguments[4]

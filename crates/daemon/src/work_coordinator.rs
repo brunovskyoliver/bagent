@@ -9,6 +9,11 @@ use crate::automation_sessions::{
     terminalize_automation_session_in_transaction, AutomationRunOutcome, AutomationTaskSnapshot,
     AutomationTerminalization,
 };
+use crate::current_chat::{
+    begin_conversation_turn_in_transaction, complete_conversation_turn_in_transaction,
+    interrupt_conversation_turn_in_transaction, BegunConversationTurn, SubmittedAttachmentMetadata,
+    ValidatedSourceMetadata,
+};
 
 const SCHEMA: &str = include_str!("../migrations/V15__work_coordinator_foundations.sql");
 const CUTOVER_SCHEMA: &str = include_str!("../migrations/V16__unified_work_cutover.sql");
@@ -18,6 +23,77 @@ const NOTCH_PROJECTION_INDEXES: &str =
 const AUTOMATION_SESSION_SCHEMA: &str =
     include_str!("../migrations/V19__automation_session_contract.sql");
 const SCHEMA_VERSION: u32 = 1;
+
+pub(crate) fn insert_work_current_chat_if_present(
+    connection: &Connection,
+    identity: &str,
+) -> rusqlite::Result<()> {
+    if canonical_table_exists(connection, "work_current_chats")? {
+        connection.execute(
+            "INSERT OR IGNORE INTO work_current_chats (identity) VALUES (?1)",
+            params![identity],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_work_automation_session_viewed_if_present(
+    connection: &Connection,
+    automation_session_identity: &str,
+) -> rusqlite::Result<()> {
+    if canonical_table_exists(connection, "work_automation_sessions")? {
+        connection.execute(
+            "UPDATE work_automation_sessions SET attention_state='viewed'
+             WHERE automation_session_identity=?1",
+            params![automation_session_identity],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_automation_work_if_present(
+    connection: &Connection,
+    automation_session_identity: &str,
+    work_identity: &str,
+) -> rusqlite::Result<()> {
+    if !canonical_table_exists(connection, "works")? {
+        return Ok(());
+    }
+    for table in [
+        "work_event_outbox",
+        "work_approvals",
+        "work_activity_projection",
+        "work_projections",
+    ] {
+        connection.execute(
+            &format!("DELETE FROM {table} WHERE work_identity=?1"),
+            params![work_identity],
+        )?;
+    }
+    connection.execute(
+        "DELETE FROM work_automation_sessions WHERE automation_session_identity=?1",
+        params![automation_session_identity],
+    )?;
+    connection.execute(
+        "DELETE FROM work_automation_runs WHERE work_identity=?1",
+        params![work_identity],
+    )?;
+    connection.execute(
+        "DELETE FROM works WHERE identity=?1",
+        params![work_identity],
+    )?;
+    Ok(())
+}
+
+fn canonical_table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoordinatorConfig {
@@ -695,6 +771,13 @@ pub enum FailurePoint {
     AfterCommitBeforeResponse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentChatTerminalOutcome {
+    Completed,
+    InterruptedContentBound,
+    InterruptedExecutionFailed,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CommandError {
     InjectedFailure(FailurePoint),
@@ -979,6 +1062,11 @@ impl WorkCoordinator {
         connection
             .execute_batch(AUTOMATION_SESSION_SCHEMA)
             .map_err(CommandError::storage)?;
+        // V19 is also used as an idempotent bootstrap schema. Its temporary
+        // chat-identity table must not be resurrected after the V22 cutover.
+        connection
+            .execute_batch("DROP TABLE IF EXISTS automation_current_chats;")
+            .map_err(CommandError::storage)?;
         initialize_generation(
             &connection,
             &generation,
@@ -994,6 +1082,108 @@ impl WorkCoordinator {
 
     pub fn submit(&self, command: Command) -> Result<CommandAcknowledgement, CommandError> {
         self.submit_with_optional_failure(command, None)
+    }
+
+    /// Admit the durable user turn and its foreground Work under one SQLite
+    /// commit. Neither record can become visible without the other.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_current_chat_turn(
+        &self,
+        command_identity: impl Into<CommandIdentity>,
+        current_chat_identity: CurrentChatIdentity,
+        expected_revision: u64,
+        user_message: &str,
+        attachments: &[SubmittedAttachmentMetadata],
+        submitted_at: chrono::DateTime<chrono::Utc>,
+        generation: DaemonGeneration,
+    ) -> Result<(CommandAcknowledgement, BegunConversationTurn), CommandError> {
+        let turn_identity = ConversationTurnIdentity::new(uuid::Uuid::new_v4().to_string());
+        let command = Command::create_conversation(
+            command_identity,
+            current_chat_identity.clone(),
+            turn_identity.clone(),
+            generation,
+        );
+        let command_hash = command.hash()?;
+        let mut connection = self.connection.lock().expect("coordinator mutex poisoned");
+        let current_generation = metadata(&connection, "daemon_generation")?
+            .ok_or_else(|| CommandError::CorruptState("missing daemon generation".to_owned()))?;
+        if command.expected_daemon_generation.as_str() != current_generation {
+            return Err(CommandError::StaleDaemonGeneration {
+                current: DaemonGeneration::new(current_generation),
+            });
+        }
+
+        let mut dependencies = self.dependencies.lock().expect("dependency mutex poisoned");
+        let generated_identity = dependencies.identity_source.next_identity()?;
+        let committed_at = dependencies.clock.now();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(CommandError::storage)?;
+        let begun = begin_conversation_turn_in_transaction(
+            &transaction,
+            current_chat_identity.as_str(),
+            expected_revision,
+            turn_identity.as_str(),
+            user_message,
+            attachments,
+            submitted_at,
+        )
+        .map_err(CommandError::storage)?;
+        let (work_identity, revision, state, event_kind) = apply_command(
+            &transaction,
+            &command,
+            Some(&generated_identity),
+            &committed_at,
+        )?;
+        let activity = load_work_activity(&transaction, &work_identity)?;
+        let payload = serde_json::json!({ "state": state, "activity": activity });
+        transaction
+            .execute(
+                "INSERT INTO work_event_outbox
+                 (schema_version, daemon_generation, committed_at, event_kind,
+                  work_identity, work_revision, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    SCHEMA_VERSION,
+                    current_generation,
+                    committed_at,
+                    event_kind.as_str(),
+                    work_identity.as_str(),
+                    revision.value(),
+                    payload.to_string(),
+                ],
+            )
+            .map_err(CommandError::storage)?;
+        let event_cursor = EventCursor::new(transaction.last_insert_rowid() as u64);
+        set_metadata(
+            &transaction,
+            "event_cursor",
+            &event_cursor.value().to_string(),
+        )?;
+        let receipt = CommitReceipt {
+            work_identity,
+            work_revision: revision,
+            state,
+            event_cursor,
+            daemon_generation: DaemonGeneration::new(&current_generation),
+        };
+        transaction
+            .execute(
+                "INSERT INTO work_command_results
+                 (command_identity, command_hash, acknowledgement, committed_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    command.command_identity.as_str(),
+                    command_hash,
+                    serde_json::to_string(&receipt).map_err(CommandError::serialization)?,
+                    committed_at,
+                ],
+            )
+            .map_err(CommandError::storage)?;
+        prune_events(&transaction, self.config.max_events)?;
+        transaction.commit().map_err(CommandError::storage)?;
+        Ok((CommandAcknowledgement::Committed(receipt), begun))
     }
 
     /// Terminalize an Automation Session and its Work in one SQLite
@@ -1068,6 +1258,173 @@ impl WorkCoordinator {
         prune_events(&transaction, self.config.max_events)?;
         transaction.commit().map_err(CommandError::storage)?;
         Ok(next_revision)
+    }
+
+    /// Terminalize one Conversation Turn and its Work through a single
+    /// immediate SQLite transaction. `assistant_output == None` is the
+    /// normalized execution-failure path; a completion that exceeds the
+    /// retained-content bound atomically interrupts the turn and fails Work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn terminalize_current_chat_turn(
+        &self,
+        command_identity: impl Into<CommandIdentity>,
+        work: WorkIdentity,
+        revision: WorkRevision,
+        current_chat_identity: &str,
+        conversation_turn_identity: &str,
+        assistant_output: Option<&str>,
+        validated_sources: &[ValidatedSourceMetadata],
+        terminal_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(WorkRevision, CurrentChatTerminalOutcome), CommandError> {
+        self.terminalize_current_chat_turn_with_optional_failure(
+            command_identity,
+            work,
+            revision,
+            current_chat_identity,
+            conversation_turn_identity,
+            assistant_output,
+            validated_sources,
+            terminal_at,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn terminalize_current_chat_turn_with_failure(
+        &self,
+        command_identity: impl Into<CommandIdentity>,
+        work: WorkIdentity,
+        revision: WorkRevision,
+        current_chat_identity: &str,
+        conversation_turn_identity: &str,
+        assistant_output: Option<&str>,
+        validated_sources: &[ValidatedSourceMetadata],
+        terminal_at: chrono::DateTime<chrono::Utc>,
+        failure: FailurePoint,
+    ) -> Result<(WorkRevision, CurrentChatTerminalOutcome), CommandError> {
+        self.terminalize_current_chat_turn_with_optional_failure(
+            command_identity,
+            work,
+            revision,
+            current_chat_identity,
+            conversation_turn_identity,
+            assistant_output,
+            validated_sources,
+            terminal_at,
+            Some(failure),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn terminalize_current_chat_turn_with_optional_failure(
+        &self,
+        command_identity: impl Into<CommandIdentity>,
+        work: WorkIdentity,
+        revision: WorkRevision,
+        current_chat_identity: &str,
+        conversation_turn_identity: &str,
+        assistant_output: Option<&str>,
+        validated_sources: &[ValidatedSourceMetadata],
+        terminal_at: chrono::DateTime<chrono::Utc>,
+        failure: Option<FailurePoint>,
+    ) -> Result<(WorkRevision, CurrentChatTerminalOutcome), CommandError> {
+        let mut connection = self.connection.lock().expect("coordinator mutex poisoned");
+        let generation = metadata(&connection, "daemon_generation")?
+            .ok_or_else(|| CommandError::CorruptState("missing daemon generation".to_owned()))?;
+        let committed_at = terminal_at.to_rfc3339();
+        inject(failure, FailurePoint::BeforeTransaction)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(CommandError::storage)?;
+        let origin_matches: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM works
+                 WHERE identity=?1 AND origin_kind='conversation'
+                   AND origin_primary_identity=?2 AND origin_secondary_identity=?3)",
+                params![
+                    work.as_str(),
+                    current_chat_identity,
+                    conversation_turn_identity
+                ],
+                |row| row.get(0),
+            )
+            .map_err(CommandError::storage)?;
+        if !origin_matches {
+            return Err(CommandError::CorruptState(
+                "Conversation Work origin does not match its Current Chat turn".to_owned(),
+            ));
+        }
+
+        let (outcome, next_state) = if let Some(output) = assistant_output {
+            let content_bound = complete_conversation_turn_in_transaction(
+                &transaction,
+                current_chat_identity,
+                conversation_turn_identity,
+                output,
+                terminal_at,
+                Some(work.as_str()),
+                validated_sources,
+            )
+            .map_err(CommandError::storage)?;
+            if content_bound {
+                (
+                    CurrentChatTerminalOutcome::InterruptedContentBound,
+                    WorkState::Failed,
+                )
+            } else {
+                (CurrentChatTerminalOutcome::Completed, WorkState::Completed)
+            }
+        } else {
+            interrupt_conversation_turn_in_transaction(
+                &transaction,
+                current_chat_identity,
+                conversation_turn_identity,
+                terminal_at,
+                Some(work.as_str()),
+            )
+            .map_err(CommandError::storage)?;
+            (
+                CurrentChatTerminalOutcome::InterruptedExecutionFailed,
+                WorkState::Failed,
+            )
+        };
+        inject(failure, FailurePoint::AfterStateMutation)?;
+
+        let command = Command::transition(
+            command_identity,
+            work.clone(),
+            revision,
+            next_state,
+            DaemonGeneration::new(generation.clone()),
+        );
+        let (work_identity, next_revision, state, event_kind) =
+            apply_command(&transaction, &command, None, &committed_at)?;
+        let activity = load_work_activity(&transaction, &work_identity)?;
+        let payload = serde_json::json!({ "state": state, "activity": activity });
+        transaction
+            .execute(
+                "INSERT INTO work_event_outbox
+                 (schema_version, daemon_generation, committed_at, event_kind,
+                  work_identity, work_revision, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    SCHEMA_VERSION,
+                    generation,
+                    committed_at,
+                    event_kind.as_str(),
+                    work_identity.as_str(),
+                    next_revision.value(),
+                    payload.to_string(),
+                ],
+            )
+            .map_err(CommandError::storage)?;
+        inject(failure, FailurePoint::AfterOutboxInsert)?;
+        let cursor = EventCursor::new(transaction.last_insert_rowid() as u64);
+        set_metadata(&transaction, "event_cursor", &cursor.value().to_string())?;
+        prune_events(&transaction, self.config.max_events)?;
+        inject(failure, FailurePoint::AtCommit)?;
+        transaction.commit().map_err(CommandError::storage)?;
+        Ok((next_revision, outcome))
     }
 
     pub fn submit_with_failure(
@@ -1424,10 +1781,9 @@ fn initialize_generation(
                 )
                 .collect::<Result<Vec<_>, CommandError>>()?
         };
-        for (work_identity, old_revision, _old_state, origin_kind, origin_identity) in
-            recoverable.into_iter().filter(|(_, _, state, _, _)| {
-                !state.is_terminal() && *state != WorkState::WaitingForApproval
-            })
+        for (work_identity, old_revision, _old_state, origin_kind, origin_identity) in recoverable
+            .into_iter()
+            .filter(|(_, _, state, _, _)| !state.is_terminal())
         {
             let revision = old_revision + 1;
             let committed_at = clock.now();
@@ -1457,14 +1813,12 @@ fn initialize_generation(
                     .query_row(
                         "SELECT r.automation_run_identity, r.automation_session_identity,
                                 r.historical_automation_identity,
-                                COALESCE(t.display_name, a.name),
+                                t.display_name,
                                 t.task_text, t.schedule_json, t.timezone,
                                 COALESCE(t.definition_revision, r.frozen_definition_revision)
                          FROM work_automation_runs r
                          LEFT JOIN automation_task_snapshots t
                            ON t.automation_session_identity=r.automation_session_identity
-                         LEFT JOIN automations a
-                           ON a.id=r.historical_automation_identity
                          WHERE r.work_identity=?1",
                         params![work_identity],
                         |row| {
@@ -1497,69 +1851,53 @@ fn initialize_generation(
                     timezone,
                     definition_revision,
                 ) = session;
-                let display_name = display_name.ok_or_else(|| {
-                    CommandError::CorruptState(
-                        "automation Work is missing its historical display name".to_owned(),
-                    )
-                })?;
-                let task_text = task_text.ok_or_else(|| {
-                    CommandError::CorruptState(
-                        "automation Work is missing its immutable Task Snapshot".to_owned(),
-                    )
-                })?;
-                let schedule_json = schedule_json.ok_or_else(|| {
-                    CommandError::CorruptState(
-                        "automation Work is missing its immutable schedule snapshot".to_owned(),
-                    )
-                })?;
-                let timezone = timezone.ok_or_else(|| {
-                    CommandError::CorruptState(
-                        "automation Work is missing its immutable time zone snapshot".to_owned(),
-                    )
-                })?;
-                transaction
-                    .execute(
-                        "INSERT OR IGNORE INTO automation_work_states
+                if let (Some(display_name), Some(task_text), Some(schedule_json), Some(timezone)) =
+                    (display_name, task_text, schedule_json, timezone)
+                {
+                    transaction
+                        .execute(
+                            "INSERT OR IGNORE INTO automation_work_states
                             (work_identity, automation_run_identity, state)
                          VALUES (?1, ?2, 'running')",
-                        params![work_identity, run_identity],
-                    )
-                    .map_err(CommandError::storage)?;
-                terminalize_automation_session_in_transaction(
-                    &transaction,
-                    AutomationTerminalization {
-                        snapshot: AutomationTaskSnapshot {
-                            automation_identity: definition_identity,
-                            automation_run_identity: run_identity,
-                            automation_session_identity: session_identity.clone(),
-                            display_name,
-                            task_text,
-                            schedule_json,
-                            timezone,
-                            definition_revision,
+                            params![work_identity, run_identity],
+                        )
+                        .map_err(CommandError::storage)?;
+                    terminalize_automation_session_in_transaction(
+                        &transaction,
+                        AutomationTerminalization {
+                            snapshot: AutomationTaskSnapshot {
+                                automation_identity: definition_identity,
+                                automation_run_identity: run_identity,
+                                automation_session_identity: session_identity.clone(),
+                                display_name,
+                                task_text,
+                                schedule_json,
+                                timezone,
+                                definition_revision,
+                            },
+                            work_identity: work_identity.clone(),
+                            outcome: AutomationRunOutcome::Abandoned,
+                            finished_at: committed_at.clone(),
+                            result_summary: Some(
+                                "Daemon sa reštartoval pred dokončením Automation Run.".to_owned(),
+                            ),
+                            final_output: None,
+                            activity_timeline: Vec::new(),
+                            validated_sources: Vec::new(),
+                            connector_references: Vec::new(),
+                            historical_approvals: Vec::new(),
+                            truncation_disclosures: Vec::new(),
                         },
-                        work_identity: work_identity.clone(),
-                        outcome: AutomationRunOutcome::Abandoned,
-                        finished_at: committed_at.clone(),
-                        result_summary: Some(
-                            "Daemon sa reštartoval pred dokončením Automation Run.".to_owned(),
-                        ),
-                        final_output: None,
-                        activity_timeline: Vec::new(),
-                        validated_sources: Vec::new(),
-                        connector_references: Vec::new(),
-                        historical_approvals: Vec::new(),
-                        truncation_disclosures: Vec::new(),
-                    },
-                )
-                .map_err(|error| CommandError::Storage(error.to_string()))?;
-                transaction
-                    .execute(
-                        "UPDATE work_automation_sessions SET attention_state='unread'
-                         WHERE automation_session_identity=?1",
-                        params![session_identity],
                     )
-                    .map_err(CommandError::storage)?;
+                    .map_err(|error| CommandError::Storage(error.to_string()))?;
+                    transaction
+                        .execute(
+                            "UPDATE work_automation_sessions SET attention_state='unread'
+                         WHERE automation_session_identity=?1",
+                            params![session_identity],
+                        )
+                        .map_err(CommandError::storage)?;
+                }
             }
             if origin_kind == "conversation" {
                 transaction
@@ -2362,14 +2700,21 @@ fn notch_snapshot_from(connection: &Connection) -> Result<WorkSnapshot, CommandE
                  SELECT identity FROM works
                  WHERE state NOT IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
                  UNION
-                 SELECT r.work_identity
-                 FROM works w
-                 JOIN work_automation_runs r ON r.work_identity = w.identity
-                 JOIN work_automation_sessions s
-                   ON s.automation_session_identity = r.automation_session_identity
-                 WHERE w.origin_kind = 'automation'
-                   AND w.state IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
-                   AND s.attention_state = 'unread'
+                 SELECT work_identity FROM (
+                     SELECT r.work_identity,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY w.state
+                                ORDER BY w.updated_at DESC, w.identity ASC
+                            ) AS terminal_rank
+                     FROM works w
+                     JOIN work_automation_runs r ON r.work_identity = w.identity
+                     JOIN work_automation_sessions s
+                       ON s.automation_session_identity = r.automation_session_identity
+                     WHERE w.origin_kind = 'automation'
+                       AND w.state IN ('completed', 'partial', 'failed', 'cancelled', 'abandoned')
+                       AND s.attention_state = 'unread'
+                 )
+                 WHERE terminal_rank = 1
                  UNION
                  SELECT identity FROM (
                      SELECT identity FROM works

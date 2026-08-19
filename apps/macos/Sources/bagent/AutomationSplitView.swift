@@ -50,7 +50,6 @@ enum AutomationSessionAttention: String, Codable, Equatable, Hashable, Sendable 
 
 struct AutomationContinuationConfirmation: Equatable, Sendable {
     let sessionIdentity: String
-    let currentChatIdentity: String
     let seed: String
 }
 

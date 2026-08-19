@@ -9,14 +9,20 @@ enum ChatAttachmentKind: String, Sendable {
     case image, pdf, text, other
 }
 
+enum ChatAttachmentAvailability: Sendable, Equatable {
+    case available
+    case unavailable
+}
+
 struct ChatAttachment: Identifiable, @unchecked Sendable {
     let id: String          // server-assigned UUID
     let filename: String
     let mime: String
     let kind: ChatAttachmentKind
     /// Local URL where the original file lives (for thumbnail generation).
-    let localURL: URL
+    let localURL: URL?
     let sizeBytes: Int
+    let availability: ChatAttachmentAvailability
     /// Base-64 encoded thumbnail (JPEG, max 120×120) for image attachments.
     var thumbnail: NSImage? = nil
 }
@@ -417,6 +423,21 @@ final class ChatViewModel: ObservableObject {
     }
     @Published var messages: [ChatMessage] = []
     @Published var inputText: String = "" {
+        didSet {
+            guard !isApplyingCurrentChatSnapshot else { return }
+            guard inputText.utf8.count <= 16 * 1024 else {
+                isApplyingCurrentChatSnapshot = true
+                inputText = oldValue
+                isApplyingCurrentChatSnapshot = false
+                slashCommandError = String(localized: "currentChat.draft.limit", defaultValue: "Current Chat Draft is limited to 16 KiB")
+                return
+            }
+            slashCommandError = nil
+            updateSlashSuggestions()
+            scheduleDraftPersistence()
+        }
+    }
+    @Published var hasUncommittedMarkedText = false {
         didSet { updateSlashSuggestions() }
     }
     var notchPresentation: NotchPresentation { notchEventConsumer.presentation }
@@ -446,10 +467,22 @@ final class ChatViewModel: ObservableObject {
     @Published var pendingApprovals: [ApprovalItem] = []
     /// Files queued to send with the next message.
     @Published var pendingAttachments: [ChatAttachment] = []
+    @Published private(set) var restoredPendingAttachmentReferences: [String] = []
+    @Published private(set) var restoredSubmittedAttachments: [ChatAttachment] = []
+    @Published private(set) var restoredValidatedSources: [DaemonClient.CurrentChatAvailability] = []
+    @Published private(set) var restoredConnectorReferences: [DaemonClient.CurrentChatAvailability] = []
+    @Published private(set) var restoredApprovalPresentations: [DaemonClient.CompletedApprovalPresentation] = []
     /// True while uploading a file to the daemon.
     @Published var isUploadingAttachment = false
     @Published var streamingAssistantMessageId: UUID? = nil
     @Published var isActivityTranscriptExpanded = false
+    @Published private(set) var currentChatSnapshot: DaemonClient.CurrentChatSnapshot?
+    @Published var clearCurrentChatConfirmationPresented = false
+    @Published var currentChatFocusRequestID = UUID()
+    private var pendingCurrentChatCaretRestoration = false
+    private var clearCurrentChatCommandIdentity: String?
+    private var draftPersistenceTask: Task<Void, Never>?
+    private var isApplyingCurrentChatSnapshot = false
 
     /// Set to true by NotchWindowController before expanding so the pill
     /// animates to its hover state before the chat panel appears.
@@ -659,34 +692,27 @@ final class ChatViewModel: ObservableObject {
     func continueAutomationSessionFromDetail() {
         guard let detail = automationSessionDetail else { return }
         let sessionIdentity = detail.taskSnapshot.automationSessionIdentity
-        let currentChatIdentity = "current-chat-" + UUID().uuidString
         let seed = detail.finalOutput ?? detail.resultSummary ?? detail.taskSnapshot.taskText
-        if !messages.isEmpty {
+        if currentChatHasContent {
             automationContinuationConfirmation = AutomationContinuationConfirmation(
                 sessionIdentity: sessionIdentity,
-                currentChatIdentity: sessionId ?? currentChatIdentity,
                 seed: seed)
             return
         }
         performAutomationContinuation(
             sessionIdentity: sessionIdentity,
-            currentChatIdentity: currentChatIdentity,
             seed: seed,
-            confirmedReplacement: false,
-            displayName: detail.taskSnapshot.displayName)
+            confirmedReplacement: false)
     }
 
     func confirmAutomationContinuation() {
         guard let confirmation = automationContinuationConfirmation,
-              let detail = automationSessionDetail
-        else { return }
+              automationSessionDetail != nil else { return }
         automationContinuationConfirmation = nil
         performAutomationContinuation(
             sessionIdentity: confirmation.sessionIdentity,
-            currentChatIdentity: confirmation.currentChatIdentity,
             seed: confirmation.seed,
-            confirmedReplacement: true,
-            displayName: detail.taskSnapshot.displayName)
+            confirmedReplacement: true)
     }
 
     func cancelAutomationContinuation() {
@@ -696,30 +722,23 @@ final class ChatViewModel: ObservableObject {
 
     private func performAutomationContinuation(
         sessionIdentity: String,
-        currentChatIdentity: String,
         seed: String,
-        confirmedReplacement: Bool,
-        displayName: String
+        confirmedReplacement: Bool
     ) {
-        let visibleSeed = "Automation Session · \(displayName)\n\n\(seed)"
         Task {
             do {
-                let provenance = try await client.continueAutomationSession(
+                _ = try await client.continueAutomationSession(
                     identity: sessionIdentity,
-                    currentChatIdentity: currentChatIdentity,
                     seed: seed,
                     confirmedReplacement: confirmedReplacement,
                     commandIdentity: "continue-" + UUID().uuidString)
                 await MainActor.run {
-                    messages = [ChatMessage(
-                        role: .assistant,
-                        content: "\(visibleSeed)\n\nProveniencia: \(provenance.identity)")]
-                    sessionId = currentChatIdentity
                     historyBrowseIndex = nil
                     automationSessionDetail = nil
                     automationSessionNavigator.resetToSplit()
                     applyNotchIntent(.openInput)
                 }
+                await restoreCurrentChat()
             } catch {
                 await MainActor.run { automationsError = "Pokračovanie zlyhalo" }
             }
@@ -1023,12 +1042,27 @@ final class ChatViewModel: ObservableObject {
     @Published var slashSuggestions: [SlashCommand] = []
     /// Keyboard-selected suggestion row.
     @Published var slashSelectionIndex: Int = 0
+    @Published var slashCommandError: String?
+    private var modifiedReturnEventID: UUID?
+    var onSlashSuggestionCompletion: ((String) -> Bool)?
+
+    func preserveModifiedReturnForNativeEditing() {
+        let eventID = UUID()
+        modifiedReturnEventID = eventID
+        DispatchQueue.main.async { [weak self] in
+            guard self?.modifiedReturnEventID == eventID else { return }
+            self?.modifiedReturnEventID = nil
+        }
+    }
     private func updateSlashSuggestions() {
         // Called only from inputText.didSet — an Escape dismissal therefore
         // holds until the text changes again.
         let matches = notchInteractionMode == .settings
             ? []
-            : SlashCommandRegistry.suggestions(for: inputText)
+            : SlashCommandRegistry.suggestions(
+                for: inputText,
+                hasMarkedText: hasUncommittedMarkedText
+            )
         if matches != slashSuggestions { slashSuggestions = matches }
         if slashSelectionIndex >= matches.count { slashSelectionIndex = 0 }
     }
@@ -1046,22 +1080,27 @@ final class ChatViewModel: ObservableObject {
         return true
     }
 
-    /// Return/Tab/click on a suggestion: canonical spelling, then execute.
-    func acceptSlashSuggestion(_ command: SlashCommand? = nil) -> Bool {
+    /// Tab or click completes one candidate. Completion never executes it.
+    func completeSlashSuggestion(_ command: SlashCommand? = nil) -> Bool {
         guard let cmd = command ?? slashSuggestions[safe: slashSelectionIndex] else { return false }
+        if onSlashSuggestionCompletion?(cmd.command) != true {
+            inputText = cmd.command
+        }
         slashSuggestions = []
         slashSelectionIndex = 0
-        inputText = cmd.command
-        execute(cmd)
         return true
     }
 
     func execute(_ command: SlashCommand) {
-        switch command.action {
-        case .openSettings:
+        switch (command.destination, command.confirmationPolicy) {
+        case (.settings, .none):
             openNotchSettings()
-        case .openAutomations:
+        case (.automations, .none):
             openAutomations()
+        case (.currentChat, .whenCurrentChatIsNonEmpty):
+            requestCurrentChatClear()
+        default:
+            assertionFailure("Invalid Slash Command destination and confirmation policy")
         }
     }
 
@@ -1749,14 +1788,6 @@ final class ChatViewModel: ObservableObject {
             }
         }
     }
-    // Session ID persisted in UserDefaults so it survives app restarts
-    private var sessionId: String? {
-        get { UserDefaults.standard.string(forKey: "bagent.session_id") }
-        set { UserDefaults.standard.set(newValue, forKey: "bagent.session_id") }
-    }
-
-    var currentSessionId: String? { sessionId }
-
     // MARK: - Init
 
     init(startMonitoring: Bool = true, client: DaemonClient = DaemonClient()) {
@@ -1770,6 +1801,7 @@ final class ChatViewModel: ObservableObject {
             startCmuxMonitor()
             Task { await refreshHealth() }
         }
+        Task { await restoreCurrentChat() }
     }
 
     func applyNotchIntent(_ intent: NotchLocalIntent) {
@@ -1818,19 +1850,307 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Actions
 
-    func clear() {
-        messages = []
-        inputText = ""
-        streamingAssistantMessageId = nil
+    private var currentChatHasContent: Bool {
+        guard let snapshot = currentChatSnapshot else { return false }
+        let draftCommand = snapshot.draft.flatMap {
+            SlashCommandRegistry.exactMatch($0.text)
+        }
+        let draftIsOnlyClearCommand = draftCommand?.destination == .currentChat
+            && draftCommand?.confirmationPolicy == .whenCurrentChatIsNonEmpty
+            && snapshot.draft?.pendingAttachmentReferences.isEmpty == true
+        return !snapshot.turns.isEmpty
+            || (snapshot.draft != nil && !draftIsOnlyClearCommand)
+            || snapshot.continuation != nil
+            || !snapshot.submittedAttachments.isEmpty
+            || !snapshot.validatedSources.isEmpty
+            || !snapshot.connectorReferences.isEmpty
+            || !snapshot.completedApprovalPresentations.isEmpty
+    }
+
+    func restoreCurrentChat(preservingActivePresentation: Bool = false) async {
+        do {
+            let snapshot = try await client.currentChat()
+            var restoredPending: [ChatAttachment] = []
+            for identity in snapshot.draft?.pendingAttachmentReferences ?? [] {
+                if let attachment = try? await client.attachment(id: identity) {
+                    restoredPending.append(attachment)
+                } else {
+                    restoredPending.append(Self.unavailablePendingAttachment(identity: identity))
+                }
+            }
+            applyCurrentChatSnapshot(
+                snapshot,
+                rebuildMessages: !preservingActivePresentation,
+                restoreCaretAtEnd: !preservingActivePresentation)
+            pendingAttachments = restoredPending
+            restoredPendingAttachmentReferences = restoredPending.map(\.id)
+        } catch {
+            if currentChatSnapshot == nil {
+                slashCommandError = String(localized: "currentChat.restore.failure", defaultValue: "Current Chat could not be restored")
+            }
+        }
+    }
+
+    func applyCurrentChatSnapshot(
+        _ snapshot: DaemonClient.CurrentChatSnapshot,
+        rebuildMessages: Bool,
+        restoreCaretAtEnd: Bool = false
+    ) {
+        currentChatSnapshot = snapshot
+        restoredSubmittedAttachments = snapshot.submittedAttachments.map(Self.restoredChatAttachment)
+        restoredValidatedSources = snapshot.validatedSources
+        restoredConnectorReferences = snapshot.connectorReferences
+        restoredApprovalPresentations = snapshot.completedApprovalPresentations
+        isApplyingCurrentChatSnapshot = true
+        inputText = snapshot.draft?.text ?? ""
+        restoredPendingAttachmentReferences = snapshot.draft?.pendingAttachmentReferences ?? []
+        isApplyingCurrentChatSnapshot = false
+        updateSlashSuggestions()
+        if restoreCaretAtEnd {
+            pendingCurrentChatCaretRestoration = true
+            currentChatFocusRequestID = UUID()
+        }
+        guard rebuildMessages else { return }
+
+        var restored: [ChatMessage] = []
+        if let continuation = snapshot.continuation {
+            restored.append(ChatMessage(role: .assistant, content: continuation.seed))
+        }
+        for turn in snapshot.turns {
+            var userMessage = ChatMessage(role: .user, content: turn.userMessage)
+            userMessage.attachments = snapshot.submittedAttachments
+                .filter { $0.conversationTurnIdentity == turn.identity }
+                .map(Self.restoredChatAttachment)
+            restored.append(userMessage)
+            if let output = turn.assistantOutput {
+                restored.append(ChatMessage(role: .assistant, content: output))
+            } else if turn.state == "interrupted" {
+                restored.append(ChatMessage(
+                    role: .assistant,
+                    content: String(localized: "currentChat.turn.interrupted", defaultValue: "This response was interrupted. Submit a new message to continue.")))
+            }
+        }
+        messages = restored
+        historyBrowseIndex = nil
+    }
+
+    private static func restoredChatAttachment(
+        _ attachment: DaemonClient.SubmittedAttachment
+    ) -> ChatAttachment {
+        let kind: ChatAttachmentKind
+        if attachment.mime.hasPrefix("image/") {
+            kind = .image
+        } else if attachment.mime == "application/pdf" {
+            kind = .pdf
+        } else if attachment.mime.hasPrefix("text/") {
+            kind = .text
+        } else {
+            kind = .other
+        }
+        return ChatAttachment(
+            id: attachment.identity,
+            filename: attachment.filename,
+            mime: attachment.mime,
+            kind: kind,
+            localURL: nil,
+            sizeBytes: Int(attachment.sizeBytes),
+            availability: attachment.available ? .available : .unavailable)
+    }
+
+    static func unavailablePendingAttachment(identity: String) -> ChatAttachment {
+        ChatAttachment(
+            id: identity,
+            filename: String(
+                localized: "currentChat.attachment.unavailable",
+                defaultValue: "Attachment unavailable"),
+            mime: "application/octet-stream",
+            kind: .other,
+            localURL: nil,
+            sizeBytes: 0,
+            availability: .unavailable)
+    }
+
+    func applyRejectedSubmissionDraft(
+        text: String,
+        attachments: [ChatAttachment],
+        availableAttachmentIdentities: Set<String>
+    ) {
+        isApplyingCurrentChatSnapshot = true
+        inputText = text
+        pendingAttachments = attachments.map { attachment in
+            guard !availableAttachmentIdentities.contains(attachment.id) else { return attachment }
+            return ChatAttachment(
+                id: attachment.id,
+                filename: attachment.filename,
+                mime: attachment.mime,
+                kind: attachment.kind,
+                localURL: attachment.localURL,
+                sizeBytes: attachment.sizeBytes,
+                availability: .unavailable,
+                thumbnail: attachment.thumbnail)
+        }
+        restoredPendingAttachmentReferences = attachments.map(\.id)
+        isApplyingCurrentChatSnapshot = false
+        updateSlashSuggestions()
+        scheduleDraftPersistence()
+    }
+
+    static func submissionWasAdmitted(
+        before: DaemonClient.CurrentChatSnapshot,
+        after: DaemonClient.CurrentChatSnapshot?,
+        exactText: String
+    ) -> Bool {
+        guard let after, after.identity == before.identity, let newest = after.turns.last else {
+            return false
+        }
+        let previousTurnIdentities = Set(before.turns.map(\.identity))
+        return !previousTurnIdentities.contains(newest.identity) && newest.userMessage == exactText
+    }
+
+    func consumeCurrentChatCaretRestoration() -> Bool {
+        defer { pendingCurrentChatCaretRestoration = false }
+        return pendingCurrentChatCaretRestoration
+    }
+
+    func restoreCurrentChatCaret(in editor: NSTextView) {
+        CurrentChatTextRestoration.placeCaretAtEnd(in: editor)
+    }
+
+    private func scheduleDraftPersistence() {
+        draftPersistenceTask?.cancel()
+        guard let snapshot = currentChatSnapshot else { return }
+        let text = inputText
+        let references = Array(Set(
+            pendingAttachments.map(\.id) + restoredPendingAttachmentReferences)).sorted()
+        draftPersistenceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled, let self else { return }
+            do {
+                let updated = try await client.saveCurrentChatDraft(
+                    identity: snapshot.identity,
+                    expectedRevision: snapshot.revision,
+                    text: text,
+                    pendingAttachmentReferences: references)
+                guard inputText == text else { return }
+                currentChatSnapshot = updated
+            } catch {
+                guard inputText == text else { return }
+                if let authoritative = try? await client.currentChat(),
+                   authoritative.identity == snapshot.identity,
+                   let retried = try? await client.saveCurrentChatDraft(
+                       identity: authoritative.identity,
+                       expectedRevision: authoritative.revision,
+                       text: text,
+                       pendingAttachmentReferences: references),
+                   inputText == text {
+                    currentChatSnapshot = retried
+                } else {
+                    slashCommandError = String(localized: "currentChat.draft.saveFailure", defaultValue: "Current Chat Draft could not be saved")
+                }
+            }
+        }
+    }
+
+    func requestCurrentChatClear() {
+        guard currentChatSnapshot != nil else {
+            slashCommandError = String(localized: "currentChat.loading", defaultValue: "Current Chat is still loading")
+            return
+        }
+        guard !isThinking, authoritativePendingApproval == nil else {
+            slashCommandError = String(localized: "currentChat.clear.active", defaultValue: "Finish the active turn or approval before clearing Current Chat")
+            return
+        }
+        clearCurrentChatCommandIdentity = clearCurrentChatCommandIdentity ?? UUID().uuidString
+        if currentChatHasContent {
+            clearCurrentChatConfirmationPresented = true
+        } else {
+            performCurrentChatClear(confirmedNonEmpty: false)
+        }
+    }
+
+    func cancelCurrentChatClear() {
+        clearCurrentChatConfirmationPresented = false
+        clearCurrentChatCommandIdentity = nil
+    }
+
+    func confirmCurrentChatClear() {
+        clearCurrentChatConfirmationPresented = false
+        performCurrentChatClear(confirmedNonEmpty: true)
+    }
+
+    private func performCurrentChatClear(confirmedNonEmpty: Bool) {
+        guard let snapshot = currentChatSnapshot,
+              let commandIdentity = clearCurrentChatCommandIdentity
+        else { return }
+        draftPersistenceTask?.cancel()
+        Task {
+            if let replacement = await resolveCurrentChatClear(
+                original: snapshot,
+                commandIdentity: commandIdentity,
+                confirmedNonEmpty: confirmedNonEmpty
+            ) {
+                completeCurrentChatClear(with: replacement)
+            }
+        }
+    }
+
+    private func resolveCurrentChatClear(
+        original: DaemonClient.CurrentChatSnapshot,
+        commandIdentity: String,
+        confirmedNonEmpty: Bool
+    ) async -> DaemonClient.CurrentChatSnapshot? {
+        var requestSnapshot = original
+        var lastAuthoritative: DaemonClient.CurrentChatSnapshot?
+        for _ in 0..<3 {
+            do {
+                return try await client.clearCurrentChat(
+                    identity: requestSnapshot.identity,
+                    expectedRevision: requestSnapshot.revision,
+                    commandIdentity: commandIdentity,
+                    confirmedNonEmpty: confirmedNonEmpty)
+            } catch {
+                guard let authoritative = try? await client.currentChat() else { continue }
+                lastAuthoritative = authoritative
+                // Same identity means a draft/revision race: retry the same
+                // command key at the refetched revision. A changed identity
+                // may be this command's lost response, so replay its original
+                // arguments and let the daemon's idempotency record decide.
+                requestSnapshot = authoritative.identity == original.identity
+                    ? authoritative : original
+            }
+        }
+        if let authoritative = lastAuthoritative {
+            applyCurrentChatSnapshot(
+                authoritative,
+                rebuildMessages: true,
+                restoreCaretAtEnd: true)
+            slashCommandError = authoritative.identity == original.identity
+                ? String(localized: "currentChat.clear.failure", defaultValue: "Current Chat could not be cleared. Try again.")
+                : String(localized: "currentChat.clear.changed", defaultValue: "Current Chat changed in another window. Review it before clearing.")
+        } else {
+            slashCommandError = String(localized: "currentChat.clear.failure", defaultValue: "Current Chat could not be cleared. Try again.")
+        }
+        return nil
+    }
+
+    private func completeCurrentChatClear(with snapshot: DaemonClient.CurrentChatSnapshot) {
+        applyCurrentChatSnapshot(snapshot, rebuildMessages: true, restoreCaretAtEnd: true)
         pendingAttachments = []
+        restoredPendingAttachmentReferences = []
         pendingConnectorActions = []
         selectedSourceMode = nil
         hoveredSourceMode = nil
         savedScrollAnchorId = nil
         savedScrollWasAtBottom = true
-        // Start a new session on explicit clear
-        sessionId = nil
-        Task { await startNewSession() }
+        slashSuggestions = []
+        slashCommandError = nil
+        clearCurrentChatCommandIdentity = nil
+        let announcement = String(localized: "currentChat.clear.announcement", defaultValue: "Current Chat cleared")
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [.announcement: announcement, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+        applyNotchIntent(.openInput)
     }
 
     func loadModels() async {
@@ -1874,9 +2194,6 @@ final class ChatViewModel: ObservableObject {
         // Keychain prompts during app launch.
         await refreshWhatsappStatusNow()
         permissions.refresh()
-        if !messages.isEmpty && sessionId == nil {
-            await startNewSession()
-        }
     }
 
     func startHealthMonitor() {
@@ -1934,9 +2251,9 @@ final class ChatViewModel: ObservableObject {
             .debugPayload ?? "Trace payload unavailable."
 
         let conversationPayload: String
-        if let sessionId {
+        if let identity = currentChatSnapshot?.identity {
             do {
-                conversationPayload = try await client.debugConversation(id: sessionId)
+                conversationPayload = try await client.debugConversation(id: identity)
             } catch {
                 conversationPayload = "Conversation debug unavailable: \(error.localizedDescription)"
             }
@@ -1944,7 +2261,7 @@ final class ChatViewModel: ObservableObject {
             conversationPayload = "No conversation id yet."
         }
 
-        let sessionLine = sessionId ?? "(none)"
+        let sessionLine = currentChatSnapshot?.identity ?? "(none)"
         let assistantText = messages
             .first(where: { $0.id == latest.id })?
             .content ?? latest.content
@@ -1968,38 +2285,41 @@ final class ChatViewModel: ObservableObject {
     }
 
     func send() {
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || !pendingAttachments.isEmpty else { return }
-        // A keyboard-selected suggestion wins over raw text; only complete
-        // recognized commands execute. Unknown slash text submits normally.
-        if !slashSuggestions.isEmpty, acceptSlashSuggestion() {
+        let text = inputText
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !pendingAttachments.isEmpty
+        else { return }
+        if modifiedReturnEventID != nil {
+            modifiedReturnEventID = nil
             return
         }
-        if let cmd = SlashCommandRegistry.exactMatch(text) {
+        if let cmd = SlashCommandRegistry.exactMatch(
+            text,
+            hasMarkedText: hasUncommittedMarkedText
+        ) {
             execute(cmd)
             return
         }
         guard !isThinking else { return }
         let sourceMode = selectedSourceMode
         let wasInputOnly = notchInteractionMode == .input
-        if messages.isEmpty {
-            sessionId = nil
+        guard let currentChatSnapshot else {
+            slashCommandError = String(localized: "currentChat.loading", defaultValue: "Current Chat is still loading")
+            return
         }
+        let submissionSnapshot = currentChatSnapshot
+        draftPersistenceTask?.cancel()
+        isApplyingCurrentChatSnapshot = true
         inputText = ""
+        isApplyingCurrentChatSnapshot = false
+        updateSlashSuggestions()
         historyBrowseIndex = nil
         pendingConnectorActions = []
         let model = selectedModel
-        let sid = sessionId
         let attachments = pendingAttachments
         pendingAttachments = []
+        restoredPendingAttachmentReferences = []
         let attachmentIds = attachments.map { $0.id }
-        // Sliding-window history so the model can resolve follow-ups.
-        // Daemon clamps again (10 turns / 8k chars) — these caps must match.
-        let history: [DaemonClient.HistoryTurn] = messages
-            .filter { !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .suffix(10)
-            .map { .init(role: $0.role == .user ? "user" : "assistant",
-                         content: String($0.content.prefix(1500))) }
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.attachments = attachments
         messages.append(userMsg)
@@ -2011,6 +2331,7 @@ final class ChatViewModel: ObservableObject {
         }
 
         Task {
+            var admissionWasObserved = false
             let assistantMsg = ChatMessage(role: .assistant, content: "")
             messages.append(assistantMsg)
             isActivityTranscriptExpanded = false
@@ -2040,7 +2361,14 @@ final class ChatViewModel: ObservableObject {
                     }
                 }
 
-                let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds, screenContext: screenCtx, sourceMode: sourceMode, history: history)
+                let stream = client.chatStream(
+                    text: text,
+                    currentChatIdentity: currentChatSnapshot.identity,
+                    expectedRevision: currentChatSnapshot.revision,
+                    model: model,
+                    attachmentIds: attachmentIds,
+                    screenContext: screenCtx,
+                    sourceMode: sourceMode)
                 var didAutoOpen = false
                 let presenter = AdaptiveStreamPresenter { [weak self] edit in
                     guard let self, messages.indices.contains(idx) else { return }
@@ -2048,6 +2376,7 @@ final class ChatViewModel: ObservableObject {
                     streamingChunk += 1
                 }
                 for try await event in stream {
+                    admissionWasObserved = true
                     switch event {
                     case .debugTrace(let trace):
                         messages[idx].debugTraceId = trace.prompt_trace_id
@@ -2058,7 +2387,6 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].debugSelectedSkills = trace.selected_skill_names
                         messages[idx].debugSelectedMemoryIds = trace.selected_memory_ids
                         messages[idx].debugConversationRecallInjected = trace.conversation_recall_injected
-                        if let sid = trace.session_id { sessionId = sid }
                     case .token(let t):
                         messages[idx].content += t
                         presenter.enqueue(t)
@@ -2137,7 +2465,8 @@ final class ChatViewModel: ObservableObject {
                                 mime: "application/pdf",
                                 kind: .pdf,
                                 localURL: URL(fileURLWithPath: ref.path),
-                                sizeBytes: ref.size
+                                sizeBytes: ref.size,
+                                availability: .available
                             )
                         }
                         messages[idx].attachments.append(contentsOf: chips)
@@ -2160,22 +2489,39 @@ final class ChatViewModel: ObservableObject {
                         messages[idx].content = message
                     case .taskRating(let level, let score, let reasons, let privacyRisk):
                         messages[idx].taskRating = (level: level, score: score, reasons: reasons, privacyRisk: privacyRisk)
-                    case .done(let returnedSessionId):
+                    case .done:
                         await presenter.finish()
                         for activityIndex in messages[idx].activities.indices
                             where messages[idx].activities[activityIndex].status == "running" {
                             messages[idx].activities[activityIndex].status = "completed"
                         }
-                        if let sid = returnedSessionId { sessionId = sid }
                         streamingAssistantMessageId = nil
                         Task { await loadDebugTrace(for: messages[idx].id) }
                     }
                 }
                 await presenter.finish()
                 streamingAssistantMessageId = nil
+                await restoreCurrentChat(preservingActivePresentation: true)
             } catch {
                 streamingAssistantMessageId = nil
                 messages[idx].content = "Chyba: \(error.localizedDescription)"
+                await restoreCurrentChat(preservingActivePresentation: true)
+                let authoritativeAdmission = Self.submissionWasAdmitted(
+                    before: submissionSnapshot,
+                    after: self.currentChatSnapshot,
+                    exactText: text)
+                if !admissionWasObserved && !authoritativeAdmission {
+                    var availableIdentities = Set<String>()
+                    for attachment in attachments {
+                        if (try? await client.attachment(id: attachment.id)) != nil {
+                            availableIdentities.insert(attachment.id)
+                        }
+                    }
+                    applyRejectedSubmissionDraft(
+                        text: text,
+                        attachments: attachments,
+                        availableAttachmentIdentities: availableIdentities)
+                }
             }
         }
     }
@@ -2288,12 +2634,15 @@ final class ChatViewModel: ObservableObject {
                 }
             }
             pendingAttachments.append(contentsOf: added)
+            scheduleDraftPersistence()
             isUploadingAttachment = false
         }
     }
 
     func removeAttachment(id: String) {
         pendingAttachments.removeAll { $0.id == id }
+        restoredPendingAttachmentReferences.removeAll { $0 == id }
+        scheduleDraftPersistence()
     }
 
     // MARK: - Image paste (Part B — Phase 7)
@@ -2378,15 +2727,4 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Private
 
-    private func startFreshSession() async {
-        sessionId = nil
-        await startNewSession()
-    }
-
-    private func startNewSession() async {
-        guard sessionId == nil else { return }
-        do {
-            sessionId = try await client.createSession()
-        } catch {}
-    }
 }

@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
+use uuid::Uuid;
 
 pub const MAX_TASK_TEXT_CHARS: usize = 4_000;
 pub const MAX_FINAL_OUTPUT_BYTES: usize = 64 * 1024;
@@ -214,6 +215,8 @@ impl From<rusqlite::Error> for AutomationSessionError {
 }
 
 pub fn initialize_schema(connection: &Connection) -> Result<(), AutomationSessionError> {
+    crate::current_chat::initialize_schema(connection)
+        .map_err(|error| AutomationSessionError::Storage(error.to_string()))?;
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS automation_work_states (
             work_identity TEXT PRIMARY KEY,
@@ -268,10 +271,6 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), AutomationSessio
         );
         CREATE TABLE IF NOT EXISTS automation_definitions (
             automation_identity TEXT PRIMARY KEY
-        );
-        CREATE TABLE IF NOT EXISTS automation_current_chats (
-            current_chat_identity TEXT PRIMARY KEY,
-            content_empty INTEGER NOT NULL CHECK (content_empty IN (0, 1))
         );
         CREATE TABLE IF NOT EXISTS automation_continuation_provenance (
             identity TEXT PRIMARY KEY,
@@ -360,23 +359,9 @@ pub fn delete_automation_definition(
     Ok(())
 }
 
-pub fn start_current_chat(
-    connection: &Connection,
-    current_chat_identity: &str,
-    content_empty: bool,
-) -> Result<(), AutomationSessionError> {
-    connection.execute(
-        "INSERT INTO automation_current_chats (current_chat_identity, content_empty)
-         VALUES (?1, ?2)",
-        params![current_chat_identity, content_empty as i64],
-    )?;
-    Ok(())
-}
-
 pub fn continue_automation_session_in_new_chat(
     connection: &Connection,
     automation_session_identity: &str,
-    current_chat_identity: &str,
     seed: &str,
     confirmed_replacement: bool,
     command_identity: &str,
@@ -405,7 +390,6 @@ pub fn continue_automation_session_in_new_chat(
         .optional()?;
     if let Some(existing) = existing {
         if existing.source_automation_session_identity == automation_session_identity
-            && existing.target_current_chat_identity == current_chat_identity
             && existing.seed == seed
         {
             return Ok(existing);
@@ -427,25 +411,55 @@ pub fn continue_automation_session_in_new_chat(
             "scheduler-only skipped Automation Sessions cannot continue".to_owned(),
         ));
     }
-    let chat_empty: bool = connection
-        .query_row(
-            "SELECT content_empty FROM automation_current_chats WHERE current_chat_identity=?1",
-            params![current_chat_identity],
-            |row| Ok(row.get::<_, i64>(0)? != 0),
-        )
-        .optional()?
-        .unwrap_or(true);
-    if !chat_empty && !confirmed_replacement {
+    let transaction = connection.unchecked_transaction()?;
+    let current_chat_identity: String = transaction.query_row(
+        "SELECT current_chat_identity FROM current_chat_authority WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let content_count: i64 = transaction.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM current_chat_turns WHERE current_chat_identity=?1)
+            + (SELECT COUNT(*) FROM current_chat_drafts WHERE current_chat_identity=?1)
+            + (SELECT COUNT(*) FROM current_chat_submitted_attachments WHERE current_chat_identity=?1)
+            + (SELECT COUNT(*) FROM current_chat_validated_sources WHERE current_chat_identity=?1)
+            + (SELECT COUNT(*) FROM current_chat_connector_references WHERE current_chat_identity=?1)
+            + (SELECT COUNT(*) FROM current_chat_approval_presentations WHERE current_chat_identity=?1)
+            + (SELECT COUNT(*) FROM automation_continuation_provenance
+               WHERE target_current_chat_identity=?1)",
+        params![current_chat_identity],
+        |row| row.get(0),
+    )?;
+    if content_count > 0 && !confirmed_replacement {
         return Err(AutomationSessionError::Invalid(
             "Current Chat is not empty; replacement confirmation is required".to_owned(),
         ));
     }
-    let transaction = connection.unchecked_transaction()?;
-    let identity = format!("continuation:{command_identity}");
-    transaction.execute(
-        "INSERT OR IGNORE INTO automation_current_chats (current_chat_identity, content_empty)
-         VALUES (?1, 1)",
+
+    let active_turn: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM current_chat_turns
+         WHERE current_chat_identity=?1 AND state='active'",
         params![current_chat_identity],
+        |row| row.get(0),
+    )?;
+    if active_turn > 0 {
+        return Err(AutomationSessionError::ActiveWork(
+            "Current Chat has an active Conversation Turn".to_owned(),
+        ));
+    }
+
+    let identity = format!("continuation:{command_identity}");
+    let replacement_identity = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    transaction.execute(
+        "INSERT INTO current_chats
+         (identity, revision, turn_count, content_bytes, created_at, updated_at)
+         VALUES (?1, 1, 0, 0, ?2, ?2)",
+        params![replacement_identity, now],
+    )?;
+    crate::work_coordinator::insert_work_current_chat_if_present(
+        &transaction,
+        &replacement_identity,
     )?;
     transaction.execute(
         "INSERT INTO automation_continuation_provenance
@@ -455,11 +469,11 @@ pub fn continue_automation_session_in_new_chat(
         params![
             identity,
             automation_session_identity,
-            current_chat_identity,
+            replacement_identity,
             command_identity,
             seed,
             seed.len(),
-            Utc::now().to_rfc3339(),
+            now,
         ],
     )?;
     transaction.execute(
@@ -467,22 +481,25 @@ pub fn continue_automation_session_in_new_chat(
          WHERE automation_session_identity=?1",
         params![automation_session_identity],
     )?;
-    if table_exists_transaction(&transaction, "work_automation_sessions")? {
-        transaction.execute(
-            "UPDATE work_automation_sessions SET attention_state='viewed'
-             WHERE automation_session_identity=?1",
-            params![automation_session_identity],
-        )?;
-    }
+    crate::work_coordinator::mark_work_automation_session_viewed_if_present(
+        &transaction,
+        automation_session_identity,
+    )?;
     transaction.execute(
-        "UPDATE automation_current_chats SET content_empty=0 WHERE current_chat_identity=?1",
+        "UPDATE current_chat_authority SET current_chat_identity=?1 WHERE singleton=1",
+        params![replacement_identity],
+    )?;
+    transaction.execute(
+        "DELETE FROM current_chats WHERE identity=?1",
         params![current_chat_identity],
     )?;
+    crate::current_chat::refresh_retained_content_bytes(&transaction, &replacement_identity)
+        .map_err(|error| AutomationSessionError::Storage(error.to_string()))?;
     transaction.commit()?;
     Ok(ContinuationProvenance {
         identity: format!("continuation:{command_identity}"),
         source_automation_session_identity: automation_session_identity.to_owned(),
-        target_current_chat_identity: current_chat_identity.to_owned(),
+        target_current_chat_identity: replacement_identity,
         seed: seed.to_owned(),
         source_deleted: false,
     })
@@ -742,13 +759,10 @@ pub fn mark_automation_session_viewed(
     if changed == 0 {
         return Err(AutomationSessionError::NotFound);
     }
-    if table_exists(connection, "work_automation_sessions")? {
-        connection.execute(
-            "UPDATE work_automation_sessions SET attention_state='viewed'
-             WHERE automation_session_identity=?1",
-            params![automation_session_identity],
-        )?;
-    }
+    crate::work_coordinator::mark_work_automation_session_viewed_if_present(
+        connection,
+        automation_session_identity,
+    )?;
     Ok(())
 }
 
@@ -786,13 +800,10 @@ pub fn open_automation_session(
     if changed == 0 {
         return Err(AutomationSessionError::NotFound);
     }
-    if table_exists_transaction(&transaction, "work_automation_sessions")? {
-        transaction.execute(
-            "UPDATE work_automation_sessions SET attention_state='viewed'
-             WHERE automation_session_identity=?1",
-            params![automation_session_identity],
-        )?;
-    }
+    crate::work_coordinator::mark_work_automation_session_viewed_if_present(
+        &transaction,
+        automation_session_identity,
+    )?;
     transaction.execute(
         "INSERT INTO automation_session_open_commands
          (command_identity, automation_session_identity, expected_revision, committed_at)
@@ -875,32 +886,11 @@ pub fn delete_automation_session(
         )?;
     }
     if let Some(work_identity) = work_identity {
-        if table_exists_transaction(&transaction, "works")? {
-            for table in [
-                "work_event_outbox",
-                "work_approvals",
-                "work_activity_projection",
-                "work_projections",
-            ] {
-                transaction.execute(
-                    &format!("DELETE FROM {table} WHERE work_identity=?1"),
-                    params![work_identity],
-                )?;
-            }
-            transaction.execute(
-                "DELETE FROM work_automation_sessions
-                 WHERE automation_session_identity=?1",
-                params![automation_session_identity],
-            )?;
-            transaction.execute(
-                "DELETE FROM work_automation_runs WHERE work_identity=?1",
-                params![work_identity],
-            )?;
-            transaction.execute(
-                "DELETE FROM works WHERE identity=?1",
-                params![work_identity],
-            )?;
-        }
+        crate::work_coordinator::delete_automation_work_if_present(
+            &transaction,
+            automation_session_identity,
+            &work_identity,
+        )?;
     }
     transaction.execute(
         "DELETE FROM automation_work_states
@@ -1099,32 +1089,11 @@ pub fn prune_automation_sessions(
             params![automation_session_identity],
         )?;
         if let Some(work_identity) = work_identity {
-            if table_exists_transaction(&transaction, "works")? {
-                for table in [
-                    "work_event_outbox",
-                    "work_approvals",
-                    "work_activity_projection",
-                    "work_projections",
-                ] {
-                    transaction.execute(
-                        &format!("DELETE FROM {table} WHERE work_identity=?1"),
-                        params![work_identity],
-                    )?;
-                }
-                transaction.execute(
-                    "DELETE FROM work_automation_sessions
-                     WHERE automation_session_identity=?1",
-                    params![automation_session_identity],
-                )?;
-                transaction.execute(
-                    "DELETE FROM work_automation_runs WHERE work_identity=?1",
-                    params![work_identity],
-                )?;
-                transaction.execute(
-                    "DELETE FROM works WHERE identity=?1",
-                    params![work_identity],
-                )?;
-            }
+            crate::work_coordinator::delete_automation_work_if_present(
+                &transaction,
+                &automation_session_identity,
+                &work_identity,
+            )?;
         }
         transaction.execute(
             "DELETE FROM automation_work_states
@@ -1389,25 +1358,3 @@ fn bounded_utf8(
 fn is_terminal_state(state: &str) -> bool {
     state.starts_with("terminal:")
 }
-
-fn table_exists(connection: &Connection, table: &str) -> Result<bool, AutomationSessionError> {
-    Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-        params![table],
-        |row| row.get::<_, i64>(0),
-    )? != 0)
-}
-
-fn table_exists_transaction(
-    transaction: &Transaction<'_>,
-    table: &str,
-) -> Result<bool, AutomationSessionError> {
-    Ok(transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-        params![table],
-        |row| row.get::<_, i64>(0),
-    )? != 0)
-}
-
-#[allow(dead_code)]
-fn _transaction_type_is_used(_: &Transaction<'_>) {}

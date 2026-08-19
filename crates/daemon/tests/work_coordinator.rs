@@ -1,12 +1,18 @@
+use bagentd::current_chat::{
+    begin_conversation_turn, initialize_schema as initialize_current_chat_schema,
+    open_or_create_current_chat, read_current_chat, ConversationTurnState,
+};
 use bagentd::work_coordinator::{
     ApprovalIdentity, AutomationDefinitionIdentity, AutomationDefinitionRevision,
     AutomationRunIdentity, AutomationSessionIdentity, Command, CommandAcknowledgement,
     CommandError, ConversationTurnIdentity, CoordinatorClock, CoordinatorConfig,
-    CoordinatorDependencies, CurrentChatIdentity, DaemonGeneration,
+    CoordinatorDependencies, CurrentChatIdentity, CurrentChatTerminalOutcome, DaemonGeneration,
     DeterministicWorkIdentitySource, EventCursor, EventRead, FailurePoint, FixedCoordinatorClock,
     ModelRuntimeGeneration, WorkActivityCategory, WorkCoordinator, WorkIdentity, WorkRevision,
     WorkState,
 };
+use chrono::{TimeZone, Utc};
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 fn dependencies(identities: &[&str]) -> CoordinatorDependencies {
@@ -1018,29 +1024,21 @@ fn daemon_restart_recovery() {
         after_restart.daemon_generation,
         DaemonGeneration::new("daemon-a10-after")
     );
-    assert_eq!(after_restart.cursor.value(), 22);
+    assert_eq!(after_restart.cursor.value(), 23);
     assert_eq!(after_restart.automation_runs.len(), 1);
     assert!(!after_restart.automation_runs[0].active);
     assert_eq!(after_restart.approvals.len(), 1);
     assert_eq!(
         after_restart.approvals[0].state,
-        bagentd::work_coordinator::ApprovalState::Pending
+        bagentd::work_coordinator::ApprovalState::Abandoned
     );
-    assert_eq!(after_restart.interruptions.len(), 4);
+    assert_eq!(after_restart.interruptions.len(), 5);
     assert!(!after_restart.model_runtime_trusted);
     assert_eq!(after_restart.model_runtime_generation, None);
     for work in &after_restart.works {
         if work.identity.as_str() == "work-a10-completed" {
             assert_eq!(work.state, WorkState::Completed);
             assert_eq!(work.revision.value(), 4);
-        } else if work.identity.as_str() == "work-a10-approval" {
-            assert_eq!(work.state, WorkState::WaitingForApproval);
-            let prior = before_restart
-                .works
-                .iter()
-                .find(|prior| prior.identity == work.identity)
-                .unwrap();
-            assert_eq!(work.revision, prior.revision);
         } else {
             assert_eq!(work.state, WorkState::Abandoned);
             let prior = before_restart
@@ -1066,7 +1064,7 @@ fn daemon_restart_recovery() {
             .iter()
             .map(|event| event.event_cursor.value())
             .collect::<Vec<_>>(),
-        vec![18, 19, 20, 21, 22]
+        vec![18, 19, 20, 21, 22, 23]
     );
     assert!(recovery_events.iter().all(|event| {
         event.state == WorkState::Abandoned
@@ -1109,14 +1107,187 @@ fn daemon_restart_fixture_process() {
         snapshot.daemon_generation,
         DaemonGeneration::new("daemon-a10-after")
     );
-    assert!(snapshot.works.iter().all(|work| {
-        work.state == WorkState::Abandoned
-            || work.state == WorkState::Completed
-            || work.state == WorkState::WaitingForApproval
-    }));
+    assert!(snapshot
+        .works
+        .iter()
+        .all(|work| { work.state == WorkState::Abandoned || work.state == WorkState::Completed }));
     assert!(snapshot
         .approvals
         .iter()
-        .all(|approval| approval.state == bagentd::work_coordinator::ApprovalState::Pending));
+        .all(|approval| approval.state == bagentd::work_coordinator::ApprovalState::Abandoned));
     assert!(!snapshot.model_runtime_trusted);
+}
+
+fn current_chat_terminal_fixture(
+    suffix: &str,
+) -> (
+    TempDir,
+    WorkCoordinator,
+    String,
+    String,
+    WorkIdentity,
+    WorkRevision,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("terminal.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    initialize_current_chat_schema(&connection).unwrap();
+    let chat = open_or_create_current_chat(&connection).unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap();
+    let turn = begin_conversation_turn(
+        &connection,
+        &chat.identity,
+        chat.revision,
+        "exact submitted prompt",
+        &[],
+        now,
+    )
+    .unwrap();
+    drop(connection);
+
+    let work_identity = format!("terminal-work-{suffix}");
+    let coordinator = WorkCoordinator::open_with_dependencies(
+        &path,
+        CoordinatorConfig { max_events: 64 },
+        DaemonGeneration::new("daemon-terminal"),
+        dependencies(&[&work_identity]),
+    )
+    .unwrap();
+    let created = coordinator
+        .submit(create_conversation(
+            format!("terminal-create-{suffix}"),
+            &chat.identity,
+            &turn.identity,
+            "daemon-terminal",
+        ))
+        .unwrap();
+    let work = created.receipt().work_identity.clone();
+    coordinator
+        .submit(work_transition(
+            format!("terminal-wait-{suffix}"),
+            work.clone(),
+            rev(1),
+            WorkState::WaitingForModel,
+            "daemon-terminal",
+        ))
+        .unwrap();
+    let running = coordinator
+        .submit(work_transition(
+            format!("terminal-run-{suffix}"),
+            work.clone(),
+            rev(2),
+            WorkState::Running,
+            "daemon-terminal",
+        ))
+        .unwrap()
+        .receipt()
+        .work_revision;
+    (
+        temp,
+        coordinator,
+        chat.identity,
+        turn.identity,
+        work,
+        running,
+    )
+}
+
+#[test]
+fn current_chat_terminalization_is_atomic_across_chat_work_and_outbox() {
+    for assistant_output in [Some("completed answer"), None] {
+        for failure in [
+            FailurePoint::BeforeTransaction,
+            FailurePoint::AfterStateMutation,
+            FailurePoint::AfterOutboxInsert,
+            FailurePoint::AtCommit,
+        ] {
+            let suffix = format!(
+                "{}-{:?}",
+                if assistant_output.is_some() {
+                    "complete"
+                } else {
+                    "interrupt"
+                },
+                failure
+            );
+            let (temp, coordinator, chat_identity, turn_identity, work, running) =
+                current_chat_terminal_fixture(&suffix);
+            assert!(matches!(
+                coordinator.terminalize_current_chat_turn_with_failure(
+                    format!("terminalize-{suffix}"),
+                    work.clone(),
+                    running,
+                    &chat_identity,
+                    &turn_identity,
+                    assistant_output,
+                    &[],
+                    Utc.with_ymd_and_hms(2026, 8, 20, 12, 1, 0).unwrap(),
+                    failure,
+                ),
+                Err(CommandError::InjectedFailure(point)) if point == failure
+            ));
+            let snapshot = coordinator.snapshot().unwrap();
+            let persisted_work = snapshot
+                .works
+                .iter()
+                .find(|candidate| candidate.identity == work)
+                .unwrap();
+            assert_eq!(persisted_work.state, WorkState::Running);
+            assert_eq!(persisted_work.revision, running);
+            let connection = Connection::open(temp.path().join("terminal.sqlite3")).unwrap();
+            let persisted_chat = read_current_chat(&connection).unwrap();
+            assert_eq!(persisted_chat.turns[0].state, ConversationTurnState::Active);
+            assert!(persisted_chat.turns[0].assistant_output.is_none());
+            assert!(persisted_chat.completed_approval_presentations.is_empty());
+        }
+    }
+
+    for assistant_output in [Some("completed answer"), None] {
+        let suffix = if assistant_output.is_some() {
+            "success"
+        } else {
+            "failure"
+        };
+        let (temp, coordinator, chat_identity, turn_identity, work, running) =
+            current_chat_terminal_fixture(suffix);
+        let (_, outcome) = coordinator
+            .terminalize_current_chat_turn(
+                format!("terminalize-{suffix}"),
+                work.clone(),
+                running,
+                &chat_identity,
+                &turn_identity,
+                assistant_output,
+                &[],
+                Utc.with_ymd_and_hms(2026, 8, 20, 12, 1, 0).unwrap(),
+            )
+            .unwrap();
+        let expected_work = if assistant_output.is_some() {
+            WorkState::Completed
+        } else {
+            WorkState::Failed
+        };
+        let snapshot = coordinator.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .works
+                .iter()
+                .find(|candidate| candidate.identity == work)
+                .unwrap()
+                .state,
+            expected_work
+        );
+        let connection = Connection::open(temp.path().join("terminal.sqlite3")).unwrap();
+        let chat = read_current_chat(&connection).unwrap();
+        if assistant_output.is_some() {
+            assert_eq!(outcome, CurrentChatTerminalOutcome::Completed);
+            assert_eq!(chat.turns[0].state, ConversationTurnState::Completed);
+        } else {
+            assert_eq!(
+                outcome,
+                CurrentChatTerminalOutcome::InterruptedExecutionFailed
+            );
+            assert_eq!(chat.turns[0].state, ConversationTurnState::Interrupted);
+        }
+    }
 }

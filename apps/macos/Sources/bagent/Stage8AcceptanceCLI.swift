@@ -27,9 +27,11 @@ enum Stage8AcceptanceCLI {
         var providers: [[String: String]] = []
         do {
             try await client.configureStage8Acceptance(acquisition: acquisition, polish: polish)
+            let currentChat = try await client.currentChat()
             for try await event in client.chatStream(
                 text: prompt,
-                sessionId: "stage8-signed-swift-client-\(UUID().uuidString)",
+                currentChatIdentity: currentChat.identity,
+                expectedRevision: currentChat.revision,
                 model: health.model
             ) {
                 _ = EvidencePresentation.apply(event, to: &presentation)

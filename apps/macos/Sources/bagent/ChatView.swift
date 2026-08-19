@@ -352,9 +352,11 @@ struct NotchWrapView: View {
             // Slash-command suggestion rows sit under the input field.
             let suggestionsExtra = CGFloat(viewModel.slashSuggestions.count)
                 * NotchWrapMetrics.slashSuggestionRowHeight
+            let commandErrorExtra = viewModel.slashCommandError == nil
+                ? 0 : NotchWrapMetrics.slashSuggestionRowHeight
             return min(
                 NotchWrapMetrics.maxBridgeHeight,
-                NotchWrapMetrics.inlineBridgeHeight + suggestionsExtra
+                NotchWrapMetrics.inlineBridgeHeight + suggestionsExtra + commandErrorExtra
             )
         }
     }
@@ -1156,6 +1158,9 @@ struct NotchWrapView: View {
         .onChange(of: viewModel.slashSuggestions) {
             refreshSurface()
         }
+        .onChange(of: viewModel.slashCommandError) {
+            refreshSurface()
+        }
         .onChange(of: viewModel.cmuxBanner) {
             refreshSurface()
         }
@@ -1335,6 +1340,8 @@ struct InlineNotchContent: View {
                 )
             } else if viewModel.showWhatsappPairing {
                 WhatsAppPairingView(viewModel: viewModel)
+            } else if viewModel.clearCurrentChatConfirmationPresented {
+                CurrentChatClearConfirmation(viewModel: viewModel)
             } else {
                 switch viewModel.notchInteractionMode {
                 case .input:
@@ -1373,6 +1380,9 @@ struct InlineNotchContent: View {
         }
         .onChange(of: viewModel.inputText.isEmpty) { _, isEmpty in
             if isEmpty { placeholderRevealID = UUID() }
+        }
+        .onChange(of: viewModel.currentChatFocusRequestID) {
+            keepInlineInputFocused(reason: "current-chat-cleared")
         }
     }
 
@@ -1417,9 +1427,18 @@ struct InlineNotchContent: View {
     private var inputWithSuggestions: some View {
         VStack(alignment: .leading, spacing: 4) {
             inputRow
+            pendingAttachmentRows
+            restoredCurrentChatRecords
             if !viewModel.slashSuggestions.isEmpty {
                 slashSuggestionRows
                     .transition(.opacity)
+            }
+            if let error = viewModel.slashCommandError {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red.opacity(0.9))
+                    .lineLimit(1)
+                    .accessibilityAddTraits(.isStaticText)
             }
         }
         .animation(
@@ -1432,22 +1451,28 @@ struct InlineNotchContent: View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(Array(viewModel.slashSuggestions.enumerated()), id: \.element.id) { index, cmd in
                 let selected = index == viewModel.slashSelectionIndex
-                HStack(spacing: 8) {
-                    if let symbol = cmd.symbol {
-                        Image(systemName: symbol)
-                            .font(.system(size: 10, weight: .medium))
+                Button {
+                    _ = viewModel.completeSlashSuggestion(cmd)
+                    inputFocused = true
+                } label: {
+                    HStack(spacing: 8) {
+                        if let symbol = cmd.symbol {
+                            Image(systemName: symbol)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                                .frame(width: 14)
+                        }
+                        Text(cmd.command)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                        Text(cmd.subtitle)
+                            .font(.system(size: 11))
                             .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                            .frame(width: 14)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
                     }
-                    Text(cmd.command)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
-                    Text(cmd.subtitle)
-                        .font(.system(size: 11))
-                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
                 }
+                .buttonStyle(.plain)
                 .padding(.horizontal, 8)
                 .frame(height: NotchWrapMetrics.slashSuggestionRowHeight - 2)
                 .background(
@@ -1455,11 +1480,13 @@ struct InlineNotchContent: View {
                         .fill(Color.white.opacity(selected ? 0.12 : 0.06))
                 )
                 .contentShape(Rectangle())
-                .onTapGesture {
-                    _ = viewModel.acceptSlashSuggestion(cmd)
-                }
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("Command \(cmd.command), \(cmd.subtitle)")
+                .accessibilityLabel(String(
+                    format: String(
+                        localized: "slashCommand.suggestion.accessibilityLabel",
+                        defaultValue: "Command %@, %@"),
+                    cmd.command,
+                    cmd.subtitle))
                 .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
             }
         }
@@ -1529,6 +1556,87 @@ struct InlineNotchContent: View {
             .accessibilityValue(text)
             if let sources = viewModel.latestAssistantMessage?.sources, !sources.isEmpty {
                 sourceLinks(sources)
+            }
+            restoredCurrentChatRecords
+        }
+    }
+
+    @ViewBuilder
+    private var pendingAttachmentRows: some View {
+        if !viewModel.pendingAttachments.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(viewModel.pendingAttachments) { attachment in
+                    HStack(spacing: 6) {
+                        Image(systemName: attachment.availability == .available
+                            ? "paperclip" : "exclamationmark.triangle")
+                        Text(attachment.filename).lineLimit(1)
+                        if attachment.availability == .unavailable {
+                            Text(String(
+                                localized: "currentChat.attachment.unavailable",
+                                defaultValue: "Attachment unavailable"))
+                                .foregroundStyle(.orange)
+                        }
+                        Spacer(minLength: 2)
+                        Button {
+                            viewModel.removeAttachment(id: attachment.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(String(
+                            localized: "currentChat.attachment.remove",
+                            defaultValue: "Remove attachment"))
+                    }
+                }
+            }
+            .font(.system(size: 10.5))
+            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+        }
+    }
+
+    @ViewBuilder
+    private var restoredCurrentChatRecords: some View {
+        let attachments = viewModel.restoredSubmittedAttachments
+        let sources = viewModel.restoredValidatedSources
+        let connectors = viewModel.restoredConnectorReferences
+        let approvals = viewModel.restoredApprovalPresentations
+        if !attachments.isEmpty || !sources.isEmpty || !connectors.isEmpty || !approvals.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(attachments) { attachment in
+                    retainedRecord(
+                        icon: "paperclip",
+                        label: attachment.filename,
+                        available: attachment.availability == .available)
+                }
+                ForEach(sources, id: \.identity) { source in
+                    retainedRecord(icon: "link", label: source.label, available: source.availability == "available")
+                }
+                ForEach(connectors, id: \.identity) { reference in
+                    retainedRecord(icon: "point.3.connected.trianglepath.dotted", label: reference.label,
+                                   available: reference.availability == "available")
+                }
+                ForEach(approvals, id: \.identity) { approval in
+                    Label("\(approval.category): \(approval.outcome)", systemImage: "checkmark.shield")
+                }
+            }
+            .font(.system(size: 10.5))
+            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(String(
+                localized: "currentChat.restoredRecords.accessibilityLabel",
+                defaultValue: "Restored Current Chat records"))
+        }
+    }
+
+    private func retainedRecord(icon: String, label: String, available: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: available ? icon : "exclamationmark.triangle")
+            Text(label).lineLimit(1)
+            if !available {
+                Text(String(
+                    localized: "currentChat.attachment.unavailable",
+                    defaultValue: "Unavailable"))
+                    .foregroundStyle(.orange)
             }
         }
     }
@@ -1694,6 +1802,10 @@ struct InlineNotchContent: View {
     }
 
     private func focusIfNeeded() {
+        guard !viewModel.clearCurrentChatConfirmationPresented else {
+            inputFocused = false
+            return
+        }
         guard viewModel.notchInteractionMode == .input else {
             inlineFocusRetryID = UUID()
             inputFocused = false
@@ -1704,17 +1816,58 @@ struct InlineNotchContent: View {
 
     private func keepInlineInputFocused(reason: String) {
         _ = reason
+        let restoreCaretAtEnd = viewModel.consumeCurrentChatCaretRestoration()
         let retryID = UUID()
         inlineFocusRetryID = retryID
-        for attempt in 0..<5 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 + Double(attempt) * 0.06) {
+        for attempt in 0..<12 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 + Double(attempt) * 0.08) {
                 guard inlineFocusRetryID == retryID,
-                      viewModel.notchInteractionMode == .input
+                      viewModel.notchInteractionMode == .input,
+                      !viewModel.clearCurrentChatConfirmationPresented
                 else { return }
                 NSApp.activate(ignoringOtherApps: true)
                 inputFocused = true
+                DispatchQueue.main.async {
+                    guard restoreCaretAtEnd,
+                          let editor = NSApp.keyWindow?.firstResponder as? NSTextView
+                    else { return }
+                    viewModel.restoreCurrentChatCaret(in: editor)
+                }
             }
         }
+    }
+}
+
+private struct CurrentChatClearConfirmation: View {
+    @ObservedObject var viewModel: ChatViewModel
+    @FocusState private var cancelFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(String(localized: "currentChat.clear.title", defaultValue: "Clear Current Chat?"))
+                .font(.system(size: 14, weight: .semibold))
+            Text(String(
+                localized: "currentChat.clear.explanation",
+                defaultValue: "Clears completed and interrupted turns, the draft, attachments, sources, Connector References, approvals, and any Continuation Seed and Provenance. No hidden archive is kept. Automation Sessions, Runs and Definitions, Saved Long-Term Memory, external side effects, and source-session viewed state remain; no Automation Work is cancelled."))
+                .font(.system(size: 12))
+                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button(String(localized: "currentChat.clear.cancel", defaultValue: "Cancel")) {
+                    viewModel.cancelCurrentChatClear()
+                }
+                .focused($cancelFocused)
+                .keyboardShortcut(.cancelAction)
+                Button(
+                    String(localized: "currentChat.clear.confirm", defaultValue: "Clear Current Chat"),
+                    role: .destructive
+                ) {
+                    viewModel.confirmCurrentChatClear()
+                }
+            }
+        }
+        .onAppear { cancelFocused = true }
+        .accessibilityElement(children: .contain)
     }
 }
 
