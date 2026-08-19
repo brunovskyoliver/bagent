@@ -351,3 +351,35 @@ The mandated fixed point is
 reviewers inspect the complete fixed-point diff after the green candidate is
 committed. Every finding is repaired and both axes rerun until zero unresolved
 findings remain.
+
+Three rounds ran against this fixed point, each against the state left by the
+previous round's fix commit:
+
+1. Against `77167d3`+`97e6539`: Standards found no hard violations (judgement-
+   call smells only, left as-is). Spec found the dead `dispatch_next`
+   admission path — fixed by `97e6539` itself (committed before this round
+   ran) plus the competing-semaphore removal, and the A22 harness-caller
+   disclosure — see the first correction section above.
+2. Against `77167d3`+`97e6539`+`de1b7fd`: Standards found no hard violations
+   and confirmed the `release_slot` additions and the new static checker are
+   internally consistent (one cosmetic latent bug noted in the checker's
+   error-message line lookup — does not affect pass/fail). Spec found the
+   slot-leak fix in `de1b7fd` was itself incomplete: `screen_intent_handler`
+   was not spawn-detached, so a client-disconnect mid-classification could
+   still leak the slot — fixed by `b067184`; see the third correction
+   section above.
+3. Against all four commits through `b067184`: independently re-verified the
+   spawn-wrap genuinely closes that gap (traced the full handler body, cross-
+   checked `req` ownership, re-confirmed all three `admit()` call sites — chat,
+   screen-intent, automation — are each spawn-detached), hunted for a fourth
+   defect in the same family across `model_runtime.rs` (its lease is already
+   `Drop`-based RAII, unaffected) and the evidence orchestrator (transitively
+   protected — only reachable from the already-spawned tool loop), and found
+   none. Rebuilt, reran `work_concurrency` and `work-authority.sh`: all green.
+   One disclosed, accepted behavior change (not a defect): a disconnected
+   client's screen-intent/chat/automation request now always runs to
+   completion in the background rather than being cancelled early, consistent
+   across all three admission paths — the necessary tradeoff for closing the
+   slot leak.
+
+Zero unresolved findings remain as of `b067184`.
