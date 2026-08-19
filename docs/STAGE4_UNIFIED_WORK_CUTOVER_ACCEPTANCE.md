@@ -217,13 +217,14 @@ already inside `tokio::spawn`; `scheduler.rs:247`, itself inside a spawned
 task) were re-confirmed already immune to this vector — `screen_intent_handler`
 was the only one of the three admission call sites that was not.
 
-Final exact run (supersedes all earlier timestamps in this document):
-`2026-08-19T14:04:00Z` through `2026-08-19T14:09:39Z`. `cargo test -p
+Final pre-close rerun (supersedes all earlier timestamps in this document):
+`2026-08-19T17:01:30Z` through `2026-08-19T17:03:22Z`. `cargo test -p
 bagentd` (all targets): 251 top-level passed, 0 failed, 5 ignored (unchanged
 environment/fixture boundaries), nested restart child 1/1 not
-double-counted. `cargo test --workspace`: 452 test-result lines summed across
-every crate, 0 failed, 12 ignored. `swift test --package-path apps/macos`: 52
-passed, 0 failed. `cargo fmt --all -- --check`, `cargo clippy --workspace
+double-counted. `cargo test --workspace`: 451 distinct top-level tests passed,
+0 failed, 12 ignored; Cargo also reported the nested restart child as a
+separate 1/1 result line, for 452 reported passes in the raw output. `swift
+test --package-path apps/macos`: 52 passed, 0 failed, 0 ignored. `cargo fmt --all -- --check`, `cargo clippy --workspace
 --all-targets --all-features -- -D warnings`, `cargo build --workspace
 --all-targets`, `cargo check -p bagentd --all-targets --features
 stage8-acceptance`, `swift build --package-path apps/macos`, `git diff
@@ -260,17 +261,16 @@ run found seven legacy tests still treating scheduler claims as execution
 authority; those fixtures were retargeted to canonical Work and the final
 daemon run is green.
 
-Final exact run: `2026-08-19T13:58:00Z` through `2026-08-19T14:02:50Z`
-(supersedes the original `2026-08-18T20:12:46Z` run — see the two correction
-sections above; this table's per-gate commands and results reflect the
-corrected admission path).
+Final exact run: `2026-08-19T17:01:30Z` through `2026-08-19T17:01:34Z`.
+This supersedes the original `2026-08-18T20:12:46Z` run and every correction
+rerun above. The table reflects the corrected admission path at `2d91930`.
 
 | Gate | Exact command | Exact result |
 |---|---|---|
-| A18 | `cargo test -p bagentd --test work_concurrency fairness_foreground -- --exact`; `admission_dispatcher_serializes_foreground_independent_of_automation` | PASS: 1 passed, 0 failed, 0 ignored, 6 filtered (each); bounded foreground priority and aged Automation progress against `dispatch_next` directly, and against the real `submit_*`→`admit()`→`run_dispatcher` production path |
-| A19 | `cargo test -p bagentd --test work_concurrency automation_capacity_two -- --exact`; `admission_dispatcher_enforces_automation_capacity_of_two` | PASS: 1 passed, 0 failed, 0 ignored, 6 filtered (each); exactly two distinct Automation executions, zero slot leak, verified against `dispatch_next` directly and against the real async admission path |
-| A20 | `cargo test -p bagentd --test work_concurrency approval_restart_capacity -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 3 filtered; same approval identity survives restart, capacity is free, one valid decision resumes, stale decision conflicts |
-| A21 | `cargo test -p bagentd --test work_concurrency cancellation_races -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 3 filtered; queued/loading/executing/approval/completion races, one terminal outcome, zero leases/slots |
+| A18 | `cargo test -p bagentd --test work_concurrency fairness_foreground -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 6 filtered; bounded foreground priority and aged Automation progress |
+| A19 | `cargo test -p bagentd --test work_concurrency automation_capacity_two -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 6 filtered; exactly two distinct Automation executions and zero slot leak |
+| A20 | `cargo test -p bagentd --test work_concurrency approval_restart_capacity -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 6 filtered; same approval identity survives restart, capacity is free, one valid decision resumes, stale decision conflicts |
+| A21 | `cargo test -p bagentd --test work_concurrency cancellation_races -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 6 filtered; queued/loading/executing/approval/completion races, one terminal outcome, zero leases/slots |
 | A22 | `cargo test -p bagentd --test work_failure_injection` | PASS: 1 passed, 0 failed; admission, persistence, outbox, runtime, tool, approval, and completion failpoints close deterministically. `ExecutionBoundaryAdapter`/`execute_with_adapter` (`unified_work.rs`) is a test-only harness seam with no production caller — it proves `UnifiedWorkAuthority`'s own recovery/invariant behavior at each named boundary, not that production's chat/automation handlers route execution through it (they call `transition`/`admit`/`release_slot` directly; see the correction section above). |
 | A23 | `cargo test -p bagentd --test persistence_migration legacy_run_records -- --exact` | PASS: 1 passed, 0 failed, 0 ignored, 1 filtered; bounded/idempotent privacy-safe records and safe active abandonment |
 | A24 | `cargo test -p bagentd --test privacy_contract work_surfaces -- --exact` | PASS: 1 passed, 0 failed; canaries absent from events, snapshots, projections, logs, and diagnostics; unknown fields rejected |
@@ -304,8 +304,8 @@ production findings are zero. The only canonical Work SQL writers are
 | `scripts/acceptance/model-runtime-authority.sh` | PASS: 13 seeded forbidden matches and zero forbidden production matches |
 | `cargo test -p basert-connector --test protocol` | 14 passed, 0 failed, 0 ignored |
 | `cargo test -p bagentd` | 251 top-level tests passed, 0 failed, 5 ignored; nested restart child passed 1/1 (superseded original candidate figures — see correction section above) |
-| `cargo test --workspace` | 452 test-result lines summed across every crate passed, 0 failed, 12 ignored; nested restart child passed 1/1 and is not a distinct test |
-| `swift test --package-path apps/macos` | 52 passed, 0 failed |
+| `cargo test --workspace` | 451 distinct top-level tests passed, 0 failed, 12 ignored; the nested restart child also passed 1/1, producing 452 reported passes in the raw Cargo result lines |
+| `swift test --package-path apps/macos` | 52 passed, 0 failed, 0 ignored; the separate Swift Testing runner contained 0 tests and is not evidence |
 | `cargo fmt --all -- --check` | exit 0 |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 |
 | `cargo build --workspace --all-targets` | exit 0 |
@@ -383,3 +383,58 @@ previous round's fix commit:
    slot leak.
 
 Zero unresolved findings remain as of `b067184`.
+
+## Final closure verification
+
+The target-locked closeout reran every command required by issue #30 against
+`2d9193016a2d5a8c1744cc1b84939be743246170`. A18-A26 and the full regression
+set passed. Every claimed focused test executed one case. No production defect
+was found, so the closeout changes only this acceptance record and does not
+require a fourth code-review round.
+
+The final Stage 4 implementation and review history is exactly these five
+commits, in order:
+
+1. `77167d34ec234f5862a0b2e309457df79224b83d`: cut over unified Work authority.
+2. `97e6539f7868be34f9e6f399f3c520cb69010c7e`: wire production admission through the fairness queue.
+3. `de1b7fd49d1a2fa0bcd5282dce4486459072d54e`: close early-return capacity-slot leaks.
+4. `b067184ec997c0b0ab58f66328baf937e071ef00`: protect screen-intent admission from client-disconnect cancellation.
+5. `2d9193016a2d5a8c1744cc1b84939be743246170`: record the third zero-unresolved-finding review pass.
+
+Final artifact hashes at that reviewed implementation commit:
+
+| Artifact | SHA-256 |
+|---|---|
+| `crates/daemon/src/unified_work.rs` | `8416257d0c3f88c9c12aa6ecda6b10735fee60411db4dd07bfa11a45a7baf120` |
+| `crates/daemon/src/main.rs` | `80c8f8035131e6d1c1a350d0e1c880fad34677822dbee8bf2b4fc2c1269cc3b0` |
+| `crates/daemon/src/automations_api.rs` | `2d95b13fec2d82177a62281a796ed21416779d9a1b7c68c11948f351c938473b` |
+| `crates/daemon/migrations/V16__unified_work_cutover.sql` | `792c6710f25c3e254c34c98c1be85e8b6c4450f414e9df366053fb9d50865364` |
+| `scripts/acceptance/work-authority.sh` | `2c9c3153b53c971650cb4ef8154759529a2210cff3d1d9f36354f571c7eee255` |
+| `scripts/acceptance/work-cutover-rollback.sh` | `2bc4f1d1e814f64aab8c181ddadd42f8272692da85d4bec5861d02b6426273d7` |
+
+The acceptance record contains two Markdown links and no local file-link
+targets. Its Markdown structure and link syntax passed the local checker;
+authenticated GitHub reads resolved #29 as closed and #30 as open before
+resolution. Shell syntax and `git diff --check` also passed.
+
+The read-only protected-runtime state was identical before and after the final
+verification. The installed-app daemon PID 758 recorded during the earlier
+review no longer existed before this closeout and remained absent. Port 8080
+had no listener before or after. Port 8082 remained owned by the same BaseRT
+process, PID 792, started `2026-08-16 10:42:21 +0200`. No command in this
+closeout bound, stopped, restarted, or otherwise touched either port, the live
+database, installed app, launch agents, credentials, caches, or TCC state.
+
+Standards verdict: zero hard violations and zero unresolved findings. The
+earlier judgement-call duplication notes remain accepted and do not violate a
+repository rule. Spec verdict: zero unresolved findings after all three review
+rounds. Stage 5 is eligible after issue #30 closes, but no Stage 5 work was
+created or started.
+
+The five reviewed commits were pushed without rewriting history. Immediately
+after that push, local `HEAD`, upstream, and the remote branch all resolved to
+`2d9193016a2d5a8c1744cc1b84939be743246170`, and the worktree was clean. The
+documentation-only closeout commit containing this section is pushed next;
+the issue #30 resolution records its exact SHA and the final local/upstream/
+remote equality and clean-worktree proof, since a commit cannot contain its
+own SHA.
