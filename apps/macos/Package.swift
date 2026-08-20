@@ -31,6 +31,14 @@ let package = Package(
                 ]),
             ]
         ),
+        .executableTarget(
+            name: "bagent-browser-harness",
+            path: "Sources/browser-harness",
+            linkerSettings: [
+                .linkedFramework("WebKit"),
+                .linkedFramework("AppKit"),
+            ]
+        ),
         .testTarget(
             name: "bagentTests",
             dependencies: ["bagent"],
