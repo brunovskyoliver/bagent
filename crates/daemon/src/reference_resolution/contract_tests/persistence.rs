@@ -1384,7 +1384,7 @@ fn fresh_migration_creates_the_complete_resolver_schema_without_backfill() {
             |row| row.get(0),
         )
         .expect("read migration ceiling");
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
 
     let actual: BTreeSet<String> = connection
         .prepare(
@@ -1443,7 +1443,7 @@ fn v14_upgrade_applies_v15_and_v16_without_resolver_backfill() {
             |row| row.get(0),
         )
         .expect("read upgraded migration ceiling");
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     let resolver_rows: i64 = connection
         .query_row(
             "SELECT (SELECT COUNT(*) FROM reference_turns) +
@@ -1524,7 +1524,7 @@ fn migrated_database_reopens_with_foreign_keys_enabled() {
             |row| row.get(0),
         )
         .expect("read reopened migration ceiling");
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     let foreign_keys: i64 = connection
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
         .expect("read reopened foreign-key pragma");
