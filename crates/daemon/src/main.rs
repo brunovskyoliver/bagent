@@ -49,6 +49,7 @@ use whatsapp_connector::{
 mod agent_exec;
 mod automations_api;
 mod evidence;
+mod notifications;
 mod reference_resolution;
 mod scheduler;
 
@@ -772,6 +773,11 @@ async fn main() -> Result<()> {
     // until the next due instant (woken immediately by automations_changed).
     tokio::spawn(scheduler::run_scheduler(state.clone()));
 
+    // Notification mirror. Apple's database holds only what Notification
+    // Center is currently showing, so history exists only because this loop
+    // runs; anything delivered and dismissed between two polls is lost.
+    tokio::spawn(notifications_poll_loop(state.clone()));
+
     let shutdown_state = state.clone();
     #[allow(unused_mut)]
     let mut app = Router::new()
@@ -881,6 +887,9 @@ async fn main() -> Result<()> {
         )
         .route("/web/tavily/status", get(tavily_status_handler))
         // Phase 11 — WhatsApp connector
+        .route("/notifications/status", get(notifications_status_handler))
+        .route("/notifications/settings", post(notifications_settings_handler))
+        .route("/notifications/forget", post(notifications_forget_handler))
         .route("/whatsapp/status", get(whatsapp_status_handler))
         .route("/whatsapp/start", post(whatsapp_start_handler))
         .route("/whatsapp/stop", post(whatsapp_stop_handler))
@@ -3727,6 +3736,92 @@ async fn tavily_config_failure_handler(State(state): State<AppState>) -> impl In
 // ── WhatsApp handlers (Phase 11) ─────────────────────────────────────────────
 
 /// `GET /whatsapp/status`
+/// Mirror macOS notifications while the feed is enabled.
+///
+// ponytail: fixed 30s tick, no backoff. A failing read logs once per minute at
+// worst; add backoff if that ever becomes noise.
+async fn notifications_poll_loop(state: AppState) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut last_error: Option<String> = None;
+    loop {
+        // Read the cursor, then drop the lock: copying Apple's database and
+        // decoding plists must not sit on the mutex that chat turns need.
+        let cursor = {
+            let conn = state.db.lock().await;
+            notifications::is_enabled(&conn).then(|| notifications::watermark(&conn))
+        };
+
+        if let Some(since) = cursor {
+            let collected =
+                tokio::task::spawn_blocking(move || notifications::collect(since)).await;
+            let outcome = match collected {
+                Ok(Ok(rows)) => {
+                    let conn = state.db.lock().await;
+                    notifications::apply(&conn, &rows, chrono::Utc::now().timestamp())
+                        .map(|n| n.inserted)
+                }
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::anyhow!("collector task panicked: {e}")),
+            };
+            match outcome {
+                Ok(inserted) => {
+                    if inserted > 0 {
+                        tracing::debug!("notifications: mirrored {inserted} new");
+                    }
+                    last_error = None;
+                }
+                Err(e) => {
+                    // Fail closed: last_sync_at stays where it was, so the tool
+                    // reports a stale feed rather than answering from a mirror
+                    // that silently stopped updating.
+                    let msg = e.to_string();
+                    if last_error.as_deref() != Some(msg.as_str()) {
+                        tracing::warn!("notifications: collector failed: {msg}");
+                        last_error = Some(msg);
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct NotificationsSettings {
+    enabled: bool,
+}
+
+async fn notifications_settings_handler(
+    State(state): State<AppState>,
+    Json(body): Json<NotificationsSettings>,
+) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    let _ = notifications::set_enabled(&conn, body.enabled);
+    // Switching off stops collection and makes the feed report unavailable; it
+    // deliberately does not erase. Destroying 30 days of history behind a
+    // toggle would be irreversible and unasked-for — that is what
+    // /notifications/forget is for.
+    Json(serde_json::json!({"enabled": body.enabled}))
+}
+
+async fn notifications_forget_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    let removed = notifications::forget_all(&conn).unwrap_or(0);
+    Json(serde_json::json!({"removed": removed}))
+}
+
+async fn notifications_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM notifications", [], |r| r.get(0))
+        .unwrap_or(0);
+    Json(serde_json::json!({
+        "enabled": notifications::is_enabled(&conn),
+        "mirrored": count,
+        "unavailable": notifications::unavailable_reason(&conn),
+    }))
+}
+
 async fn whatsapp_status_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.whatsapp.status().await {
         Ok(s) => {

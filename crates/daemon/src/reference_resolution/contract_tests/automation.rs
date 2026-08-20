@@ -621,7 +621,7 @@ fn migration_runs_on_a_fresh_temporary_database() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
 }
 
 #[test]
