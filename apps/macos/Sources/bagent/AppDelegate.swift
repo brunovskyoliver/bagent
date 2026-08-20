@@ -8,6 +8,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var daemonLauncher: DaemonLauncher?
     private var tavilyConfigurationManager: TavilyConfigurationManager?
     private var chatViewModel: ChatViewModel?
+    private var browserCoordinator: BrowserCoordinator?
+    private var browserCommandServer: BrowserCommandServer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -22,7 +24,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let vm = ChatViewModel()
         chatViewModel = vm
-        let nc = NotchWindowController(chatViewModel: vm)
+        let browserCoordinator = BrowserCoordinator()
+        browserCoordinator.start()
+        self.browserCoordinator = browserCoordinator
+        let nc = NotchWindowController(chatViewModel: vm, browserCoordinator: browserCoordinator)
         notchController = nc
 
         // Background automation approvals preempt everything: open the notch
@@ -33,6 +38,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             nc.presentInputOnly()
         }
         vm.startEventsMonitor()
+
+        let browserCommandServer = BrowserCommandServer(coordinator: browserCoordinator)
+        browserCoordinator.onEnabledChanged = { [weak browserCommandServer] _ in
+            // Keep the user-only endpoint alive while the feature is disabled
+            // so MCP clients receive browser_disabled instead of an ambiguous
+            // startup timeout. The coordinator still creates no session or cue.
+            browserCommandServer?.start()
+        }
+        browserCommandServer.start()
+        self.browserCommandServer = browserCommandServer
 
         GlobalHotkey.register { [weak self] in
             DispatchQueue.main.async { self?.handleHotkey() }
@@ -46,6 +61,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        browserCommandServer?.stop()
+        if let browserCoordinator {
+            for session in browserCoordinator.sessions.values { session.terminate() }
+        }
         GlobalHotkey.unregister()
         chatViewModel?.cmuxMonitor.stop()
         tavilyConfigurationManager?.stop()

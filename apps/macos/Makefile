@@ -1,9 +1,11 @@
 APP_NAME   = bagent
 BUILD_DIR  = .build/release
 BUNDLE     = $(APP_NAME).app
+LOCALIZATION_CATALOG = Resources/Localizable.xcstrings
 REPO_ROOT  = ../..
 DAEMON_DEV = $(REPO_ROOT)/target/debug/bagentd
 DAEMON_REL = $(REPO_ROOT)/target/release/bagentd
+BROWSER_MCP_REL = $(REPO_ROOT)/target/release/bagent-browser-mcp
 # Stable signing identity: ad-hoc ("-") signatures use a per-build cdhash as the
 # designated requirement, so every rebuild invalidates TCC grants (Accessibility,
 # Screen Recording). A real identity keys the grant to identifier+team instead.
@@ -13,7 +15,7 @@ ifeq ($(SIGN_ID),)
 SIGN_ID   := -
 endif
 
-.PHONY: run build daemon daemon-acceptance bundle bundle-acceptance assemble-bundle clean whatsapp-bridge-install
+.PHONY: run build browser-mcp daemon daemon-acceptance bundle bundle-acceptance assemble-bundle clean whatsapp-bridge-install
 
 # Dev run: builds daemon first, then the Swift app. The Info.plist is embedded in
 # the binary (see Package.swift) so screen-capture TCC works without bundling. Ad-hoc
@@ -50,14 +52,17 @@ daemon-acceptance:
 build:
 	swift build -c release
 
+browser-mcp:
+	cargo build --release --manifest-path $(REPO_ROOT)/Cargo.toml -p bagent-browser-mcp
+
 # Bundle: Swift + daemon release binary
-bundle: build daemon
+bundle: build daemon browser-mcp
 	$(MAKE) assemble-bundle
 	@echo "✓  $(BUNDLE) ready — open $(BUNDLE) or drag to Applications"
 
 # Signed-app acceptance bundle. This is never used by the ordinary bundle
 # target, so production/default builds contain no fixture controls.
-bundle-acceptance: build daemon-acceptance
+bundle-acceptance: build daemon-acceptance browser-mcp
 	$(MAKE) assemble-bundle
 	@echo "✓  $(BUNDLE) Stage 8 acceptance build ready"
 
@@ -66,6 +71,7 @@ assemble-bundle:
 	mkdir -p "$(BUNDLE)/Contents/MacOS"
 	cp "$(BUILD_DIR)/$(APP_NAME)" "$(BUNDLE)/Contents/MacOS/"
 	cp "$(DAEMON_REL)" "$(BUNDLE)/Contents/MacOS/"
+	cp "$(BROWSER_MCP_REL)" "$(BUNDLE)/Contents/MacOS/"
 	@printf '<?xml version="1.0" encoding="UTF-8"?>\n\
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n\
 <plist version="1.0"><dict>\n\
@@ -78,6 +84,11 @@ assemble-bundle:
   <key>NSHighResolutionCapable</key> <true/>\n\
   <key>NSScreenCaptureUsageDescription</key> <string>bagent captures your screen on demand to answer questions about what is displayed. Screenshots are processed in memory and never saved to disk.</string>\n\
   </dict></plist>\n' > "$(BUNDLE)/Contents/Info.plist"
+	codesign --force --sign $(SIGN_ID) "$(BUNDLE)/Contents/MacOS/$(APP_NAME)"
+	codesign --force --sign $(SIGN_ID) "$(BUNDLE)/Contents/MacOS/$(notdir $(DAEMON_REL))"
+	codesign --force --sign $(SIGN_ID) "$(BUNDLE)/Contents/MacOS/$(notdir $(BROWSER_MCP_REL))"
+	mkdir -p "$(BUNDLE)/Contents/Resources"
+	cp "$(LOCALIZATION_CATALOG)" "$(BUNDLE)/Contents/Resources/"
 	codesign --force --sign $(SIGN_ID) "$(BUNDLE)"
 
 clean:

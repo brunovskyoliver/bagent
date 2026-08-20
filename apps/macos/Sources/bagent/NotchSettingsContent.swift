@@ -5,14 +5,18 @@ import SwiftUI
 /// controls; the notch's left-wing icon mirrors the current page.
 struct NotchSettingsContent: View {
     @ObservedObject var viewModel: ChatViewModel
+    @ObservedObject var browserCoordinator: BrowserCoordinator
     @ObservedObject private var permissions: PermissionsManager
     @AppStorage(NotchWindowController.pasteWheelEnabledKey) private var pasteWheelEnabled = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// +1 = forward (push from trailing), -1 = back.
     @State private var pageDirection: CGFloat = 1
 
-    init(viewModel: ChatViewModel) {
+    @State private var showingBrowserProfileConfirmation = false
+
+    init(viewModel: ChatViewModel, browserCoordinator: BrowserCoordinator = BrowserCoordinator()) {
         self.viewModel = viewModel
+        self.browserCoordinator = browserCoordinator
         self.permissions = viewModel.permissions
     }
 
@@ -326,6 +330,44 @@ struct NotchSettingsContent: View {
                 subtitle: "Upozornenia agentov v notchi",
                 isOn: $viewModel.cmuxNotificationsEnabled
             )
+            toggleRow(
+                icon: "globe",
+                title: String(localized: "browser.settings.title", defaultValue: "bagent Browser"),
+                subtitle: String(localized: "browser.settings.subtitle",
+                                  defaultValue: "Private WebKit sessions for Codex and Claude"),
+                isOn: Binding(
+                    get: { browserCoordinator.isEnabled },
+                    set: { browserCoordinator.setEnabled($0) }
+                )
+            )
+            if browserCoordinator.isEnabled {
+                HStack {
+                    Text(String(localized: "browser.settings.profile",
+                                defaultValue: "Browser Profile keeps its own website data."))
+                        .font(.system(size: 10))
+                        .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                    Spacer()
+                    notchButton(String(localized: "browser.settings.clear",
+                                       defaultValue: "Clear")) {
+                        showingBrowserProfileConfirmation = true
+                    }
+                }
+            }
+        }
+        .alert(
+            String(localized: "browser.settings.clear.title",
+                   defaultValue: "Clear bagent Browser Profile?"),
+            isPresented: $showingBrowserProfileConfirmation
+        ) {
+            Button(String(localized: "browser.settings.clear.cancel",
+                          defaultValue: "Cancel"), role: .cancel) {}
+            Button(String(localized: "browser.settings.clear.confirm",
+                          defaultValue: "Clear Profile"), role: .destructive) {
+                Task { await browserCoordinator.clearProfileAfterUserConfirmation() }
+            }
+        } message: {
+            Text(String(localized: "browser.settings.clear.message",
+                        defaultValue: "This closes all Browser Sessions and removes their cookies and website data."))
         }
     }
 
