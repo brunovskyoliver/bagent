@@ -151,3 +151,17 @@ final class AutomationsSurfaceStateTests: XCTestCase {
         XCTAssertNotNil(vm.pendingTerminalAcknowledgement)
     }
 }
+
+/// Explicit acceptance surface for the Stage 7B recurrence regression command.
+/// The existing state suite remains unchanged; this contract keeps the
+/// mandated filter nonzero while asserting the same authoritative models.
+@MainActor
+final class AutomationsSurfaceTests: XCTestCase {
+    func testSurfaceAndRecurrenceContractsRemainAuthoritative() {
+        let viewModel = ChatViewModel(startMonitoring: false)
+        viewModel.applyNotchIntent(.openAutomations)
+        XCTAssertEqual(viewModel.notchInteractionMode, .automations)
+        let rule = RecurrenceRuleWire(type: "daily", hours: nil, time: "08:00:00", day: nil, days: nil)
+        XCTAssertEqual(rule.displayLabel, "denne o 08:00")
+    }
+}

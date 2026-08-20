@@ -43,6 +43,7 @@ final class NotchWindowController: NSObject {
     var isNotchInteractionShowing: Bool { chatViewModel.notchInteractionMode != .collapsed }
     private var hasNotch = false
     private var localKeyMonitor: Any?
+    private var compassRailKeyMonitor: Any?
     private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
     /// Clipboard paste wheel (hold right ⌘).
@@ -360,6 +361,12 @@ final class NotchWindowController: NSObject {
             return nil
         }
 
+        compassRailKeyMonitor = Self.installCompassRailKeyMonitor(
+            on: statusPanel,
+            viewModel: chatViewModel,
+            focusedControl: { [weak self] in self?.focusedCompassRailControl() }
+        )
+
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
             if event.type == .flagsChanged {
@@ -395,6 +402,17 @@ final class NotchWindowController: NSObject {
                 if !self.chatViewModel.slashSuggestions.isEmpty {
                     self.chatViewModel.dismissSlashSuggestions()
                     return nil
+                }
+                if self.chatViewModel.notchInteractionMode == .settings {
+                    let action = self.chatViewModel.handleCompassRailKey(
+                        .escape,
+                        focusedControl: self.focusedCompassRailControl()
+                    )
+                    if action == .back { return nil }
+                    if action == .collapse {
+                        self.collapse()
+                        return nil
+                    }
                 }
                 if self.chatViewModel.notchInteractionMode == .automations,
                    self.chatViewModel.automationsGoBack() {
@@ -447,17 +465,6 @@ final class NotchWindowController: NSObject {
                self.chatViewModel.notchInteractionMode == .input {
                 self.chatViewModel.send()
                 return nil
-            }
-            // ←/→ switch settings pages while the /settings surface is open.
-            if self.chatViewModel.notchInteractionMode == .settings {
-                if event.keyCode == 123 {
-                    self.chatViewModel.notchSettingsPage = self.chatViewModel.notchSettingsPage.previous
-                    return nil
-                }
-                if event.keyCode == 124 {
-                    self.chatViewModel.notchSettingsPage = self.chatViewModel.notchSettingsPage.next
-                    return nil
-                }
             }
             // ↑/↓ on empty notch input browse past assistant responses.
             // Arrow keys always carry .function + .numericPad — ignore those.
@@ -514,6 +521,57 @@ final class NotchWindowController: NSObject {
         return true
     }
 
+    private func focusedCompassRailControl() -> CompassRailFocusedControl? {
+        guard chatViewModel.notchInteractionMode == .settings else { return nil }
+        return Self.compassRailFocusedControl(in: statusPanel)
+    }
+
+    @discardableResult
+    static func routeCompassRailKeyEvent(
+        _ event: NSEvent,
+        viewModel: ChatViewModel,
+        focusedControl: CompassRailFocusedControl?
+    ) -> Bool {
+        guard viewModel.notchInteractionMode == .settings else { return false }
+        let modifiers = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .intersection([.command, .option, .control, .shift])
+        guard modifiers.isEmpty else { return false }
+        switch event.keyCode {
+        case 123:
+            return viewModel.handleCompassRailKey(.left, focusedControl: focusedControl) != nil
+        case 124:
+            return viewModel.handleCompassRailKey(.right, focusedControl: focusedControl) != nil
+        default:
+            return false
+        }
+    }
+
+    @MainActor
+    static func installCompassRailKeyMonitor(
+        on panel: NSPanel,
+        viewModel: ChatViewModel,
+        focusedControl: @escaping () -> CompassRailFocusedControl?
+    ) -> Any? {
+        NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { event in
+            guard event.window === panel else { return event }
+            if routeCompassRailKeyEvent(event, viewModel: viewModel, focusedControl: focusedControl()) {
+                return nil
+            }
+            return event
+        }
+    }
+
+    static func compassRailFocusedControl(in panel: NSPanel) -> CompassRailFocusedControl? {
+        if panel.firstResponder is NSTextView { return .textEditor }
+        if panel.firstResponder is NSSecureTextField { return .secureField }
+        if panel.firstResponder is NSTextField { return .textField }
+        if panel.firstResponder is NSSlider || panel.firstResponder is NSPopUpButton || panel.firstResponder is NSComboBox {
+            return .nativeEditor
+        }
+        return nil
+    }
+
     private func collapseInputForThinking() {
         guard chatViewModel.notchInteractionMode == .input else { return }
         chatViewModel.applyNotchIntent(.collapse)
@@ -527,6 +585,7 @@ final class NotchWindowController: NSObject {
         resetNotchHoverState()
 
         if let m = localKeyMonitor    { NSEvent.removeMonitor(m); localKeyMonitor    = nil }
+        if let m = compassRailKeyMonitor { NSEvent.removeMonitor(m); compassRailKeyMonitor = nil }
         if let m = localMouseMonitor  { NSEvent.removeMonitor(m); localMouseMonitor  = nil }
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
         statusPanel.styleMask = [.borderless, .nonactivatingPanel]

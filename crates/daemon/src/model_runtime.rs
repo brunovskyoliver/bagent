@@ -6,6 +6,24 @@ use std::{
     time::Duration,
 };
 
+pub const PRELOAD_ON_INPUT_POLICY: bool = false;
+pub const SHARED_IDLE_TIMEOUT_SECONDS: u64 = 20 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelRuntimePolicy {
+    pub preload_on_input: bool,
+    pub shared_idle_timeout_seconds: u64,
+}
+
+impl Default for ModelRuntimePolicy {
+    fn default() -> Self {
+        Self {
+            preload_on_input: PRELOAD_ON_INPUT_POLICY,
+            shared_idle_timeout_seconds: SHARED_IDLE_TIMEOUT_SECONDS,
+        }
+    }
+}
+
 pub use crate::work_coordinator::WorkIdentity;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -948,6 +966,7 @@ pub struct ModelRuntime {
     transition: AsyncMutex<()>,
     changed: tokio::sync::Notify,
     simulated: bool,
+    policy: ModelRuntimePolicy,
 }
 
 impl ModelRuntime {
@@ -987,6 +1006,7 @@ impl ModelRuntime {
             transition: AsyncMutex::new(()),
             changed: tokio::sync::Notify::new(),
             simulated: true,
+            policy: ModelRuntimePolicy::default(),
         })
     }
 
@@ -1010,6 +1030,7 @@ impl ModelRuntime {
             transition: AsyncMutex::new(()),
             changed: tokio::sync::Notify::new(),
             simulated: false,
+            policy: ModelRuntimePolicy::default(),
         })
     }
 
@@ -1430,6 +1451,10 @@ impl ModelRuntime {
         }
     }
 
+    pub fn policy(&self) -> ModelRuntimePolicy {
+        self.policy
+    }
+
     pub async fn request_retirement(&self, model: ModelClass) {
         let mut state = self.state.lock().expect("model runtime state");
         if state.resident != Some(model) {
@@ -1493,7 +1518,7 @@ impl ModelRuntime {
     }
 
     pub async fn maintain(&self) -> Result<()> {
-        const IDLE_RETIREMENT: Duration = Duration::from_secs(20 * 60);
+        let idle_retirement = Duration::from_secs(self.policy.shared_idle_timeout_seconds);
         let _transition = self.transition.lock().await;
         let action = {
             let state = self.state.lock().expect("model runtime state");
@@ -1503,7 +1528,7 @@ impl ModelRuntime {
                 state.retirement_started_at,
             ) {
                 (0, Some(model), Some(started))
-                    if self.clock.now().saturating_sub(started) >= IDLE_RETIREMENT =>
+                    if self.clock.now().saturating_sub(started) >= idle_retirement =>
                 {
                     Some(RuntimeAction::Unload(model))
                 }

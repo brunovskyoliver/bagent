@@ -343,42 +343,6 @@ enum AutomationDraftBuilder {
     }
 }
 
-/// Pages of the notch-style settings surface (`/settings`).
-enum NotchSettingsPage: Int, CaseIterable, Equatable {
-    case general
-    case permissions
-    case model
-    case connectors
-    case setup
-
-    var title: String {
-        switch self {
-        case .general:     return "Všeobecné"
-        case .permissions: return "Povolenia"
-        case .model:       return "Model"
-        case .connectors:  return "Konektory"
-        case .setup:       return "Nastavenie"
-        }
-    }
-
-    var symbolName: String {
-        switch self {
-        case .general:     return "gearshape"
-        case .permissions: return "lock.shield"
-        case .model:       return "cpu"
-        case .connectors:  return "puzzlepiece.extension"
-        case .setup:       return "slider.horizontal.3"
-        }
-    }
-
-    var next: NotchSettingsPage {
-        NotchSettingsPage(rawValue: (rawValue + 1) % Self.allCases.count) ?? .general
-    }
-    var previous: NotchSettingsPage {
-        NotchSettingsPage(rawValue: (rawValue + Self.allCases.count - 1) % Self.allCases.count) ?? .general
-    }
-}
-
 enum SourceMode: String, CaseIterable, Equatable, Identifiable {
     case mail
     case filesystem
@@ -459,7 +423,6 @@ final class ChatViewModel: ObservableObject {
     @Published var hoveredSourceMode: SourceMode? = nil
     @Published var isSourcePickerForced = false
     @Published var hasNotch = false
-    @Published var availableModels: [String] = [ModelRuntimeConfiguration.model]
     @Published var daemonHealth: DaemonHealth?
     @Published var isSyncing = false
     @Published var lastSyncResult: String? = nil
@@ -488,15 +451,51 @@ final class ChatViewModel: ObservableObject {
     /// animates to its hover state before the chat panel appears.
     @Published var pillHovered = false
 
-    /// Current page of the notch settings surface.
-    @Published var notchSettingsPage: NotchSettingsPage = .general
+    /// The sole writable settings-selection state for the Compass Rail.
+    @Published var compassRailRoute: CompassRailRoute = .initial
 
     /// Open the notch-style settings surface (`/settings` command).
     func openNotchSettings() {
         inputText = ""
         historyBrowseIndex = nil
-        notchSettingsPage = .general
+        compassRailRoute = .initial
         applyNotchIntent(.openSettings)
+    }
+
+    func selectCompassRailArea(_ area: CompassRailArea) {
+        compassRailRoute = .area(area)
+    }
+
+    func openCompassRailChild(_ child: CompassRailChild) {
+        compassRailRoute = .child(child)
+    }
+
+    @discardableResult
+    func goBackInCompassRail() -> Bool {
+        guard let parent = compassRailRoute.parent else { return false }
+        compassRailRoute = parent
+        return true
+    }
+
+    /// Routes settings-only keyboard commands after the native editor has had
+    /// the first opportunity to keep its own left/right keys.
+    @discardableResult
+    func handleCompassRailKey(
+        _ key: CompassRailKey,
+        focusedControl: CompassRailFocusedControl?
+    ) -> CompassRailKeyboardAction? {
+        guard notchInteractionMode == .settings else { return nil }
+        guard let action = CompassRailKeyboard.route(
+            key,
+            route: compassRailRoute,
+            focusedControl: focusedControl
+        ) else { return nil }
+        switch action {
+        case .select(let area): selectCompassRailArea(area)
+        case .back: _ = goBackInCompassRail()
+        case .collapse: break
+        }
+        return action
     }
 
     // MARK: - Automations surface (/automations)
@@ -1233,23 +1232,18 @@ final class ChatViewModel: ObservableObject {
     private var healthMonitorTask: Task<Void, Never>?
     private let tavilyConfigurationSynchronizer = TavilyConfigurationSynchronizer()
 
-    @Published var selectedModel: String = ModelRuntimeConfiguration.model {
-        didSet { UserDefaults.standard.set(selectedModel, forKey: "bagent.model") }
-    }
-
-    @Published var selectedClassifierModel: String = ModelRuntimeConfiguration.model {
-        didSet { UserDefaults.standard.set(selectedClassifierModel, forKey: "bagent.classifier_model") }
-    }
-
     // MARK: - Codex (Phase 8)
 
     /// User-configured path to the `codex` binary. Empty = auto-discover from $PATH.
     @Published var codexBinaryPath: String = UserDefaults.standard.string(forKey: "bagent.codex_path") ?? "" {
-        didSet { UserDefaults.standard.set(codexBinaryPath, forKey: "bagent.codex_path") }
+        didSet {
+            if !isSettingsFixture { UserDefaults.standard.set(codexBinaryPath, forKey: "bagent.codex_path") }
+        }
     }
     /// Last result from "Testovať Codex" — nil while not tested, true/false after.
     @Published var codexTestResult: String? = nil
     @Published var isTestingCodex: Bool = false
+    @Published var codexServiceAvailable: Bool? = nil
 
     func testCodex() {
         isTestingCodex = true
@@ -1260,14 +1254,17 @@ final class ChatViewModel: ObservableObject {
                 await MainActor.run {
                     if status.available {
                         self.codexTestResult = "✓ \(status.version ?? "dostupný")"
+                        self.codexServiceAvailable = status.available
                     } else {
                         self.codexTestResult = "✗ \(status.error ?? "nenájdený")"
+                        self.codexServiceAvailable = false
                     }
                     self.isTestingCodex = false
                 }
             } catch {
                 await MainActor.run {
                     self.codexTestResult = "✗ \(error.localizedDescription)"
+                    self.codexServiceAvailable = false
                     self.isTestingCodex = false
                 }
             }
@@ -1287,11 +1284,34 @@ final class ChatViewModel: ObservableObject {
 
     @Published var odooTestResult: String? = nil
     @Published var isTestingOdoo: Bool = false
-    @Published var odooMcpAvailable: Bool = false
+    @Published var odooMcpAvailable: Bool? = nil
     @Published var odooToolCount: Int = 0
+    @Published private(set) var rulesPolicySummary: String = "Not reported"
+
+    var canTestOdoo: Bool {
+        !odooURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !odooDB.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !odooUser.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !odooAPIKey.isEmpty
+    }
+
+    func refreshRulesPolicySummary() {
+        Task {
+            do {
+                let yaml = try await client.rulesYaml()
+                let summary = yaml.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "Unavailable"
+                    : "Configured by daemon"
+                await MainActor.run { self.rulesPolicySummary = summary }
+            } catch {
+                await MainActor.run { self.rulesPolicySummary = "Unavailable" }
+            }
+        }
+    }
 
     /// Save creds to Keychain + UserDefaults and authenticate with the daemon via MCP.
     func configureOdoo() {
+        guard canTestOdoo else { return }
         // Persist non-secret fields in UserDefaults (URL, DB, user, uvx path).
         UserDefaults.standard.set(odooURL,     forKey: "bagent.odoo.url")
         UserDefaults.standard.set(odooDB,      forKey: "bagent.odoo.db")
@@ -1325,6 +1345,7 @@ final class ChatViewModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.odooTestResult = "✗ \(error.localizedDescription)"
+                    self.odooMcpAvailable = false
                     self.isTestingOdoo = false
                 }
             }
@@ -1583,6 +1604,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private let client: DaemonClient
+    private let isSettingsFixture: Bool
     private let notchEventConsumer: NotchEventConsumer
     private var projectionCancellable: AnyCancellable?
     let permissions = PermissionsManager()
@@ -1790,8 +1812,16 @@ final class ChatViewModel: ObservableObject {
     }
     // MARK: - Init
 
-    init(startMonitoring: Bool = true, client: DaemonClient = DaemonClient()) {
+    init(startMonitoring: Bool = true, client: DaemonClient = DaemonClient(), settingsFixture: Bool = false) {
         self.client = client
+        self.isSettingsFixture = settingsFixture
+        if settingsFixture {
+            codexBinaryPath = ""
+            odooURL = ""
+            odooDB = ""
+            odooUser = ""
+            odooUvxPath = ""
+        }
         notchEventConsumer = NotchEventConsumer(transport: client)
         projectionCancellable = notchEventConsumer.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
@@ -1801,7 +1831,9 @@ final class ChatViewModel: ObservableObject {
             startCmuxMonitor()
             Task { await refreshHealth() }
         }
-        Task { await restoreCurrentChat() }
+        if startMonitoring {
+            Task { await restoreCurrentChat() }
+        }
     }
 
     func applyNotchIntent(_ intent: NotchLocalIntent) {
@@ -2153,21 +2185,6 @@ final class ChatViewModel: ObservableObject {
         applyNotchIntent(.openInput)
     }
 
-    func loadModels() async {
-        do {
-            let fetched = try await client.models()
-            if !fetched.isEmpty {
-                availableModels = fetched
-                if !fetched.contains(selectedModel) {
-                    selectedModel = fetched.first ?? ModelRuntimeConfiguration.model
-                }
-                if !fetched.contains(selectedClassifierModel) {
-                    selectedClassifierModel = fetched.first ?? ModelRuntimeConfiguration.model
-                }
-            }
-        } catch {}
-    }
-
     func syncMail() async {
         guard !isSyncing else { return }
         isSyncing = true
@@ -2315,7 +2332,13 @@ final class ChatViewModel: ObservableObject {
         updateSlashSuggestions()
         historyBrowseIndex = nil
         pendingConnectorActions = []
-        let model = selectedModel
+        guard let model = daemonHealth?.model,
+              !model.isEmpty,
+              model != "—"
+        else {
+            slashCommandError = "Model Runtime is unavailable."
+            return
+        }
         let attachments = pendingAttachments
         pendingAttachments = []
         restoredPendingAttachmentReferences = []

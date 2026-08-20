@@ -97,6 +97,158 @@
         "ja" : { "stringUnit" : { "state" : "translated", "value" : "この応答は中断されました。続けるには新しいメッセージを送信してください。" } }
       }
     },
+    "settings.area.general" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "General" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "一般" } }
+      }
+    },
+    "settings.area.modelRuntime" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Model and Runtime" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "モデルとランタイム" } }
+      }
+    },
+    "settings.area.integrations" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Integrations" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "統合" } }
+      }
+    },
+    "settings.area.privacy" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Privacy and Permissions" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "プライバシーと権限" } }
+      }
+    },
+    "settings.child.whatsapp" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "WhatsApp" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "WhatsApp" } }
+      }
+    },
+    "settings.child.odoo" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Odoo" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Odoo" } }
+      }
+    },
+    "settings.child.codex" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex" } }
+      }
+    },
+    "settings.child.fullDiskAccess" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Full Disk Access" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "フルディスクアクセス" } }
+      }
+    },
+    "settings.child.screenRecording" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Screen Recording" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "画面収録" } }
+      }
+    },
+    "settings.child.accessibility" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Accessibility" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "アクセシビリティ" } }
+      }
+    },
+    "settings.child.rules" : {
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Rules and approval policy" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ルールと承認ポリシー" } }
+      }
+    },
+    "Accessibility permission required" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Accessibility permission required" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アクセシビリティ権限が必要です" } } } },
+    "Agent notifications in the notch" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Agent notifications in the notch" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ノッチのエージェント通知" } } } },
+    "Active lease" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Active lease" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アクティブなリース" } } } },
+    "Automation waiting" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Automation waiting" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "自動化の待機" } } } },
+    "Changed-PID recovery" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Changed-PID recovery" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "PID変更からの復旧" } } } },
+    "Configured by daemon" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Configured by daemon" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "デーモンで設定" } } } },
+    "Connector service" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Connector service" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "コネクターサービス" } } } },
+    "Database" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Database" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "データベース" } } } },
+    "Disconnect" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Disconnect" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "接続解除" } } } },
+    "General settings" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "General settings" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "一般設定" } } } },
+    "Integrations settings" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Integrations settings" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "統合設定" } } } },
+    "Local chat model" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Local chat model" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ローカルチャットモデル" } } } },
+    "Local service unavailable" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Local service unavailable" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ローカルサービスを利用できません" } } } },
+    "Model and Runtime settings" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Model and Runtime settings" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "モデルとランタイムの設定" } } } },
+    "Needs setup" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Needs setup" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "設定が必要です" } } } },
+    "Not reported" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Not reported" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "未報告" } } } },
+    "Not tested" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Not tested" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "未テスト" } } } },
+    "No work waiting" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "No work waiting" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "待機中の作業はありません" } } } },
+    "Option-Space opens the notch input." : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Option-Space opens the notch input." } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "Option-Spaceでノッチ入力を開きます。" } } } },
+    "Paste wheel" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Paste wheel" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ペーストホイール" } } } },
+    "Permission required" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Permission required" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "権限が必要です" } } } },
+    "Policy details remain authoritative in the daemon." : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Policy details remain authoritative in the daemon." } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ポリシーの詳細はデーモンが管理します。" } } } },
+    "Policy source" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Policy source" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ポリシーのソース" } } } },
+    "Preload on input" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Preload on input" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "入力時のプリロード" } } } },
+    "Privacy and Permissions settings" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Privacy and Permissions settings" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "プライバシーと権限の設定" } } } },
+    "Residency" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Residency" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "常駐状態" } } } },
+    "Secrets stay in Keychain and are never displayed." : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Secrets stay in Keychain and are never displayed." } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "シークレットはキーチェーンに保存され、表示されません。" } } } },
+    "Shared idle timeout" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Shared idle timeout" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "共有アイドルタイムアウト" } } } },
+    "Show pairing QR" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Show pairing QR" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ペアリングQRを表示" } } } },
+    "Stored in Keychain" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Stored in Keychain" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "キーチェーンに保存" } } } },
+    "Validation failed" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Validation failed" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "検証に失敗しました" } } } },
+    "Waiting for residency" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Waiting for residency" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "常駐を待機中" } } } },
+    "Active" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Active" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アクティブ" } } } },
+    "Active — unloading prevented" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Active — unloading prevented" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アクティブ — アンロード防止" } } } },
+    "Available" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Available" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "利用可能" } } } },
+    "Connected" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Connected" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "接続済み" } } } },
+    "Loading" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Loading" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "読み込み中" } } } },
+    "Loaded" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Loaded" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "読み込み済み" } } } },
+    "Ready" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Ready" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "準備完了" } } } },
+    "Testing" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Testing" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "テスト中" } } } },
+    "Valid" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Valid" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "有効" } } } },
+    "On" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "On" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "オン" } } } },
+    "Off" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Off" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "オフ" } } } },
+    "Unloaded" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Unloaded" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アンロード済み" } } } },
+    "Unloading" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Unloading" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アンロード中" } } } },
+    "Unavailable" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Unavailable" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "利用できません" } } } },
+    "API key" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "API key" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "APIキー" } } } },
+    "Apple Mail" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Apple Mail" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "Apple Mail" } } } },
+    "Apple Notes" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Apple Notes" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "Apple Notes" } } } },
+    "Automatic from PATH" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Automatic from PATH" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "PATHから自動" } } } },
+    "Back to Integrations" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Back to Integrations" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "統合に戻る" } } } },
+    "Binary" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Binary" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "バイナリ" } } } },
+    "Codex configuration" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex configuration" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex設定" } } } },
+    "Connect" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Connect" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "接続" } } } },
+    "Daemon-owned" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Daemon-owned" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "デーモン管理" } } } },
+    "Full Disk Access" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Full Disk Access" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "フルディスクアクセス" } } } },
+    "Hold the right Command key for recent clips" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Hold the right Command key for recent clips" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "右Commandキーで最近のクリップを表示" } } } },
+    "None" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "None" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "なし" } } } },
+    "Not selected" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Not selected" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "未選択" } } } },
+    "Odoo configuration" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Odoo configuration" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "Odoo設定" } } } },
+    "Open" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Open" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "開く" } } } },
+    "Opens Privacy and Permissions" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Opens Privacy and Permissions" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "プライバシーと権限を開く" } } } },
+    "Rules and approval policy" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Rules and approval policy" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ルールと承認ポリシー" } } } },
+    "Selected" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Selected" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "選択済み" } } } },
+    "Status" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Status" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ステータス" } } } },
+    "Test" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Test" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "テスト" } } } },
+    "Testing…" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Testing…" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "テスト中…" } } } },
+    "URL" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "URL" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "URL" } } } },
+    "User" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "User" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "ユーザー" } } } },
+    "Validation" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Validation" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "検証" } } } },
+    "WhatsApp configuration" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "WhatsApp configuration" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "WhatsApp設定" } } } },
+    "cmux notifications" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "cmux notifications" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "cmux通知" } } } },
+    "Compass Rail" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Compass Rail" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "コンパスレール" } } } },
+    "In progress" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "In progress" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "進行中" } } } },
+    "Back to General" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Back to General" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "一般に戻る" } } } },
+    "Back to Model and Runtime" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Back to Model and Runtime" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "モデルとランタイムに戻る" } } } },
+    "Back to Privacy and Permissions" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Back to Privacy and Permissions" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "プライバシーと権限に戻る" } } } },
+    "https://company.odoo.com" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "https://company.odoo.com" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "https://company.odoo.com" } } } },
+    "company" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "company" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "company" } } } },
+    "user@example.com" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "user@example.com" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "user@example.com" } } } },
+    "seconds" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "seconds" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "秒" } } } },
+    "WhatsApp" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "WhatsApp" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "WhatsApp" } } } },
+    "Odoo" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Odoo" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "Odoo" } } } },
+    "Codex" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Codex" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "Codex" } } } },
+    "Accessibility" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Accessibility" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "アクセシビリティ" } } } },
+    "Screen Recording" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Screen Recording" } }, "ja" : { "stringUnit" : { "state" : "translated", "value" : "画面収録" } } } },
     "slashCommand.clear.subtitle" : {
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Clear Current Chat" } },

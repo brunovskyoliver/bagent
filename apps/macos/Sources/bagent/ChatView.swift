@@ -29,8 +29,6 @@ enum NotchWrapMetrics {
     /// origin because the outer panel geometry is unchanged.
     static let automationsWingWidth: CGFloat = 248
     static let automationsBridgeHeight: CGFloat = 252
-    /// The setup page carries credentials + the rules editor — it needs the full bridge.
-    static let setupBridgeHeight: CGFloat   = 280
     static let slashSuggestionRowHeight: CGFloat = 24  // one command suggestion row
     static let wheelWingWidth: CGFloat    = 196  // paste wheel — 5 chips along the arc
     static let wheelBridgeHeight: CGFloat = 36   // thin strip; the dome carries the height
@@ -240,6 +238,7 @@ struct NotchWrapView: View {
     let onTap: () -> Void
     let onHoverChanged: (Bool) -> Void
     var acceptanceReduceMotionOverride: Bool? = nil
+    var acceptanceSettingsState: CompassRailAcceptanceState? = nil
 
     // Explicit @State so withAnimation directly tweens the shape's animatableData.
     @State private var wingWidth: CGFloat    = NotchWrapMetrics.idleWingWidth
@@ -330,6 +329,7 @@ struct NotchWrapView: View {
         case .automations: base = NotchWrapMetrics.automationsWingWidth
         default:           base = NotchWrapMetrics.inlineWingWidth
         }
+        if mode == .settings { return base }
         return viewModel.notchPresentation.statusPill.label == nil
             ? base
             : max(base, viewModel.notchPresentation.geometry.wingWidth)
@@ -342,10 +342,7 @@ struct NotchWrapView: View {
         }
         switch mode {
         case .output:   return outputBridgeHeight()
-        case .settings:
-            return viewModel.notchSettingsPage == .setup
-                ? NotchWrapMetrics.setupBridgeHeight
-                : NotchWrapMetrics.settingsBridgeHeight
+        case .settings: return NotchWrapMetrics.settingsBridgeHeight
         case .automations:
             return NotchWrapMetrics.automationsBridgeHeight
         default:
@@ -688,7 +685,9 @@ struct NotchWrapView: View {
                 InlineNotchContent(
                     viewModel: viewModel,
                     outputGrowthPhase: viewModel.isLatestAssistantStreaming
-                        && targetBridgeHeight < NotchWrapMetrics.outputMaxBridgeHeight
+                        && targetBridgeHeight < NotchWrapMetrics.outputMaxBridgeHeight,
+                    acceptanceSettingsState: acceptanceSettingsState,
+                    acceptanceReduceMotionOverride: acceptanceReduceMotionOverride
                 )
                     .frame(
                         width: (notchWidth + 2 * contentWing) * NotchWrapMetrics.inlineContentScale,
@@ -725,9 +724,13 @@ struct NotchWrapView: View {
                 action: viewModel.openActiveAutomations
             )
             .position(
-                x: NotchPillLayout.origin(maxPanelWidth: maxSize.width).x
+                x: (isSettingsActive
+                    ? NotchPillLayout.settingsOrigin(maxPanelWidth: maxSize.width)
+                    : NotchPillLayout.origin(maxPanelWidth: maxSize.width)).x
                     + NotchPillLayout.size.width / 2,
-                y: NotchPillLayout.origin(maxPanelWidth: maxSize.width).y
+                y: (isSettingsActive
+                    ? NotchPillLayout.settingsOrigin(maxPanelWidth: maxSize.width)
+                    : NotchPillLayout.origin(maxPanelWidth: maxSize.width)).y
                     + NotchPillLayout.size.height / 2
             )
             .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
@@ -1042,12 +1045,12 @@ struct NotchWrapView: View {
             iconDepartureLayer
 
             // Left icon — only when chat open, hovered, or voice active (idle = blank notch).
-            // In settings mode it shows the current page's icon; DrawInSymbol's
-            // symbolEffect(.replace) animates the swap between pages.
+            // In settings mode it shows the selected top-level area's icon;
+            // child routes keep the same parent icon.
             if showsLeftStatusIcon || isSettingsActive {
                 DrawInSymbol(
                     systemName: isSettingsActive
-                        ? viewModel.notchSettingsPage.symbolName
+                        ? viewModel.compassRailRoute.area.symbolName
                         : (viewModel.selectedSourceMode?.symbolName ?? "sparkles"),
                     trigger: hoverIconRevealID,
                     duration: NotchWrapMetrics.surfaceDuration,
@@ -1150,8 +1153,7 @@ struct NotchWrapView: View {
         .onChange(of: viewModel.notchPresentation.revision) {
             refreshSurface()
         }
-        // The setup page is taller than the other settings pages.
-        .onChange(of: viewModel.notchSettingsPage) {
+        .onChange(of: viewModel.compassRailRoute) {
             refreshSurface()
         }
         // Slash-command suggestion rows grow the input bridge.
@@ -1310,16 +1312,22 @@ struct InlineNotchContent: View {
     @ObservedObject var viewModel: ChatViewModel
     let showsInputLeadingIcon: Bool
     let outputGrowthPhase: Bool
+    let acceptanceSettingsState: CompassRailAcceptanceState?
+    let acceptanceReduceMotionOverride: Bool?
     @FocusState private var inputFocused: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var placeholderRevealID = UUID()
     @State private var inlineFocusRetryID = UUID()
 
-    init(viewModel: ChatViewModel, showsInputLeadingIcon: Bool = true, outputGrowthPhase: Bool = false) {
+    init(viewModel: ChatViewModel, showsInputLeadingIcon: Bool = true, outputGrowthPhase: Bool = false, acceptanceSettingsState: CompassRailAcceptanceState? = nil, acceptanceReduceMotionOverride: Bool? = nil) {
         self.viewModel = viewModel
         self.showsInputLeadingIcon = showsInputLeadingIcon
         self.outputGrowthPhase = outputGrowthPhase
+        self.acceptanceSettingsState = acceptanceSettingsState
+        self.acceptanceReduceMotionOverride = acceptanceReduceMotionOverride
     }
+
+    private var reduceMotion: Bool { acceptanceReduceMotionOverride ?? systemReduceMotion }
 
     private var canSend: Bool {
         (!viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1354,7 +1362,7 @@ struct InlineNotchContent: View {
                 case .output:
                     outputView
                 case .settings:
-                    NotchSettingsContent(viewModel: viewModel)
+                    NotchSettingsContent(viewModel: viewModel, acceptanceState: acceptanceSettingsState, reduceMotionOverride: acceptanceReduceMotionOverride)
                 case .automations:
                     AutomationsNotchContent(viewModel: viewModel)
                 case .collapsed:

@@ -10,6 +10,7 @@ struct DaemonHealth: Sendable {
     let baseRTUp: Bool
     let model: String
     let classifierModel: String
+    let modelRuntime: ModelRuntimeHealth?
     let mailConnector: Bool
     let notesConnector: Bool
     let codexConnector: Bool
@@ -23,6 +24,7 @@ struct DaemonHealth: Sendable {
         baseRTUp: Bool,
         model: String,
         classifierModel: String,
+        modelRuntime: ModelRuntimeHealth? = nil,
         mailConnector: Bool,
         notesConnector: Bool,
         codexConnector: Bool,
@@ -35,11 +37,28 @@ struct DaemonHealth: Sendable {
         self.baseRTUp = baseRTUp
         self.model = model
         self.classifierModel = classifierModel
+        self.modelRuntime = modelRuntime
         self.mailConnector = mailConnector
         self.notesConnector = notesConnector
         self.codexConnector = codexConnector
         self.odooConnector = odooConnector
         self.whatsappConnector = whatsappConnector
+    }
+}
+
+struct ModelRuntimeHealth: Sendable, Equatable, Decodable {
+    let phase: String
+    let leaseCount: Int
+    let residencyPinned: Bool
+    let queuedDemandCount: Int
+    let changedPIDRecovery: String
+    let preloadOnInput: Bool?
+    let sharedIdleTimeoutSeconds: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case phase, leaseCount = "lease_count", residencyPinned = "residency_pinned"
+        case queuedDemandCount = "queued_demand_count", changedPIDRecovery = "changed_pid_recovery"
+        case preloadOnInput = "preload_on_input", sharedIdleTimeoutSeconds = "shared_idle_timeout_seconds"
     }
 }
 
@@ -118,7 +137,8 @@ struct DaemonClient: Sendable, NotchEventTransport {
     }
 
     private static let dataDir: URL = {
-        if ProcessInfo.processInfo.environment["BAGENT_STAGE7A_ACCEPTANCE_FIXTURE"] == "1",
+        if (ProcessInfo.processInfo.environment["BAGENT_STAGE7A_ACCEPTANCE_FIXTURE"] == "1"
+            || ProcessInfo.processInfo.environment["BAGENT_STAGE7B_SETTINGS_FIXTURE"] == "1"),
            let path = ProcessInfo.processInfo.environment["BAGENT_DATA_DIR"] {
             return URL(fileURLWithPath: path, isDirectory: true)
         }
@@ -216,6 +236,7 @@ struct DaemonClient: Sendable, NotchEventTransport {
             struct HealthResp: Decodable {
                 let status: String; let basert: Bool; let model: String
                 let classifier_model: String?
+                let model_runtime: ModelRuntimeHealth?
                 let process_id: Int?
                 let tavily_configuration: TavilyConfigurationStatus?
                 let connectors: ConnectorResp?
@@ -228,6 +249,7 @@ struct DaemonClient: Sendable, NotchEventTransport {
                 baseRTUp: h.basert,
                 model: h.model,
                 classifierModel: h.classifier_model ?? ModelRuntimeConfiguration.model,
+                modelRuntime: h.model_runtime,
                 mailConnector:      h.connectors?.mail      ?? false,
                 notesConnector:     h.connectors?.notes     ?? false,
                 codexConnector:     h.connectors?.codex     ?? false,

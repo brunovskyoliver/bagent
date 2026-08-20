@@ -737,6 +737,16 @@ enum NotchPillLayout {
     static func origin(maxPanelWidth: CGFloat) -> CGPoint {
         CGPoint(x: maxPanelWidth - (260 - 248) - size.width - 12, y: 9)
     }
+
+    /// Settings has 205 pt wings. Keep the pill's 74 × 18 pt frame 12 pt from
+    /// that visible right edge while the outer panel remains fixed at max size.
+    static func settingsOrigin(maxPanelWidth: CGFloat) -> CGPoint {
+        CGPoint(
+            x: maxPanelWidth - (NotchWrapMetrics.maxWingWidth - NotchWrapMetrics.settingsWingWidth)
+                - size.width - 12,
+            y: 9
+        )
+    }
 }
 
 enum NotchProjectionDecodingError: Error, Equatable {

@@ -24,6 +24,23 @@ if (arguments.count == 3 || arguments.count == 4),
         exit(status)
     }
     RunLoop.main.run()
+} else if (3...4).contains(arguments.count),
+          arguments[1] == "--stage7b-settings-fixture",
+          ProcessInfo.processInfo.environment[Stage7BSettingsAcceptanceCLI.environmentKey] == "1" {
+    let outputDirectory = URL(fileURLWithPath: arguments[2], isDirectory: true)
+    let variant = arguments.count == 4 ? arguments[3] : "default"
+    Task { @MainActor in
+        exit(await Stage7BSettingsAcceptanceCLI.run(outputDirectory: outputDirectory, variant: variant))
+    }
+    RunLoop.main.run()
+} else if arguments.count == 3,
+          arguments[1] == "--stage7b-settings-ax-fixture",
+          ProcessInfo.processInfo.environment[Stage7BSettingsAcceptanceCLI.accessibilityEnvironmentKey] == "1" {
+    let outputDirectory = URL(fileURLWithPath: arguments[2], isDirectory: true)
+    Task { @MainActor in
+        exit(await Stage7BSettingsAcceptanceCLI.runLiveAccessibility(outputDirectory: outputDirectory))
+    }
+    RunLoop.main.run()
 } else if (2...3).contains(arguments.count),
           arguments[1] == "--stage5-notch-fixture",
           ProcessInfo.processInfo.environment["BAGENT_STAGE5_ACCEPTANCE_FIXTURE"] == "1" {

@@ -301,13 +301,26 @@ struct HealthResponse {
     basert: bool,
     model: String,
     classifier_model: String,
+    model_runtime: ModelRuntimeHealth,
     connectors: ConnectorStatus,
+}
+
+#[derive(Serialize)]
+struct ModelRuntimeHealth {
+    phase: &'static str,
+    lease_count: usize,
+    residency_pinned: bool,
+    queued_demand_count: usize,
+    changed_pid_recovery: &'static str,
+    preload_on_input: Option<bool>,
+    shared_idle_timeout_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
 struct ConnectorStatus {
     mail: bool,
     notes: bool,
+    codex: bool,
     odoo: bool,
     whatsapp: WhatsappHealthStatus,
 }
@@ -2010,6 +2023,23 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             error: Some("status unavailable".into()),
             diagnostics: None,
         });
+    let runtime = state.model_runtime.snapshot();
+    let policy = state.model_runtime.policy();
+    let phase = match runtime.phase {
+        RuntimePhase::Unavailable => "unavailable",
+        RuntimePhase::Unloaded => "unloaded",
+        RuntimePhase::Loading(_) => "loading",
+        RuntimePhase::LoadedNotReady(_) => "loaded_not_ready",
+        RuntimePhase::Ready(_) => "ready",
+        RuntimePhase::Retiring(_) => "retiring",
+        RuntimePhase::Poisoned(_) => "poisoned",
+        RuntimePhase::Restarting => "restarting",
+    };
+    let changed_pid_recovery = match runtime.phase {
+        RuntimePhase::Poisoned(_) | RuntimePhase::Restarting => "in progress",
+        _ if runtime.clean_changed_pid_boundary => "ready",
+        _ => "not reported",
+    };
     Json(HealthResponse {
         status: "ok",
         process_id: std::process::id(),
@@ -2017,9 +2047,19 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         basert: state.model_runtime.health().await,
         model: state.default_model,
         classifier_model: state.classifier_model,
+        model_runtime: ModelRuntimeHealth {
+            phase,
+            lease_count: runtime.lease_count,
+            residency_pinned: runtime.residency_pinned,
+            queued_demand_count: runtime.queued_demand_count,
+            changed_pid_recovery,
+            preload_on_input: Some(policy.preload_on_input),
+            shared_idle_timeout_seconds: Some(policy.shared_idle_timeout_seconds),
+        },
         connectors: ConnectorStatus {
             mail: state.mail.is_some(),
             notes: state.notes.is_some(),
+            codex: state.codex.is_some(),
             odoo: odoo_configured,
             whatsapp: WhatsappHealthStatus {
                 connected: wa_status.status == WhatsappConnectionStatus::Ready,
@@ -2699,6 +2739,10 @@ async fn embeddings(
     )
 }
 
+fn chat_acceptance_fixture_active(stage7a_fixture: bool, stage8_fixture: bool) -> bool {
+    stage7a_fixture || stage8_fixture
+}
+
 async fn chat(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
@@ -2718,17 +2762,21 @@ async fn chat(
     let skills = state.skills.clone();
     let task_rater = state.task_rater.clone();
     let runtime_refs = state.runtime_refs.clone();
+    #[cfg(feature = "stage7a-acceptance")]
+    let stage7a_fixture_active =
+        std::env::var("BAGENT_STAGE7A_ACCEPTANCE_FIXTURE").as_deref() == Ok("1");
+    #[cfg(not(feature = "stage7a-acceptance"))]
+    let stage7a_fixture_active = false;
     #[cfg(feature = "stage8-acceptance")]
-    let acceptance_runtime_active = state.acceptance.is_some();
-    #[cfg(not(feature = "stage8-acceptance"))]
-    let acceptance_runtime_active = false;
-    #[cfg(feature = "stage8-acceptance")]
-    let acceptance_fixture_active = state
+    let stage8_fixture_active = state
         .acceptance
         .as_ref()
         .is_some_and(|control| control.selection().is_some());
     #[cfg(not(feature = "stage8-acceptance"))]
-    let acceptance_fixture_active = false;
+    let stage8_fixture_active = false;
+    let acceptance_runtime_active =
+        chat_acceptance_fixture_active(stage7a_fixture_active, stage8_fixture_active);
+    let acceptance_fixture_active = acceptance_runtime_active;
 
     tokio::spawn(async move {
         let t0 = std::time::Instant::now();
@@ -5293,6 +5341,13 @@ async fn persist_runtime_ref<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage7a_signed_fixture_uses_isolated_chat_execution_policy() {
+        assert!(chat_acceptance_fixture_active(true, false));
+        assert!(chat_acceptance_fixture_active(false, true));
+        assert!(!chat_acceptance_fixture_active(false, false));
+    }
 
     #[test]
     fn acknowledgement_errors_distinguish_authoritative_conflicts_from_server_failures() {

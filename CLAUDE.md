@@ -124,7 +124,8 @@ no menu-bar item. Read `docs/UI_DESIGN.md` before any UI change.
 | `AppDelegate.swift` | App lifecycle; `⌥Space` toggles the notch input |
 | `NotchWindowController.swift` | The single `BagentPanel`: geometry, monitors, present/collapse, paste wheel |
 | `ChatView.swift` | `NotchWrapView` + `InlineNotchContent` — every notch state renders here |
-| `NotchSettingsContent.swift` | Settings pages (general / permissions / model / connectors / setup) |
+| `NotchSettingsContent.swift` | Persistent four-peer Compass Rail settings and bounded child destinations |
+| `CompassRail.swift` | Typed settings areas, child routes, keyboard policy, focus memory, and deterministic catalog |
 | `ChatViewModel.swift` | `@MainActor ObservableObject`; all daemon calls; session/attachment/screen state; `notchInteractionMode` |
 | `DaemonClient.swift` | HTTP + SSE client; all REST/SSE types |
 | `ScreenContextProvider.swift` | ScreenCaptureKit capture → local Vision OCR; only text reaches `/chat` |
