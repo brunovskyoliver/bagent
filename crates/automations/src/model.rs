@@ -69,6 +69,8 @@ pub struct Automation {
     pub updated_at: DateTime<Utc>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub last_run_status: Option<AutomationRunStatus>,
+    /// Closed structural reason for the latest unattended reference block.
+    pub last_reference_outcome_code: Option<String>,
     /// Concise latest-result summary suitable for the notch.
     pub last_result_summary: Option<String>,
 }
@@ -100,6 +102,8 @@ pub enum AutomationRunStatus {
     /// Finished, but at least one step was blocked (approval denied/timed out)
     /// or a non-fatal tool failure occurred.
     Partial,
+    /// Finished before unattended execution could safely resolve a reference.
+    Blocked,
     Failed,
     /// A due occurrence was skipped because a run of the same automation was
     /// still active.
@@ -120,6 +124,7 @@ impl AutomationRunStatus {
             AutomationRunStatus::Running => "running",
             AutomationRunStatus::Completed => "completed",
             AutomationRunStatus::Partial => "partial",
+            AutomationRunStatus::Blocked => "blocked",
             AutomationRunStatus::Failed => "failed",
             AutomationRunStatus::SkippedOverlap => "skipped_overlap",
             AutomationRunStatus::SkippedStale => "skipped_stale",
@@ -136,6 +141,7 @@ impl std::str::FromStr for AutomationRunStatus {
             "running" => AutomationRunStatus::Running,
             "completed" => AutomationRunStatus::Completed,
             "partial" => AutomationRunStatus::Partial,
+            "blocked" => AutomationRunStatus::Blocked,
             "failed" => AutomationRunStatus::Failed,
             "skipped_overlap" => AutomationRunStatus::SkippedOverlap,
             "skipped_stale" => AutomationRunStatus::SkippedStale,
@@ -156,6 +162,8 @@ pub struct AutomationRun {
     pub status: AutomationRunStatus,
     /// Concise, redacted final result for display. Never raw tool payloads.
     pub result_summary: Option<String>,
+    /// Closed structural reason for a blocked terminal run.
+    pub reference_outcome_code: Option<String>,
     pub is_catch_up: bool,
     /// True for `run-now`, false for scheduler-claimed runs.
     pub is_manual: bool,
@@ -213,6 +221,7 @@ mod tests {
             AutomationRunStatus::Running,
             AutomationRunStatus::Completed,
             AutomationRunStatus::Partial,
+            AutomationRunStatus::Blocked,
             AutomationRunStatus::Failed,
             AutomationRunStatus::SkippedOverlap,
             AutomationRunStatus::SkippedStale,
@@ -222,5 +231,10 @@ mod tests {
         }
         assert!(!AutomationRunStatus::Running.is_terminal());
         assert!(AutomationRunStatus::Failed.is_terminal());
+    }
+
+    #[test]
+    fn blocked_status_uses_the_closed_wire_value() {
+        assert_eq!(AutomationRunStatus::Blocked.as_str(), "blocked");
     }
 }

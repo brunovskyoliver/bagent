@@ -40,6 +40,7 @@ use crate::evidence::{
     EvidenceOrigin, EvidenceRequest, SynthesisContract, SynthesisObserver, SynthesisPhaseEvent,
     SynthesisService, ValidationOutcome, EVIDENCE_SCHEMA_VERSION,
 };
+use crate::reference_resolution::TurnCompletion;
 use crate::{
     audit_fs, json_str_arg, request_tool_approval, run_aerospace, save_last_file_ref,
     save_last_mail_ref, save_last_odoo_ref, save_last_whatsapp_ref, sha256_str,
@@ -204,7 +205,19 @@ pub(crate) struct ExecOutcome {
     #[allow(dead_code)]
     pub tool_calls_used: usize,
     /// Gated actions the user denied (or that timed out) during this run.
+    #[allow(dead_code)]
     pub approvals_denied: usize,
+    /// Producer-owned terminal completion. Callers must map this value
+    /// exhaustively and must not infer it from text or counters.
+    pub completion: TurnCompletion,
+}
+
+fn completion_for(approvals_denied: usize) -> TurnCompletion {
+    if approvals_denied == 0 {
+        TurnCompletion::Completed
+    } else {
+        TurnCompletion::Partial
+    }
 }
 
 #[derive(Debug)]
@@ -2656,6 +2669,7 @@ async fn run_evidence_synthesis_with_limits(
         final_text: full_response,
         tool_calls_used,
         approvals_denied,
+        completion: completion_for(approvals_denied),
     })
 }
 
@@ -3430,15 +3444,12 @@ impl SynthesisContract for WebSynthesisContract<'_> {
 fn canonical_web_answer(bundle: &EvidenceBundle) -> crate::evidence::CanonicalGroundedAnswer {
     let text = render_canonical_web_text(bundle);
     let shortfall = text.starts_with("Verification Shortfall:");
-    let rendered_urls = cited_urls(&text);
     let covered = bundle
         .web
         .iter()
-        .filter(|item| {
-            rendered_urls
-                .iter()
-                .any(|url| url == item.evidence.final_url.as_str())
-        })
+        .enumerate()
+        .filter(|(index, item)| canonical_item_is_rendered(bundle, *index, item))
+        .map(|(_, item)| item)
         .collect::<Vec<_>>();
     crate::evidence::CanonicalGroundedAnswer {
         text,
@@ -3466,6 +3477,45 @@ fn canonical_web_answer(bundle: &EvidenceBundle) -> crate::evidence::CanonicalGr
             .iter()
             .map(|item| item.evidence.source_identity.clone())
             .collect(),
+    }
+}
+
+/// Keep canonical coverage tied to the typed render branches.  In particular,
+/// provenance capture never reparses the finalized answer to rediscover which
+/// evidence or citation was rendered.
+fn canonical_item_is_rendered(
+    bundle: &EvidenceBundle,
+    index: usize,
+    item: &crate::evidence::WebBundleItem,
+) -> bool {
+    if item.evidence.quality.low_quality_reason.is_some() {
+        return false;
+    }
+    match web_fact_query(&bundle.intent) {
+        Some(query) => {
+            if !bundle.conflicts.is_empty() {
+                return !deterministic_conflict_claims(query, item).is_empty();
+            }
+            let claim = deterministic_fact_claim(query, item).is_some();
+            if matches!(
+                bundle.intent,
+                EvidenceIntent::WebFact {
+                    verification: crate::evidence::VerificationLevel::Corroborated,
+                    ..
+                }
+            ) {
+                claim
+                    && bundle
+                        .web
+                        .iter()
+                        .filter(|candidate| deterministic_fact_claim(query, candidate).is_some())
+                        .count()
+                        >= 2
+            } else {
+                index == 0 && claim
+            }
+        }
+        None => index == 0 && deterministic_direct_page_description(item).is_some(),
     }
 }
 
@@ -3963,6 +4013,7 @@ async fn run_web_evidence_synthesis(
         final_text: full_response,
         tool_calls_used,
         approvals_denied,
+        completion: completion_for(approvals_denied),
     })
 }
 
@@ -3995,6 +4046,7 @@ async fn run_shared_synthesis(
         final_text: outcome.text,
         tool_calls_used,
         approvals_denied,
+        completion: completion_for(approvals_denied),
     })
 }
 
@@ -4136,6 +4188,7 @@ pub(crate) async fn run_agent_loop(
             final_text,
             tool_calls_used: 0,
             approvals_denied: 0,
+            completion: TurnCompletion::Completed,
         });
     }
     let focused_mail_turn = guidance.is_some();
@@ -4204,6 +4257,7 @@ pub(crate) async fn run_agent_loop(
                         final_text,
                         tool_calls_used,
                         approvals_denied,
+                        completion: completion_for(approvals_denied),
                     });
                 }
                 if matches!(
@@ -4251,6 +4305,7 @@ pub(crate) async fn run_agent_loop(
                     final_text,
                     tool_calls_used,
                     approvals_denied,
+                    completion: completion_for(approvals_denied),
                 });
             }
             ValidationOutcome::Clarification { prompt, .. } => {
@@ -4263,6 +4318,7 @@ pub(crate) async fn run_agent_loop(
                     final_text: prompt,
                     tool_calls_used,
                     approvals_denied,
+                    completion: completion_for(approvals_denied),
                 });
             }
         }
@@ -4453,6 +4509,7 @@ pub(crate) async fn run_agent_loop(
             final_text: full_response,
             tool_calls_used,
             approvals_denied,
+            completion: completion_for(approvals_denied),
         });
     }
 
@@ -5142,6 +5199,7 @@ pub(crate) async fn run_agent_loop(
         final_text: full_response,
         tool_calls_used,
         approvals_denied,
+        completion: completion_for(approvals_denied),
     })
 }
 

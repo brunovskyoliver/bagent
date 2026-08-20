@@ -6,16 +6,25 @@ REPO_ROOT  = ../..
 DAEMON_DEV = $(REPO_ROOT)/target/debug/bagentd
 DAEMON_REL = $(REPO_ROOT)/target/release/bagentd
 BROWSER_MCP_REL = $(REPO_ROOT)/target/release/bagent-browser-mcp
+REFERENCE_BUILD_ROOT ?= $(abspath .build/reference-verification)
+REFERENCE_ORDINARY_TARGET_DIR = $(REFERENCE_BUILD_ROOT)/ordinary-build/cargo
+REFERENCE_ACCEPTANCE_TARGET_DIR = $(REFERENCE_BUILD_ROOT)/acceptance-build/cargo
 # Stable signing identity: ad-hoc ("-") signatures use a per-build cdhash as the
 # designated requirement, so every rebuild invalidates TCC grants (Accessibility,
 # Screen Recording). A real identity keys the grant to identifier+team instead.
 # Falls back to ad-hoc when no identity is available.
+REFERENCE_ONLY_GOALS = reference-daemon-ordinary reference-daemon-acceptance reference-verification-controls
+REFERENCE_ONLY_REQUEST = $(if $(strip $(MAKECMDGOALS)),$(if $(filter-out $(REFERENCE_ONLY_GOALS),$(MAKECMDGOALS)),,1),)
+ifeq ($(REFERENCE_ONLY_REQUEST),1)
+SIGN_ID   := -
+else
 SIGN_ID   := $(shell security find-identity -v -p codesigning 2>/dev/null | grep -o '"Apple Development: [^"]*"' | head -1)
 ifeq ($(SIGN_ID),)
 SIGN_ID   := -
 endif
+endif
 
-.PHONY: run build browser-mcp daemon daemon-acceptance bundle bundle-acceptance assemble-bundle clean whatsapp-bridge-install
+.PHONY: run build browser-mcp daemon daemon-acceptance bundle bundle-acceptance assemble-bundle clean whatsapp-bridge-install reference-daemon-ordinary reference-daemon-acceptance reference-verification-controls
 
 # Dev run: builds daemon first, then the Swift app. The Info.plist is embedded in
 # the binary (see Package.swift) so screen-capture TCC works without bundling. Ad-hoc
@@ -47,6 +56,17 @@ daemon:
 # require BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 at daemon startup.
 daemon-acceptance:
 	cargo build --release --manifest-path $(REPO_ROOT)/Cargo.toml -p bagentd --features stage8-acceptance
+
+# Compile-only verification artifacts. These targets never assemble, sign,
+# install, launch, or restart an app or daemon.
+reference-daemon-ordinary:
+	cargo build --manifest-path $(REPO_ROOT)/Cargo.toml -p bagentd --target-dir "$(REFERENCE_ORDINARY_TARGET_DIR)"
+
+reference-daemon-acceptance:
+	cargo build --manifest-path $(REPO_ROOT)/Cargo.toml -p bagentd --features stage8-acceptance --target-dir "$(REFERENCE_ACCEPTANCE_TARGET_DIR)"
+
+reference-verification-controls:
+	python3 $(REPO_ROOT)/scripts/reference-verification.py --repo $(REPO_ROOT) controls --package bagentd
 
 # Release Swift build
 build:

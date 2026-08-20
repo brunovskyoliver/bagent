@@ -49,6 +49,7 @@ use whatsapp_connector::{
 mod agent_exec;
 mod automations_api;
 mod evidence;
+mod reference_resolution;
 mod scheduler;
 
 mod embedded {
@@ -66,6 +67,10 @@ struct AppState {
     classifier_model: String,
     /// Local opt-in rollback flag for deterministic typed Mail/web evidence routing.
     evidence_orchestrator: agent_exec::EvidenceOrchestratorFlag,
+    /// Optional inert resolver runtime selected at startup; no request path
+    /// consumes it in this slice.
+    #[allow(dead_code)]
+    resolver_runtime: Option<reference_resolution::ResolverRuntime>,
     attachments_dir: PathBuf,
     inference: BaseRtClient,
     /// Shared preferred/fallback synthesis lifecycle for chat and automations.
@@ -418,11 +423,62 @@ async fn main() -> Result<()> {
     std::fs::write(data_dir.join("daemon.pid"), std::process::id().to_string())?;
 
     let mut conn = Connection::open(data_dir.join("bagent.db"))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     embedded::migrations::runner()
         .run(&mut conn)
         .map_err(|e| anyhow::anyhow!("migration error: {e}"))?;
-    purge_legacy_context_data(&data_dir, &mut conn);
     let db = Arc::new(Mutex::new(conn));
+    let evidence_orchestrator = agent_exec::EvidenceOrchestratorFlag::from_local_env();
+    let resolver_selection = reference_resolution::select_runtime(
+        evidence_orchestrator,
+        || std::env::var(reference_resolution::REFERENCE_RESOLVER_MODE_ENV).ok(),
+        |_mode| {
+            Ok::<
+                Arc<dyn reference_resolution::ConversationalReferenceResolver>,
+                reference_resolution::ResolverFault,
+            >(reference_resolution::production_with_database(Arc::clone(
+                &db,
+            )))
+        },
+    );
+    tracing::info!(
+        enabled = evidence_orchestrator == agent_exec::EvidenceOrchestratorFlag::Enabled,
+        env = agent_exec::EVIDENCE_ORCHESTRATOR_FLAG_ENV,
+        "typed evidence production routing"
+    );
+    let resolver_selection_fields = (
+        resolver_selection.selection_label(),
+        resolver_selection.mode_label(),
+        resolver_selection.parse_status_label(),
+    );
+    if resolver_selection_fields.2 == "invalid" {
+        tracing::warn!(
+            selection = resolver_selection_fields.0,
+            mode = resolver_selection_fields.1,
+            parse_status = resolver_selection_fields.2,
+            "invalid resolver mode; using contracts-only off"
+        );
+    } else {
+        tracing::info!(
+            selection = resolver_selection_fields.0,
+            mode = resolver_selection_fields.1,
+            parse_status = resolver_selection_fields.2,
+            "resolver startup selection"
+        );
+    }
+    let resolver_runtime = resolver_selection.into_runtime();
+    if let Some(runtime) = resolver_runtime.as_ref() {
+        runtime
+            .startup()
+            .await
+            .map_err(|_| anyhow::anyhow!("resolver readiness failed"))?;
+        runtime.start_scheduled_prune();
+    }
+
+    {
+        let mut connection = db.lock().await;
+        purge_legacy_context_data(&data_dir, &mut connection);
+    }
 
     let token_path = data_dir.join("daemon.token");
     let token = if token_path.exists() {
@@ -489,13 +545,6 @@ async fn main() -> Result<()> {
         std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
     let classifier_model =
         std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
-    let evidence_orchestrator = agent_exec::EvidenceOrchestratorFlag::from_local_env();
-    tracing::info!(
-        enabled = evidence_orchestrator == agent_exec::EvidenceOrchestratorFlag::Enabled,
-        env = agent_exec::EVIDENCE_ORCHESTRATOR_FLAG_ENV,
-        "typed evidence production routing"
-    );
-
     // Automated mail sync: battery-aware interval poller
     // On AC power:      every 5 minutes
     // On battery power: no background polling — sync only on demand when user asks about mail
@@ -690,6 +739,7 @@ async fn main() -> Result<()> {
         debug_dir,
         classifier_model,
         evidence_orchestrator,
+        resolver_runtime,
         attachments_dir,
         inference,
         synthesis,

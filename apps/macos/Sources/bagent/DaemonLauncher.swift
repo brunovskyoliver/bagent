@@ -29,6 +29,10 @@ enum DaemonLaunchAgent {
         if let evidenceRouting = processEnvironment["BAGENT_EVIDENCE_ORCHESTRATOR"] {
             environment["BAGENT_EVIDENCE_ORCHESTRATOR"] = evidenceRouting
         }
+        if processEnvironment["BAGENT_EVIDENCE_ORCHESTRATOR"] != "0",
+           let resolverMode = processEnvironment["BAGENT_REFERENCE_RESOLVER_MODE"] {
+            environment["BAGENT_REFERENCE_RESOLVER_MODE"] = resolverMode
+        }
         if processEnvironment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"] == "1" {
             environment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"] = "1"
         }

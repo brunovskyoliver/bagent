@@ -193,3 +193,20 @@ Tool dispatch helpers live at the bottom of `crates/daemon/src/main.rs` (`tool_m
 Run the app-managed service on port 8082 and verify authenticated `/health`,
 `/v1/models`, Slovak output, streaming, and tool-call round trips. Never reuse
 or stop the unrelated service on port 8080.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as local Markdown under `.scratch/`; external PRs are not a
+request surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the canonical labels `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository using root `CONTEXT.md` and system ADRs at
+`docs/ADR-*.md`. See `docs/agents/domain.md`.

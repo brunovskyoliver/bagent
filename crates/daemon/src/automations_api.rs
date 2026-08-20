@@ -10,7 +10,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ use bagent_automations::{
     AutomationRunStatus, AutomationSchedule, ScheduleError,
 };
 
+use crate::reference_resolution::{ReferenceOutcomeCode, TurnCompletion};
 use crate::{audit_fs, AppState};
 
 // ── Repository ────────────────────────────────────────────────────────────────
@@ -71,12 +72,14 @@ fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation> {
         updated_at: parse_ts(&updated_at).unwrap_or_default(),
         last_run_at: last_run_at.as_deref().and_then(parse_ts),
         last_run_status: last_run_status.and_then(|s| s.parse().ok()),
-        last_result_summary: row.get(11)?,
+        last_reference_outcome_code: row.get(11)?,
+        last_result_summary: row.get(12)?,
     })
 }
 
 const AUTOMATION_COLS: &str = "id, name, prompt, enabled, timezone, schedule_json, next_run_at, \
-     created_at, updated_at, last_run_at, last_run_status, last_result_summary";
+     created_at, updated_at, last_run_at, last_run_status, \
+     last_reference_outcome_code, last_result_summary";
 
 /// Validate fields, compute the first occurrence, insert.
 pub(crate) fn repo_create(
@@ -106,6 +109,7 @@ pub(crate) fn repo_create(
         updated_at: now,
         last_run_at: None,
         last_run_status: None,
+        last_reference_outcome_code: None,
         last_result_summary: None,
     };
     conn.execute(
@@ -277,13 +281,14 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRun> {
             .parse()
             .unwrap_or(bagent_automations::AutomationRunStatus::Failed),
         result_summary: row.get(6)?,
-        is_catch_up: row.get::<_, i64>(7)? != 0,
-        is_manual: row.get::<_, i64>(8)? != 0,
+        reference_outcome_code: row.get(7)?,
+        is_catch_up: row.get::<_, i64>(8)? != 0,
+        is_manual: row.get::<_, i64>(9)? != 0,
     })
 }
 
 const RUN_COLS: &str = "id, automation_id, scheduled_for, started_at, finished_at, status, \
-     result_summary, is_catch_up, is_manual";
+     result_summary, reference_outcome_code, is_catch_up, is_manual";
 
 pub(crate) fn repo_recent_runs(
     conn: &Connection,
@@ -305,7 +310,7 @@ pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<
     conn.execute(
         &format!(
             "INSERT INTO automation_runs ({RUN_COLS}, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
         ),
         params![
             run.id.to_string(),
@@ -315,6 +320,7 @@ pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<
             run.finished_at.map(ts),
             run.status.as_str(),
             run.result_summary,
+            run.reference_outcome_code,
             run.is_catch_up as i64,
             run.is_manual as i64,
             ts(Utc::now()),
@@ -323,27 +329,247 @@ pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<
     Ok(())
 }
 
-/// Finish a run and mirror the outcome onto the automation row, then prune
-/// history past the retention cap. Audit entries are untouched (append-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredRunTerminalTuple {
+    finished_at: Option<String>,
+    status: String,
+    result_summary: Option<String>,
+    reference_outcome_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredAutomationTerminalTuple {
+    last_run_at: Option<String>,
+    last_run_status: Option<String>,
+    last_result_summary: Option<String>,
+    last_reference_outcome_code: Option<String>,
+}
+
+fn read_run_terminal_tuple(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<StoredRunTerminalTuple>, RepoError> {
+    Ok(conn
+        .query_row(
+            "SELECT finished_at, status, result_summary, reference_outcome_code
+             FROM automation_runs WHERE id=?1",
+            params![run_id],
+            |row| {
+                Ok(StoredRunTerminalTuple {
+                    finished_at: row.get(0)?,
+                    status: row.get(1)?,
+                    result_summary: row.get(2)?,
+                    reference_outcome_code: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn read_automation_terminal_tuple(
+    conn: &Connection,
+    automation_id: &str,
+) -> Result<Option<StoredAutomationTerminalTuple>, RepoError> {
+    Ok(conn
+        .query_row(
+            "SELECT last_run_at, last_run_status, last_result_summary,
+                    last_reference_outcome_code
+             FROM automations WHERE id=?1",
+            params![automation_id],
+            |row| {
+                Ok(StoredAutomationTerminalTuple {
+                    last_run_at: row.get(0)?,
+                    last_run_status: row.get(1)?,
+                    last_result_summary: row.get(2)?,
+                    last_reference_outcome_code: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn terminal_readback_matches(
+    conn: &Connection,
+    run_id: &str,
+    automation_id: &str,
+    intended_run: &StoredRunTerminalTuple,
+    intended_automation: &StoredAutomationTerminalTuple,
+) -> Result<bool, RepoError> {
+    Ok(
+        read_run_terminal_tuple(conn, run_id)?.as_ref() == Some(intended_run)
+            && read_automation_terminal_tuple(conn, automation_id)?.as_ref()
+                == Some(intended_automation),
+    )
+}
+
+fn finish_run_transaction(
+    conn: &Connection,
+    run_id: &str,
+    automation_id: &str,
+    intended_run: &StoredRunTerminalTuple,
+    intended_automation: &StoredAutomationTerminalTuple,
+    report_ambiguous_after_commit: bool,
+) -> Result<(), RepoError> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE automation_runs
+         SET status=?3, finished_at=?4, result_summary=?5,
+             reference_outcome_code=?6
+         WHERE id=?1 AND automation_id=?2 AND status='running'",
+        params![
+            run_id,
+            automation_id,
+            intended_run.status,
+            intended_run.finished_at,
+            intended_run.result_summary,
+            intended_run.reference_outcome_code,
+        ],
+    )?;
+    if changed == 0 {
+        let current_run = read_run_terminal_tuple(&tx, run_id)?;
+        let current_automation = read_automation_terminal_tuple(&tx, automation_id)?;
+        if current_run.as_ref() == Some(intended_run)
+            && current_automation.as_ref() == Some(intended_automation)
+        {
+            tx.commit()?;
+            return Ok(());
+        }
+        return Err(RepoError::Db(
+            "automation run terminal transition was already committed differently".into(),
+        ));
+    }
+
+    let mirrored = tx.execute(
+        "UPDATE automations
+         SET last_run_at=?2, last_run_status=?3, last_result_summary=?4,
+             last_reference_outcome_code=?5
+         WHERE id=?1",
+        params![
+            automation_id,
+            intended_automation.last_run_at,
+            intended_automation.last_run_status,
+            intended_automation.last_result_summary,
+            intended_automation.last_reference_outcome_code,
+        ],
+    )?;
+    if mirrored != 1 {
+        return Err(RepoError::Db(
+            "automation run terminal snapshot parent was not found".into(),
+        ));
+    }
+
+    repo_prune_runs(&tx, automation_id)?;
+    tx.commit()?;
+    if report_ambiguous_after_commit {
+        return Err(RepoError::Db(
+            "synthetic ambiguous commit result after commit".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Finish a claimed run, mirror its complete terminal tuple, prune history,
+/// and commit all of it as one immediate SQLite transaction.
 pub(crate) fn repo_finish_run(
     conn: &Connection,
     run_id: &str,
     automation_id: &str,
     status: AutomationRunStatus,
     result_summary: Option<&str>,
+    reference_outcome_code: Option<ReferenceOutcomeCode>,
     now: DateTime<Utc>,
 ) -> Result<(), RepoError> {
-    let summary = result_summary.map(policy::clamp_result_summary);
-    conn.execute(
-        "UPDATE automation_runs SET status=?2, finished_at=?3, result_summary=?4 WHERE id=?1",
-        params![run_id, status.as_str(), ts(now), summary],
-    )?;
-    conn.execute(
-        "UPDATE automations SET last_run_at=?2, last_run_status=?3, last_result_summary=?4 WHERE id=?1",
-        params![automation_id, ts(now), status.as_str(), summary],
-    )?;
-    repo_prune_runs(conn, automation_id)?;
-    Ok(())
+    repo_finish_run_with_commit_mode(
+        conn,
+        run_id,
+        automation_id,
+        status,
+        result_summary,
+        reference_outcome_code,
+        now,
+        false,
+    )
+}
+
+fn repo_finish_run_with_commit_mode(
+    conn: &Connection,
+    run_id: &str,
+    automation_id: &str,
+    status: AutomationRunStatus,
+    result_summary: Option<&str>,
+    reference_outcome_code: Option<ReferenceOutcomeCode>,
+    now: DateTime<Utc>,
+    report_ambiguous_after_commit: bool,
+) -> Result<(), RepoError> {
+    if matches!(status, AutomationRunStatus::Blocked) != reference_outcome_code.is_some() {
+        return Err(RepoError::Db(
+            "blocked terminal status and reference outcome code must agree".into(),
+        ));
+    }
+    let summary =
+        if let (AutomationRunStatus::Blocked, Some(code)) = (status, reference_outcome_code) {
+            Some(blocked_result_summary(code).to_string())
+        } else {
+            result_summary.map(policy::clamp_result_summary)
+        };
+    let finished_at = ts(now);
+    let intended_run = StoredRunTerminalTuple {
+        finished_at: Some(finished_at.clone()),
+        status: status.as_str().to_string(),
+        result_summary: summary.clone(),
+        reference_outcome_code: reference_outcome_code.map(|code| code.as_str().to_string()),
+    };
+    let intended_automation = StoredAutomationTerminalTuple {
+        last_run_at: Some(finished_at),
+        last_run_status: Some(status.as_str().to_string()),
+        last_result_summary: summary,
+        last_reference_outcome_code: intended_run.reference_outcome_code.clone(),
+    };
+    match finish_run_transaction(
+        conn,
+        run_id,
+        automation_id,
+        &intended_run,
+        &intended_automation,
+        report_ambiguous_after_commit,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if terminal_readback_matches(
+                conn,
+                run_id,
+                automation_id,
+                &intended_run,
+                &intended_automation,
+            )? {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn repo_finish_run_ambiguous_commit_for_test(
+    conn: &Connection,
+    run_id: &str,
+    automation_id: &str,
+    status: AutomationRunStatus,
+    result_summary: Option<&str>,
+    reference_outcome_code: Option<ReferenceOutcomeCode>,
+    now: DateTime<Utc>,
+) -> Result<(), RepoError> {
+    repo_finish_run_with_commit_mode(
+        conn,
+        run_id,
+        automation_id,
+        status,
+        result_summary,
+        reference_outcome_code,
+        now,
+        true,
+    )
 }
 
 /// Keep only the newest `RUN_HISTORY_RETAINED` runs per automation. Each
@@ -375,13 +601,117 @@ fn publish_automation_event(
     a_id: &str,
     extra: serde_json::Value,
 ) {
+    state.publish_event(automation_event(event_type, a_id, extra));
+}
+
+fn automation_event(event_type: &str, a_id: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut ev = json!({"type": event_type, "automation_id": a_id});
     if let (Some(obj), Some(x)) = (ev.as_object_mut(), extra.as_object()) {
         for (k, v) in x {
             obj.insert(k.clone(), v.clone());
         }
     }
-    state.publish_event(ev);
+    ev
+}
+
+fn terminal_event_fields(
+    terminal: &AutomationTerminalOutcome,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::from_iter([(
+        "status".to_string(),
+        serde_json::Value::String(terminal.status.as_str().to_string()),
+    )]);
+    if let Some(code) = terminal.reference_outcome_code {
+        fields.insert(
+            "reference_outcome_code".to_string(),
+            serde_json::Value::String(code.as_str().to_string()),
+        );
+    }
+    fields
+}
+
+pub(crate) fn finalize_automation_terminal<Publish, Audit>(
+    conn: &Connection,
+    automation_id: &str,
+    run_id: &str,
+    terminal: &AutomationTerminalOutcome,
+    now: DateTime<Utc>,
+    mut publish: Publish,
+    mut audit: Audit,
+) -> bool
+where
+    Publish: FnMut(serde_json::Value),
+    Audit: FnMut(&str, serde_json::Value),
+{
+    if let Err(error) = repo_finish_run(
+        conn,
+        run_id,
+        automation_id,
+        terminal.status,
+        Some(&terminal.result_summary),
+        terminal.reference_outcome_code,
+        now,
+    ) {
+        tracing::error!("automation run finish persist failed: {error:?}");
+        publish(automation_event(
+            "automation_run_persistence_failed",
+            automation_id,
+            json!({"run_id": run_id}),
+        ));
+        return false;
+    }
+
+    if let Some(code) = terminal.reference_outcome_code {
+        publish(automation_event(
+            "reference_resolution",
+            automation_id,
+            json!({
+                "version": 1,
+                "turn_id": run_id,
+                "origin": "automation",
+                "run_id": run_id,
+                "disposition": "blocked",
+                "reference_outcome_code": code.as_str(),
+            }),
+        ));
+    }
+
+    let mut audit_fields = serde_json::Map::from_iter([
+        (
+            "automation_id".to_string(),
+            serde_json::Value::String(automation_id.to_string()),
+        ),
+        (
+            "run_id".to_string(),
+            serde_json::Value::String(run_id.to_string()),
+        ),
+        (
+            "status".to_string(),
+            serde_json::Value::String(terminal.status.as_str().to_string()),
+        ),
+    ]);
+    if let Some(code) = terminal.reference_outcome_code {
+        audit_fields.insert(
+            "reference_outcome_code".to_string(),
+            serde_json::Value::String(code.as_str().to_string()),
+        );
+    }
+    audit(
+        "automation_run_finish",
+        serde_json::Value::Object(audit_fields),
+    );
+
+    let mut finished_fields = terminal_event_fields(terminal);
+    finished_fields.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(run_id.to_string()),
+    );
+    publish(automation_event(
+        "automation_run_finished",
+        automation_id,
+        serde_json::Value::Object(finished_fields),
+    ));
+    true
 }
 
 fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
@@ -632,6 +962,7 @@ fn is_evidence_event(event: &serde_json::Value) -> bool {
                 | "evidence_validation"
                 | "evidence_polish"
                 | "evidence_outcome"
+                | "reference_resolution"
         )
     )
 }
@@ -655,6 +986,7 @@ pub(crate) fn repo_claim_run(
         finished_at: None,
         status: AutomationRunStatus::Running,
         result_summary: None,
+        reference_outcome_code: None,
         is_catch_up,
         is_manual,
     };
@@ -662,7 +994,7 @@ pub(crate) fn repo_claim_run(
     let inserted = conn.execute(
         &format!(
             "INSERT INTO automation_runs ({RUN_COLS}, created_at) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 \
              WHERE NOT EXISTS (SELECT 1 FROM automation_runs WHERE automation_id=?2 AND status='running')"
         ),
         params![
@@ -672,6 +1004,7 @@ pub(crate) fn repo_claim_run(
             run.started_at.map(ts),
             Option::<String>::None,
             run.status.as_str(),
+            Option::<String>::None,
             Option::<String>::None,
             run.is_catch_up as i64,
             run.is_manual as i64,
@@ -715,36 +1048,70 @@ pub(crate) fn automation_system_context(ctx: &AutomationExecutionContext) -> Str
     )
 }
 
-/// Map a finished agent loop onto a run status + display summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutomationTerminalOutcome {
+    pub status: AutomationRunStatus,
+    pub result_summary: String,
+    pub reference_outcome_code: Option<ReferenceOutcomeCode>,
+}
+
+fn default_result_summary(final_text: &str) -> String {
+    let summary = final_text.trim();
+    if summary.is_empty() {
+        "Dokončené bez výstupu.".to_string()
+    } else {
+        summary.to_string()
+    }
+}
+
+fn blocked_result_summary(code: ReferenceOutcomeCode) -> &'static str {
+    match code {
+        ReferenceOutcomeCode::MissingReferent
+        | ReferenceOutcomeCode::Ambiguous
+        | ReferenceOutcomeCode::ConfirmationRequired
+        | ReferenceOutcomeCode::PrivateSourceDenied
+        | ReferenceOutcomeCode::Expired
+        | ReferenceOutcomeCode::Unsupported => {
+            "Blocked: update the automation task with one exact public name, make/model, or URL; unattended runs cannot clarify references."
+        }
+        ReferenceOutcomeCode::ResolverUnavailable => {
+            "Blocked: reference safety checks were unavailable; no external or model work was attempted."
+        }
+    }
+}
+
+/// Map the producer-owned typed completion onto the complete terminal input.
 pub(crate) fn outcome_to_status(
     result: &Result<ExecOutcome, ExecError>,
-) -> (AutomationRunStatus, String) {
+) -> AutomationTerminalOutcome {
     match result {
-        Ok(outcome) => {
-            let mut summary = outcome.final_text.trim().to_string();
-            if summary.is_empty() {
-                summary = "Dokončené bez výstupu.".to_string();
-            }
-            if outcome.approvals_denied > 0 {
-                (
-                    AutomationRunStatus::Partial,
-                    format!(
-                        "{summary}\n({} akcií nebolo schválených)",
-                        outcome.approvals_denied
-                    ),
-                )
-            } else {
-                (AutomationRunStatus::Completed, summary)
-            }
-        }
-        Err(ExecError::Model(e)) => (
-            AutomationRunStatus::Failed,
-            format!("Model error: {}", e.chars().take(200).collect::<String>()),
-        ),
-        Err(ExecError::SinkClosed) => (
-            AutomationRunStatus::Failed,
-            "Execution aborted.".to_string(),
-        ),
+        Ok(outcome) => match outcome.completion {
+            TurnCompletion::Completed => AutomationTerminalOutcome {
+                status: AutomationRunStatus::Completed,
+                result_summary: default_result_summary(&outcome.final_text),
+                reference_outcome_code: None,
+            },
+            TurnCompletion::Partial => AutomationTerminalOutcome {
+                status: AutomationRunStatus::Partial,
+                result_summary: default_result_summary(&outcome.final_text),
+                reference_outcome_code: None,
+            },
+            TurnCompletion::ReferenceBlocked(code) => AutomationTerminalOutcome {
+                status: AutomationRunStatus::Blocked,
+                result_summary: blocked_result_summary(code).to_string(),
+                reference_outcome_code: Some(code),
+            },
+        },
+        Err(ExecError::Model(e)) => AutomationTerminalOutcome {
+            status: AutomationRunStatus::Failed,
+            result_summary: format!("Model error: {}", e.chars().take(200).collect::<String>()),
+            reference_outcome_code: None,
+        },
+        Err(ExecError::SinkClosed) => AutomationTerminalOutcome {
+            status: AutomationRunStatus::Failed,
+            result_summary: "Execution aborted.".to_string(),
+            reference_outcome_code: None,
+        },
     }
 }
 
@@ -864,36 +1231,27 @@ pub(crate) async fn execute_automation_run(
     drop(sink);
     let _ = drain.await;
 
-    let (status, summary) = outcome_to_status(&result);
+    let terminal = outcome_to_status(&result);
     let now = Utc::now();
-    {
+    let mut audit_records = Vec::new();
+    let persisted = {
         let conn = state.db.lock().await;
-        if let Err(e) = repo_finish_run(
+        finalize_automation_terminal(
             &conn,
-            &run.id.to_string(),
             &automation.id.to_string(),
-            status,
-            Some(&summary),
+            &run.id.to_string(),
+            &terminal,
             now,
-        ) {
-            tracing::error!("automation run finish persist failed: {e:?}");
-        }
+            |event| state.publish_event(event),
+            |action, payload| audit_records.push((action.to_string(), payload)),
+        )
+    };
+    if !persisted {
+        return;
     }
-    audit_fs(
-        &state.db,
-        "automation_run_finish",
-        &json!({
-            "automation_id": automation.id.to_string(),
-            "run_id": run.id.to_string(),
-            "status": status.as_str(),
-        }),
-    );
-    publish_automation_event(
-        &state,
-        "automation_run_finished",
-        &automation.id.to_string(),
-        json!({"run_id": run.id.to_string(), "status": status.as_str()}),
-    );
+    for (action, payload) in audit_records {
+        audit_fs(&state.db, &action, &payload);
+    }
     state.automations_changed.notify_waiters();
 }
 
@@ -962,6 +1320,7 @@ mod tests {
         ] {
             assert!(is_evidence_event(&json!({"type": event_type})));
         }
+        assert!(is_evidence_event(&json!({"type": "reference_resolution"})));
         assert!(!is_evidence_event(&json!({"type": "token"})));
         assert!(!is_evidence_event(&json!({"type": "activity_completed"})));
     }
@@ -1106,6 +1465,7 @@ mod tests {
             finished_at: None,
             status: AutomationRunStatus::Running,
             result_summary: None,
+            reference_outcome_code: None,
             is_catch_up: false,
             is_manual: false,
         };
@@ -1118,6 +1478,7 @@ mod tests {
             &id,
             AutomationRunStatus::Completed,
             Some("hotovo"),
+            None,
             now(),
         )
         .unwrap();
@@ -1183,6 +1544,7 @@ mod tests {
             &a.id.to_string(),
             AutomationRunStatus::Completed,
             Some("ok"),
+            None,
             now(),
         )
         .unwrap();
@@ -1195,24 +1557,26 @@ mod tests {
             final_text: "Hotovo, 3 maily.".into(),
             tool_calls_used: 2,
             approvals_denied: 0,
+            completion: TurnCompletion::Completed,
         });
-        let (s, sum) = outcome_to_status(&ok);
-        assert_eq!(s, AutomationRunStatus::Completed);
-        assert_eq!(sum, "Hotovo, 3 maily.");
+        let outcome = outcome_to_status(&ok);
+        assert_eq!(outcome.status, AutomationRunStatus::Completed);
+        assert_eq!(outcome.result_summary, "Hotovo, 3 maily.");
 
         let denied = Ok(ExecOutcome {
             final_text: "Čiastočne.".into(),
             tool_calls_used: 2,
             approvals_denied: 1,
+            completion: TurnCompletion::Partial,
         });
-        let (s, sum) = outcome_to_status(&denied);
-        assert_eq!(s, AutomationRunStatus::Partial);
-        assert!(sum.contains("nebolo schválených"));
+        let outcome = outcome_to_status(&denied);
+        assert_eq!(outcome.status, AutomationRunStatus::Partial);
+        assert_eq!(outcome.result_summary, "Čiastočne.");
 
         let failed: Result<ExecOutcome, ExecError> =
             Err(ExecError::Model("connection refused".into()));
-        let (s, _) = outcome_to_status(&failed);
-        assert_eq!(s, AutomationRunStatus::Failed);
+        let outcome = outcome_to_status(&failed);
+        assert_eq!(outcome.status, AutomationRunStatus::Failed);
 
         // Persisted summaries are clamped to the 2000-char policy cap.
         let long = "x".repeat(5000);
@@ -1275,6 +1639,7 @@ mod tests {
                 finished_at: None,
                 status: AutomationRunStatus::Completed,
                 result_summary: None,
+                reference_outcome_code: None,
                 is_catch_up: false,
                 is_manual: false,
             };

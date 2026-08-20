@@ -77,6 +77,7 @@ fn record_skip(
         finished_at: Some(now),
         status,
         result_summary: None,
+        reference_outcome_code: None,
         is_catch_up: false,
         is_manual: false,
     };
@@ -426,6 +427,7 @@ mod tests {
             &a.id.to_string(),
             AutomationRunStatus::Completed,
             Some("ok"),
+            None,
             t(2026, 7, 18, 6, 1),
         )
         .unwrap();
@@ -599,6 +601,7 @@ mod tests {
             &a.id.to_string(),
             AutomationRunStatus::Failed,
             Some("Model error"),
+            None,
             t(2026, 7, 17, 12, 1),
         )
         .unwrap();
@@ -769,6 +772,7 @@ mod tests {
             &id,
             AutomationRunStatus::Completed,
             Some("ok"),
+            None,
             t(2026, 7, 18, 6, 10),
         )
         .unwrap();
@@ -800,6 +804,7 @@ mod tests {
             &a.id.to_string(),
             AutomationRunStatus::Failed,
             Some("Model error: connection refused"),
+            None,
             t(2026, 7, 18, 9, 1),
         )
         .unwrap();
