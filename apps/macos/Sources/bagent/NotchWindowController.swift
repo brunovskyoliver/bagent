@@ -26,63 +26,83 @@ private final class BagentPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
+    override func sendEvent(_ event: NSEvent) {
+        if BrowserCueTrace.isEnabled, event.type == .leftMouseDown {
+            let hit = contentView?.hitTest(event.locationInWindow)
+            BrowserCueTrace.log(
+                "statusPanel leftMouseDown appActive=\(NSApp.isActive) key=\(isKeyWindow) "
+                + "hit=\(hit.map { String(describing: type(of: $0)) } ?? "nil")"
+            )
+        }
+        super.sendEvent(event)
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // Control+1–4 go through keyDown, not performKeyEquivalent — handled by localKeyMonitor.
         return super.performKeyEquivalent(with: event)
     }
 }
 
+// While bagent isn't the frontmost app (the collapsed notch's normal state),
+// AppKit treats the first click on any of its windows as an activation click
+// and swallows it unless the hit view accepts first mouse. NSHostingView
+// returns false by default, so this override is necessary — but it is not
+// sufficient. Measured: with a live cue, the AppKit hit test over the cue
+// resolved to exactly this view, so the cold mouse-down *was* delivered here,
+// and the cue's SwiftUI DragGesture still never ran — the event was dropped
+// inside SwiftUI (gesture routing or arbitration with the ancestor surface
+// gesture; the internal reason was not isolated). That is why the Browser Cue
+// owns a real AppKit hit view of its own — see BrowserCueHitView.
+private final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 @MainActor
 final class NotchWindowController: NSObject {
 
-    /// Always-visible pill that shows the label/status.
-    /// On notch displays the window frame stays at max voice size; SwiftUI
-    /// animates the visible shape inside it to avoid AppKit resize clipping.
+    /// Always-visible pill that shows the label/status. The notch surface is the
+    /// only UI: SwiftUI animates the visible shape inside a fixed AppKit frame to
+    /// avoid resize clipping.
     private var statusPanel: BagentPanel!
-    /// The expandable chat sheet — appears below the pill, hidden when collapsed.
-    private var chatPanel: BagentPanel!
-    /// Voice visualization panel — used only on non-notch displays (notch path
-    /// renders voice content inline in the status panel's bridge area).
-    private var voicePanel: BagentPanel?
     private let chatViewModel: ChatViewModel
-    private(set) var isExpanded = false
-    private(set) var isInputShowing = false
-    private(set) var isVoiceShowing = false
-    var isVoiceModeEnabled: Bool { chatViewModel.voiceModeEnabled }
+    private let browserCoordinator: BrowserCoordinator
+    /// Browser Cue hover preview — a plain subview of the status panel's own
+    /// content view, not a floating window (see BrowserCuePreviewPanel.swift).
+    private var cuePreviewView: BrowserCuePreviewView?
+    var isNotchInteractionShowing: Bool { chatViewModel.notchInteractionMode != .collapsed }
     private var hasNotch = false
     private var localKeyMonitor: Any?
+    private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
-    /// Monitors used only for the non-notch voice panel (click-away + Escape).
-    private var voiceMouseMonitor: Any?
-    private var voiceKeyMonitor: Any?
+    /// Clipboard paste wheel (hold right ⌘).
+    private let clipboardHistory = ClipboardHistory()
+    private let pasteTap = PasteEventTap()
+    /// Click-away monitor active while the wheel is pinned (mouse mode).
+    private var wheelMouseMonitor: Any?
+    /// Pending auto-dismiss of the transient cmux banner (5s after presenting).
+    private var cmuxBannerDismissWork: DispatchWorkItem?
 
     private var pillFrame: NSRect = .zero
-    private var chatFrame: NSRect = .zero
-    private var inputFrame: NSRect = .zero
-    private var voiceFrame: NSRect = .zero
     private var notchWidth: CGFloat = 0
     private var notchHeight: CGFloat = 0
     /// The real bottom-of-menu-bar Y coordinate (screen space).
-    /// Used to anchor the chat panel independently of the oversized voice pill frame.
     private var menuBarBottomY: CGFloat = 0
 
-    /// Y below which the chat panel should start — accounts for the hover bridge
-    /// (22 pt) that hangs below the menu bar when the notch is expanded.
-    private var chatAnchorY: CGFloat {
-        hasNotch
-            ? menuBarBottomY - NotchWrapMetrics.hoverBridgeHeight
-            : menuBarBottomY
-    }
-    private var sizeCancellable: AnyCancellable?
+    private var visibilityCancellable: AnyCancellable?
+    private var approvalCancellable: AnyCancellable?
+    private var dropTargetCancellable: AnyCancellable?
     private var previousApp: NSRunningApplication?
 
-    init(chatViewModel: ChatViewModel) {
+#if DEBUG
+    var statusPanelForTesting: NSPanel { statusPanel }
+#endif
+
+    init(chatViewModel: ChatViewModel, browserCoordinator: BrowserCoordinator = BrowserCoordinator()) {
         self.chatViewModel = chatViewModel
+        self.browserCoordinator = browserCoordinator
         super.init()
         computeGeometry()
         buildStatusPanel()
-        buildChatPanel()
-        if !hasNotch { buildVoicePanel() }
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensChanged),
@@ -90,61 +110,151 @@ final class NotchWindowController: NSObject {
             object: nil
         )
 
-        // Hands-free voice loop: after a voice-initiated reply finishes, collapse
-        // the chat and re-open the voice overlay for the next utterance.
-        chatViewModel.onVoiceTurnComplete = { [weak self] in
-            guard let self else { return }
-            guard self.chatViewModel.voiceModeEnabled else { return }
-            // Give the user time to read/absorb the response before re-opening voice.
-            // Delay is proportional to response word count (≈150 WPM reading pace),
-            // clamped to a sensible range so very short or very long replies don't
-            // feel awkward.
-            let readDelay = self.chatViewModel.voiceTurnResumeDelay()
-            self.collapse()
-            DispatchQueue.main.asyncAfter(deadline: .now() + readDelay) { [weak self] in
-                guard let self, self.chatViewModel.voiceModeEnabled else { return }
-                self.presentVoice()
+        browserCoordinator.notchDropZoneProvider = { [weak self] in self?.notchDropZone ?? .zero }
+        // The notch opens up as a drop affordance while a Browser Panel is
+        // dragged over it, and settles back when it leaves.
+        dropTargetCancellable = browserCoordinator.$isNotchDropTargeted
+            .removeDuplicates()
+            .sink { [weak self] targeted in
+                guard let self, self.chatViewModel.notchInteractionMode == .collapsed else { return }
+                self.chatViewModel.pillHovered = targeted
             }
-        }
-        chatViewModel.onVoiceModeDisabled = { [weak self] in
-            guard let self else { return }
-            if self.isVoiceShowing {
-                self.teardownVoiceNotch(restoreApp: true)
-            }
-        }
+
         chatViewModel.onInputOnlySubmitted = { [weak self] in
             self?.collapseInputForThinking()
         }
         chatViewModel.onFirstAssistantToken = { [weak self] in
             self?.presentOutputChat()
         }
-        chatViewModel.onPromoteToChat = { [weak self] draft in
-            self?.promoteInputToChat(preserving: draft)
-        }
 
-        // Silent background action: show confirmation in notch for 2.5s then collapse.
-        chatViewModel.onVoiceActionTaken = { [weak self] _ in
+        // cmux agent event: transient banner in the collapsed notch for 5s, then
+        // collapse back to the persistent left icon (still jiggling) + right corner
+        // dot, which linger until the event clears. Latest event wins the banner.
+        chatViewModel.onCmuxNotification = { [weak self] notification in
             guard let self else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                guard let self else { return }
-                self.chatViewModel.voiceActionMessage = nil
-                self.teardownVoiceNotch(restoreApp: true)
+            guard self.chatViewModel.notchInteractionMode == .collapsed else { return }
+            self.chatViewModel.cmuxBanner = notification
+            self.cmuxBannerDismissWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.chatViewModel.cmuxBanner = nil
             }
+            self.cmuxBannerDismissWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: work)
         }
 
-        sizeCancellable = Publishers.CombineLatest(
-            chatViewModel.$chatWindowW,
-            chatViewModel.$chatWindowH
-        )
-        .dropFirst()
-        .receive(on: DispatchQueue.main)
-        .sink { [weak self] (w, h) in
-            // Call synchronously — no async hop so AppKit frame update is
-            // in the same runloop pass as the SwiftUI layout change.
-            self?.updateChatSize(w: w, h: h)
-        }
+        // A gated write auto-denies after 60 s, so an arriving approval has to open
+        // the notch on its own — the user may never look at the pill in time.
+        approvalCancellable = chatViewModel.$pendingApprovals
+            .map { !$0.isEmpty }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] hasPending in
+                guard hasPending else { return }
+                self?.presentOutputChat()
+            }
+
+        visibilityCancellable = chatViewModel.$notchInteractionMode
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.reconcileStatusPanelVisibility()
+            }
 
         setupFullscreenMonitoring()
+        setupPasteWheel()
+    }
+
+    // MARK: - Clipboard paste wheel (hold right ⌘)
+
+    static let pasteWheelEnabledKey = "pasteWheelEnabled"
+    /// Default-on; the notch settings "general" page writes the same key.
+    private var pasteWheelEnabled: Bool {
+        UserDefaults.standard.object(forKey: Self.pasteWheelEnabledKey) == nil
+            || UserDefaults.standard.bool(forKey: Self.pasteWheelEnabledKey)
+    }
+
+    private func setupPasteWheel() {
+        clipboardHistory.start()
+
+        pasteTap.canOpenWheel = { [weak self] in
+            guard let self else { return false }
+            // Never intercept pastes into bagent's own windows (settings, chat).
+            let selfFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                == ProcessInfo.processInfo.processIdentifier
+            return self.pasteWheelEnabled
+                && !selfFrontmost
+                && self.chatViewModel.notchInteractionMode == .collapsed
+                && !self.notchHiddenForFullscreen
+                && !self.clipboardHistory.items.isEmpty
+        }
+        pasteTap.onWheelOpen = { [weak self] in self?.presentPasteWheel() }
+        pasteTap.onDigit = { [weak self] slot in self?.commitPasteWheel(slot: slot) }
+        pasteTap.onCommit = { [weak self] in self?.commitPasteWheel(slot: 0) }
+        pasteTap.onCancel = { [weak self] in self?.dismissPasteWheel() }
+
+        chatViewModel.onPasteWheelPinned = { [weak self] in self?.pinPasteWheel() }
+        chatViewModel.onPasteWheelChipClicked = { [weak self] slot in
+            self?.commitPasteWheel(slot: slot)
+        }
+        // A drag-out took the content with it — the OS drop is the delivery,
+        // no paste.
+        chatViewModel.onPasteWheelDragStarted = { [weak self] in self?.dismissPasteWheel() }
+
+        pasteTap.start()
+    }
+
+    func presentPasteWheel() {
+        guard !chatViewModel.pasteWheelActive else { return }
+        chatViewModel.pasteWheelItems = clipboardHistory.items
+        chatViewModel.pasteWheelFlashSlot = nil
+        chatViewModel.pasteWheelActive = true
+        // Panel must stay non-key: the paste target keeps focus the whole time.
+        showStatusPanel()
+    }
+
+    func dismissPasteWheel() {
+        pasteTap.reset()
+        if let m = wheelMouseMonitor { NSEvent.removeMonitor(m); wheelMouseMonitor = nil }
+        guard chatViewModel.pasteWheelActive else { return }
+        chatViewModel.pasteWheelActive = false
+        chatViewModel.pasteWheelFlashSlot = nil
+    }
+
+    /// Mouse entered the wheel — keyboard release no longer commits; click-away
+    /// dismisses (Escape is handled by the event tap).
+    private func pinPasteWheel() {
+        guard chatViewModel.pasteWheelActive else { return }
+        pasteTap.pin()
+        guard wheelMouseMonitor == nil else { return }
+        wheelMouseMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            let loc = NSEvent.mouseLocation
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if !self.statusPanel.frame.contains(loc) { self.dismissPasteWheel() }
+            }
+        }
+    }
+
+    /// Paste the item in `slot`: promote + write to pasteboard, then a
+    /// synthetic ⌘V to the frontmost app right away.
+    private func commitPasteWheel(slot: Int) {
+        guard chatViewModel.pasteWheelActive else { return }
+        guard chatViewModel.pasteWheelItems.indices.contains(slot) else {
+            dismissPasteWheel()
+            return
+        }
+        let item = chatViewModel.pasteWheelItems[slot]
+        chatViewModel.pasteWheelFlashSlot = slot
+        clipboardHistory.promote(item)
+        clipboardHistory.writeToPasteboard(item)
+        PasteEventTap.postSyntheticPaste()
+
+        // Chip flash reads for ~0.12s, then the wheel folds.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.dismissPasteWheel()
+        }
     }
 
     // MARK: - Geometry
@@ -166,85 +276,28 @@ final class NotchWindowController: NSObject {
         } else {
             hasNotch = false
             notchCenterX = screen.frame.midX
-            menuBarH = NSStatusBar.system.thickness
+            let visibleMenuBarH = max(0, screen.frame.maxY - screen.visibleFrame.maxY)
+            menuBarH = max(NSStatusBar.system.thickness, visibleMenuBarH)
             menuBarBottomY = screen.frame.maxY - menuBarH
-            notchWidth  = 0
-            notchHeight = 0
+            notchWidth  = NotchWrapMetrics.syntheticNotchWidth
+            notchHeight = menuBarH
         }
         self.menuBarBottomY = menuBarBottomY
 
         chatViewModel.hasNotch = hasNotch
 
-        if hasNotch {
-            // pillFrame sized for voice mode (widest/tallest state) so AppKit frame
-            // never needs resizing — SwiftUI animates the visible shape within it.
-            // Width = 2*voiceWingWidth + notchWidth.
-            // Height = menuBarH + voiceBridgeHeight.
-            let totalW = 2 * NotchWrapMetrics.voiceWingWidth + notchWidth
-            let totalH = menuBarH + NotchWrapMetrics.voiceBridgeHeight
-            pillFrame = NSRect(
-                x: notchCenterX - totalW / 2,
-                y: menuBarBottomY - NotchWrapMetrics.voiceBridgeHeight,
-                width: totalW,
-                height: totalH
-            )
-        } else {
-            let pillW = min(500, max(260, screen.frame.width * 0.40))
-            pillFrame = NSRect(
-                x: notchCenterX - pillW / 2,
-                y: menuBarBottomY,
-                width: pillW,
-                height: menuBarH
-            )
-            // Voice panel drops from the pill on non-notch displays, like the chat panel.
-            let voiceW: CGFloat = max(pillW, 440)
-            let voiceH: CGFloat = 190
-            voiceFrame = NSRect(
-                x: notchCenterX - voiceW / 2,
-                y: pillFrame.minY - voiceH - 8,
-                width: voiceW,
-                height: voiceH
-            )
-        }
-
-        // Chat panel drops from below the hover-expanded notch bridge.
-        // chatAnchorY = menuBarBottomY - hoverBridgeHeight on notch displays.
-        let chatW = chatViewModel.chatWindowW
-        let chatH = chatViewModel.chatWindowH
-        let chatGap: CGFloat = 8
-        chatFrame = NSRect(
-            x: notchCenterX - chatW / 2,
-            y: chatAnchorY - chatH - chatGap,
-            width: chatW,
-            height: chatH
+        // pillFrame sized for voice mode (widest/tallest state) so AppKit frame
+        // never needs resizing — SwiftUI animates the visible shape within it.
+        // On external/non-notch displays this creates a centered fake notch wrap
+        // whose top edge is flush with the menu-bar/screen top and expands down.
+        let totalW = 2 * NotchWrapMetrics.maxWingWidth + notchWidth
+        let totalH = menuBarH + NotchWrapMetrics.maxBridgeHeight
+        pillFrame = NSRect(
+            x: notchCenterX - totalW / 2,
+            y: menuBarBottomY - NotchWrapMetrics.maxBridgeHeight,
+            width: totalW,
+            height: totalH
         )
-
-        let inputW = min(820, max(640, screen.frame.width * 0.42))
-        // Extra height gives the glass shadow room to render without clipping at the
-        // transparent window edge (especially relevant for the wider, softer Liquid Glass
-        // shadow on macOS 26).
-        let inputH: CGFloat = 96
-        inputFrame = NSRect(
-            x: notchCenterX - inputW / 2,
-            y: chatAnchorY - inputH - 12,
-            width: inputW,
-            height: inputH
-        )
-    }
-
-    private func updateChatSize(w: CGFloat, h: CGFloat) {
-        let notchCenterX = pillFrame.midX
-        chatFrame = NSRect(
-            x: notchCenterX - w / 2,
-            y: chatAnchorY - h - 8,
-            width: w,
-            height: h
-        )
-        if isExpanded {
-            chatPanel.setFrame(chatFrame, display: true, animate: false)
-        } else if isInputShowing {
-            chatPanel.setFrame(inputFrame, display: true, animate: false)
-        }
     }
 
     // MARK: - Panels
@@ -268,285 +321,95 @@ final class NotchWindowController: NSObject {
     private func buildStatusPanel() {
         let panel = makeBasePanel(frame: pillFrame, styleMask: [.borderless, .nonactivatingPanel])
         let content = StatusPillView(
-            isOnNotch: hasNotch,
             notchWidth: notchWidth,
             notchHeight: notchHeight,
             viewModel: chatViewModel,
-            onTap: { [weak self] in self?.toggle() },
-            onHoverChanged: { [weak self] hovering in self?.hoverChanged(isHovered: hovering) }
+            onTap: { [weak self] in
+                guard let self else { return }
+                // Tapping retires the transient cmux banner (dot state persists).
+                self.cmuxBannerDismissWork?.cancel()
+                self.chatViewModel.cmuxBanner = nil
+                self.isNotchInteractionShowing ? self.collapse() : self.presentInputOnly()
+            },
+            onHoverChanged: { [weak self] hovering in self?.hoverChanged(isHovered: hovering) },
+            browserCoordinator: browserCoordinator
         )
-        panel.contentView = NSHostingView(rootView: content)
-        panel.orderFront(nil)
+        panel.contentView = FirstMouseHostingView(rootView: content)
+
+        let preview = BrowserCuePreviewView(hostWindow: panel)
+        panel.contentView?.addSubview(preview)
+        cuePreviewView = preview
+        browserCoordinator.cuePreviewHost = preview
+
         self.statusPanel = panel
+        reconcileStatusPanelVisibility()
     }
 
-    private func hoverChanged(isHovered: Bool) {
-        guard hasNotch else { return }
-        // Keep the AppKit window stable. Resizing this panel while SwiftUI also
-        // animates the notch path can clip the bottom arcs into sharp corners.
-        statusPanel.setFrame(pillFrame, display: true, animate: false)
-    }
-
-    private func buildChatPanel() {
-        let panel = makeBasePanel(frame: chatFrame, styleMask: [.borderless, .nonactivatingPanel])
-        let content = ChatPanelContent(
-            viewModel: chatViewModel,
-            onCollapse: { [weak self] in self?.collapse() }
+    /// Screen rect of the collapsed notch — the drop target that collapses a
+    /// dragged Browser Panel back into its cue.
+    var notchDropZone: CGRect {
+        // Grows with the notch: while it is hover-expanded or an inline surface
+        // is open, the whole visible pill is a valid drop target.
+        let expanded = chatViewModel.notchInteractionMode != .collapsed || chatViewModel.pillHovered
+        let wing = expanded ? NotchWrapMetrics.outputWingWidth : NotchWrapMetrics.hoverWingWidth
+        let width = notchWidth + 2 * wing
+        let height = notchHeight
+            + (expanded ? NotchWrapMetrics.maxBridgeHeight : NotchWrapMetrics.hoverBridgeHeight)
+        return CGRect(
+            x: pillFrame.midX - width / 2,
+            y: menuBarBottomY + notchHeight - height,
+            width: width,
+            height: height
         )
-        let hostingView = NSHostingView(rootView: content)
-        // Prevent mid-resize re-rasterization which causes text shake during drag.
-        hostingView.wantsLayer = true
-        hostingView.layerContentsRedrawPolicy = .onSetNeedsDisplay
-        panel.contentView = hostingView
-        // Stays hidden until expand() is called.
-        self.chatPanel = panel
     }
 
-    private func buildVoicePanel() {
-        let panel = makeBasePanel(frame: voiceFrame, styleMask: [.borderless, .nonactivatingPanel])
-        let content = VoiceOverlayView(
-            speech: chatViewModel.speech,
-            onCancel: { [weak self] in self?.dismissVoice() }
-        )
-        panel.contentView = NSHostingView(rootView: content)
-        // Stays hidden until presentVoice() is called on a non-notch display.
-        self.voicePanel = panel
+    private func hoverChanged(isHovered _: Bool) {
+        // The panel already owns the maximum fixed frame. Even assigning that
+        // same frame here forces NSHostingView layout and can re-enter SwiftUI
+        // while a hover/update transaction is still being rendered.
     }
 
-    // MARK: - Voice mode
-
-    /// Open voice mode (single ⌥Space when collapsed).
-    ///
-    /// - Notch display: expands the notch bridge shape and renders `VoiceNotchContent` inside it.
-    /// - Non-notch display: shows the `voicePanel` below the centered pill; the pill's icon and
-    ///   label react to `isVoiceNotchActive` in SwiftUI.
-    func presentVoice() {
-        guard chatViewModel.voiceModeEnabled else { return }
-        guard !isExpanded, !isVoiceShowing else { return }
-        isVoiceShowing = true
-        previousApp = NSWorkspace.shared.frontmostApplication
-
-        chatViewModel.speech.onFinalTranscript = { [weak self] text in
-            self?.voiceToChatHandoff(text: text)
-        }
-
-        // Signal SwiftUI so the pill icon/label react in both display types.
-        chatViewModel.isVoiceNotchActive = true
-
-        if hasNotch {
-            // ---- Notch path: inline bridge expansion ----
-            chatViewModel.pillHovered = true
-            hoverChanged(isHovered: true)
-            // Click-away monitor — clicking outside the status panel (the notch bridge
-            // area) cancels voice, same as the non-notch path.
-            voiceMouseMonitor = NSEvent.addGlobalMonitorForEvents(
-                matching: [.leftMouseDown, .rightMouseDown]
-            ) { [weak self] _ in
-                guard let self else { return }
-                let loc = NSEvent.mouseLocation
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    if !self.statusPanel.frame.contains(loc) { self.dismissVoice() }
-                }
-            }
-            voiceKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                if event.keyCode == 53 {
-                    Task { @MainActor [weak self] in self?.dismissVoice() }
-                }
-            }
-        } else {
-            // ---- Non-notch path: drop the voice panel below the pill ----
-            if let vp = voicePanel {
-                vp.setFrame(voiceFrame, display: false)
-                vp.orderFront(nil)
-                vp.hasShadow = true
-            }
-            // Click-away monitor — clicking outside the voice or status panel dismisses voice.
-            voiceMouseMonitor = NSEvent.addGlobalMonitorForEvents(
-                matching: [.leftMouseDown, .rightMouseDown]
-            ) { [weak self] _ in
-                guard let self else { return }
-                let loc = NSEvent.mouseLocation
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    let inVoice  = self.voicePanel?.frame.contains(loc) ?? false
-                    let inStatus = self.statusPanel.frame.contains(loc)
-                    if !inVoice && !inStatus { self.dismissVoice() }
-                }
-            }
-            // Escape key monitor
-            voiceKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                if event.keyCode == 53 {   // Escape
-                    Task { @MainActor [weak self] in self?.dismissVoice() }
-                }
-            }
-        }
-
-        Task { await chatViewModel.speech.startSession(mode: .overlay) }
+    private func resetNotchHoverState() {
+        chatViewModel.pillHovered = false
+        chatViewModel.notchHoverResetID = UUID()
+        hoverChanged(isHovered: false)
     }
 
-    /// Cancel voice capture and collapse the notch back to idle.
-    func dismissVoice() {
-        guard isVoiceShowing else { return }
-        chatViewModel.speech.cancel()
-        teardownVoiceNotch(restoreApp: true)
-    }
-
-    /// Double ⌥Space: drop voice and open the chat window instead.
-    func openChatFromVoice() {
-        guard isVoiceShowing else { return }
-        chatViewModel.speech.cancel()
-        let original = previousApp
-        teardownVoiceNotch(restoreApp: false)
-        presentInputOnly()
-        previousApp = original
-    }
-
-    private func voiceToChatHandoff(text: String) {
-        guard isVoiceShowing else { return }
-        guard chatViewModel.voiceModeEnabled else {
-            teardownVoiceNotch(restoreApp: true)
-            return
-        }
-        if isStopIntent(text) {
-            teardownVoiceNotch(restoreApp: true)
-            return
-        }
-        let savedApp = previousApp
-        teardownVoiceNotch(restoreApp: false)
-        // Brief pause so voice content fades before chat begins expanding.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            guard let self else { return }
-            self.previousApp = savedApp
-            self.chatViewModel.voiceTurnActive = true
-            self.chatViewModel.submitTranscript(text)
-        }
-    }
-
-    private func teardownVoiceNotch(restoreApp: Bool) {
-        guard isVoiceShowing else { return }
-        isVoiceShowing = false
-        chatViewModel.isVoiceNotchActive = false   // triggers pill icon/label reset in SwiftUI
-
-        let app = restoreApp ? previousApp : nil
-        if restoreApp { previousApp = nil }
-
-        if hasNotch {
-            // Remove click-away / Escape monitors added in presentVoice.
-            if let m = voiceMouseMonitor { NSEvent.removeMonitor(m); voiceMouseMonitor = nil }
-            if let m = voiceKeyMonitor   { NSEvent.removeMonitor(m); voiceKeyMonitor   = nil }
-            // After content fades (150 ms), contract notch and restore focus.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
-                guard let self else { return }
-                if !self.isExpanded {
-                    self.chatViewModel.pillHovered = false
-                    self.hoverChanged(isHovered: false)
-                }
-                app?.activate(options: [])
-            }
-        } else {
-            // Remove voice monitors and hide the panel immediately.
-            if let m = voiceMouseMonitor { NSEvent.removeMonitor(m); voiceMouseMonitor = nil }
-            if let m = voiceKeyMonitor   { NSEvent.removeMonitor(m); voiceKeyMonitor   = nil }
-            voicePanel?.hasShadow = false
-            voicePanel?.orderOut(nil)
-            app?.activate(options: [])
-        }
-    }
-
-    // MARK: - Stop intent detection
-
-    private static let stopPatterns: [String] = [
-        "thank you", "thanks", "that's it", "that's all", "that is it",
-        "that is all", "stop", "goodbye", "bye", "we're done", "you can stop",
-        "ok thanks", "okay thanks", "all good", "got it thanks",
-        "ďakujem", "to je všetko", "stačí", "skončime",
-        "dobre ďakujem", "dosť", "koniec", "dobré ďakujem",
-    ]
-
-    private func isStopIntent(_ text: String) -> Bool {
-        let lower = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        let wordCount = lower.split(separator: " ").count
-        guard wordCount < 8 else { return false }
-        return Self.stopPatterns.contains { lower.contains($0) }
-    }
-
-    // MARK: - Toggle
-
-    func toggle() {
-        (isExpanded || isInputShowing) ? collapse() : presentInputOnly()
-    }
-
-    func expand() {
-        presentOutputChat()
-    }
-
+    /// Open the notch input surface (⌥Space when collapsed).
     func presentInputOnly() {
-        guard !isExpanded, !isInputShowing else { return }
+        BrowserCueTrace.log("presentInputOnly mode=\(chatViewModel.notchInteractionMode)")
+        guard chatViewModel.notchInteractionMode == .collapsed else { return }
         if chatViewModel.isThinking {
             presentOutputChat()
             return
         }
-        isInputShowing = true
-
         previousApp = NSWorkspace.shared.frontmostApplication
 
-        chatViewModel.pillHovered = true
-        if hasNotch { hoverChanged(isHovered: true) }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, self.isInputShowing else { return }
-            self.showInputPanel()
-        }
-    }
-
-    func presentOutputChat() {
-        guard !isExpanded else { return }
-        isInputShowing = false
-        isExpanded = true
-
-        // Save the app that was active before bagent takes focus
-        if previousApp == nil {
-            previousApp = NSWorkspace.shared.frontmostApplication
-        }
-
-        // Step 1 — animate notch to hover state so it "charges up" before the panel appears.
-        chatViewModel.pillHovered = true
-        if hasNotch { hoverChanged(isHovered: true) }
-
-        // Step 2 — after hover spring mostly settles, pop the chat panel from the notch.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, self.isExpanded else { return }
-            self.showChatPanel()
-        }
-    }
-
-    private func showInputPanel() {
-        chatPanel.styleMask = [.borderless]
-        // On macOS 26+ the Liquid Glass surface renders its own shadow; disabling the
-        // AppKit window shadow avoids a muddy double-shadow beneath the spotlight bar.
-        // The expanded chat panel (showChatPanel) keeps hasShadow = true unchanged.
-        if #available(macOS 26, *) {
-            chatPanel.hasShadow = false
-        } else {
-            chatPanel.hasShadow = true
-        }
-        chatPanel.setFrame(inputFrame, display: false)
-        chatViewModel.isExpanded = false
+        chatViewModel.isExpanded = true
         chatViewModel.chatSurfaceMode = .inputOnly
-        chatPanel.makeKeyAndOrderFront(nil)
+        chatViewModel.notchInteractionMode = .input
+        hoverChanged(isHovered: true)
+
+        statusPanel.styleMask = [.borderless]
+        showStatusPanel(makeKey: true)
         NSApp.activate(ignoringOtherApps: true)
         installPanelMonitors()
     }
 
-    private func showChatPanel() {
-        chatPanel.styleMask = [.borderless]
-        chatPanel.hasShadow = true
-        chatPanel.setFrame(chatFrame, display: false)
-        chatPanel.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    /// Reveal streamed output in the notch (first assistant token).
+    func presentOutputChat() {
+        guard chatViewModel.notchInteractionMode != .output else { return }
+        if previousApp == nil {
+            previousApp = NSWorkspace.shared.frontmostApplication
+        }
+
         chatViewModel.isExpanded = true
         chatViewModel.chatSurfaceMode = .outputExpanded
+        chatViewModel.notchInteractionMode = .output
+        hoverChanged(isHovered: true)
+
+        statusPanel.styleMask = [.borderless]
+        showStatusPanel()
         installPanelMonitors()
     }
 
@@ -559,22 +422,112 @@ final class NotchWindowController: NSObject {
             let loc = NSEvent.mouseLocation
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if !self.chatPanel.frame.contains(loc) && !self.statusPanel.frame.contains(loc) {
+                if !self.statusPanel.frame.contains(loc) {
                     self.collapse()
                 }
             }
+        }
+
+        // Option+click anywhere in the notch panel copies the debug trace.
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            guard let self,
+                  event.modifierFlags.contains(.option),
+                  event.window === self.statusPanel
+            else { return event }
+            // ⌥-click on a Browser Cue closes that session (or shakes it) — the
+            // monitor must not swallow it, nor flash "trace copied" over it.
+            if self.browserCoordinator.isPointOverCue(
+                self.statusPanel.convertPoint(toScreen: event.locationInWindow)) {
+                return event
+            }
+            self.chatViewModel.copyDebugTrace()
+            return nil
         }
 
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
             if event.type == .flagsChanged {
                 let forced = event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.control)
-                if self.isInputShowing {
+                if self.chatViewModel.notchInteractionMode == .input {
                     self.chatViewModel.isSourcePickerForced = forced
                 }
                 return event
             }
-            if event.keyCode == 53 { self.collapse(); return nil }
+            if event.keyCode == 53 {
+                // Esc dismisses slash suggestions first, then steps back in
+                // the automations surface, then exits response-history
+                // browsing, then collapses the notch.
+                if !self.chatViewModel.slashSuggestions.isEmpty {
+                    self.chatViewModel.dismissSlashSuggestions()
+                    return nil
+                }
+                if self.chatViewModel.notchInteractionMode == .automations,
+                   self.chatViewModel.automationsGoBack() {
+                    return nil
+                }
+                if self.chatViewModel.historyBrowseIndex != nil {
+                    self.chatViewModel.exitHistoryBrowse()
+                    return nil
+                }
+                self.collapse()
+                return nil
+            }
+            // Automations: ↑/↓ select a list row, Return opens the detail or
+            // advances the editor one step (keyboard equivalent of "Ďalej").
+            if self.chatViewModel.notchInteractionMode == .automations {
+                switch event.keyCode {
+                case 126: if self.chatViewModel.moveAutomationsSelection(by: -1) { return nil }
+                case 125: if self.chatViewModel.moveAutomationsSelection(by: 1) { return nil }
+                case 36:
+                    if self.chatViewModel.openSelectedAutomationDetail() { return nil }
+                    switch self.chatViewModel.automationsSurface {
+                    case .editorTask, .editorSchedule, .editorRecurrence, .editorReview:
+                        self.chatViewModel.automationEditorNext()
+                        return nil
+                    default:
+                        break
+                    }
+                default: break
+                }
+            }
+            // Slash-command suggestions consume ↑/↓ (selection), Tab and
+            // Return (accept) while visible.
+            if !self.chatViewModel.slashSuggestions.isEmpty {
+                switch event.keyCode {
+                case 126: if self.chatViewModel.moveSlashSelection(by: -1) { return nil }
+                case 125: if self.chatViewModel.moveSlashSelection(by: 1) { return nil }
+                case 48, 36:
+                    if self.chatViewModel.acceptSlashSuggestion() { return nil }
+                default: break
+                }
+            }
+            // ←/→ switch settings pages while the /settings surface is open.
+            if self.chatViewModel.notchInteractionMode == .settings {
+                if event.keyCode == 123 {
+                    self.chatViewModel.notchSettingsPage = self.chatViewModel.notchSettingsPage.previous
+                    return nil
+                }
+                if event.keyCode == 124 {
+                    self.chatViewModel.notchSettingsPage = self.chatViewModel.notchSettingsPage.next
+                    return nil
+                }
+            }
+            // ↑/↓ on empty notch input browse past assistant responses.
+            // Arrow keys always carry .function + .numericPad — ignore those.
+            if event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                .subtracting([.function, .numericPad]).isEmpty {
+                if event.keyCode == 126, self.chatViewModel.browseOlderResponse() { return nil }
+                if event.keyCode == 125, self.chatViewModel.browseNewerResponse() { return nil }
+            }
+            // Any printable key while browsing returns to the input and types it.
+            if self.chatViewModel.historyBrowseIndex != nil,
+               !event.modifierFlags.contains(.command),
+               let chars = event.characters,
+               chars.rangeOfCharacter(from: .alphanumerics.union(.punctuationCharacters).union(.symbols).union(.whitespaces)) != nil {
+                self.chatViewModel.exitHistoryBrowse()
+                self.chatViewModel.inputText += chars
+                return nil
+            }
             if let index = sourceModeCommandDigitIndex(for: event),
                self.selectVisibleSourceMode(at: index) {
                 return nil
@@ -605,7 +558,7 @@ final class NotchWindowController: NSObject {
     }
 
     private func selectVisibleSourceMode(at index: Int) -> Bool {
-        guard isInputShowing else { return false }
+        guard chatViewModel.notchInteractionMode == .input else { return false }
         let modes = Array(chatViewModel.topSourceModes.prefix(4))
         guard modes.indices.contains(index) else { return false }
         let mode = modes[index]
@@ -615,75 +568,32 @@ final class NotchWindowController: NSObject {
     }
 
     private func collapseInputForThinking() {
-        guard isInputShowing else { return }
-        isInputShowing = false
+        guard chatViewModel.notchInteractionMode == .input else { return }
         chatViewModel.chatSurfaceMode = .thinkingHidden
-        if let m = localKeyMonitor { NSEvent.removeMonitor(m); localKeyMonitor = nil }
-        if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
-        chatPanel.styleMask = [.borderless, .nonactivatingPanel]
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { [weak self] in
-            guard let self, !self.isInputShowing, !self.isExpanded else { return }
-            self.chatPanel.hasShadow = false
-            self.chatPanel.orderOut(nil)
-            self.chatPanel.resignKey()
-            self.previousApp?.activate(options: [])
-        }
-    }
-
-    /// Promotes the spotlight input bar to the full expanded chat panel without
-    /// losing focus or keystrokes. The panel is already key; we animate its frame
-    /// from inputFrame → chatFrame and flip SwiftUI state so `ExpandedChatView`
-    /// appears. Do NOT call makeKeyAndOrderFront — that would cause a focus blip.
-    func promoteInputToChat(preserving draft: String) {
-        guard isInputShowing, !isExpanded else {
-            chatViewModel.finishSpotlightDraftPromotion()
-            return
-        }
-        isInputShowing = false
-        isExpanded = true
-        chatViewModel.isExpanded = true
-        chatViewModel.chatSurfaceMode = .outputExpanded
-        chatPanel.hasShadow = true
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.35
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            chatPanel.animator().setFrame(chatFrame, display: true)
-        }
-        DispatchQueue.main.async { [weak self] in
-            self?.chatViewModel.finishSpotlightDraftPromotion()
-        }
+        chatViewModel.notchInteractionMode = .thinking
+        reconcileStatusPanelVisibility()
     }
 
     func collapse() {
-        guard isExpanded || isInputShowing else { return }
-        let wasInputOnly = isInputShowing
-        isExpanded = false
-        isInputShowing = false
+        guard isNotchInteractionShowing else { return }
         chatViewModel.isExpanded = false  // triggers SwiftUI spring-out animation
         chatViewModel.chatSurfaceMode = .collapsed
+        chatViewModel.notchInteractionMode = .collapsed
         chatViewModel.isSourcePickerForced = false
+        resetNotchHoverState()
 
         if let m = localKeyMonitor    { NSEvent.removeMonitor(m); localKeyMonitor    = nil }
+        if let m = localMouseMonitor  { NSEvent.removeMonitor(m); localMouseMonitor  = nil }
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
-        chatPanel.styleMask = [.borderless, .nonactivatingPanel]
+        statusPanel.styleMask = [.borderless, .nonactivatingPanel]
+        reconcileStatusPanelVisibility()
 
-        // Hide chat panel after spring settles (~0.35 s), then contract notch back to idle.
+        // Restore focus to the app that was active before bagent opened, once the
+        // notch spring-out has settled.
         let appToRestore = previousApp
         previousApp = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + (wasInputOnly ? 0.22 : 0.35)) { [weak self] in
-            guard let self else { return }
-            self.chatPanel.hasShadow = false
-            self.chatPanel.orderOut(nil)
-            self.chatPanel.resignKey()
-            // Restore focus to the app that was active before bagent opened
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
             appToRestore?.activate(options: [])
-            // Contract notch back to idle only if mouse is no longer over the pill.
-            let loc = NSEvent.mouseLocation
-            if !self.statusPanel.frame.contains(loc) {
-                self.chatViewModel.pillHovered = false
-                if self.hasNotch { self.hoverChanged(isHovered: false) }
-            }
         }
     }
 
@@ -692,6 +602,35 @@ final class NotchWindowController: NSObject {
     private var fullscreenPollTimer: Timer?
     /// Tracks last known hide state to avoid redundant show/hide calls.
     private var notchHiddenForFullscreen = false
+
+    private var statusPanelAllowedOverFullscreen: Bool {
+        switch chatViewModel.notchInteractionMode {
+        case .input, .output, .settings, .automations:
+            return true
+        case .collapsed, .thinking:
+            return false
+        }
+    }
+
+    private var shouldShowStatusPanel: Bool {
+        !notchHiddenForFullscreen || statusPanelAllowedOverFullscreen
+    }
+
+    private func showStatusPanel(makeKey: Bool = false) {
+        guard shouldShowStatusPanel else {
+            if statusPanel.isVisible { statusPanel.orderOut(nil) }
+            return
+        }
+        if makeKey {
+            statusPanel.makeKeyAndOrderFront(nil)
+        } else if !statusPanel.isVisible {
+            statusPanel.orderFront(nil)
+        }
+    }
+
+    private func reconcileStatusPanelVisibility() {
+        showStatusPanel()
+    }
 
     private func setupFullscreenMonitoring() {
         let wsnc = NSWorkspace.shared.notificationCenter
@@ -719,16 +658,37 @@ final class NotchWindowController: NSObject {
     }
 
     private func updateNotchVisibility() {
+        checkCmuxSeen()
         let shouldHide = isExternalFullscreenActive()
-        guard shouldHide != notchHiddenForFullscreen else { return }
+        guard shouldHide != notchHiddenForFullscreen else {
+            reconcileStatusPanelVisibility()
+            return
+        }
         notchHiddenForFullscreen = shouldHide
 
         if shouldHide {
-            if statusPanel.isVisible { statusPanel.orderOut(nil) }
-            if isVoiceShowing { dismissVoice() }
-            if isExpanded || isInputShowing { collapse() }
-        } else {
-            if !statusPanel.isVisible { statusPanel.orderFront(nil) }
+            if chatViewModel.pasteWheelActive { dismissPasteWheel() }
+            if chatViewModel.notchInteractionMode != .output, isNotchInteractionShowing {
+                collapse()
+            }
+        }
+        reconcileStatusPanelVisibility()
+    }
+
+    /// Auto-clear cmux cues the user has actually looked at: if cmux is frontmost
+    /// and the notified workspace is the one selected on screen, treat it as seen
+    /// and fly it off. Same predicate as delivery-time suppression
+    /// (`ChatViewModel.handleCmuxEvent`). Cheap — only runs while cues are pending.
+    private func checkCmuxSeen() {
+        guard !chatViewModel.cmuxPending.isEmpty,
+              CmuxEventMonitor.isCmuxFrontmost() else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let visible = await CmuxEventMonitor.visibleWorkspaceIds()
+            let seen = Set(self.chatViewModel.cmuxPending.map(\.workspaceId)).intersection(visible)
+            for workspaceId in seen {
+                self.chatViewModel.markCmuxSeen(workspaceId: workspaceId)
+            }
         }
     }
 
@@ -806,15 +766,5 @@ final class NotchWindowController: NSObject {
         statusPanel.orderOut(nil)
         buildStatusPanel()
         statusPanel.setFrame(pillFrame, display: true)
-        if isExpanded {
-            chatPanel.setFrame(chatFrame, display: true)
-        } else if isInputShowing {
-            chatPanel.setFrame(inputFrame, display: true)
-        }
-        // Rebuild voice panel on non-notch displays to pick up new frame.
-        if !hasNotch {
-            voicePanel?.orderOut(nil)
-            buildVoicePanel()
-        }
     }
 }

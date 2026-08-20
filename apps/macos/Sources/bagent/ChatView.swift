@@ -4,42 +4,289 @@ import SwiftUI
 
 enum NotchWrapMetrics {
     static let idleWingWidth: CGFloat     = 32
-    static let hoverWingWidth: CGFloat    = 52   // proportional — not too wide
+    static let hoverWingWidth: CGFloat    = 72   // wider hover target, still proportional
     static let idleBridgeHeight: CGFloat  = 0
     static let hoverBridgeHeight: CGFloat = 22   // wraps under the notch
     static let cornerRadius: CGFloat      = 10   // bottom corners only
     static let innerCornerRadius: CGFloat = 8    // notch border
+    static let syntheticNotchWidth: CGFloat = 221 // measured Mac17,2 notch width for external/non-notch displays
     static let expandedBridgeHeight: CGFloat = 520  // matches chatH
     static let expandedWingWidth: CGFloat   = 200   // chatW / 2
-    static let voiceWingWidth: CGFloat    = 100  // voice mode — wide enough for sentence
-    static let voiceBridgeHeight: CGFloat = 120  // voice mode — fits wave + 2 text lines
+    static let inlineWingWidth: CGFloat   = 221
+    static let inlineBridgeHeight: CGFloat = 72
+    static let outputWingWidth: CGFloat   = 154
+    static let outputMinWingWidth: CGFloat = 72
+    static let outputBridgeHeight: CGFloat = 96
+    static let outputMinBridgeHeight: CGFloat = 88
+    static let outputMaxBridgeHeight: CGFloat = 280
+    static let inlineContentScale: CGFloat = 0.90
+    static let cmuxWingWidth: CGFloat     = 84   // cmux banner — fits one-line event title
+    static let cmuxBridgeHeight: CGFloat  = 19   // single caption line, minimal growth
+    static let settingsWingWidth: CGFloat   = 205  // /settings surface
+    static let settingsBridgeHeight: CGFloat = 252
+    static let automationsWingWidth: CGFloat = 205   // /automations surface
+    static let automationsBridgeHeight: CGFloat = 214
+    /// The setup page carries credentials + the rules editor — it needs the full bridge.
+    static let setupBridgeHeight: CGFloat   = 280
+    static let slashSuggestionRowHeight: CGFloat = 24  // one command suggestion row
+    static let wheelWingWidth: CGFloat    = 196  // paste wheel — 5 chips along the arc
+    static let wheelBridgeHeight: CGFloat = 36   // thin strip; the dome carries the height
+    static let wheelBulgeDepth: CGFloat   = 96   // circular-arc dome below the strip
+    static let maxWingWidth: CGFloat      = 260
+    static let maxBridgeHeight: CGFloat   = 280
+    static let surfaceDuration: Double     = 0.58
     static let notchBorderColor           = Color(white: 0.30)
+
+    // Soft off-white for notch text — grayish, never pure white.
+    static let notchTextPrimary   = Color(white: 0.80)   // primary lines
+    static let notchTextSecondary = Color(white: 0.55)   // subtitles / echoes
+    static let notchTextFaint     = Color(white: 0.42)   // placeholder
+    static let notchTextPrimaryNS = NSColor(white: 0.80, alpha: 1)  // AppKit output
+}
+
+/// Pure geometry for the notch's left-wing icon row (connector actions,
+/// Browser Cues, cmux, the trace-copied flash). Extracted from `NotchWrapView`
+/// so the collapsed-notch wing width a live Browser Cue requires — and the
+/// row's hit region — are unit-testable without instantiating SwiftUI.
+enum NotchLeftWingLayout {
+    static let iconSize: CGFloat = 18
+    static let iconSpacing: CGFloat = 6
+    /// Gap between the row's right edge and the notch's left edge.
+    static let rowInset: CGFloat = 8
+
+    /// Icons always sit side by side. They used to rest as an overlapping deck
+    /// that fanned on hover, which just made them unreadable — the wing widens
+    /// to fit the row instead.
+    static func rowWidth(count: Int) -> CGFloat {
+        let n = CGFloat(count)
+        guard n > 0 else { return 0 }
+        return n * iconSize + (n - 1) * iconSpacing
+    }
+
+    /// Slot the hover/settings status icon occupies to the left of the row.
+    static let statusIconSlot: CGFloat = iconSize + 6
+
+    /// Wing floor so the whole row (including a live Browser Cue) fits inside
+    /// the black pill even while the notch is fully collapsed. With
+    /// `statusIcon`, the wing also reserves the hover status icon's slot —
+    /// without it the hover-expanded wing (72pt) is too narrow and the status
+    /// icon is drawn straight through the cue row.
+    static func requiredWingWidth(count: Int, statusIcon: Bool = false) -> CGFloat {
+        guard count > 0 else { return 0 }
+        let row = rowWidth(count: count) + 2 * rowInset
+        return statusIcon ? row + statusIconSlot : row
+    }
+
+    /// Centre of the left status icon. It stays centred in the wing while the
+    /// row is empty (unchanged notch behaviour) and steps aside to the row's
+    /// left once any icon — a Browser Cue included — is showing.
+    static func statusIconCenterX(notchOffset: CGFloat, wingWidth: CGFloat,
+                                  count: Int) -> CGFloat {
+        guard count > 0 else { return notchOffset - wingWidth / 2 }
+        let rowLeft = notchOffset - rowInset - rowWidth(count: count)
+        return rowLeft - statusIconSlot / 2
+    }
+}
+
+enum NotchStatusDotGeometry {
+    static func outputTopRight(
+        notchOffset: CGFloat,
+        notchWidth: CGFloat,
+        targetWingWidth: CGFloat,
+        notchHeight: CGFloat
+    ) -> CGPoint {
+        let visibleWidth = notchWidth + 2 * targetWingWidth
+        let contentWidth = visibleWidth * NotchWrapMetrics.inlineContentScale
+        return CGPoint(
+            x: notchOffset + notchWidth / 2 + contentWidth / 2 - 10,
+            y: notchHeight + 12
+        )
+    }
+}
+
+enum NotchActivityLayout {
+    static let headerHeight: CGFloat = 18
+    static let rowHeight: CGFloat = 22
+    static let maxRowsHeight: CGFloat = 84
+    static let maxVisibleRows = Int(maxRowsHeight / rowHeight)
+
+    static func extraHeight(activityCount: Int, expanded: Bool) -> CGFloat {
+        guard activityCount > 0 else { return 0 }
+        let rows = expanded
+            ? min(maxRowsHeight, CGFloat(activityCount) * rowHeight)
+            : 0
+        return headerHeight + rows
+    }
+}
+
+private enum NotchOutputLayout {
+    static let lineSpacing: CGFloat = 1.5
+    static let bottomSlack: CGFloat = 12
+    static let chromePadding: CGFloat = 26
+    static let contentVerticalInset: CGFloat = 14
+    static let minTextWidth: CGFloat = 120
+    static let resizeThreshold: CGFloat = 14
+    static func font() -> NSFont { NSFont.systemFont(ofSize: 13, weight: .regular) }
+
+    static func responseText(
+        latestText: String,
+        isStreaming: Bool,
+        isThinking: Bool
+    ) -> String {
+        latestText.isEmpty
+            ? (isStreaming || isThinking ? "Thinking" : "Done")
+            : latestText
+    }
+
+    /// Width of the widest rendered line when nothing wraps — drives the
+    /// content-fit panel width the same way `textHeight` drives the height.
+    static func longestLineWidth(_ text: String) -> CGFloat {
+        let attributed = NotchMarkdown.attributedString(text.isEmpty ? " " : text)
+        let rect = attributed.boundingRect(
+            with: NSSize(width: CGFloat.greatestFiniteMagnitude,
+                         height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        return ceil(rect.width)
+    }
+
+    /// Wing width that fits the longest line, clamped to
+    /// [outputMinWingWidth, outputWingWidth]. Inverts the visible-width formula
+    /// used by the output surface. The +16 slack absorbs measurement rounding
+    /// so text measured to exactly fit doesn't wrap at the rendered width.
+    static func wingWidth(text: String, notchWidth: CGFloat) -> CGFloat {
+        let contentWidth = longestLineWidth(text) + 16
+        let visibleWidth = contentWidth / NotchWrapMetrics.inlineContentScale
+        let wing = (visibleWidth - notchWidth) / 2
+        return min(NotchWrapMetrics.outputWingWidth,
+                   max(NotchWrapMetrics.outputMinWingWidth, ceil(wing)))
+    }
+
+    static func textHeight(_ text: String, width: CGFloat) -> CGFloat {
+        let attributed = NotchMarkdown.attributedString(text.isEmpty ? " " : text)
+        let rect = attributed.boundingRect(
+            with: NSSize(width: width, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        return ceil(rect.height)
+    }
+
+    static func bridgeHeight(
+        text: String,
+        visibleWidth: CGFloat
+    ) -> CGFloat {
+        let textWidth = max(minTextWidth, visibleWidth)
+        let wanted = ceil(textHeight(text, width: textWidth) + chromePadding + bottomSlack)
+        return min(
+            NotchWrapMetrics.outputMaxBridgeHeight,
+            max(NotchWrapMetrics.outputMinBridgeHeight, wanted)
+        )
+    }
+}
+
+private struct NotchWrapBorderShape: Shape {
+    var wingWidth: CGFloat
+    var bridgeHeight: CGFloat
+    let notchOffset: CGFloat
+    let notchWidth: CGFloat
+    let notchHeight: CGFloat
+    let cornerRadius: CGFloat
+    var bulgeDepth: CGFloat = 0
+    var bulgeSweep: CGFloat = 0
+
+    var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>>> {
+        get {
+            AnimatablePair(wingWidth,
+                           AnimatablePair(bridgeHeight, AnimatablePair(bulgeDepth, bulgeSweep)))
+        }
+        set {
+            wingWidth = newValue.first
+            bridgeHeight = newValue.second.first
+            bulgeDepth = newValue.second.second.first
+            bulgeSweep = newValue.second.second.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let r = cornerRadius
+        let br = max(0, bridgeHeight)
+        let x = notchOffset - wingWidth
+        let w = 2 * wingWidth + notchWidth
+        let h = notchHeight + br
+        let depth = max(0, bulgeDepth)
+        let sweep = min(1, max(0, bulgeSweep))
+
+        var path = Path()
+        path.move(to: CGPoint(x: x + w, y: 0))
+        if depth > 0.5, sweep > 0.01 {
+            path.addLine(to: CGPoint(x: x + w, y: h))
+            let frontier = NotchWrapShape.domePoint(t: sweep, x: x, w: w, h: h, depth: depth)
+            path.addLine(to: CGPoint(x: frontier.x, y: h))
+            path.addLine(to: frontier)
+            let steps = max(2, Int(48 * sweep))
+            for i in stride(from: steps - 1, through: 0, by: -1) {
+                let t = sweep * CGFloat(i) / CGFloat(steps)
+                path.addLine(to: NotchWrapShape.domePoint(t: t, x: x, w: w, h: h, depth: depth))
+            }
+            path.addLine(to: CGPoint(x: x, y: 0))
+            return path
+        }
+        path.addLine(to: CGPoint(x: x + w, y: h - r))
+        path.addArc(
+            center: CGPoint(x: x + w - r, y: h - r),
+            radius: r,
+            startAngle: .degrees(0),
+            endAngle: .degrees(90),
+            clockwise: false
+        )
+        path.addLine(to: CGPoint(x: x + r, y: h))
+        path.addArc(
+            center: CGPoint(x: x + r, y: h - r),
+            radius: r,
+            startAngle: .degrees(90),
+            endAngle: .degrees(180),
+            clockwise: false
+        )
+        path.addLine(to: CGPoint(x: x, y: 0))
+        return path
+    }
 }
 
 // MARK: - Status panel content (always visible, never moves)
 
 struct StatusPillView: View {
-    let isOnNotch: Bool
     let notchWidth: CGFloat
     let notchHeight: CGFloat
     @ObservedObject var viewModel: ChatViewModel
     let onTap: () -> Void
     let onHoverChanged: (Bool) -> Void
+    @ObservedObject var browserCoordinator: BrowserCoordinator
+
+    init(
+        notchWidth: CGFloat,
+        notchHeight: CGFloat,
+        viewModel: ChatViewModel,
+        onTap: @escaping () -> Void,
+        onHoverChanged: @escaping (Bool) -> Void,
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator()
+    ) {
+        self.notchWidth = notchWidth
+        self.notchHeight = notchHeight
+        self.viewModel = viewModel
+        self.onTap = onTap
+        self.onHoverChanged = onHoverChanged
+        self.browserCoordinator = browserCoordinator
+    }
 
     var body: some View {
-        if isOnNotch {
-            NotchWrapView(
-                notchWidth: notchWidth,
-                notchHeight: notchHeight,
-                viewModel: viewModel,
-                onTap: onTap,
-                onHoverChanged: onHoverChanged
-            )
-        } else {
-            MenuBarPillView(viewModel: viewModel)
-                .contentShape(Rectangle())
-                .onTapGesture { onTap() }
-        }
+        NotchWrapView(
+            notchWidth: notchWidth,
+            notchHeight: notchHeight,
+            viewModel: viewModel,
+            onTap: onTap,
+            onHoverChanged: onHoverChanged,
+            browserCoordinator: browserCoordinator
+        )
     }
 }
 
@@ -51,172 +298,881 @@ struct NotchWrapView: View {
     @ObservedObject var viewModel: ChatViewModel
     let onTap: () -> Void
     let onHoverChanged: (Bool) -> Void
+    @ObservedObject var browserCoordinator: BrowserCoordinator
+
+    init(
+        notchWidth: CGFloat,
+        notchHeight: CGFloat,
+        viewModel: ChatViewModel,
+        onTap: @escaping () -> Void,
+        onHoverChanged: @escaping (Bool) -> Void,
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator()
+    ) {
+        self.notchWidth = notchWidth
+        self.notchHeight = notchHeight
+        self.viewModel = viewModel
+        self.onTap = onTap
+        self.onHoverChanged = onHoverChanged
+        self.browserCoordinator = browserCoordinator
+    }
 
     // Explicit @State so withAnimation directly tweens the shape's animatableData.
     @State private var wingWidth: CGFloat    = NotchWrapMetrics.idleWingWidth
     @State private var bridgeHeight: CGFloat = NotchWrapMetrics.idleBridgeHeight
+    @State private var bulgeDepth: CGFloat   = 0
+    @State private var bulgeSweep: CGFloat   = 0
+    @State private var wheelContentOpacity: CGFloat = 0
+    @State private var targetWingWidth: CGFloat = NotchWrapMetrics.idleWingWidth
+    @State private var targetBridgeHeight: CGFloat = NotchWrapMetrics.idleBridgeHeight
     @State private var isHovered = false
     @State private var pulsing = false
     @State private var copyFlashed = false
     @State private var isDragTargeted = false
-    @State private var isVoiceActive = false
-    @State private var voiceContentOpacity: CGFloat = 0
+    @State private var inlineContentOpacity: CGFloat = 0
+    @State private var cmuxContentOpacity: CGFloat = 0
+    /// When the pointer entered a cmux hover-reveal — gates the ≥0.4s dwell before
+    /// a hover-leave counts as "seen".
+    @State private var cmuxRevealStartedAt: Date?
+    @State private var hoverIconRevealID = UUID()
+    @State private var inlineRevealID = UUID()
     @State private var borderPulseOpacity: CGFloat = 0.35
+    @State private var previousNotchInteractionMode: NotchInteractionMode = .collapsed
+    @State private var returningStatusDotFromOutput = false
+    /// Content-fit output wing — grow-only per assistant message so the panel
+    /// never pumps narrower mid-stream; reset when a new message starts.
+    @State private var outputWingRatchet: CGFloat = NotchWrapMetrics.outputMinWingWidth
+    @State private var outputStatusReturnStartPos: CGPoint = .zero
+    @State private var outputStatusReturnStartBridgeHeight: CGFloat = NotchWrapMetrics.outputMinBridgeHeight
+    /// Multiple left-wing icons rest as an overlapped deck; hover fans them out.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     // Panel is sized for voice mode (the widest/tallest state) so the frame never needs
     // AppKit resizing. notchOffset = voiceWingWidth = left edge of the physical notch.
-    private let notchOffset = NotchWrapMetrics.voiceWingWidth
+    private let notchOffset = NotchWrapMetrics.maxWingWidth
 
-    private var spring: Animation {
-        reduceMotion ? .easeInOut(duration: 0.18) : .spring(response: 0.28, dampingFraction: 0.78)
+    private var surfaceAnimation: Animation {
+        reduceMotion
+            ? .easeInOut(duration: 0.18)
+            : .easeInOut(duration: NotchWrapMetrics.surfaceDuration)
     }
     private var status: AgentStatus { viewModel.agentStatus }
-
-    /// SF Symbol name for the right-wing voice indicator.
-    private var voiceIconName: String {
-        switch viewModel.speech.state {
-        case .loadingModel:        return "waveform.badge.magnifyingglass"
-        case .listening:           return "waveform"
-        case .finalizing:          return "waveform.badge.clock"
-        case .error:               return "exclamationmark.triangle"
-        default:                   return "waveform"
-        }
+    private var isInlineActive: Bool {
+        viewModel.notchInteractionMode == .input || viewModel.notchInteractionMode == .output
+            || viewModel.notchInteractionMode == .settings
+            || viewModel.notchInteractionMode == .automations
     }
+    private var isSettingsActive: Bool { viewModel.notchInteractionMode == .settings }
+
+    /// Transient cmux banner (5s after an agent event, latest wins).
+    private var isCmuxBannerActive: Bool {
+        viewModel.cmuxBanner != nil && !isInlineActive
+    }
+    /// Hovering the collapsed notch re-reveals pending cmux events.
+    private var isCmuxHoverReveal: Bool {
+        viewModel.cmuxBanner == nil && !viewModel.cmuxPending.isEmpty
+            && isHovered && !isInlineActive
+    }
+    private var isCmuxSurfaceActive: Bool { isCmuxBannerActive || isCmuxHoverReveal }
+    private var displayedCmuxNotification: CmuxNotification? {
+        viewModel.cmuxBanner ?? viewModel.cmuxPending.first
+    }
+
     private var maxSize: CGSize {
         CGSize(
-            width: 2 * NotchWrapMetrics.voiceWingWidth + notchWidth,
-            height: notchHeight + NotchWrapMetrics.voiceBridgeHeight
+            width: 2 * NotchWrapMetrics.maxWingWidth + notchWidth,
+            height: notchHeight + NotchWrapMetrics.maxBridgeHeight
         )
     }
 
-    private func setExpansion(expanded: Bool) {
-        withAnimation(spring) {
-            wingWidth    = expanded ? NotchWrapMetrics.hoverWingWidth    : NotchWrapMetrics.idleWingWidth
-            bridgeHeight = expanded ? NotchWrapMetrics.hoverBridgeHeight : NotchWrapMetrics.idleBridgeHeight
+    private func inlineWingWidth(for mode: NotchInteractionMode) -> CGFloat {
+        switch mode {
+        case .output:      return outputWingWidth()
+        case .settings:    return NotchWrapMetrics.settingsWingWidth
+        case .automations: return NotchWrapMetrics.automationsWingWidth
+        default:           return NotchWrapMetrics.inlineWingWidth
         }
     }
 
-    private func setVoiceState(active: Bool) {
-        withAnimation(spring) {
-            wingWidth    = active ? NotchWrapMetrics.voiceWingWidth    : (viewModel.pillHovered ? NotchWrapMetrics.hoverWingWidth    : NotchWrapMetrics.idleWingWidth)
-            bridgeHeight = active ? NotchWrapMetrics.voiceBridgeHeight : (viewModel.pillHovered ? NotchWrapMetrics.hoverBridgeHeight : NotchWrapMetrics.idleBridgeHeight)
+    private func inlineBridgeHeight(for mode: NotchInteractionMode) -> CGFloat {
+        switch mode {
+        case .output:   return outputBridgeHeight()
+        case .settings:
+            return viewModel.notchSettingsPage == .setup
+                ? NotchWrapMetrics.setupBridgeHeight
+                : NotchWrapMetrics.settingsBridgeHeight
+        case .automations:
+            return NotchWrapMetrics.automationsBridgeHeight
+        default:
+            // Slash-command suggestion rows sit under the input field.
+            let suggestionsExtra = CGFloat(viewModel.slashSuggestions.count)
+                * NotchWrapMetrics.slashSuggestionRowHeight
+            return min(
+                NotchWrapMetrics.maxBridgeHeight,
+                NotchWrapMetrics.inlineBridgeHeight + suggestionsExtra
+            )
         }
-        if active {
-            if !reduceMotion {
-                withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
-                    borderPulseOpacity = 0.75
+    }
+
+    private var outputResponseText: String {
+        NotchOutputLayout.responseText(
+            latestText: viewModel.latestAssistantText,
+            isStreaming: viewModel.isLatestAssistantStreaming,
+            isThinking: viewModel.isThinking
+        )
+    }
+
+    private func measuredOutputWingWidth() -> CGFloat {
+        NotchOutputLayout.wingWidth(
+            text: outputResponseText,
+            notchWidth: notchWidth
+        )
+    }
+
+    private func outputWingWidth() -> CGFloat {
+        // Layout evaluation must be pure. Advancing the grow-only ratchet from
+        // this getter publishes @State while SwiftUI is rendering, recursively
+        // invalidating NSHostingView and eventually poisoning NSEventThread.
+        max(outputWingRatchet, measuredOutputWingWidth())
+    }
+
+    private func advanceOutputWingRatchet() {
+        let measured = measuredOutputWingWidth()
+        guard measured > outputWingRatchet else { return }
+        outputWingRatchet = measured
+    }
+
+    private func outputBridgeHeight() -> CGFloat {
+        // Streaming text only grows, so a bridge already pinned at max stays
+        // there — skip the full-text height measure. Post-stream calls still
+        // measure exactly (final fit may shrink).
+        if viewModel.isLatestAssistantStreaming,
+           targetBridgeHeight >= NotchWrapMetrics.outputMaxBridgeHeight {
+            return NotchWrapMetrics.outputMaxBridgeHeight
+        }
+        // Height must be measured at the same width the text will render at,
+        // so wrap width and measured height always agree.
+        let visibleWidth = (notchWidth + 2 * outputWingWidth()) * NotchWrapMetrics.inlineContentScale
+        let base = NotchOutputLayout.bridgeHeight(
+            text: outputResponseText,
+            visibleWidth: visibleWidth
+        )
+        // Browse header row (‹n/N› + prompt) sits above the response text.
+        let browseExtra: CGFloat = viewModel.historyBrowseIndex == nil ? 0 : 20
+        // Tool-status chip also sits above the response text during streaming.
+        let toolChipExtra: CGFloat = viewModel.toolStatus == nil ? 0 : 20
+        let activityExtra = NotchActivityLayout.extraHeight(
+            activityCount: viewModel.latestTranscriptActivityCount,
+            expanded: viewModel.isActivityTranscriptExpanded
+        )
+        return min(
+            NotchWrapMetrics.outputMaxBridgeHeight,
+            base + browseExtra + toolChipExtra + activityExtra
+        )
+    }
+
+    private func estimatedNotchTextHeight(_ text: String, width: CGFloat) -> CGFloat {
+        NotchOutputLayout.textHeight(text, width: width)
+    }
+
+    private func refreshOutputSurfaceIfNeeded(force: Bool = false) {
+        guard viewModel.notchInteractionMode == .output else { return }
+        // Callers cross the main-queue boundary before reaching this method, so
+        // ratchet state changes happen outside SwiftUI's active update pass.
+        advanceOutputWingRatchet()
+        // Streaming text only grows — once the panel is pinned at max in both
+        // dimensions nothing a new token adds can change the surface, so skip
+        // the (full-text parse + layout) measurement entirely. Without this,
+        // every token past ~max-height re-measured and re-refreshed the panel.
+        if !force, viewModel.isLatestAssistantStreaming,
+           targetWingWidth >= NotchWrapMetrics.outputWingWidth,
+           targetBridgeHeight >= NotchWrapMetrics.outputMaxBridgeHeight {
+            return
+        }
+        let nextWing = outputWingWidth()
+        let nextBridge = outputBridgeHeight()
+        // The "== max" arms keep the panel re-fitting on every flush once one
+        // dimension is pinned, so the growing bridge always leads the text —
+        // suppressing them made the text overflow between threshold steps and
+        // visibly bounce between bottom-pin and top-anchor.
+        let shouldResize = force
+            || !viewModel.isLatestAssistantStreaming
+            || abs(nextBridge - targetBridgeHeight) >= NotchOutputLayout.resizeThreshold
+            || nextBridge == NotchWrapMetrics.outputMaxBridgeHeight
+            || abs(nextWing - targetWingWidth) >= NotchOutputLayout.resizeThreshold
+            || nextWing == NotchWrapMetrics.outputWingWidth
+        guard shouldResize else { return }
+        refreshSurface()
+    }
+
+    private func deferOutputSurfaceRefresh(force: Bool = false) {
+        DispatchQueue.main.async {
+            refreshOutputSurfaceIfNeeded(force: force)
+        }
+    }
+
+    private func refreshSurface() {
+        // Captured before updateStatusDotTravelState() mutates previousNotchInteractionMode.
+        let previousModeWasOutput = previousNotchInteractionMode == .output
+        updateStatusDotTravelState()
+
+        let hoverExpanded = isHovered || isDragTargeted || viewModel.pillHovered
+        var targetWing: CGFloat
+        let targetBridge: CGFloat
+        if viewModel.pasteWheelActive {
+            targetWing = NotchWrapMetrics.wheelWingWidth
+            targetBridge = NotchWrapMetrics.wheelBridgeHeight
+        } else if isInlineActive {
+            targetWing = inlineWingWidth(for: viewModel.notchInteractionMode)
+            targetBridge = inlineBridgeHeight(for: viewModel.notchInteractionMode)
+        } else if isCmuxSurfaceActive {
+            targetWing = NotchWrapMetrics.cmuxWingWidth
+            targetBridge = NotchWrapMetrics.cmuxBridgeHeight
+        } else if hoverExpanded {
+            targetWing = NotchWrapMetrics.hoverWingWidth
+            targetBridge = NotchWrapMetrics.hoverBridgeHeight
+        } else {
+            targetWing = NotchWrapMetrics.idleWingWidth
+            targetBridge = NotchWrapMetrics.idleBridgeHeight
+        }
+        // The pill widens so the pending left-wing icon row always fits inside
+        // the black shape.
+        targetWing = max(targetWing, requiredLeftWingWidth)
+
+        let surfaceTargetChanged = targetWingWidth != targetWing || targetBridgeHeight != targetBridge
+        // Width/height growth while already in output mode must not replay the
+        // inline reveal — only the initial transition into output resets it.
+        let outputContentOnlyResize = viewModel.notchInteractionMode == .output
+            && previousModeWasOutput
+        var instantTargetUpdate = Transaction()
+        instantTargetUpdate.disablesAnimations = true
+        withTransaction(instantTargetUpdate) {
+            targetWingWidth = targetWing
+            targetBridgeHeight = targetBridge
+            if surfaceTargetChanged {
+                hoverIconRevealID = UUID()
+                if !outputContentOnlyResize {
+                    inlineRevealID = UUID()
                 }
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                withAnimation(.easeIn(duration: 0.20)) { voiceContentOpacity = 1 }
+        }
+
+        // Wheel morphs use a snappier spring than the ambient surface ease —
+        // the hold gesture already cost 0.5s, the reveal must feel instant.
+        let targetBulge: CGFloat = viewModel.pasteWheelActive
+            ? NotchWrapMetrics.wheelBulgeDepth : 0
+        let wheelInvolved = targetBulge > 0 || bulgeDepth > 0
+        let animation: Animation = wheelInvolved && !reduceMotion
+            ? .spring(response: 0.34, dampingFraction: 0.82)
+            : surfaceAnimation
+        withAnimation(animation) {
+            wingWidth = targetWing
+            bridgeHeight = targetBridge
+        }
+        // The dome doesn't grow downward — it draws itself across, left→right.
+        // Depth is set instantly (invisible at sweep 0); the sweep does the reveal.
+        if targetBulge > 0 {
+            var instant = Transaction()
+            instant.disablesAnimations = true
+            withTransaction(instant) { bulgeDepth = targetBulge }
+            if bulgeSweep < 1 {
+                withAnimation(reduceMotion
+                    ? .easeOut(duration: 0.12)
+                    : .easeInOut(duration: 0.50)) {
+                    bulgeSweep = 1
+                }
+            }
+        } else if bulgeSweep > 0 || bulgeDepth > 0 {
+            // Retract right→left, then flatten what's left.
+            withAnimation(reduceMotion ? .easeOut(duration: 0.10) : .easeInOut(duration: 0.30)) {
+                bulgeSweep = 0
+            }
+            withAnimation(.easeOut(duration: 0.16).delay(reduceMotion ? 0 : 0.24)) {
+                bulgeDepth = 0
+            }
+        }
+        updateInlineOpacity(active: isInlineActive)
+        updateCmuxOpacity(active: isCmuxSurfaceActive)
+    }
+
+    private func updateWheelOpacity(active: Bool) {
+        if active {
+            let delay = reduceMotion ? 0.0 : 0.14
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard viewModel.pasteWheelActive else { return }
+                withAnimation(.easeOut(duration: reduceMotion ? 0.10 : 0.20)) {
+                    wheelContentOpacity = 1
+                }
             }
         } else {
-            withAnimation(.easeOut(duration: 0.15)) {
-                voiceContentOpacity = 0
-                borderPulseOpacity = 0.35
+            withAnimation(.easeOut(duration: 0.12)) {
+                wheelContentOpacity = 0
             }
         }
     }
 
-    // Icon x tracks wing center. Icon y is clamped to the notch/hover area so it
-    // doesn't drift into the bridge content during voice mode (bridge = 120 pt).
+    private func updateStatusDotTravelState() {
+        let currentMode = viewModel.notchInteractionMode
+        if previousNotchInteractionMode == .output && currentMode != .output {
+            outputStatusReturnStartPos = outputStatusTargetPos
+            outputStatusReturnStartBridgeHeight = max(1, targetBridgeHeight)
+            returningStatusDotFromOutput = !reduceMotion
+        } else if currentMode == .output {
+            returningStatusDotFromOutput = false
+        } else if returningStatusDotFromOutput && bridgeHeight <= NotchWrapMetrics.idleBridgeHeight + 0.5 {
+            returningStatusDotFromOutput = false
+        }
+        previousNotchInteractionMode = currentMode
+    }
+
+    private func updateInlineOpacity(active: Bool) {
+        if active {
+            let delay = reduceMotion ? 0.0 : NotchWrapMetrics.surfaceDuration * 0.62
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard viewModel.notchInteractionMode != .collapsed else { return }
+                withAnimation(.easeOut(duration: reduceMotion ? 0.10 : 0.24)) {
+                    inlineContentOpacity = 1
+                }
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.14)) {
+                inlineContentOpacity = 0
+            }
+        }
+    }
+
+    private func updateCmuxOpacity(active: Bool) {
+        if active {
+            let delay = reduceMotion ? 0.0 : NotchWrapMetrics.surfaceDuration * 0.55
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard isCmuxSurfaceActive else { return }
+                withAnimation(.easeOut(duration: reduceMotion ? 0.10 : 0.24)) {
+                    cmuxContentOpacity = 1
+                }
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.14)) {
+                cmuxContentOpacity = 0
+            }
+        }
+    }
+
+    // Icon y is clamped to the notch/hover area so it doesn't drift into bridge content.
     private var iconY: CGFloat {
         let clampedBridge = min(bridgeHeight, NotchWrapMetrics.hoverBridgeHeight)
         return (notchHeight + clampedBridge) / 2
     }
-    private var leftIconPos: CGPoint {
-        CGPoint(x: notchOffset - wingWidth / 2, y: iconY)
+    private var targetLeftIconPos: CGPoint {
+        let clampedBridge = min(targetBridgeHeight, NotchWrapMetrics.hoverBridgeHeight)
+        let y = (notchHeight + clampedBridge) / 2
+        return CGPoint(
+            x: NotchLeftWingLayout.statusIconCenterX(
+                notchOffset: notchOffset,
+                wingWidth: targetWingWidth,
+                count: leftWingIconCount
+            ),
+            y: y
+        )
     }
     private var rightIconPos: CGPoint {
         CGPoint(x: notchOffset + notchWidth + wingWidth / 2, y: iconY)
     }
+    private var collapsedStatusPos: CGPoint {
+        CGPoint(
+            x: notchOffset + notchWidth + NotchWrapMetrics.idleWingWidth / 2,
+            y: notchHeight / 2
+        )
+    }
+    private var outputStatusTargetPos: CGPoint {
+        NotchStatusDotGeometry.outputTopRight(
+            notchOffset: notchOffset,
+            notchWidth: notchWidth,
+            targetWingWidth: targetWingWidth,
+            notchHeight: notchHeight
+        )
+    }
+    private var outputStatusTravelProgress: CGFloat {
+        guard viewModel.notchInteractionMode == .output else { return 0 }
+        guard targetBridgeHeight > 0 else { return 1 }
+        return min(1, max(0, bridgeHeight / targetBridgeHeight))
+    }
+    private var animatedInlineStatusPos: CGPoint {
+        let visibleW = notchWidth + 2 * wingWidth
+        let contentW = visibleW * NotchWrapMetrics.inlineContentScale
+        return CGPoint(
+            x: notchOffset + notchWidth / 2 + contentW / 2 - 10,
+            y: notchHeight + bridgeHeight / 2
+        )
+    }
+    private var statusDotPos: CGPoint {
+        if viewModel.notchInteractionMode == .output {
+            let progress = reduceMotion ? CGFloat(1) : outputStatusTravelProgress
+            return CGPoint(
+                x: collapsedStatusPos.x + (outputStatusTargetPos.x - collapsedStatusPos.x) * progress,
+                y: collapsedStatusPos.y + (outputStatusTargetPos.y - collapsedStatusPos.y) * progress
+            )
+        }
+        if returningStatusDotFromOutput || (previousNotchInteractionMode == .output && viewModel.notchInteractionMode != .output) {
+            let startPos = returningStatusDotFromOutput ? outputStatusReturnStartPos : outputStatusTargetPos
+            let startBridgeHeight = returningStatusDotFromOutput
+                ? outputStatusReturnStartBridgeHeight
+                : max(1, targetBridgeHeight)
+            let progress = min(1, max(0, bridgeHeight / startBridgeHeight))
+            return CGPoint(
+                x: collapsedStatusPos.x + (startPos.x - collapsedStatusPos.x) * progress,
+                y: collapsedStatusPos.y + (startPos.y - collapsedStatusPos.y) * progress
+            )
+        }
+        if isInlineActive {
+            return animatedInlineStatusPos
+        }
+        return rightIconPos
+    }
 
-    var body: some View {
-        ZStack(alignment: .topLeading) {
-            // Single Canvas — fill + border computed in one closure call from the same
-            // @State values, so fill and border are always pixel-identical per frame.
-            Canvas { ctx, size in
-                let r  = NotchWrapMetrics.cornerRadius
-                let br = max(0, bridgeHeight)
-                let x  = notchOffset - wingWidth
-                let w  = 2 * wingWidth + notchWidth
-                let h  = notchHeight + br
+    private var animatedNotchClipShape: NotchWrapShape {
+        NotchWrapShape(
+            wingWidth: wingWidth,
+            bridgeHeight: bridgeHeight,
+            notchOffset: notchOffset,
+            notchWidth: notchWidth,
+            notchHeight: notchHeight,
+            cornerRadius: NotchWrapMetrics.cornerRadius,
+            bulgeDepth: bulgeDepth,
+            bulgeSweep: bulgeSweep
+        )
+    }
 
-                // Closed fill path — top corners sharp, bottom corners rounded r=10
-                var fill = Path()
-                fill.move(to:    CGPoint(x: x,         y: 0))
-                fill.addLine(to: CGPoint(x: x + w,     y: 0))
-                fill.addLine(to: CGPoint(x: x + w,     y: h - r))
-                fill.addArc(center: CGPoint(x: x+w-r, y: h-r), radius: r,
-                            startAngle: .degrees(0),   endAngle: .degrees(90),  clockwise: false)
-                fill.addLine(to: CGPoint(x: x + r,     y: h))
-                fill.addArc(center: CGPoint(x: x+r,   y: h-r), radius: r,
-                            startAngle: .degrees(90),  endAngle: .degrees(180), clockwise: false)
-                fill.closeSubpath()
-
-                // Open border path — same arcs, no top edge
-                var border = Path()
-                border.move(to:    CGPoint(x: x + w,   y: 0))
-                border.addLine(to: CGPoint(x: x + w,   y: h - r))
-                border.addArc(center: CGPoint(x: x+w-r, y: h-r), radius: r,
-                              startAngle: .degrees(0),   endAngle: .degrees(90),  clockwise: false)
-                border.addLine(to: CGPoint(x: x + r,   y: h))
-                border.addArc(center: CGPoint(x: x+r,  y: h-r), radius: r,
-                              startAngle: .degrees(90),  endAngle: .degrees(180), clockwise: false)
-                border.addLine(to: CGPoint(x: x,       y: 0))
-
-                ctx.fill(fill, with: .color(.black))
-                ctx.stroke(border,
-                           with: .color(NotchWrapMetrics.notchBorderColor.opacity(
-                               isVoiceActive ? borderPulseOpacity : (isHovered ? 0.80 : 0.35)
-                           )),
-                           lineWidth: 1)
-            }
-
-            // Left icon — only when chat open, hovered, or voice active (idle = blank notch)
-            if viewModel.isExpanded || isHovered || isVoiceActive {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity((isHovered || isVoiceActive) ? 1.0 : 0.75))
-                    .contentTransition(.symbolEffect(.replace))
-                    .position(leftIconPos)
-            }
-
-            // Right icon — animated waveform symbol in voice mode, status dot otherwise.
-            // Dot hidden when idle and collapsed (pure notch bg); shown when chat open,
-            // task running, approval pending, or error (so a down daemon always surfaces).
-            if isVoiceActive {
-                Image(systemName: voiceIconName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white)
-                    // `.repeating` is the macOS 14-compatible equivalent of `.repeat(.continuous)`.
-                    .symbolEffect(
-                        .variableColor.iterative.dimInactiveLayers.nonReversing,
-                        options: .repeating,
-                        isActive: viewModel.speech.state == .listening
-                    )
-                    .contentTransition(.symbolEffect(.replace))
-                    .position(rightIconPos)
-                    .opacity(voiceContentOpacity)
-            } else if viewModel.isExpanded || status != .ready {
-                // Show dot: chat open (green) OR non-idle status (thinking/approval/error)
-                StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
-                    .position(rightIconPos)
-            }
-
-            // Voice content in bridge area (wave + live sentence)
-            if isVoiceActive {
-                VoiceNotchContent(speech: viewModel.speech, viewModel: viewModel)
+    @ViewBuilder
+    private var inlineSurfaceLayer: some View {
+        if isInlineActive {
+            let contentWing = wingWidth
+            let contentBridge = bridgeHeight
+            ZStack(alignment: .topLeading) {
+                InlineNotchContent(
+                    viewModel: viewModel,
+                    outputGrowthPhase: viewModel.isLatestAssistantStreaming
+                        && targetBridgeHeight < NotchWrapMetrics.outputMaxBridgeHeight,
+                    browserCoordinator: browserCoordinator
+                )
                     .frame(
-                        width: notchWidth + 2 * NotchWrapMetrics.voiceWingWidth - 20,
-                        height: NotchWrapMetrics.voiceBridgeHeight - 12
+                        width: (notchWidth + 2 * contentWing) * NotchWrapMetrics.inlineContentScale,
+                        height: max(1, contentBridge - NotchOutputLayout.contentVerticalInset)
                     )
                     .position(x: notchOffset + notchWidth / 2,
-                              y: notchHeight + NotchWrapMetrics.voiceBridgeHeight / 2)
-                    .opacity(voiceContentOpacity)
+                              y: notchHeight + contentBridge / 2)
+                    .opacity(inlineContentOpacity)
+                    .id(inlineRevealID)
+                    .animation(surfaceAnimation, value: viewModel.notchInteractionMode)
+            }
+            .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+            .clipShape(animatedNotchClipShape)
+        }
+    }
+
+    @ViewBuilder
+    private var statusDotLayer: some View {
+        if !viewModel.traceCopiedFlash,
+           status != .ready || (viewModel.isExpanded && !isInlineActive) {
+            StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
+                .position(statusDotPos)
+                .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+                .clipShape(animatedNotchClipShape)
+        }
+    }
+
+    /// Transient "trace copied" confirmation (⌥-click). It lives on the right
+    /// wing with the status pills — in the left-wing row it landed on top of
+    /// the Browser Cues.
+    private var traceCopiedLayer: some View {
+        // Always in the tree, so appearing is a fade/scale in place. As a
+        // conditional insertion SwiftUI animated it in from the layer's origin
+        // — the tick flew up from the bottom-left corner.
+        Image(systemName: "checkmark.circle.fill")
+            .font(.system(size: Self.leftWingIconSize * 0.8, weight: .semibold))
+            .symbolRenderingMode(.palette)
+            .foregroundStyle(.white, .green)
+            .frame(width: Self.leftWingIconSize, height: Self.leftWingIconSize)
+            .opacity(viewModel.traceCopiedFlash ? 1 : 0)
+            .scaleEffect(viewModel.traceCopiedFlash ? 1 : 0.5)
+            .animation(reduceMotion ? nil : .spring(response: 0.26, dampingFraction: 0.7),
+                       value: viewModel.traceCopiedFlash)
+            .accessibilityLabel("Trace skopírovaný do schránky")
+            .allowsHitTesting(false)
+            .position(statusDotPos)
+            .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+            .clipShape(animatedNotchClipShape)
+    }
+
+    /// Pending cmux events — animated dot on the right wing, own agent status wins.
+    @ViewBuilder
+    private var cmuxDotLayer: some View {
+        if let kind = viewModel.cmuxDotKind,
+           !isInlineActive, !viewModel.isExpanded, status == .ready {
+            CmuxStatusDotView(kind: kind, reduceMotion: reduceMotion)
+                .position(rightIconPos)
+                .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+                .clipShape(animatedNotchClipShape)
+        }
+    }
+
+    /// Left-wing icon row: colorful connector action icons plus the cmux app
+    /// icon. cmux keeps its collapsed-only visibility; connector icons stay
+    /// visible while the inline input/output surface is open too — they
+    /// persist (no timeout) until clicked or the next user message. The row is
+    /// right-aligned against the notch's left edge and enters with the same
+    /// bell-swing the cmux icon uses.
+    @ViewBuilder
+    private var leftWingIconLayer: some View {
+        if leftWingIconCount > 0 {
+            HStack(spacing: Self.leftWingIconSpacing) {
+                ForEach(Array(visibleConnectorActions.enumerated()), id: \.element.id) { index, action in
+                    Button {
+                        viewModel.performConnectorAction(action, slotIndex: index)
+                    } label: {
+                        ConnectorIconView(kind: action.kind, reduceMotion: reduceMotion,
+                                          size: Self.leftWingIconSize)
+                    }
+                    .buttonStyle(.plain)
+                    .help(action.kind.accessibilityLabel)
+                    .accessibilityLabel(action.kind.accessibilityLabel)
+                }
+                ForEach(visibleBrowserCues) { cue in
+                    BrowserCueInteractionView(
+                        cue: cue,
+                        reduceMotion: reduceMotion,
+                        onClick: {
+                            browserCoordinator.toggleCue(cue.id)
+                        },
+                        onOptionClick: {
+                            browserCoordinator.optionClickCue(cue.id)
+                        },
+                        onDragPhase: { phase, location in
+                            browserCoordinator.dragCue(cue.id, phase: phase, location: location)
+                        },
+                        // The cue's AppKit hit view sits on top of the icon, so
+                        // the row's own .onHover never fires over a cue — fan
+                        // the deck from here instead, otherwise the icons stay
+                        // stacked (overlapping) exactly where the pointer is.
+                        onHoverChanged: { hovering, cursor in
+                            if hovering {
+                                browserCoordinator.previewCue(cue.id, at: cursor)
+                            } else {
+                                browserCoordinator.hideCuePreview()
+                            }
+                        },
+                        onGeometryChanged: { rect in
+                            browserCoordinator.updateCueRect(cue.id, rect)
+                        },
+                        shakes: browserCoordinator.cueShakes[cue.id] ?? 0
+                    )
+                    .contextMenu {
+                        if browserCoordinator.isSubmissionPending(for: cue.id) {
+                            Button(String(localized: "browser.cue.approve_submission",
+                                          defaultValue: "Approve form submission")) {
+                                browserCoordinator.approveSubmission(sessionID: cue.id)
+                            }
+                        }
+                        if cue.state == .attention {
+                            Button(String(localized: "browser.cue.resume_agent",
+                                          defaultValue: "Resume agent control")) {
+                                browserCoordinator.resumeAgent(sessionID: cue.id)
+                            }
+                        }
+                        if let label = browserCoordinator.reclaimLabel(for: cue.id) {
+                            Button(String(localized: "browser.cue.reclaim",
+                                          defaultValue: "Reclaim for \(label)")) {
+                                try? browserCoordinator.approvePendingReclaim(sessionID: cue.id)
+                            }
+                            Button(String(localized: "browser.cue.reject_reclaim",
+                                          defaultValue: "Leave detached")) {
+                                browserCoordinator.rejectPendingReclaim(sessionID: cue.id)
+                            }
+                        }
+                        Button(String(localized: "browser.cue.close",
+                                      defaultValue: "Close browser session"),
+                               role: .destructive) {
+                            browserCoordinator.approveClose(sessionID: cue.id)
+                        }
+                    }
+                }
+                if showsCmuxLeftIcon, let notification = displayedCmuxNotification {
+                    CmuxIconView(kind: notification.kind, reduceMotion: reduceMotion)
+                        .opacity(isCmuxSurfaceActive ? cmuxContentOpacity : 1)
+                }
+            }
+            .padding(6)
+            .contentShape(Rectangle())
+            .position(x: notchOffset - Self.leftWingRowInset - leftWingRowWidth / 2, y: iconY)
+        }
+    }
+
+    private static let leftWingIconSize: CGFloat = NotchLeftWingLayout.iconSize
+    private static let leftWingIconSpacing: CGFloat = NotchLeftWingLayout.iconSpacing
+    /// Gap between the row's right edge and the notch's left edge.
+    private static let leftWingRowInset: CGFloat = NotchLeftWingLayout.rowInset
+
+    /// Connector icons stay through inline
+    /// input/output and the expanded chat panel so results are actionable
+    /// the moment they stream in.
+    private var visibleConnectorActions: [ConnectorAction] {
+        return viewModel.pendingConnectorActions
+    }
+
+    /// Browser Cues step aside while an inline surface is open — ⌥Space is
+    /// meant to leave just the input field.
+    private var visibleBrowserCues: [BrowserCue] {
+        isInlineActive ? [] : browserCoordinator.cues
+    }
+
+    private var leftWingIconCount: Int {
+        visibleConnectorActions.count
+            + visibleBrowserCues.count
+            + (showsCmuxLeftIcon ? 1 : 0)
+    }
+
+    private var leftWingRowWidth: CGFloat {
+        NotchLeftWingLayout.rowWidth(count: leftWingIconCount)
+    }
+
+    /// Wing floor so the whole row — plus the hover status icon beside it —
+    /// fits inside the black pill.
+    private var requiredLeftWingWidth: CGFloat {
+        NotchLeftWingLayout.requiredWingWidth(count: leftWingIconCount,
+                                              statusIcon: showsLeftStatusIcon || isSettingsActive)
+    }
+
+    /// Where the connector icon sat at click time — the row still had the
+    /// departing icon, so measure against a one-wider row.
+    private func connectorSlotPosition(_ slotIndex: Int) -> CGPoint {
+        let n = CGFloat(leftWingIconCount + 1)
+        let rowWidth = n * Self.leftWingIconSize + (n - 1) * Self.leftWingIconSpacing
+        let left = notchOffset - Self.leftWingRowInset - rowWidth
+        let step = Self.leftWingIconSize + Self.leftWingIconSpacing
+        return CGPoint(x: left + Self.leftWingIconSize / 2 + CGFloat(slotIndex) * step, y: iconY)
+    }
+
+    /// The cmux icon sits in the row's rightmost slot.
+    private var cmuxSlotPosition: CGPoint {
+        CGPoint(x: notchOffset - Self.leftWingRowInset - Self.leftWingIconSize / 2, y: iconY)
+    }
+
+    /// The left cmux icon shows while any cmux event is pending and the notch is in
+    /// its collapsed presentation (not inline/expanded).
+    private var showsCmuxLeftIcon: Bool {
+        guard !isInlineActive, !viewModel.isExpanded else { return false }
+        return displayedCmuxNotification != nil
+    }
+
+    /// Where an acknowledged cmux icon flies to: on a notched display, up into the
+    /// physical notch gap; on an external display, off the top edge (same centered X
+    /// since the synthetic notch is centered).
+    private var cmuxFlyoffTarget: CGPoint {
+        CGPoint(x: notchOffset + notchWidth / 2,
+                y: viewModel.hasNotch ? notchHeight * 0.15 : -40)
+    }
+
+    /// Fly-off animations for cues the user just acknowledged (tab-open / hover-leave
+    /// / click). Rendered unclipped so the icon is visible travelling into the notch.
+    @ViewBuilder
+    private var iconDepartureLayer: some View {
+        ForEach(viewModel.cmuxDeparting) { departure in
+            IconFlyoffView(
+                start: cmuxSlotPosition,
+                target: cmuxFlyoffTarget,
+                hasNotch: viewModel.hasNotch,
+                onFinished: { viewModel.finishCmuxDeparture(departure.id) }
+            ) {
+                Image(nsImage: CmuxEventMonitor.appIcon)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
             }
         }
+        ForEach(viewModel.connectorDeparting) { departure in
+            IconFlyoffView(
+                start: connectorSlotPosition(departure.slotIndex),
+                target: cmuxFlyoffTarget,
+                hasNotch: viewModel.hasNotch,
+                size: Self.leftWingIconSize,
+                onFinished: { viewModel.finishConnectorDeparture(departure.id) }
+            ) {
+                ConnectorIconView(kind: departure.kind, reduceMotion: true,
+                                  size: Self.leftWingIconSize)
+            }
+        }
+    }
+
+    /// Click-through on a cmux banner/reveal focuses the cmux workspace/tab.
+    /// Option+click in any state copies the session/debug trace instead.
+    private func handleTap() {
+        if NSApp.currentEvent?.modifierFlags.contains(.option) == true {
+            // A cue owns its own ⌥-click. Checked against the cue's tracked
+            // screen rect rather than a hit test: the busy shake is a render
+            // transform, so the icon can sit a few points off its own view.
+            if let event = NSApp.currentEvent,
+               let window = event.window,
+               browserCoordinator.isPointOverCue(window.convertPoint(toScreen: event.locationInWindow)) {
+                return
+            }
+            viewModel.copyDebugTrace()
+            return
+        }
+        if isCmuxSurfaceActive, let notification = displayedCmuxNotification {
+            viewModel.focusCmux(notification)
+            refreshSurface()
+        } else {
+            onTap()
+        }
+    }
+
+    /// One-line cmux event title shown in the bridge while the banner or
+    /// hover-reveal surface is grown.
+    @ViewBuilder
+    private var cmuxBannerLayer: some View {
+        if isCmuxSurfaceActive, let notification = displayedCmuxNotification {
+            HStack(spacing: 5) {
+                Text(notification.title)
+                    .font(.system(size: 11, weight: .regular))
+                    .kerning(0.2)
+                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                    .lineLimit(1)
+                if isCmuxHoverReveal && viewModel.cmuxPending.count > 1 {
+                    Text("+\(viewModel.cmuxPending.count - 1)")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                }
+            }
+            .frame(maxWidth: notchWidth + 2 * NotchWrapMetrics.cmuxWingWidth - 36)
+            .position(x: notchOffset + notchWidth / 2,
+                      y: notchHeight + max(1, bridgeHeight) / 2)
+            .opacity(cmuxContentOpacity)
+            .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+            .clipShape(animatedNotchClipShape)
+        }
+    }
+
+    private var showsLeftStatusIcon: Bool {
+        !isInlineActive
+            && !isCmuxSurfaceActive
+            && viewModel.notchInteractionMode != .thinking
+            && (viewModel.isExpanded || isHovered)
+    }
+
+    private func isNearVisibleSurface(_ point: CGPoint) -> Bool {
+        let margin: CGFloat = isInlineActive ? 3 : 6
+        let x = notchOffset - wingWidth
+        let w = 2 * wingWidth + notchWidth
+        let h = notchHeight + max(0, bridgeHeight)
+        return CGRect(
+            x: x - margin,
+            y: 0,
+            width: w + margin * 2,
+            height: h + margin
+        ).contains(point)
+    }
+
+    private func setPointerHover(_ active: Bool) {
+        guard isHovered != active else { return }
+        let wasRevealingCmux = isCmuxHoverReveal
+        isHovered = active
+        if active {
+            if isCmuxHoverReveal { cmuxRevealStartedAt = Date() }
+        } else if wasRevealingCmux {
+            // Cues are seen once the hover reveal ends — but only if the pointer
+            // actually dwelt (≥0.4s), so a mouse merely passing through the notch
+            // doesn't wipe everything.
+            let dwelt = (cmuxRevealStartedAt.map { Date().timeIntervalSince($0) } ?? 0) >= 0.4
+            cmuxRevealStartedAt = nil
+            if dwelt { viewModel.markAllCmuxSeen() }
+        }
+        // SwiftUI may be rebuilding the expanded transcript while AppKit is
+        // still dispatching this hover event. Resizing the notch in that same
+        // transaction can invalidate the event's old tracking hierarchy.
+        // Cross the main-queue boundary before changing any surface geometry.
+        DispatchQueue.main.async {
+            refreshSurface()
+            onHoverChanged(active || isDragTargeted)
+        }
+    }
+
+    // Split out of `body` so the modifier chain below stays type-checkable.
+    private var surfaceLayers: some View {
+        ZStack(alignment: .topLeading) {
+            NotchWrapShape(
+                wingWidth: wingWidth,
+                bridgeHeight: bridgeHeight,
+                notchOffset: notchOffset,
+                notchWidth: notchWidth,
+                notchHeight: notchHeight,
+                cornerRadius: NotchWrapMetrics.cornerRadius,
+                bulgeDepth: bulgeDepth,
+                bulgeSweep: bulgeSweep
+            )
+            .fill(.black)
+
+            NotchWrapBorderShape(
+                wingWidth: wingWidth,
+                bridgeHeight: bridgeHeight,
+                notchOffset: notchOffset,
+                notchWidth: notchWidth,
+                notchHeight: notchHeight,
+                cornerRadius: NotchWrapMetrics.cornerRadius,
+                bulgeDepth: bulgeDepth,
+                bulgeSweep: bulgeSweep
+            )
+            .stroke(
+                NotchWrapMetrics.notchBorderColor.opacity(
+                    isHovered || isInlineActive ? 0.80 : 0.35
+                ),
+                lineWidth: 1
+            )
+
+            leftWingIconLayer
+            iconDepartureLayer
+
+            // Left icon — only when chat open, hovered, or voice active (idle = blank notch).
+            // In settings mode it shows the current page's icon; DrawInSymbol's
+            // symbolEffect(.replace) animates the swap between pages.
+            if showsLeftStatusIcon || isSettingsActive {
+                DrawInSymbol(
+                    systemName: isSettingsActive
+                        ? viewModel.notchSettingsPage.symbolName
+                        : (viewModel.selectedSourceMode?.symbolName ?? "sparkles"),
+                    trigger: hoverIconRevealID,
+                    duration: NotchWrapMetrics.surfaceDuration,
+                    reduceMotion: reduceMotion
+                )
+                .position(x: targetLeftIconPos.x, y: targetLeftIconPos.y)
+            }
+
+            // Right icon — status dot. Hidden when idle and collapsed (pure notch
+            // bg); shown when chat open, task running, approval pending, or error
+            // (so a down daemon always surfaces).
+            inlineSurfaceLayer
+            cmuxBannerLayer
+            statusDotLayer
+            traceCopiedLayer
+            cmuxDotLayer
+            pasteWheelLayer
+        }
+    }
+
+    /// Clipboard wheel chips laid along the bulged bottom edge.
+    @ViewBuilder
+    private var pasteWheelLayer: some View {
+        if viewModel.pasteWheelActive || wheelContentOpacity > 0 {
+            PasteWheelView(
+                viewModel: viewModel,
+                notchOffset: notchOffset,
+                notchWidth: notchWidth,
+                notchHeight: notchHeight
+            )
+            .opacity(wheelContentOpacity)
+            .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+            .clipShape(animatedNotchClipShape)
+        }
+    }
+
+    private var interactiveSurface: some View {
+        surfaceLayers
         .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
         .contentShape(
             NotchWrapShape(
@@ -225,10 +1181,21 @@ struct NotchWrapView: View {
                 notchOffset: notchOffset,
                 notchWidth: notchWidth,
                 notchHeight: notchHeight,
-                cornerRadius: NotchWrapMetrics.cornerRadius
+                cornerRadius: NotchWrapMetrics.cornerRadius,
+                bulgeDepth: bulgeDepth,
+                bulgeSweep: bulgeSweep
             )
         )
-        .onTapGesture { onTap() }
+        // The surface tap toggles the pill / focuses cmux. While an inline
+        // surface (input/output/settings/automations) is open, the mask hands
+        // clicks to the content instead — otherwise this ancestor gesture
+        // races SwiftUI Buttons inside the bridge (e.g. the automations
+        // editor's "Ďalej") and a button click collapses the notch.
+        // Esc and click-away still dismiss inline surfaces.
+        .gesture(
+            TapGesture().onEnded { handleTap() },
+            including: isInlineActive ? .subviews : .all
+        )
         .onDrop(of: [.fileURL], isTargeted: $isDragTargeted) { providers in
             // Expand the chat panel, then queue the dropped files
             onTap()
@@ -243,35 +1210,78 @@ struct NotchWrapView: View {
             }
             return true
         }
-        .onHover { hovering in
-            isHovered = hovering
-            // Don't let hover-leave shrink the bridge during voice mode — the voice
-            // dimensions are owned by setVoiceState; only hover controls expansion otherwise.
-            if !isVoiceActive {
-                setExpansion(expanded: hovering || isDragTargeted || viewModel.pillHovered)
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let location):
+                setPointerHover(isNearVisibleSurface(location))
+            case .ended:
+                setPointerHover(false)
             }
-            onHoverChanged(hovering || isDragTargeted)
         }
         .onChange(of: viewModel.pillHovered) {
-            if !isVoiceActive {
-                setExpansion(expanded: viewModel.pillHovered || isHovered || isDragTargeted)
-            }
+            refreshSurface()
         }
         .onChange(of: isDragTargeted) { _, targeted in
-            if !isVoiceActive {
-                setExpansion(expanded: targeted || isHovered || viewModel.pillHovered)
-            }
+            refreshSurface()
             onHoverChanged(targeted || isHovered)
         }
-        .onChange(of: viewModel.isVoiceNotchActive) { _, active in
-            isVoiceActive = active
-            setVoiceState(active: active)
+        .onChange(of: viewModel.pasteWheelActive) { _, active in
+            refreshSurface()
+            updateWheelOpacity(active: active)
+        }
+        .onChange(of: viewModel.notchInteractionMode) { _, mode in
+            if mode != .output { outputWingRatchet = NotchWrapMetrics.outputMinWingWidth }
+            refreshSurface()
+        }
+        // The setup page is taller than the other settings pages.
+        .onChange(of: viewModel.notchSettingsPage) {
+            refreshSurface()
+        }
+        // Slash-command suggestion rows grow the input bridge.
+        .onChange(of: viewModel.slashSuggestions) {
+            refreshSurface()
+        }
+        .onChange(of: viewModel.cmuxBanner) {
+            refreshSurface()
+        }
+        .onChange(of: viewModel.pendingConnectorActions) {
+            refreshSurface()
+        }
+        .onChange(of: browserCoordinator.cues) {
+            refreshSurface()
+        }
+        .onChange(of: viewModel.traceCopiedFlash) {
+            refreshSurface()
+        }
+        .onChange(of: viewModel.isActivityTranscriptExpanded) {
+            deferOutputSurfaceRefresh(force: true)
+        }
+    }
+
+    var body: some View {
+        interactiveSurface
+        .onChange(of: viewModel.streamingChunk) {
+            deferOutputSurfaceRefresh()
+        }
+        .onChange(of: viewModel.latestAssistantMessageId) {
+            outputWingRatchet = NotchWrapMetrics.outputMinWingWidth
+            deferOutputSurfaceRefresh(force: true)
+        }
+        .onChange(of: viewModel.isLatestAssistantStreaming) {
+            deferOutputSurfaceRefresh(force: true)
+        }
+        .onChange(of: viewModel.notchHoverResetID) {
+            isHovered = false
+            isDragTargeted = false
+            refreshSurface()
+            onHoverChanged(false)
         }
         .onChange(of: status) {
             pulsing = (status == .thinking)
         }
         .onAppear {
             pulsing = (status == .thinking)
+            refreshSurface()
         }
         .onReceive(NotificationCenter.default.publisher(for: .bagentCodeCopied)) { _ in
             guard !reduceMotion else { return }
@@ -284,6 +1294,745 @@ struct NotchWrapView: View {
         .accessibilityLabel("bagent — \(status.accessibilityLabel)")
         .accessibilityHint("Otvoriť chat")
         .accessibilityAddTraits(.isButton)
+    }
+}
+
+// MARK: - Inline notch input / output
+
+private struct DrawInSymbol: View {
+    let systemName: String
+    let trigger: UUID
+    let duration: Double
+    let reduceMotion: Bool
+    @State private var progress: CGFloat = 0
+
+    var body: some View {
+        Image(systemName: systemName)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(Color.white.opacity(0.92))
+            .contentTransition(.symbolEffect(.replace))
+            .scaleEffect(0.82 + progress * 0.18)
+            .opacity(0.20 + progress * 0.80)
+            .mask(alignment: .leading) {
+                GeometryReader { geo in
+                    Rectangle()
+                        .frame(width: geo.size.width * progress)
+                }
+            }
+            .onAppear { runReveal() }
+            .onChange(of: trigger) { runReveal() }
+    }
+
+    private func runReveal() {
+        progress = reduceMotion ? 1 : 0
+        let currentTrigger = trigger
+        DispatchQueue.main.async {
+            guard currentTrigger == trigger else { return }
+            withAnimation(.easeInOut(duration: reduceMotion ? 0.01 : duration)) {
+                progress = 1
+            }
+        }
+    }
+}
+
+struct InlineNotchContent: View {
+    @ObservedObject var viewModel: ChatViewModel
+    @ObservedObject var browserCoordinator: BrowserCoordinator
+    let showsInputLeadingIcon: Bool
+    let outputGrowthPhase: Bool
+    @FocusState private var inputFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var placeholderRevealID = UUID()
+    @State private var inlineFocusRetryID = UUID()
+
+    init(
+        viewModel: ChatViewModel,
+        showsInputLeadingIcon: Bool = true,
+        outputGrowthPhase: Bool = false,
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator()
+    ) {
+        self.viewModel = viewModel
+        self.showsInputLeadingIcon = showsInputLeadingIcon
+        self.outputGrowthPhase = outputGrowthPhase
+        self.browserCoordinator = browserCoordinator
+    }
+
+    private var canSend: Bool {
+        (!viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !viewModel.pendingAttachments.isEmpty)
+            && !viewModel.isThinking
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            // A pending approval preempts every other mode — it is the only place
+            // a gated write can be allowed, and it auto-denies after 60 s.
+            if let approval = viewModel.pendingApprovals.first {
+                ApprovalModalOverlay(approval: approval, viewModel: viewModel)
+            } else if viewModel.showWhatsappPairing {
+                WhatsAppPairingView(viewModel: viewModel)
+            } else {
+                switch viewModel.notchInteractionMode {
+                case .input:
+                    inputWithSuggestions
+                case .thinking:
+                    thinkingRow
+                case .output:
+                    outputView
+                case .settings:
+                    NotchSettingsContent(viewModel: viewModel, browserCoordinator: browserCoordinator)
+                case .automations:
+                    AutomationsNotchContent(viewModel: viewModel)
+                case .collapsed:
+                    EmptyView()
+                }
+            }
+        }
+        .font(.system(size: 15, weight: .regular))
+        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+        .onAppear { focusIfNeeded() }
+        .onChange(of: viewModel.notchInteractionMode) {
+            placeholderRevealID = UUID()
+            focusIfNeeded()
+        }
+        .onChange(of: inputFocused) { _, focused in
+            guard !focused else { return }
+            keepInlineInputFocused(reason: "focus-lost")
+        }
+        .onChange(of: viewModel.inputText.isEmpty) { _, isEmpty in
+            if isEmpty { placeholderRevealID = UUID() }
+        }
+    }
+
+    private var inputRow: some View {
+        HStack(spacing: 10) {
+            if showsInputLeadingIcon {
+                Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "sparkles")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.82))
+                    .frame(width: 18, height: 18)
+            }
+
+            ZStack(alignment: .leading) {
+                if viewModel.inputText.isEmpty {
+                    LeftToRightRevealText(
+                        text: "What's on your mind?",
+                        trigger: placeholderRevealID,
+                        delay: NotchWrapMetrics.surfaceDuration * 0.82,
+                        reduceMotion: reduceMotion
+                    )
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        .allowsHitTesting(false)
+                        .id(placeholderRevealID)
+                }
+
+                TextField("", text: $viewModel.inputText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14, weight: .regular))
+                    .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                    .focused($inputFocused)
+                    .onSubmit {
+                        if canSend { viewModel.send() }
+                    }
+                    .opacity(viewModel.inputText.isEmpty ? 0.02 : 1)
+                    .animation(.easeOut(duration: 0.18), value: viewModel.inputText.isEmpty)
+            }
+            .frame(height: 24)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var inputWithSuggestions: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            inputRow
+            if !viewModel.slashSuggestions.isEmpty {
+                slashSuggestionRows
+                    .transition(.opacity)
+            }
+        }
+        .animation(
+            reduceMotion ? nil : .easeOut(duration: 0.18),
+            value: viewModel.slashSuggestions
+        )
+    }
+
+    private var slashSuggestionRows: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(viewModel.slashSuggestions.enumerated()), id: \.element.id) { index, cmd in
+                let selected = index == viewModel.slashSelectionIndex
+                HStack(spacing: 8) {
+                    if let symbol = cmd.symbol {
+                        Image(systemName: symbol)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                            .frame(width: 14)
+                    }
+                    Text(cmd.command)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                    Text(cmd.subtitle)
+                        .font(.system(size: 11))
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 8)
+                .frame(height: NotchWrapMetrics.slashSuggestionRowHeight - 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(selected ? 0.12 : 0.06))
+                )
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    _ = viewModel.acceptSlashSuggestion(cmd)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Command \(cmd.command), \(cmd.subtitle)")
+                .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+            }
+        }
+    }
+
+    private var thinkingRow: some View {
+        HStack(spacing: 10) {
+            ThinkingIndicator()
+                .scaleEffect(0.74)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(viewModel.latestEvidenceStatus ?? viewModel.toolStatus ?? "Thinking")
+                    .font(.system(size: 14, weight: .regular))
+                    .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                    .lineLimit(1)
+                    .animation(.easeOut(duration: 0.18), value: viewModel.toolStatus)
+                if !viewModel.latestUserText.isEmpty {
+                    Text(viewModel.latestUserText)
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var outputView: some View {
+        let text = NotchOutputLayout.responseText(
+            latestText: viewModel.latestAssistantText,
+            isStreaming: viewModel.isLatestAssistantStreaming,
+            isThinking: viewModel.isThinking
+        )
+        return VStack(alignment: .leading, spacing: 6) {
+            // History-browse header (↑/↓ on empty input): position + the prompt
+            // that produced the browsed answer.
+            if let pos = viewModel.historyBrowsePosition {
+                HStack(spacing: 6) {
+                    Text("‹ \(pos.0)/\(pos.1) ›")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                    if let prompt = viewModel.historyBrowsePrompt {
+                        Text(prompt)
+                            .font(.system(size: 11))
+                            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .transition(.opacity)
+            }
+            if let message = viewModel.latestAssistantMessage,
+               !message.activities.isEmpty || message.evidencePhase != nil || message.evidenceOutcome != nil {
+                activityTranscript(message, streaming: viewModel.isLatestAssistantStreaming)
+            }
+            LatestAssistantOutputScrollView(
+                text: text,
+                messageId: viewModel.latestAssistantMessageId,
+                isStreaming: viewModel.isLatestAssistantStreaming,
+                growthPhase: outputGrowthPhase,
+                reduceMotion: reduceMotion,
+                sources: viewModel.latestAssistantMessage?.sources ?? []
+            )
+            .frame(maxWidth: .infinity)
+            .frame(maxHeight: .infinity)
+            .accessibilityLabel("Latest assistant response")
+            .accessibilityValue(text)
+            if let sources = viewModel.latestAssistantMessage?.sources, !sources.isEmpty {
+                sourceLinks(sources)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func activityTranscript(_ message: ChatMessage, streaming: Bool) -> some View {
+        if message.evidencePhase != nil || message.evidenceOutcome != nil {
+            evidenceActivityTranscript(message, streaming: streaming)
+        } else {
+            legacyActivityTranscript(message.activities, streaming: streaming)
+        }
+    }
+
+    @ViewBuilder
+    private func legacyActivityTranscript(_ activities: [TurnActivity], streaming: Bool) -> some View {
+        let current = activities.last(where: { $0.status == "running" }) ?? activities.last!
+        let failureCount = activities.filter { $0.status == "failed" }.count
+        let completedSummary = failureCount == 0
+            ? "Legacy activity complete · \(activities.count) actions"
+            : "Legacy activity · \(activities.count) actions · \(failureCount) failed"
+        Button {
+            viewModel.isActivityTranscriptExpanded.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: viewModel.isActivityTranscriptExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(streaming && current.status == "running" ? current.title : completedSummary)
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+                if streaming && current.status == "running" { ProgressView().controlSize(.mini) }
+            }
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(viewModel.isActivityTranscriptExpanded ? "Collapse assistant activity" : "Expand assistant activity")
+
+        if viewModel.isActivityTranscriptExpanded {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(activities.suffix(NotchActivityLayout.maxVisibleRows))) { activity in
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        Image(systemName: activity.status == "failed"
+                            ? "exclamationmark.circle"
+                            : (activity.status == "running" ? "circle.dotted" : "checkmark.circle"))
+                            .foregroundStyle(activity.status == "failed" ? Color.orange : NotchWrapMetrics.notchTextSecondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(activity.title)
+                            if let detail = activity.detail, !detail.isEmpty {
+                                Text(detail).foregroundStyle(NotchWrapMetrics.notchTextSecondary).lineLimit(1)
+                            }
+                        }
+                        Spacer(minLength: 2)
+                        if let ms = activity.durationMs {
+                            Text(String(format: "%.1fs", Double(ms) / 1000))
+                                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        }
+                    }
+                }
+            }
+            .font(.system(size: 9.5))
+            .padding(.leading, 2)
+            .frame(maxHeight: 84)
+            .clipped()
+        }
+    }
+
+    @ViewBuilder
+    private func evidenceActivityTranscript(_ message: ChatMessage, streaming: Bool) -> some View {
+        let summary = message.evidenceOutcome.map(EvidencePresentation.outcomeLabel)
+            ?? message.evidencePhase.map(EvidencePresentation.phaseLabel)
+            ?? "Working with evidence"
+        Button {
+            viewModel.isActivityTranscriptExpanded.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: viewModel.isActivityTranscriptExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                Text(summary).lineLimit(1)
+                Spacer(minLength: 2)
+                if streaming && message.evidenceOutcome == nil {
+                    ProgressView().controlSize(.mini)
+                }
+            }
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            message.evidenceOutcome.map {
+                EvidencePresentation.accessibilityLabel(
+                    outcome: $0,
+                    expanded: viewModel.isActivityTranscriptExpanded
+                )
+            } ?? "\(viewModel.isActivityTranscriptExpanded ? "Collapse" : "Expand") evidence activity. \(summary)"
+        )
+
+        if viewModel.isActivityTranscriptExpanded {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(message.evidenceActivities.suffix(NotchActivityLayout.maxVisibleRows))) { activity in
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        Image(systemName: evidenceActivitySymbol(activity))
+                            .foregroundStyle(
+                                activity.executionStatus == .failed
+                                    || activity.executionStatus == .denied
+                                    || activity.executionStatus == .timedOut
+                                    ? Color.orange
+                                    : NotchWrapMetrics.notchTextSecondary
+                            )
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(activity.operation)
+                            Text(EvidencePresentation.activityDetail(activity))
+                                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                                .lineLimit(2)
+                        }
+                        Spacer(minLength: 2)
+                        if activity.durationMs > 0 {
+                            Text(String(format: "%.1fs", Double(activity.durationMs) / 1000))
+                                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(
+                        "\(activity.operation), \(activity.executionStatus.rawValue), \(EvidencePresentation.activityDetail(activity))"
+                    )
+                }
+            }
+            .font(.system(size: 9.5))
+            .padding(.leading, 2)
+            .frame(maxHeight: 84)
+            .clipped()
+        }
+    }
+
+    private func evidenceActivitySymbol(_ activity: EvidenceLogicalActivity) -> String {
+        switch activity.executionStatus {
+        case .inProgress: return "circle.dotted"
+        case .failed, .denied, .timedOut: return "exclamationmark.circle"
+        case .succeeded:
+            return activity.contribution == .satisfied || activity.contribution == .partial
+                ? "checkmark.circle"
+                : "minus.circle"
+        }
+    }
+
+    private func sourceLinks(_ sources: [DaemonClient.TranscriptSource]) -> some View {
+        HStack(spacing: 5) {
+            Text("Sources")
+                .font(.system(size: 9.5, weight: .medium))
+                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            ForEach(Array(sources.prefix(6).enumerated()), id: \.element.id) { index, source in
+                Button("[\(index + 1)]") {
+                    NSWorkspace.shared.open(source.url)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .help("\(source.title) — \(source.domain)")
+                .accessibilityLabel("Open source \(index + 1), \(source.title)")
+            }
+        }
+    }
+
+    private func focusIfNeeded() {
+        guard viewModel.notchInteractionMode == .input else {
+            inlineFocusRetryID = UUID()
+            inputFocused = false
+            return
+        }
+        keepInlineInputFocused(reason: "input-mode")
+    }
+
+    private func keepInlineInputFocused(reason: String) {
+        _ = reason
+        let retryID = UUID()
+        inlineFocusRetryID = retryID
+        for attempt in 0..<5 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 + Double(attempt) * 0.06) {
+                guard inlineFocusRetryID == retryID,
+                      viewModel.notchInteractionMode == .input
+                else { return }
+                NSApp.activate(ignoringOtherApps: true)
+                inputFocused = true
+            }
+        }
+    }
+}
+
+private struct LatestAssistantOutputScrollView: NSViewRepresentable {
+    let text: String
+    let messageId: UUID?
+    let isStreaming: Bool
+    let growthPhase: Bool
+    let reduceMotion: Bool
+    let sources: [DaemonClient.TranscriptSource]
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = UserTrackingScrollView()
+        scrollView.onUserScroll = { [weak coordinator = context.coordinator] in
+            coordinator?.handleUserScroll()
+        }
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.verticalScrollElasticity = .allowed
+        scrollView.horizontalScrollElasticity = .none
+        scrollView.contentView.postsBoundsChangedNotifications = true
+
+        let textView = NSTextView()
+        textView.drawsBackground = false
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.heightTracksTextView = false
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.backgroundColor = .clear
+        textView.insertionPointColor = .white
+        textView.delegate = context.coordinator
+
+        scrollView.documentView = textView
+        context.coordinator.scrollView = scrollView
+        context.coordinator.textView = textView
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.boundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard context.coordinator.textView != nil else { return }
+        let coordinator = context.coordinator
+        let messageChanged = coordinator.messageId != messageId
+
+        if messageChanged {
+            coordinator.messageId = messageId
+            coordinator.userScrolledAway = false
+            coordinator.lastText = nil
+        }
+
+        coordinator.growthPhase = growthPhase
+        let sourceIDs = sources.map(\.id)
+        if coordinator.sourceIDs != sourceIDs {
+            coordinator.sourceIDs = sourceIDs
+            coordinator.sources = sources
+            coordinator.lastText = nil
+        }
+        if coordinator.lastText != text {
+            coordinator.lastText = text
+            coordinator.applyText(text)
+        }
+
+        coordinator.resizeTextView()
+        coordinator.applyAutoScroll()
+    }
+
+    static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        NotificationCenter.default.removeObserver(
+            coordinator,
+            name: NSView.boundsDidChangeNotification,
+            object: nsView.contentView
+        )
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        weak var scrollView: NSScrollView?
+        weak var textView: NSTextView?
+        var messageId: UUID?
+        var lastText: String?
+        var userScrolledAway = false
+        var growthPhase = false
+        var sources: [DaemonClient.TranscriptSource] = []
+        var sourceIDs: [String] = []
+        private var lastClipSize: NSSize = .zero
+
+        /// Render the complete canonical value, then append only when the
+        /// complete attributed prefix is unchanged. The former source-line
+        /// bookkeeping inferred a TextKit range from independently normalized
+        /// markdown fragments. A formatter normalization at finalization could
+        /// therefore leave `finalizedRendered` beyond the live storage and
+        /// crash `NSMutableRLEArray` from `replaceCharacters`.
+        func applyText(_ text: String) {
+            guard let storage = textView?.textStorage else { return }
+            let rendered = NSMutableAttributedString(
+                attributedString: NotchMarkdown.attributedString(text)
+            )
+            decorateCitations(rendered)
+            NotchTextStorageUpdater.apply(rendered, to: storage)
+        }
+
+        private func decorateCitations(_ output: NSMutableAttributedString) {
+            guard !sources.isEmpty else { return }
+            let nsText = output.string as NSString
+            let regex = try? NSRegularExpression(pattern: #"\[(\d+)\]"#)
+            regex?.enumerateMatches(
+                in: output.string,
+                range: NSRange(location: 0, length: nsText.length)
+            ) { match, _, _ in
+                guard let match, match.numberOfRanges == 2 else { return }
+                let number = Int(nsText.substring(with: match.range(at: 1))) ?? 0
+                guard sources.indices.contains(number - 1) else { return }
+                output.addAttributes(
+                    [
+                        .link: sources[number - 1].url,
+                        .foregroundColor: NSColor.controlAccentColor,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    ],
+                    range: match.range
+                )
+            }
+        }
+
+        /// Called only for scroll-wheel/trackpad events (including momentum),
+        /// never for programmatic pins — so it is the single source of truth
+        /// for user scroll intent. Scrolling back to the bottom re-engages
+        /// the streaming auto-scroll.
+        func handleUserScroll() {
+            userScrolledAway = !isNearBottom()
+        }
+
+        @objc func boundsDidChange(_ note: Notification) {
+            guard let scrollView else { return }
+            let size = scrollView.contentView.bounds.size
+            let clipHeightChanged = abs(size.height - lastClipSize.height) > 0.5
+            let clipWidthChanged = abs(size.width - lastClipSize.width) > 0.5
+            lastClipSize = size
+            guard clipHeightChanged || clipWidthChanged else { return }
+            resizeTextView()
+            applyAutoScroll()
+        }
+
+        /// Two-phase streaming scroll policy:
+        /// - Growth phase (viewport below its max height): the text stays
+        ///   top-anchored and perfectly still while the notch panel grows
+        ///   downward to reveal new lines. Bottom-pinning here would drag the
+        ///   text down with the animating panel edge while token pins push it
+        ///   up — the vertical jumping this replaces.
+        /// - Scroll phase (panel target at max height): pin to the bottom so
+        ///   new lines scroll into view. Never overrides a user's manual
+        ///   scroll. The phase signal is `growthPhase` (from the panel's
+        ///   *target* height, set by SwiftUI) — not momentary overflow against
+        ///   the animating clip: mid-animation the clip lags the text by a
+        ///   line, so overflow flip-flops per line (bottom-pin jump up, then
+        ///   slide back to top anchor — the jitter this replaces). Overflow is
+        ///   still checked once pinning, because siblings above the scroll
+        ///   view (tool-status chip, browse header) shrink the clip below the
+        ///   theoretical max.
+        func applyAutoScroll() {
+            guard !userScrolledAway else { return }
+            if !growthPhase && contentOverflows() {
+                pinToBottom()
+            } else {
+                scrollTo(y: 0)
+            }
+        }
+
+        func contentOverflows() -> Bool {
+            guard let scrollView, let documentView = scrollView.documentView else { return false }
+            return documentView.bounds.height > scrollView.contentView.bounds.height + 1
+        }
+
+        func resizeTextView() {
+            guard let scrollView, let textView, let textContainer = textView.textContainer else { return }
+            let width = max(1, scrollView.contentSize.width)
+            textContainer.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+            textView.frame.size.width = width
+            textView.layoutManager?.ensureLayout(for: textContainer)
+            let usedRect = textView.layoutManager?.usedRect(for: textContainer) ?? .zero
+            let height = max(scrollView.contentSize.height, ceil(usedRect.height) + NotchOutputLayout.bottomSlack)
+            textView.setFrameSize(NSSize(width: width, height: height))
+        }
+
+        func isNearBottom(threshold: CGFloat = 12) -> Bool {
+            guard let scrollView, let documentView = scrollView.documentView else { return true }
+            let maxY = max(0, documentView.bounds.height - scrollView.contentView.bounds.height)
+            let distance = maxY - scrollView.contentView.bounds.origin.y
+            return distance <= threshold
+        }
+
+        func pinToBottom() {
+            guard let scrollView, let documentView = scrollView.documentView else { return }
+            scrollTo(y: max(0, documentView.bounds.height - scrollView.contentView.bounds.height))
+        }
+
+        func scrollTo(y targetY: CGFloat) {
+            guard let scrollView else { return }
+            let clipView = scrollView.contentView
+            guard abs(clipView.bounds.origin.y - targetY) > 0.5 else { return }
+            clipView.setBoundsOrigin(NSPoint(x: 0, y: targetY))
+            scrollView.reflectScrolledClipView(clipView)
+        }
+
+        func textView(
+            _ textView: NSTextView,
+            clickedOnLink link: Any,
+            at charIndex: Int
+        ) -> Bool {
+            let url: URL?
+            if let value = link as? URL {
+                url = value
+            } else if let value = link as? String {
+                url = URL(string: value)
+            } else {
+                url = nil
+            }
+            guard let url,
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? "")
+            else { return true }
+            NSWorkspace.shared.open(url)
+            return true
+        }
+    }
+}
+
+/// NSScrollView that reports user-initiated scrolling. Programmatic
+/// `setBoundsOrigin` pins do not go through `scrollWheel`, so this cleanly
+/// separates user intent from streaming auto-scroll.
+private final class UserTrackingScrollView: NSScrollView {
+    var onUserScroll: (() -> Void)?
+
+    override func scrollWheel(with event: NSEvent) {
+        super.scrollWheel(with: event)
+        onUserScroll?()
+    }
+}
+
+private struct LeftToRightRevealText: View {
+    let text: String
+    let trigger: UUID
+    let delay: Double
+    let reduceMotion: Bool
+    @State private var reveal: CGFloat = 0
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 14, weight: .regular))
+            .lineLimit(1)
+            .mask(alignment: .leading) {
+                GeometryReader { geo in
+                    Rectangle()
+                        .frame(width: geo.size.width * reveal)
+                }
+            }
+            .onAppear {
+                runReveal()
+            }
+            .onChange(of: trigger) {
+                runReveal()
+            }
+    }
+
+    private func runReveal() {
+        reveal = reduceMotion ? 1 : 0
+        let currentTrigger = trigger
+        DispatchQueue.main.asyncAfter(deadline: .now() + (reduceMotion ? 0 : delay)) {
+            guard currentTrigger == trigger else { return }
+            withAnimation(.easeOut(duration: reduceMotion ? 0.01 : 0.46)) {
+                reveal = 1
+            }
+        }
     }
 }
 
@@ -380,27 +2129,169 @@ struct StatusDotView: View {
     }
 }
 
-// MARK: - Menu-bar inline pill (external / non-notch display)
+/// Right-wing dot for pending cmux events — same pulse/blink rhythm as the
+/// thinking dot; amber = agent needs attention, green = agent finished.
+struct CmuxStatusDotView: View {
+    let kind: CmuxEventKind
+    let reduceMotion: Bool
 
-struct MenuBarPillView: View {
-    @ObservedObject var viewModel: ChatViewModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var pulsing = false
+    @State private var blink = false
 
-    private var isVoice: Bool { viewModel.isVoiceNotchActive }
+    private let blinkDuration: Double = 0.6
+    private var ringDuration: Double { blinkDuration * 2 }
+    private var color: Color {
+        kind == .attention ? AgentStatus.awaitingApproval.color : AgentStatus.ready.color
+    }
 
     var body: some View {
-        Color.clear
-            .overlay {
-                HStack(spacing: 5) {
-                    // Non-notch pill always stays "bagent" + sparkles.
-                    // (Voice feedback is shown in the dropdown VoiceOverlayView panel below.)
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 11, weight: .semibold))
+        ZStack {
+            if !reduceMotion {
+                Circle()
+                    .fill(color.opacity(0.45))
+                    .frame(width: 16, height: 16)
+                    .scaleEffect(pulsing ? 1.9 : 1.0)
+                    .opacity(pulsing ? 0.0 : 0.65)
+                    .animation(
+                        pulsing
+                            ? .easeOut(duration: ringDuration).repeatForever(autoreverses: false)
+                            : .default,
+                        value: pulsing
+                    )
+            }
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+                .opacity(reduceMotion ? 1.0 : (blink ? 0.28 : 1.0))
+                .animation(
+                    reduceMotion
+                        ? .default
+                        : .easeInOut(duration: blinkDuration).repeatForever(autoreverses: true),
+                    value: blink
+                )
+        }
+        .onAppear {
+            pulsing = true
+            blink = true
+        }
+    }
+}
 
-                    Text("bagent")
-                        .font(.system(size: 12, weight: .medium))
+/// cmux app icon shown in the left wing of the notch. For attention events it
+/// swings from its top edge like a rung bell — a periodic nudge that manual
+/// action is waiting in cmux. Finished events keep the icon still.
+struct CmuxIconView: View {
+    let kind: CmuxEventKind
+    let reduceMotion: Bool
+    var size: CGFloat = 17
+
+    var body: some View {
+        let icon = Image(nsImage: CmuxEventMonitor.appIcon)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(width: size, height: size)
+        if kind == .attention && !reduceMotion {
+            icon.phaseAnimator(NotchIconSwing.phases) { view, angle in
+                view.rotationEffect(.degrees(angle), anchor: .top)
+            } animation: { angle in
+                NotchIconSwing.animation(for: angle)
+            }
+        } else {
+            icon
+        }
+    }
+}
+
+/// An acknowledged notch icon flying off. Four concurrent keyframe tracks
+/// (travel, scale, opacity, tilt) — an anticipation pop then a quick
+/// shrink-and-fade as it settles into the notch (built-in) or shoots off the
+/// top edge (external). Reports back when the flight is over so the token can
+/// be dropped. Only spawned when Reduce Motion is off. Shared by the cmux icon
+/// and the connector icons.
+struct IconFlyoffFrame {
+    var x: CGFloat
+    var y: CGFloat
+    var scale: CGFloat
+    var opacity: CGFloat
+    var rotation: CGFloat
+}
+
+struct IconFlyoffView<Icon: View>: View {
+    let start: CGPoint
+    let target: CGPoint
+    let hasNotch: Bool
+    var size: CGFloat = 17
+    let onFinished: () -> Void
+    @ViewBuilder let icon: () -> Icon
+
+    var body: some View {
+        // Type-erased so the keyframe animator below isn't generic (avoids a
+        // non-Sendable metatype capture warning in its closures).
+        IconFlyoffCore(
+            start: start, target: target, hasNotch: hasNotch,
+            size: size, onFinished: onFinished, icon: AnyView(icon())
+        )
+    }
+}
+
+private struct IconFlyoffCore: View {
+    let start: CGPoint
+    let target: CGPoint
+    let hasNotch: Bool
+    let size: CGFloat
+    let onFinished: () -> Void
+    let icon: AnyView
+
+    @State private var play = false
+
+    /// Built-in settles a touch slower than the external "lose it over the top".
+    private var duration: Double { hasNotch ? 0.5 : 0.42 }
+
+    var body: some View {
+        let endScale: CGFloat = hasNotch ? 0.26 : 0.55
+        icon
+            .frame(width: size, height: size)
+            .keyframeAnimator(
+                initialValue: IconFlyoffFrame(x: start.x, y: start.y, scale: 1, opacity: 1, rotation: 0),
+                trigger: play
+            ) { view, f in
+                view
+                    .rotationEffect(.degrees(f.rotation))
+                    .scaleEffect(f.scale)
+                    .opacity(f.opacity)
+                    .position(x: f.x, y: f.y)
+            } keyframes: { _ in
+                KeyframeTrack(\.x) {
+                    CubicKeyframe(target.x, duration: duration)
                 }
-                .foregroundStyle(.primary)
+                KeyframeTrack(\.y) {
+                    // brief anticipation dip, then travel to the target
+                    SpringKeyframe(start.y + 5, duration: duration * 0.24, spring: .snappy)
+                    CubicKeyframe(target.y, duration: duration * 0.76)
+                }
+                KeyframeTrack(\.scale) {
+                    CubicKeyframe(1.10, duration: duration * 0.24)
+                    CubicKeyframe(endScale, duration: duration * 0.76)
+                }
+                KeyframeTrack(\.opacity) {
+                    // Built-in: hold opaque so it visibly reaches the notch, then fade.
+                    // External: fade earlier so it dissolves before the panel's top edge
+                    // clips it (target is above the window bounds).
+                    LinearKeyframe(1.0, duration: duration * (hasNotch ? 0.55 : 0.28))
+                    CubicKeyframe(0.0, duration: duration * (hasNotch ? 0.45 : 0.72))
+                }
+                KeyframeTrack(\.rotation) {
+                    CubicKeyframe(-6, duration: duration * 0.3)
+                    CubicKeyframe(0, duration: duration * 0.7)
+                }
+            }
+            .onAppear {
+                play.toggle()
+                // Hoisted so the async closure doesn't capture the generic self.
+                let finish = onFinished
+                DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.05) {
+                    finish()
+                }
             }
     }
 }
@@ -408,826 +2299,9 @@ struct MenuBarPillView: View {
 /// "Listening" label with three animated dots that fade in sequentially and
 /// drift left↔right as a group. Falls back to a static "Listening…" in
 /// Reduce Motion mode.
-struct ListeningDotsView: View {
-    let reduceMotion: Bool
-    @State private var dotOffset: CGFloat = 0
-
-    var body: some View {
-        if reduceMotion {
-            Text("Listening…")
-        } else {
-            HStack(spacing: 1) {
-                Text("Listening")
-                TimelineView(.animation) { timeline in
-                    HStack(spacing: 2) {
-                        ForEach(0..<3, id: \.self) { i in
-                            let t = timeline.date.timeIntervalSinceReferenceDate
-                            let phase = t * 2.2 + Double(i) * 0.55
-                            let opacity = (sin(phase) + 1) / 2   // 0…1
-                            Text("•")
-                                .opacity(0.30 + opacity * 0.70)
-                        }
-                    }
-                    .offset(x: {
-                        let t = timeline.date.timeIntervalSinceReferenceDate
-                        return CGFloat(sin(t * 1.1)) * 2.5
-                    }())
-                }
-            }
-        }
-    }
+extension Notification.Name {
+    static let bagentCodeCopied = Notification.Name("bagentCodeCopied")
 }
-
-// MARK: - Chat panel content (shown below the pill when expanded)
-
-struct ChatPanelContent: View {
-    @ObservedObject var viewModel: ChatViewModel
-    let onCollapse: () -> Void
-
-    var body: some View {
-        ZStack {
-            if viewModel.chatSurfaceMode == .inputOnly {
-                SpotlightInputPanel(viewModel: viewModel, onCollapse: onCollapse)
-                    .transition(
-                        .scale(scale: 0.82, anchor: UnitPoint(x: 0.5, y: 0))
-                        .combined(with: .opacity)
-                    )
-            } else if viewModel.isExpanded {
-                ExpandedChatView(viewModel: viewModel, onCollapse: onCollapse)
-                    .transition(
-                        .scale(scale: 0.82, anchor: UnitPoint(x: 0.5, y: 0))
-                        .combined(with: .opacity)
-                    )
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .animation(.spring(response: 0.30, dampingFraction: 0.62), value: viewModel.isExpanded)
-        .animation(.spring(response: 0.30, dampingFraction: 0.68), value: viewModel.chatSurfaceMode)
-    }
-}
-
-// MARK: - Spotlight-style input panel
-
-private struct LiquidGlassFallbackSurface: ViewModifier {
-    let cornerRadius: CGFloat
-
-    func body(content: Content) -> some View {
-        content
-            .background(.ultraThinMaterial)
-            .overlay(alignment: .topLeading) {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                .white.opacity(0.18),
-                                .white.opacity(0.04),
-                                .clear,
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .blendMode(.screen)
-                    .allowsHitTesting(false)
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .stroke(.white.opacity(0.16), lineWidth: 1)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .shadow(color: .black.opacity(0.34), radius: 22, x: 0, y: 18)
-    }
-}
-
-private extension View {
-    func liquidGlassFallback(cornerRadius: CGFloat) -> some View {
-        modifier(LiquidGlassFallbackSurface(cornerRadius: cornerRadius))
-    }
-
-    /// Capsule glass surface. On macOS 26+ uses real Liquid Glass; falls back to
-    /// the hand-rolled material surface on earlier systems.
-    @ViewBuilder
-    func liquidGlassInputSurface() -> some View {
-        if #available(macOS 26, *) {
-            self.glassEffect(.regular, in: .capsule)
-        } else {
-            self.liquidGlassFallback(cornerRadius: 18)
-        }
-    }
-
-    /// Circle glass surface for source-mode bubbles. Matches the capsule's `.regular`
-    /// glass on macOS 26+; falls back to the hand-rolled material on earlier systems.
-    @ViewBuilder
-    func liquidGlassBubbleSurface(selected: Bool) -> some View {
-        if #available(macOS 26, *) {
-            self.glassEffect(
-                selected ? .regular.tint(Color.accentColor) : .regular,
-                in: .circle
-            )
-        } else {
-            self
-                .background(selected ? Color.accentColor.opacity(0.86) : Color.white.opacity(0.05))
-                .liquidGlassFallback(cornerRadius: 22)
-        }
-    }
-}
-
-struct SpotlightInputPanel: View {
-    @ObservedObject var viewModel: ChatViewModel
-    let onCollapse: () -> Void
-
-    @FocusState private var inputFocused: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var fieldWidth: CGFloat = 220
-    @State private var verticalOffset: CGFloat = -34
-    @State private var fieldOpacity: CGFloat = 0
-    @State private var localPickerVisible = false
-    /// True once the open animation has fully settled — gates overflow detection
-    /// so short text typed immediately after opening never triggers a promotion.
-    @State private var openSettled = false
-    /// Set true immediately before triggering promotion so that the macOS TextField
-    /// focus-loss path (which fires onSubmit) doesn't accidentally call send().
-    @State private var isPromoting = false
-
-    private let fullFieldWidth: CGFloat = 540
-    private let compactFieldWidth: CGFloat = 356
-    private let inputHeight: CGFloat = 56
-    /// Text wider than this (measured with NSFont at size 22) overflows one line.
-    /// Computed from fullFieldWidth (540) minus horizontal padding (2×20), icon
-    /// (24), HStack spacing (10), and a safety margin — ≈420 pt.
-    private let textOverflowThreshold: CGFloat = 420
-
-    private var pickerVisible: Bool {
-        localPickerVisible || viewModel.isSourcePickerForced
-    }
-
-    private var currentFieldWidth: CGFloat {
-        pickerVisible ? compactFieldWidth : fieldWidth
-    }
-
-    var body: some View {
-        glassPillLayout
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .offset(y: verticalOffset)
-            .opacity(fieldOpacity)
-            .onHover { hovering in
-                localPickerVisible = hovering
-            }
-            .onAppear {
-                viewModel.hoveredSourceMode = nil
-                inputFocused = true
-                if reduceMotion {
-                    fieldOpacity = 1
-                    verticalOffset = 0
-                    fieldWidth = fullFieldWidth
-                } else {
-                    withAnimation(.spring(response: 0.34, dampingFraction: 0.66)) {
-                        fieldOpacity = 1
-                        verticalOffset = 0
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-                        withAnimation(.easeOut(duration: 0.22)) {
-                            fieldWidth = fullFieldWidth
-                        }
-                    }
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    inputFocused = true
-                }
-                // Gate overflow detection until the open animation fully settles
-                // (0.18 s delay + 0.22 s animation + small buffer = 0.45 s).
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-                    openSettled = true
-                }
-            }
-            .onDisappear {
-                viewModel.hoveredSourceMode = nil
-                viewModel.isSourcePickerForced = false
-                openSettled = false
-            }
-            .onChange(of: viewModel.inputText) { _, text in
-                guard openSettled, !isPromoting else { return }
-                // Paste can insert a newline directly.
-                if text.contains("\n") {
-                    promoteToChat(preserving: text)
-                    return
-                }
-                // Measure the proportional text width. Promote if it no longer fits
-                // one line in the input capsule (threshold ≈ fullFieldWidth minus
-                // padding, icon, and spacing). Always measure against the full-width
-                // threshold so showing the source picker never triggers promotion.
-                guard !text.isEmpty else { return }
-                let font = NSFont.systemFont(ofSize: 22, weight: .regular)
-                let measured = (text as NSString).size(withAttributes: [.font: font]).width
-                if measured > textOverflowThreshold {
-                    promoteToChat(preserving: text)
-                }
-            }
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel("bagent input")
-    }
-
-    /// The pill layout container.
-    ///
-    /// On macOS 26+ wraps the search bar and icon row inside a `GlassEffectContainer`
-    /// so both elements share a sampling region and the icon row can morph in/out
-    /// as a proper glass transition. The picker stays mounted so repeated Cmd
-    /// presses do not recreate each bubble mid-animation.
-    ///
-    /// On earlier systems keeps the original opacity/scale/frame trick unchanged.
-    @ViewBuilder
-    private var glassPillLayout: some View {
-        // Picker is conditionally rendered (not just hidden) so GlassEffectContainer
-        // never registers the glass circles when the picker is not visible — otherwise
-        // the dark glass shapes show through even at opacity(0).
-        let pickerTransition: AnyTransition = reduceMotion
-            ? .opacity
-            : .opacity.combined(with: .scale(scale: 0.88, anchor: .leading))
-
-        if #available(macOS 26, *) {
-            GlassEffectContainer(spacing: 12) {
-                HStack(spacing: 12) {
-                    inputField
-                        .frame(width: currentFieldWidth, height: inputHeight)
-                        .animation(
-                            reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.30, dampingFraction: 0.72),
-                            value: pickerVisible
-                        )
-                        .animation(.easeOut(duration: 0.20), value: fieldWidth)
-
-                    if pickerVisible {
-                        SourceModePicker(viewModel: viewModel, visible: true)
-                            .frame(width: 208, height: inputHeight)
-                            .transition(pickerTransition)
-                    }
-                }
-                .animation(
-                    reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.30, dampingFraction: 0.68),
-                    value: pickerVisible
-                )
-            }
-        } else {
-            HStack(spacing: 12) {
-                inputField
-                    .frame(width: currentFieldWidth, height: inputHeight)
-                    .animation(
-                        reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.30, dampingFraction: 0.72),
-                        value: pickerVisible
-                    )
-                    .animation(.easeOut(duration: 0.20), value: fieldWidth)
-
-                if pickerVisible {
-                    SourceModePicker(viewModel: viewModel, visible: true)
-                        .frame(width: 208, height: inputHeight)
-                        .transition(pickerTransition)
-                }
-            }
-            .animation(
-                reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.30, dampingFraction: 0.68),
-                value: pickerVisible
-            )
-        }
-    }
-
-    private var inputField: some View {
-        HStack(spacing: 10) {
-            Image(systemName: viewModel.selectedSourceMode?.symbolName ?? "magnifyingglass")
-                .font(.system(size: 20, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: 24, height: 24)
-
-            TextField(viewModel.activeSourcePlaceholder, text: $viewModel.inputText)
-                .textFieldStyle(.plain)
-                .font(.system(size: 22, weight: .regular))
-                .focused($inputFocused)
-                .onSubmit {
-                    if !isPromoting && !viewModel.isPromotingSpotlightDraft {
-                        viewModel.send()
-                    }
-                }
-
-            if viewModel.selectedSourceMode != nil {
-                Button { viewModel.clearSourceMode() } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.plain)
-                .help("Clear source")
-                .accessibilityLabel("Clear source")
-            }
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
-        .liquidGlassInputSurface()
-    }
-
-    private func promoteToChat(preserving text: String) {
-        guard !isPromoting else { return }
-        isPromoting = true
-        viewModel.promoteSpotlightDraft(text)
-    }
-}
-
-struct SourceModePicker: View {
-    @ObservedObject var viewModel: ChatViewModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    let visible: Bool
-
-    var body: some View {
-        HStack(spacing: 8) {
-            ForEach(Array(viewModel.topSourceModes.prefix(4).enumerated()), id: \.element.id) { idx, mode in
-                SourceModeBubble(
-                    mode: mode,
-                    index: idx,
-                    selected: viewModel.selectedSourceMode == mode,
-                    visible: visible,
-                    reduceMotion: reduceMotion,
-                    onSelect: { viewModel.selectSourceMode(mode) },
-                    onHover: { hovering in
-                        viewModel.hoveredSourceMode = hovering ? mode : nil
-                    }
-                )
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Source modes")
-    }
-}
-
-struct SourceModeBubble: View {
-    let mode: SourceMode
-    let index: Int
-    let selected: Bool
-    let visible: Bool
-    let reduceMotion: Bool
-    let onSelect: () -> Void
-    let onHover: (Bool) -> Void
-
-    var body: some View {
-        Button(action: onSelect) {
-            // Use a neutral Color.clear base so the glass circle is sized from a
-            // true 44×44 square rather than from the SF Symbol's font layout box
-            // (which includes baseline/side-bearing space and shifts the circle).
-            // The icon is then independently centered via .overlay.
-            Image(systemName: mode.symbolName)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(selected ? .white : .primary)
-                .frame(width: 44, height: 44)
-                .liquidGlassBubbleSurface(selected: selected)
-        }
-        .buttonStyle(.plain)
-        .help("\(mode.title) (⌃\(index + 1))")
-        .accessibilityLabel(mode.title)
-        .scaleEffect(reduceMotion || visible ? 1 : 0.82)
-        .opacity(visible ? 1 : 0)
-        .offset(x: reduceMotion || visible ? 0 : -4)
-        .animation(
-            reduceMotion
-                ? .easeOut(duration: 0.10)
-                : .spring(response: 0.22, dampingFraction: 0.82).delay(visible ? Double(index) * 0.024 : 0),
-            value: visible
-        )
-        .allowsHitTesting(visible)
-        .onHover(perform: onHover)
-    }
-}
-
-// MARK: - Expanded chat panel
-
-/// PreferenceKey that tracks the minY of the LazyVStack content in the ScrollView's
-/// coordinate space — used to detect whether the user has scrolled away from the bottom.
-private struct ScrollOffsetKey: PreferenceKey {
-    nonisolated(unsafe) static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-struct ExpandedChatView: View {
-    @ObservedObject var viewModel: ChatViewModel
-    let onCollapse: () -> Void
-    @FocusState private var inputFocused: Bool
-    @State private var dragBaseW: CGFloat? = nil
-    @State private var dragBaseH: CGFloat? = nil
-    @State private var isResizing = false
-    @State private var isDropTargeted = false
-    /// True when the user scrolled away from the bottom during streaming.
-    /// Gates the auto-scroll-to-bottom behavior.
-    @State private var userScrolledUp = false
-    /// Height of the ScrollView viewport — measured via GeometryReader.
-    @State private var scrollViewHeight: CGFloat = 0
-    /// Current content minY offset in the ScrollView coordinate space.
-    @State private var contentOffsetY: CGFloat = 0
-
-    var body: some View {
-        ZStack {
-            VStack(spacing: 0) {
-                header
-                Divider()
-                if viewModel.showWhatsappPairing {
-                    WhatsAppPairingView(viewModel: viewModel)
-                        .transition(
-                            .asymmetric(
-                                insertion: .move(edge: .trailing).combined(with: .opacity),
-                                removal: .move(edge: .leading).combined(with: .opacity)
-                            )
-                        )
-                } else if viewModel.showSettings {
-                    SettingsView(viewModel: viewModel)
-                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
-                } else if viewModel.showMemory {
-                    MemoryPanelView(viewModel: viewModel)
-                } else if viewModel.showSkills {
-                    SkillsPanelView(viewModel: viewModel)
-                } else if viewModel.showDebug {
-                    DebugPanelView(viewModel: viewModel)
-                } else {
-                    messageList
-                    Divider()
-                    inputBar
-                }
-            }
-            // Swap .regularMaterial for a solid background while resizing to
-            // prevent the vibrancy layer re-layout from shaking text content.
-            .background(isResizing
-                ? AnyShapeStyle(Color(nsColor: .windowBackgroundColor).opacity(0.96))
-                : AnyShapeStyle(.regularMaterial)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-            .overlay {
-                if let approval = viewModel.pendingApprovals.first {
-                    ApprovalModalOverlay(approval: approval, viewModel: viewModel)
-                }
-            }
-            .overlay {
-                // Drag-drop highlight border
-                if isDropTargeted {
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(Color.accentColor, lineWidth: 2)
-                }
-            }
-
-            resizeHandles
-        }
-        // Accept file drops onto the conversation area
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-            handleFileDrop(providers)
-        }
-        .alert("Nainštalovať model pre obrázky?", isPresented: $viewModel.showVisionModelAlert) {
-            Button("Zavrieť") {}
-        } message: {
-            Text("Na analýzu obrázkov je potrebný model qwen2.5vl:7b.\nSpusti v termináli: ollama pull qwen2.5vl:7b")
-        }
-        .onAppear {
-            if let promoted = viewModel.pendingPromotedText {
-                // Clear the signal immediately so it isn't re-applied if the view re-appears.
-                viewModel.pendingPromotedText = nil
-                // Force a genuine binding delta: "" → promoted.
-                // SwiftUI's TextField doesn't propagate programmatic binding changes to the
-                // NSTextField field editor once it's focused; clearing first ensures the
-                // value is visibly different when we restore and set focus next tick.
-                viewModel.inputText = ""
-                DispatchQueue.main.async {
-                    viewModel.inputText = promoted
-                    inputFocused = true
-                }
-            } else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { inputFocused = true }
-            }
-            viewModel.startApprovalPolling()
-            // Restore scroll viewport is handled inside messageList via ScrollViewProxy.
-        }
-        .onDisappear {
-            viewModel.stopApprovalPolling()
-            // Save whether we were at the bottom or had scrolled up.
-            viewModel.savedScrollWasAtBottom = !userScrolledUp
-            if userScrolledUp {
-                // Save the topmost-visible message id as the anchor.
-                // We approximate this as the first message whose index corresponds to
-                // the current scroll offset — use the last message as a safe fallback.
-                viewModel.savedScrollAnchorId = viewModel.messages.last?.id
-            } else {
-                viewModel.savedScrollAnchorId = nil
-            }
-        }
-        // Escape handled by NSEvent local monitor in NotchWindowController
-    }
-
-    private func handleFileDrop(_ providers: [NSItemProvider]) -> Bool {
-        var handled = false
-        for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier("public.file-url") {
-                provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { item, _ in
-                    guard let data = item as? Data,
-                          let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                    DispatchQueue.main.async { self.viewModel.addAttachments(urls: [url]) }
-                }
-                handled = true
-            }
-        }
-        return handled
-    }
-
-    // MARK: - Resize handles
-
-    private var resizeHandles: some View {
-        ZStack {
-            // Right edge
-            HStack(spacing: 0) {
-                Spacer()
-                Color.clear.frame(width: 6)
-                    .contentShape(Rectangle())
-                    .onHover { h in h ? NSCursor.resizeLeftRight.push() : NSCursor.pop() }
-                    .gesture(rightEdgeDrag)
-            }
-            // Left edge
-            HStack(spacing: 0) {
-                Color.clear.frame(width: 6)
-                    .contentShape(Rectangle())
-                    .onHover { h in h ? NSCursor.resizeLeftRight.push() : NSCursor.pop() }
-                    .gesture(leftEdgeDrag)
-                Spacer()
-            }
-            // Bottom edge
-            VStack(spacing: 0) {
-                Spacer()
-                Color.clear.frame(height: 6)
-                    .contentShape(Rectangle())
-                    .onHover { h in h ? NSCursor.resizeUpDown.push() : NSCursor.pop() }
-                    .gesture(bottomEdgeDrag)
-            }
-        }
-    }
-
-    private var rightEdgeDrag: some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { v in
-                if dragBaseW == nil { dragBaseW = viewModel.chatWindowW; isResizing = true }
-                viewModel.chatWindowW = max(360, min(dragBaseW! + 2 * v.translation.width, 900))
-            }
-            .onEnded { _ in dragBaseW = nil; isResizing = false }
-    }
-
-    private var leftEdgeDrag: some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { v in
-                if dragBaseW == nil { dragBaseW = viewModel.chatWindowW; isResizing = true }
-                viewModel.chatWindowW = max(360, min(dragBaseW! - 2 * v.translation.width, 900))
-            }
-            .onEnded { _ in dragBaseW = nil; isResizing = false }
-    }
-
-    private var bottomEdgeDrag: some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { v in
-                if dragBaseH == nil { dragBaseH = viewModel.chatWindowH; isResizing = true }
-                viewModel.chatWindowH = max(320, min(dragBaseH! + v.translation.height, 900))
-            }
-            .onEnded { _ in dragBaseH = nil; isResizing = false }
-    }
-
-    // MARK: Header
-
-    private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-            Text("bagent")
-                .font(.system(size: 13, weight: .semibold))
-            if viewModel.lastMemorySavedId != nil {
-                HStack(spacing: 3) {
-                    Image(systemName: "brain")
-                        .font(.system(size: 9))
-                    Text("uložené")
-                        .font(.system(size: 10))
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.purple)
-                .clipShape(Capsule())
-                .transition(.opacity.combined(with: .scale(scale: 0.8)))
-            }
-            if !viewModel.pendingApprovals.isEmpty {
-                HStack(spacing: 3) {
-                    Image(systemName: "shield.lefthalf.filled")
-                        .font(.system(size: 9))
-                    Text("\(viewModel.pendingApprovals.count)")
-                        .font(.system(size: 10, weight: .bold))
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.orange)
-                .clipShape(Capsule())
-                .transition(.opacity.combined(with: .scale(scale: 0.8)))
-            }
-            Spacer()
-            Button { viewModel.toggleDebugPanel() } label: {
-                Image(systemName: viewModel.showDebug ? "ladybug.fill" : "ladybug")
-                    .font(.system(size: 14))
-                    .foregroundStyle(viewModel.showDebug ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.tertiary))
-            }
-            .buttonStyle(.plain)
-            .help("Debug")
-            Button { viewModel.toggleSkillsPanel() } label: {
-                Image(systemName: viewModel.showSkills ? "wand.and.stars" : "wand.and.stars.inverse")
-                    .font(.system(size: 14))
-                    .foregroundStyle(viewModel.showSkills ? AnyShapeStyle(Color.teal) : AnyShapeStyle(.tertiary))
-            }
-            .buttonStyle(.plain)
-            .help("Schopnosti")
-            Button { viewModel.toggleMemoryPanel() } label: {
-                Image(systemName: viewModel.showMemory ? "brain.fill" : "brain")
-                    .font(.system(size: 14))
-                    .foregroundStyle(viewModel.showMemory ? AnyShapeStyle(Color.purple) : AnyShapeStyle(.tertiary))
-            }
-            .buttonStyle(.plain)
-            .help("Pamäť")
-            Button { viewModel.toggleSettingsPanel() } label: {
-                Image(systemName: viewModel.showSettings ? "gear.circle.fill" : "gear")
-                    .font(.system(size: 15))
-                    .foregroundStyle(viewModel.showSettings ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
-            }
-            .buttonStyle(.plain)
-            Button { viewModel.clear() } label: {
-                Image(systemName: "trash")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.tertiary)
-            }
-            .buttonStyle(.plain)
-            Button { onCollapse() } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 16))
-                    .foregroundStyle(.tertiary)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-    }
-
-    // MARK: Messages
-
-    private var messageList: some View {
-        ScrollViewReader { proxy in
-            GeometryReader { geo in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        if viewModel.messages.isEmpty {
-                            SuggestionChips(viewModel: viewModel)
-                                .padding(.top, 12)
-                        }
-                        ForEach(viewModel.messages) { msg in
-                            let streaming = viewModel.isThinking && msg.id == viewModel.messages.last?.id
-                            MessageBubble(message: msg, isStreaming: streaming, viewModel: viewModel)
-                                .id(msg.id)
-                        }
-                        if viewModel.isThinking {
-                            ThinkingIndicator()
-                                .padding(.leading, 4)
-                                .id("thinking")
-                        }
-                        // Bottom sentinel — used to detect when the user scrolled away.
-                        Color.clear.frame(height: 1).id("_bottom_sentinel")
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    // Report the content's minY in the scroll view coordinate space.
-                    .background(
-                        GeometryReader { contentGeo in
-                            Color.clear.preference(
-                                key: ScrollOffsetKey.self,
-                                value: contentGeo.frame(in: .named("scrollArea")).minY
-                            )
-                        }
-                    )
-                }
-                .coordinateSpace(name: "scrollArea")
-                .onPreferenceChange(ScrollOffsetKey.self) { minY in
-                    let viewHeight = geo.size.height
-                    // Estimate content height from minY + scrolled amount.
-                    // If minY < -(40) the user has scrolled up at least ~40 pt.
-                    let scrolledUp = minY < -40
-                    if scrolledUp != userScrolledUp {
-                        userScrolledUp = scrolledUp
-                    }
-                    contentOffsetY = minY
-                    scrollViewHeight = viewHeight
-                }
-                // Restore scroll position on first appear (panel re-opened).
-                .onAppear {
-                    DispatchQueue.main.async {
-                        if viewModel.savedScrollWasAtBottom {
-                            scrollToLatest(proxy)
-                        } else if let anchorId = viewModel.savedScrollAnchorId {
-                            proxy.scrollTo(anchorId, anchor: .top)
-                        }
-                    }
-                }
-                .onChange(of: viewModel.messages.count) {
-                    // New user message sent → always snap to bottom and reset flag.
-                    if let last = viewModel.messages.last, last.role == .user {
-                        userScrolledUp = false
-                    }
-                    if !userScrolledUp {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            scrollToLatest(proxy)
-                        }
-                    }
-                }
-                // Fires on every streaming token — keep pinned only when not scrolled up.
-                .onChange(of: viewModel.streamingChunk) {
-                    if !userScrolledUp {
-                        scrollToLatest(proxy)
-                    }
-                }
-            }
-        }
-    }
-
-    private func scrollToLatest(_ proxy: ScrollViewProxy) {
-        if viewModel.isThinking {
-            proxy.scrollTo("thinking", anchor: .bottom)
-        } else if let last = viewModel.messages.last {
-            proxy.scrollTo(last.id, anchor: .bottom)
-        }
-    }
-
-    // MARK: Input
-
-    private var inputBar: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Pending attachments chip row
-            if !viewModel.pendingAttachments.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(viewModel.pendingAttachments) { att in
-                            AttachmentChip(attachment: att) {
-                                viewModel.removeAttachment(id: att.id)
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.top, 6)
-                }
-            }
-
-            HStack(alignment: .center, spacing: 8) {
-                // Attachments (+) with a mic button that reveals on hover / while recording.
-                VoiceAttachControl(
-                    viewModel: viewModel,
-                    isUploading: viewModel.isUploadingAttachment,
-                    attachDisabled: viewModel.isThinking || viewModel.pendingAttachments.count >= 5,
-                    onPlus: { openFilePicker() }
-                )
-
-                TextField("Napíš správu…", text: $viewModel.inputText, axis: .vertical)
-                    .lineLimit(1...4)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .focused($inputFocused)
-                    .onSubmit { viewModel.send() }
-                    .padding(.vertical, 6)
-
-                let canSend = (!viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || !viewModel.pendingAttachments.isEmpty)
-                    && !viewModel.isThinking
-                Button { viewModel.send() } label: {
-                    Image(systemName: canSend ? "arrow.up.circle.fill" : "arrow.up.circle")
-                        .font(.system(size: 24))
-                        .foregroundStyle(canSend ? Color.accentColor : Color.secondary)
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSend)
-                .keyboardShortcut(.return, modifiers: .command)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-    }
-
-    private func openFilePicker() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowedContentTypes = [.image, .pdf, .plainText, .text, .sourceCode]
-        panel.message = "Vyber súbory na priloženie"
-        // Appear above status-bar-level chat window
-        panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
-        panel.begin { response in
-            guard response == .OK else { return }
-            viewModel.addAttachments(urls: panel.urls)
-        }
-    }
-}
-
-// MARK: - Message bubble
 
 private func copyToPasteboard(_ text: String) {
     NSPasteboard.general.clearContents()
@@ -1327,14 +2401,13 @@ struct WhatsAppPairingView: View {
             Button {
                 withAnimation(reduceMotion ? .easeOut(duration: 0.12) : .spring(response: 0.24, dampingFraction: 0.8)) {
                     viewModel.showWhatsappPairing = false
-                    viewModel.showSettings = true
                 }
             } label: {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 12, weight: .semibold))
             }
             .buttonStyle(.plain)
-            .help("Späť do nastavení")
+            .help("Späť")
 
             Label("WhatsApp pairing", systemImage: "qrcode.viewfinder")
                 .font(.system(size: 13, weight: .semibold))
@@ -1501,653 +2574,6 @@ struct WhatsAppPairingView: View {
     }
 }
 
-struct DebugPanelView: View {
-    @ObservedObject var viewModel: ChatViewModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Label("Debug", systemImage: "ladybug")
-                    .font(.system(size: 13, weight: .semibold))
-                Spacer()
-                if let id = viewModel.currentSessionId {
-                    Button {
-                        copyToPasteboard(id)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                            .font(.system(size: 12))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Kopírovať ID konverzácie")
-                }
-                Button {
-                    if let payload = viewModel.debugConversationPayload {
-                        copyToPasteboard(payload)
-                    }
-                } label: {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(.system(size: 12))
-                }
-                .buttonStyle(.plain)
-                .help("Kopírovať debug payload")
-            }
-
-            if let id = viewModel.currentSessionId {
-                HStack(spacing: 6) {
-                    Text("Conversation ID")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    Text(id)
-                        .font(.system(size: 10, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                }
-            }
-
-            if viewModel.isLoadingDebug {
-                ProgressView()
-                    .scaleEffect(0.8)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    Text(viewModel.debugConversationPayload ?? "Žiadne debug dáta.")
-                        .font(.system(size: 11, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                        .background(Color.black.opacity(0.08))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-            }
-        }
-        .padding(12)
-        .task { await viewModel.loadDebugConversation() }
-    }
-}
-
-struct PromptTraceDisclosure: View {
-    let message: ChatMessage
-    @ObservedObject var viewModel: ChatViewModel
-    @State private var expanded = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Button {
-                    expanded.toggle()
-                    if expanded {
-                        Task { await viewModel.loadDebugTrace(for: message.id) }
-                    }
-                } label: {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9, weight: .bold))
-                    Text(previewText)
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                .buttonStyle(.plain)
-                Spacer(minLength: 8)
-                if let id = message.debugTraceId {
-                    Button {
-                        copyToPasteboard(id)
-                    } label: {
-                        Image(systemName: "number")
-                            .font(.system(size: 10))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Kopírovať trace ID")
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(Color.gray.opacity(0.13))
-            .clipShape(RoundedRectangle(cornerRadius: 7))
-
-            if expanded {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text(message.debugTraceId ?? "")
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer()
-                        Button {
-                            copyToPasteboard(message.debugPayload ?? "")
-                        } label: {
-                            Image(systemName: "doc.on.doc")
-                                .font(.system(size: 11))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Kopírovať prompt/debug trace")
-                    }
-                    contextPlanChips
-                    if let ids = message.debugSelectedMemoryIds, !ids.isEmpty {
-                        Text("Pamäť: \(ids.count) záznamov")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
-                    }
-                    if message.debugConversationRecallInjected == true {
-                        Label("Recall histórie konverzácie", systemImage: "clock.arrow.circlepath")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
-                    }
-                    ScrollView {
-                        Text(message.debugPayload ?? "Načítavam trace…")
-                            .font(.system(size: 10, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
-                    }
-                    .frame(maxHeight: 220)
-                    .background(Color.black.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-                .padding(8)
-                .background(Color.gray.opacity(0.10))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-            }
-        }
-    }
-
-    private var previewText: String {
-        let base = message.debugPreview?.isEmpty == false ? message.debugPreview! : "Prompt trace"
-        var parts = [base]
-        if let count = message.debugMessageCount { parts.append("\(count) msgs") }
-        if let tokens = message.debugTokenEstimate { parts.append("~\(tokens) tok") }
-        if let skills = message.debugSelectedSkills, !skills.isEmpty { parts.append("\(skills.count) skills") }
-        if message.debugConversationRecallInjected == true { parts.append("recall") }
-        return parts.joined(separator: " · ")
-    }
-
-    @ViewBuilder
-    private var contextPlanChips: some View {
-        if let skills = message.debugSelectedSkills, !skills.isEmpty {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    ForEach(skills, id: \.self) { name in
-                        Text(name)
-                            .font(.system(size: 9, weight: .medium))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(Color.teal.opacity(0.15))
-                            .foregroundStyle(Color.teal)
-                            .clipShape(Capsule())
-                    }
-                }
-                .padding(.horizontal, 2)
-            }
-        }
-    }
-}
-
-struct MessageBubble: View {
-    let message: ChatMessage
-    let isStreaming: Bool
-    @ObservedObject var viewModel: ChatViewModel
-
-    var body: some View {
-        HStack(alignment: .top) {
-            if message.role == .user { Spacer(minLength: 40) }
-
-            if message.role == .user {
-                VStack(alignment: .trailing, spacing: 4) {
-                    if !message.content.isEmpty {
-                        Text(message.content)
-                            .font(.system(size: 13))
-                            .foregroundStyle(Color.white)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .background(Color.accentColor)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                    }
-                    // Attachments shown below the text bubble, fixed-size so they stay right-aligned
-                    if !message.attachments.isEmpty {
-                        AttachmentStrip(attachments: message.attachments, trailingAligned: true)
-                    }
-                }
-            } else {
-                VStack(alignment: .leading, spacing: 4) {
-                    if message.debugTraceId != nil {
-                        PromptTraceDisclosure(message: message, viewModel: viewModel)
-                    }
-                    MessageContentView(text: message.content, isStreaming: isStreaming)
-                        .padding(.horizontal, 10)
-                        // Extra top padding when a button is present so text doesn't overlap it.
-                        .padding(.top, ((message.mailRef != nil || message.odooRef != nil || message.whatsappRef != nil) && !isStreaming) ? 38 : 7)
-                        .padding(.bottom, 7)
-                        .background(Color(nsColor: .controlBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(alignment: .topTrailing) {
-                            // Show only after streaming ends so no layout jump mid-response.
-                            if !isStreaming {
-                                HStack(spacing: 6) {
-                                    if let ref = message.whatsappRef {
-                                        WhatsAppOpenButton(ref: ref)
-                                    }
-                                    if let ref = message.odooRef {
-                                        OdooOpenButton(ref: ref) { viewModel.openOdoo(ref) }
-                                    }
-                                    if let ref = message.mailRef {
-                                        MailOpenButton(ref: ref) { viewModel.openMail(ref) }
-                                    }
-                                }
-                                .padding(.top, 6)
-                                .padding(.trailing, 8)
-                                .transition(.opacity)
-                            }
-                        }
-                    // Mail attachments shown below the assistant response (Phase 5C)
-                    if !message.attachments.isEmpty {
-                        AttachmentStrip(attachments: message.attachments)
-                    }
-                    // Codex task rating badge (Phase 8) — shown after streaming ends
-                    if !isStreaming, let rating = message.taskRating {
-                        CodexRatingBadge(rating: rating)
-                    }
-                }
-            }
-
-            if message.role == .assistant { Spacer(minLength: 40) }
-        }
-    }
-}
-
-// MARK: - Codex Task Rating Badge (Phase 8)
-
-/// Small inline chip shown below an assistant message when the daemon emitted a `task_rating` SSE event.
-/// Only shown for CodexCandidate+ levels; provides transparency about complexity classification.
-struct CodexRatingBadge: View {
-    let rating: (level: String, score: Int, reasons: [String], privacyRisk: String)
-
-    @State private var expanded: Bool = false
-
-    private var levelColor: Color {
-        switch rating.level {
-        case "LocalOnly", "LocalPreferred": return .secondary
-        case "CodexCandidate": return .orange
-        case "CodexRecommended": return Color.accentColor
-        case "CodexRequired": return .red
-        default: return .secondary
-        }
-    }
-
-    private var levelLabel: String {
-        switch rating.level {
-        case "LocalOnly": return "Lokálna úloha"
-        case "LocalPreferred": return "Lokálna (preferovaná)"
-        case "CodexCandidate": return "Kandidát pre Codex"
-        case "CodexRecommended": return "Odporúčaný Codex"
-        case "CodexRequired": return "Vyžaduje Codex"
-        default: return rating.level
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "cpu")
-                        .font(.system(size: 10))
-                        .foregroundStyle(levelColor)
-                    Text(levelLabel)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(levelColor)
-                    Text("·")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                    Text("skóre \(rating.score)")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                    if !rating.privacyRisk.isEmpty && rating.privacyRisk != "Low" {
-                        Text("·")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
-                        Image(systemName: "lock.fill")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.orange)
-                        Text(rating.privacyRisk)
-                            .font(.system(size: 10))
-                            .foregroundStyle(.orange)
-                    }
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .buttonStyle(.plain)
-
-            if expanded && !rating.reasons.isEmpty {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(rating.reasons, id: \.self) { reason in
-                        HStack(alignment: .top, spacing: 4) {
-                            Text("·")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                            Text(reason)
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .padding(.leading, 4)
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(levelColor.opacity(0.06))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(levelColor.opacity(0.2), lineWidth: 0.5)
-                )
-        )
-    }
-}
-
-// MARK: - Attachment strip (thumbnails + chips)
-
-struct AttachmentStrip: View {
-    let attachments: [ChatAttachment]
-    var trailingAligned: Bool = false
-
-    var body: some View {
-        if trailingAligned {
-            // Fixed-size so it stays right-aligned inside a trailing VStack
-            chipRow.fixedSize()
-        } else {
-            ScrollView(.horizontal, showsIndicators: false) { chipRow }
-        }
-    }
-
-    private var chipRow: some View {
-        HStack(spacing: 6) {
-            ForEach(attachments) { att in
-                if att.kind == .image, let thumb = att.thumbnail {
-                    Image(nsImage: thumb)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 72, height: 72)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .onTapGesture { NSWorkspace.shared.open(att.localURL) }
-                } else {
-                    Button {
-                        NSWorkspace.shared.open(att.localURL)
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: iconName(for: att.kind))
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                            Text(att.filename)
-                                .font(.system(size: 11))
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Text(formatSize(att.sizeBytes))
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(Color(nsColor: .controlBackgroundColor))
-                        .clipShape(Capsule())
-                        .overlay(Capsule().stroke(Color.secondary.opacity(0.2), lineWidth: 0.5))
-                    }
-                    .buttonStyle(.plain)
-                    .onHover { h in h ? NSCursor.pointingHand.push() : NSCursor.pop() }
-                }
-            }
-        }
-    }
-
-    private func iconName(for kind: ChatAttachmentKind) -> String {
-        switch kind {
-        case .pdf:   return "doc.fill"
-        case .text:  return "doc.text"
-        case .image: return "photo"
-        default:     return "paperclip"
-        }
-    }
-
-    private func formatSize(_ bytes: Int) -> String {
-        if bytes < 1024 { return "\(bytes) B" }
-        if bytes < 1024 * 1024 { return "\(bytes / 1024) KB" }
-        return String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
-    }
-}
-
-// MARK: - "Otvoriť mail" animated button (Phase 5E)
-
-/// Attachments `+` button and a microphone button, side by side. `+` opens the
-/// file picker; the mic toggles inline voice transcription into the text field.
-struct VoiceAttachControl: View {
-    @ObservedObject var viewModel: ChatViewModel
-    var isUploading: Bool
-    var attachDisabled: Bool
-    var onPlus: () -> Void
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Button { onPlus() } label: {
-                if isUploading {
-                    ProgressView().scaleEffect(0.7).frame(width: 20, height: 20)
-                } else {
-                    Image(systemName: "plus.circle")
-                        .font(.system(size: 20))
-                        .foregroundStyle(Color.secondary)
-                }
-            }
-            .buttonStyle(.plain)
-            .disabled(attachDisabled)
-
-            Button { viewModel.toggleInlineVoice() } label: {
-                Image(systemName: viewModel.isVoiceRecording ? "waveform" : "mic")
-                    .font(.system(size: 18))
-                    .foregroundStyle(
-                        !viewModel.voiceModeEnabled
-                            ? Color.secondary.opacity(0.45)
-                            : (viewModel.isVoiceRecording ? Color.accentColor : Color.secondary)
-                    )
-                    // `.repeating` is the macOS 14 equivalent of `.repeat(.continuous)`.
-                    .symbolEffect(.pulse.byLayer, options: .repeating,
-                                  isActive: viewModel.isVoiceRecording)
-            }
-            .buttonStyle(.plain)
-            .disabled(!viewModel.voiceModeEnabled)
-            .accessibilityLabel(viewModel.voiceModeEnabled ? "Hlasový vstup" : "Hlasový vstup je vypnutý")
-        }
-    }
-}
-
-/// Circle-to-pill hover-morph button that opens the found email in Mail.app.
-/// Collapsed: 28 pt envelope-filled circle.
-/// Hovered:   expands to a ~150 pt rounded rect; icon slides left; text fades in.
-struct MailOpenButton: View {
-    let ref: DaemonClient.MailRef
-    let onOpen: () -> Void
-
-    @State private var isHovered = false
-
-    var body: some View {
-        Button(action: onOpen) {
-            HStack(spacing: 6) {
-                if isHovered {
-                    Text("Otvoriť mail")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                        .fixedSize()
-                        .transition(
-                            .asymmetric(
-                                insertion: .opacity.combined(with: .move(edge: .trailing)),
-                                removal: .opacity.combined(with: .move(edge: .trailing))
-                            )
-                        )
-                }
-                Image(systemName: "envelope.fill")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.white)
-            }
-            .padding(.horizontal, 9)
-            .frame(height: 28)
-            .frame(minWidth: 28)
-            .background(Capsule().fill(Color.accentColor))
-        }
-        .buttonStyle(.plain)
-        .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isHovered)
-        .onHover { h in
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.68)) {
-                isHovered = h
-            }
-            h ? NSCursor.pointingHand.push() : NSCursor.pop()
-        }
-    }
-}
-
-// MARK: - Odoo open button (Phase 6)
-
-/// Capsule button displayed above assistant messages that found an Odoo record.
-/// Clicking opens the record in Safari via the daemon's `/odoo/open` route.
-struct OdooOpenButton: View {
-    let ref: DaemonClient.OdooRef
-    let onOpen: () -> Void
-
-    @State private var isHovered = false
-
-    var body: some View {
-        Button(action: onOpen) {
-            HStack(spacing: 6) {
-                if isHovered {
-                    Text("Otvoriť v Safari")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                        .fixedSize()
-                        .transition(
-                            .asymmetric(
-                                insertion: .opacity.combined(with: .move(edge: .trailing)),
-                                removal: .opacity.combined(with: .move(edge: .trailing))
-                            )
-                        )
-                }
-                Image(systemName: "globe")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.white)
-            }
-            .padding(.horizontal, 9)
-            .frame(height: 28)
-            .frame(minWidth: 28)
-            .background(Capsule().fill(Color.orange))
-        }
-        .buttonStyle(.plain)
-        .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isHovered)
-        .onHover { h in
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.68)) {
-                isHovered = h
-            }
-            h ? NSCursor.pointingHand.push() : NSCursor.pop()
-        }
-    }
-}
-
-// MARK: - WhatsApp chat chip (Phase 11)
-
-/// Minimal chip shown above assistant messages that found a WhatsApp chat.
-struct WhatsAppOpenButton: View {
-    let ref: DaemonClient.WhatsappRef
-
-    @State private var isHovered = false
-
-    var body: some View {
-        HStack(spacing: 5) {
-            if isHovered {
-                Text(ref.contact_name ?? "WhatsApp")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .transition(
-                        .asymmetric(
-                            insertion: .opacity.combined(with: .move(edge: .trailing)),
-                            removal: .opacity.combined(with: .move(edge: .trailing))
-                        )
-                    )
-            }
-            Image(systemName: "bubble.left.and.bubble.right.fill")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 9)
-        .frame(height: 28)
-        .frame(minWidth: 28)
-        .background(Capsule().fill(Color.green))
-        .animation(.spring(response: 0.28, dampingFraction: 0.68), value: isHovered)
-        .onHover { h in
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.68)) {
-                isHovered = h
-            }
-            h ? NSCursor.pointingHand.push() : NSCursor.pop()
-        }
-    }
-}
-
-// MARK: - Pending attachment chip (input bar)
-
-struct AttachmentChip: View {
-    let attachment: ChatAttachment
-    let onRemove: () -> Void
-
-    var body: some View {
-        HStack(spacing: 4) {
-            if attachment.kind == .image, let thumb = attachment.thumbnail {
-                Image(nsImage: thumb)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 18, height: 18)
-                    .clipShape(RoundedRectangle(cornerRadius: 3))
-            } else {
-                Image(systemName: chipIcon)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
-            Text(attachment.filename)
-                .font(.system(size: 11))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 100)
-            Button {
-                onRemove()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 4)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(Capsule())
-        .overlay(Capsule().stroke(Color.secondary.opacity(0.25), lineWidth: 0.5))
-    }
-
-    private var chipIcon: String {
-        switch attachment.kind {
-        case .pdf:   return "doc.fill"
-        case .text:  return "doc.text"
-        case .image: return "photo"
-        default:     return "paperclip"
-        }
-    }
-}
-
-// MARK: - Thinking indicator
-
 struct ThinkingIndicator: View {
     @State private var animating = false
 
@@ -2173,38 +2599,9 @@ struct ThinkingIndicator: View {
 
 // MARK: - Suggestion chips
 
-struct SuggestionChips: View {
-    @ObservedObject var viewModel: ChatViewModel
-
-    private let suggestions: [(String, String)] = [
-        ("envelope.badge", "Zhrň neprečítané správy"),
-        ("square.and.pencil", "Navrhni odpoveď po slovensky"),
-        ("info.circle",  "Čo vieš urobiť?"),
-    ]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(suggestions, id: \.1) { icon, text in
-                Button {
-                    viewModel.inputText = text
-                    viewModel.send()
-                } label: {
-                    Label(text, systemImage: icon)
-                        .font(.system(size: 12))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Color(nsColor: .controlBackgroundColor))
-                        .clipShape(Capsule())
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-// MARK: - Approval modal overlay
-
+/// Approval prompt for gated write actions, rendered inside the notch.
+/// The only approval surface — the daemon auto-denies after 60 s, so this must
+/// stay reachable whenever `pendingApprovals` is non-empty.
 struct ApprovalModalOverlay: View {
     let approval: ApprovalItem
     @ObservedObject var viewModel: ChatViewModel
@@ -2213,62 +2610,76 @@ struct ApprovalModalOverlay: View {
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.45)
-                .ignoresSafeArea()
-            VStack(spacing: 14) {
-                HStack(spacing: 8) {
-                    Image(systemName: "shield.lefthalf.filled")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(Color.orange)
-                    Text("Schválenie akcie")
-                        .font(.system(size: 14, weight: .semibold))
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 7) {
+                Image(systemName: "shield.lefthalf.filled")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("Schválenie akcie")
+                    .font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Text("\(secondsLeft) s")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+            }
+            .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+
+            // Identify the originating automation for unattended approvals.
+            if let origin = approval.origin, origin.kind == "automation",
+               let name = origin.automationName {
+                HStack(spacing: 5) {
+                    Image(systemName: "clock.arrow.2.circlepath")
+                        .font(.system(size: 10, weight: .medium))
+                    Text("Automatizácia · \(name)")
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
                 }
-                VStack(alignment: .leading, spacing: 6) {
-                    Label(approval.toolName, systemImage: "wrench.and.screwdriver")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.secondary)
-                    if let desc = approval.description {
-                        Text(desc)
-                            .font(.system(size: 13))
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(10)
-                .background(Color(nsColor: .controlBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                .accessibilityLabel("Požiadavka z automatizácie \(name)")
+            }
 
-                Text("Automatické zamietnutie za \(secondsLeft) s")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-
-                HStack(spacing: 10) {
-                    Button {
-                        viewModel.decideApproval(approval, allow: false)
-                    } label: {
-                        Text("Zamietnuť")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .keyboardShortcut(.escape, modifiers: [])
-
-                    Button {
-                        viewModel.decideApproval(approval, allow: true)
-                    } label: {
-                        Text("Schváliť")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Color.green)
-                    .keyboardShortcut(.return, modifiers: [])
+            VStack(alignment: .leading, spacing: 4) {
+                Text(approval.toolName)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                if let desc = approval.description {
+                    Text(desc)
+                        .font(.system(size: 12))
+                        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(4)
                 }
             }
-            .padding(20)
-            .frame(width: 300)
-            .background(.regularMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-            .shadow(radius: 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
+            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+
+            HStack(spacing: 8) {
+                // Styling lives inside the label + contentShape: with a
+                // `.plain` button, outside styling leaves only the text
+                // glyphs clickable and the pill is effectively dead.
+                Button { viewModel.decideApproval(approval, allow: false) } label: {
+                    Text("Zamietnuť")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.escape, modifiers: [])
+                Button { viewModel.decideApproval(approval, allow: true) } label: {
+                    Text("Schváliť")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(Color.white.opacity(0.9), in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.return, modifiers: [])
+            }
         }
         .onReceive(timer) { _ in
             if secondsLeft > 0 {

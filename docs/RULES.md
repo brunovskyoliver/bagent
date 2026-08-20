@@ -25,11 +25,11 @@ Rules are defined in `~/.config/bagent/rules.yaml` and enforced by the Rust rule
 - Summarize, classify, extract entities from local text.
 - Generate draft text (email replies, summaries, task descriptions) — **drafts are never sent automatically**.
 - Retrieve from memory / search index.
-- Compute embeddings via local Ollama.
+- Run FTS-only local retrieval.
 - Translate UI text within the app.
 - Log to audit trail.
 - Check connector health status.
-- Fetch Ollama model list.
+- Fetch the local BaseRT model list.
 
 ### Ask (Approval Required)
 
@@ -64,7 +64,7 @@ Rules are defined in `~/.config/bagent/rules.yaml` and enforced by the Rust rule
 
 ### Language Detection
 - Every user turn and every connector record is classified: `sk`, `en`, or `und` (undetermined).
-- Detection runs locally (Ollama or a lightweight classifier); result stored in `language` metadata.
+- Detection runs locally (BaseRT or a lightweight classifier); result stored in `language` metadata.
 - Mixed-language input defaults to the dominant language of the message.
 
 ### Response Language
@@ -123,7 +123,7 @@ S pozdravom,
 - PII is never included in a cloud LLM prompt without:
   1. User approval for the specific connector × cloud model pairing.
   2. The approval recorded in the audit log.
-- Local Ollama: PII may be included (stays on device) unless a rule explicitly forbids it.
+- Local BaseRT: PII may be included (stays on device) unless a rule explicitly forbids it.
 - Redaction: before any cloud call, a redaction pass replaces PII tokens with `[REDACTED_<type>]`.
 - Screen frames: treated as maximum-PII; never leave device by default.
 

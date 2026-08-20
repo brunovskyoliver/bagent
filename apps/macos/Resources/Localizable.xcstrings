@@ -1,0 +1,22 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "browser.cue.accessibility" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "bagent Browser %@" } } } },
+    "browser.cue.approve_submission" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Approve form submission" } } } },
+    "browser.cue.close" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Close browser session" } } } },
+    "browser.cue.origin" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "bagent Browser · %@" } } } },
+    "browser.cue.reclaim" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Reclaim for %@" } } } },
+    "browser.cue.reject_reclaim" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Leave detached" } } } },
+    "browser.cue.resume_agent" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Resume agent control" } } } },
+    "browser.cue.title" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "bagent Browser" } } } },
+    "browser.settings.clear" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Clear" } } } },
+    "browser.settings.clear.cancel" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Cancel" } } } },
+    "browser.settings.clear.confirm" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Clear Profile" } } } },
+    "browser.settings.clear.message" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "This closes all Browser Sessions and removes their cookies and website data." } } } },
+    "browser.settings.clear.title" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Clear bagent Browser Profile?" } } } },
+    "browser.settings.profile" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Browser Profile keeps its own website data." } } } },
+    "browser.settings.subtitle" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "Private WebKit sessions for Codex and Claude" } } } },
+    "browser.settings.title" : { "localizations" : { "en" : { "stringUnit" : { "state" : "translated", "value" : "bagent Browser" } } } }
+  },
+  "version" : "1.0"
+}

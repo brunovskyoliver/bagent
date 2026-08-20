@@ -29,9 +29,14 @@ For each fixture, a passing model response must:
 ## Running Tests
 
 ```bash
-# Manual: pipe fixture to ollama
-cat fixtures/sk/faktura-upomienka.txt | ollama run qwen2.5:7b \
-  "Zhrň túto správu v 2 vetách. Zachovaj slovenčinu a diakritiku."
+# Manual: call the app-managed BaseRT service
+jq -Rs '{model:"basecompute/Qwen3-4B-Instruct-2507",messages:[{
+  role:"user",content:("Zhrň túto správu v 2 vetách. Zachovaj slovenčinu a diakritiku.\n\n" + .)
+}],stream:false}' fixtures/sk/faktura-upomienka.txt | \
+curl http://127.0.0.1:8082/v1/chat/completions \
+  -H 'Authorization: Bearer basert-local' \
+  -H 'Content-Type: application/json' \
+  --data-binary @-
 
 # Automated: see scripts/test_sk_fixtures.sh (Phase 3)
 ```

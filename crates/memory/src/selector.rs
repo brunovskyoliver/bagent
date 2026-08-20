@@ -61,17 +61,13 @@ pub async fn select(store: &Arc<MemoryStore>, q: SelectQuery<'_>) -> Result<Vec<
 mod tests {
     use super::*;
     use crate::MemoryStore;
-    use ollama_connector::OllamaClient;
     use rusqlite::Connection;
     use std::sync::Mutex;
 
     fn test_store() -> Arc<MemoryStore> {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(TEST_SCHEMA).unwrap();
-        Arc::new(MemoryStore::new(
-            Arc::new(Mutex::new(conn)),
-            OllamaClient::new("http://127.0.0.1:9"), // unreachable — no embed calls in these tests
-        ))
+        Arc::new(MemoryStore::new(Arc::new(Mutex::new(conn))))
     }
 
     // Minimal schema matching V4 + V11 columns

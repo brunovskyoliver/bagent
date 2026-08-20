@@ -136,40 +136,38 @@ Each connector is described with: **Purpose · Permissions · Read Actions · Wr
 
 ---
 
-## Ollama
+## BaseRT
 
-**Purpose:** Local LLM inference for all private tasks — summarization, classification, embeddings, Slovak text generation, coding fallback.
+**Purpose:** Local text inference for private tasks — summarization, classification, Slovak text generation, and tool calling.
 
 **Permissions Required:**
-- Network (loopback only: `localhost:11434`). No external network needed.
+- Network (loopback only: `127.0.0.1:8082`). Model download requires internet on first use.
 
 **Read Actions:**
-- `ollama_chat(model, messages, stream?)` — streaming or blocking chat completion.
-- `ollama_embed(model, text)` — compute embedding vector.
-- `ollama_list_models()` — list installed models.
-- `ollama_model_info(model)` — model metadata (context length, quantization).
+- `POST /v1/chat/completions` — OpenAI-compatible streaming or blocking chat.
+- `GET /v1/models` — list loaded models.
+- `GET /health` — runtime liveness.
 
 **Write Actions:**
-- None exposed to the agent tool layer. Model installation is user-initiated via Ollama CLI or the Ollama app.
+- None exposed to the agent tool layer. The app manages a dedicated LaunchAgent and BaseRT downloads the model on first serve.
 
 **Approval Level:**
-- All Ollama calls: `Auto` (stays local; no PII leaves device).
+- All BaseRT calls: `Auto` (stays local; no PII leaves device).
 
 **Failure Modes:**
-- Ollama not running: `/health` shows `ollama_up: false`; show "Start Ollama" button with `open ollama://` deep link.
-- Model not installed: surface model name + `ollama pull <model>` instruction.
+- BaseRT not running: `/health` shows `basert: false`; inspect `~/Library/Logs/bagent/basert.log`.
+- Model unavailable: surface `basert pull basecompute/Qwen3-4B-Instruct-2507`.
 - Context window exceeded: truncate with sliding window strategy; log truncation in audit.
 - Slow response (> 5 s TTFT): show animated indicator; allow user to cancel.
-- Out of memory (OOM): Ollama returns 500; surface "Model too large" with suggested smaller model.
+- Out of memory (OOM): surface the BaseRT error without falling back to a cloud model.
 
 **MVP Scope (Phase 3):**
 - Chat with streaming.
 - Model picker.
-- Basic embedding for memory indexing.
+- FTS5 retrieval; semantic embeddings are intentionally disabled.
 - Slovak diacritics verified.
 
 **Future Scope:**
-- Vision model support (`llava`, `minicpm-v`) for screen context.
 - Multi-model routing (small model for classification, large for generation).
 - Local fine-tuned Slovak business model.
 - Automatic model download prompts.
@@ -253,6 +251,76 @@ Each connector is described with: **Purpose · Permissions · Read Actions · Wr
 
 ---
 
+## bagent Browser MCP
+
+**Purpose:** Provide Codex and Claude with a private bagent-owned WebKit
+Browser Session through the bundled `bagent-browser-mcp` stdio server.
+
+**Transport:** The Rust proxy owns the MCP stdio protocol and connects to the
+Swift app through the user-only `~/Library/Application Support/bagent/browser.sock`
+socket. The directory is `0700`, the socket is `0600`, and Swift checks the
+peer effective UID. WebKit, AppKit, profile state, policy, cues, and panels
+remain in Swift on the main actor.
+
+When the user explicitly requests bagent-browser, the first browser tool call
+must be `bagent-browser.browser_open`. Do not invoke the in-app browser or the
+generic browser-control skill first. The server owns the hidden, persistent
+bagent WebKit session.
+
+Codex and Claude Code also route UI work here without waiting for a separate
+browser request. If the task needs layout or spacing judgment, visual
+debugging, screenshots, rendered-page comparison, click/type/scroll/drag/hover
+behavior, frontend interaction debugging, forms, dialogs, menus, loading or
+responsive state, or local web-app validation, the client should call
+`browser_open` first when a local or allowlisted URL is known. It should then
+call `get_page_content` and `screenshot` while the session stays hidden. A
+non-UI coding task must not open a Browser Session just because this connector
+is installed. The response should include the inspected origin, page/load
+state, screenshot result, and a concise partial console/network summary.
+
+This is agent policy carried by MCP initialization instructions and tool
+metadata, not a keyword-only classifier. Both clients use the same policy and
+the same Swift authorization gates. If the explicit bagent Browser setting is
+off, the proxy returns structured `browser_disabled` and tells the user to
+enable bagent Browser in Settings.
+
+**Read actions:** `bagent-browser.browser_open`, `bagent-browser.page_info`,
+`bagent-browser.get_page_content`, `bagent-browser.wait_for_navigation`,
+`bagent-browser.browser_wait`, `bagent-browser.screenshot`,
+`bagent-browser.browser_console_messages`, and
+`bagent-browser.list_network_requests`.
+
+**Mutating actions:** `bagent-browser.navigate_to_url`,
+`bagent-browser.page_interactions`, `bagent-browser.set_viewport_size`,
+`bagent-browser.browser_set_visibility`,
+`bagent-browser.browser_release_control`,
+`bagent-browser.browser_acknowledge_alert`,
+`bagent-browser.browser_request_close`, and
+`bagent-browser.browser_request_reclaim`. The popup stays hidden for inspection,
+screenshots, DOM actions, and debugging. Form submission, destructive controls,
+native input, confirmation dialogs, permissions, and trusted gestures require
+explicit user action from the Browser Cue. The agent never types passwords or
+other secrets, uploads or downloads files, uses the clipboard, evaluates
+JavaScript, or auto-submits.
+
+**Hard boundaries:** Four live sessions maximum; one implicit owner per stdio
+connection; fixed private-network/loopback navigation policy; hidden default;
+no raw HTML, arbitrary JavaScript, cookies, storage, credentials, file
+transfer, unsupported permissions, or persistent screenshot files. Console
+and network output is explicitly partial and excludes bodies, headers, cookies,
+and authorization values.
+
+**MVP scope:** This connector does not control Safari.app. Safari 27 MCP, if
+used later, is a separate provider with separate profile and window semantics.
+
+For a local signed build, register the same bundled stdio executable with
+either client:
+
+```bash
+codex mcp add bagent-browser -- /absolute/path/to/bagent.app/Contents/MacOS/bagent-browser-mcp
+claude mcp add bagent-browser -- /absolute/path/to/bagent.app/Contents/MacOS/bagent-browser-mcp
+```
+
 ## Screen Context
 
 **Purpose:** Provide the agent with awareness of what is on screen and what the user has selected, enabling contextual assistance without copy-paste.
@@ -290,7 +358,7 @@ Each connector is described with: **Purpose · Permissions · Read Actions · Wr
 
 **Future Scope:**
 - Continuous low-fps ambient awareness (opt-in, local only).
-- Vision model inference (Ollama `llava`) for complex UI understanding.
+- Optional future local multimodal runtime for complex UI understanding.
 - Cursor/selection tracking for proactive suggestions.
 - Multi-display support.
 

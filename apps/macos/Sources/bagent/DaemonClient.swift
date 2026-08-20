@@ -5,7 +5,9 @@ import AppKit
 
 struct DaemonHealth: Sendable {
     let daemonUp: Bool
-    let ollamaUp: Bool
+    let processID: Int?
+    let tavilyConfiguration: DaemonClient.TavilyConfigurationStatus
+    let baseRTUp: Bool
     let model: String
     let classifierModel: String
     let mailConnector: Bool
@@ -13,6 +15,32 @@ struct DaemonHealth: Sendable {
     let codexConnector: Bool
     let odooConnector: Bool
     let whatsappConnector: Bool
+
+    init(
+        daemonUp: Bool,
+        processID: Int? = nil,
+        tavilyConfiguration: DaemonClient.TavilyConfigurationStatus = .pending,
+        baseRTUp: Bool,
+        model: String,
+        classifierModel: String,
+        mailConnector: Bool,
+        notesConnector: Bool,
+        codexConnector: Bool,
+        odooConnector: Bool,
+        whatsappConnector: Bool
+    ) {
+        self.daemonUp = daemonUp
+        self.processID = processID
+        self.tavilyConfiguration = tavilyConfiguration
+        self.baseRTUp = baseRTUp
+        self.model = model
+        self.classifierModel = classifierModel
+        self.mailConnector = mailConnector
+        self.notesConnector = notesConnector
+        self.codexConnector = codexConnector
+        self.odooConnector = odooConnector
+        self.whatsappConnector = whatsappConnector
+    }
 }
 
 // MARK: - Memory
@@ -61,7 +89,6 @@ struct SkillItem: Identifiable, Decodable, Sendable {
 /// Ephemeral screen context collected by ScreenContextProvider and forwarded to
 /// the daemon in the `/chat` request body. Never persisted to disk on either side.
 struct ScreenContextFields: Sendable {
-    var imagePNGBase64: String?
     var ocrText: String
     var activeApp: String?
     var selectedText: String?
@@ -77,6 +104,13 @@ struct ScreenIntentResponse: Decodable, Sendable {
 // MARK: - Client
 
 struct DaemonClient: Sendable {
+
+    enum TavilyConfigurationStatus: String, Codable, Sendable, Equatable {
+        case pending
+        case configured
+        case absent
+        case configurationFailed = "configuration_failed"
+    }
 
     private static let dataDir = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)
@@ -135,7 +169,7 @@ struct DaemonClient: Sendable {
             req.timeoutInterval = 3
             let (data, response) = try await URLSession.shared.data(for: req)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—",
+                return DaemonHealth(daemonUp: false, baseRTUp: false, model: "—",
                                     classifierModel: "—", mailConnector: false, notesConnector: false,
                                     codexConnector: false, odooConnector: false, whatsappConnector: false)
             }
@@ -169,16 +203,20 @@ struct DaemonClient: Sendable {
                 let whatsapp: WhatsappConnectorResp?
             }
             struct HealthResp: Decodable {
-                let status: String; let ollama: Bool; let model: String
+                let status: String; let basert: Bool; let model: String
                 let classifier_model: String?
+                let process_id: Int?
+                let tavily_configuration: TavilyConfigurationStatus?
                 let connectors: ConnectorResp?
             }
             let h = try JSONDecoder().decode(HealthResp.self, from: data)
             return DaemonHealth(
                 daemonUp: h.status == "ok",
-                ollamaUp: h.ollama,
+                processID: h.process_id,
+                tavilyConfiguration: h.tavily_configuration ?? .pending,
+                baseRTUp: h.basert,
                 model: h.model,
-                classifierModel: h.classifier_model ?? "qwen2.5:0.5b",
+                classifierModel: h.classifier_model ?? BaseRTLaunchAgent.model,
                 mailConnector:      h.connectors?.mail      ?? false,
                 notesConnector:     h.connectors?.notes     ?? false,
                 codexConnector:     h.connectors?.codex     ?? false,
@@ -186,7 +224,7 @@ struct DaemonClient: Sendable {
                 whatsappConnector:  h.connectors?.whatsapp?.isConnected  ?? false
             )
         } catch {
-            return DaemonHealth(daemonUp: false, ollamaUp: false, model: "—",
+            return DaemonHealth(daemonUp: false, baseRTUp: false, model: "—",
                                 classifierModel: "—", mailConnector: false, notesConnector: false,
                                 codexConnector: false, odooConnector: false, whatsappConnector: false)
         }
@@ -273,12 +311,135 @@ struct DaemonClient: Sendable {
         let truncated: Bool
     }
 
+    struct ActivityEvent: Sendable {
+        let id: String
+        let kind: String
+        let tool: String?
+        let title: String
+        let detail: String?
+        let status: String?
+        let durationMs: Int?
+    }
+
+    enum EvidencePhase: String, Sendable, Equatable {
+        case findingMail = "finding_mail"
+        case reading
+        case searching
+        case verifying
+        case loadingSynthesisModel = "loading_synthesis_model"
+        case preparingAnswer = "preparing_answer"
+        case repairing
+        case fallingBack = "falling_back"
+        case validating
+        case deterministicRendering = "deterministic_rendering"
+    }
+
+    enum EvidenceExecutionStatus: String, Sendable, Equatable {
+        case inProgress = "in_progress"
+        case succeeded
+        case failed
+        case denied
+        case timedOut = "timed_out"
+    }
+
+    enum EvidenceContribution: String, Sendable, Equatable {
+        case satisfied
+        case partial
+        case empty
+        case duplicate
+        case irrelevant
+    }
+
+    enum EvidenceOutcomeState: String, Sendable, Equatable {
+        case verified
+        case conflict
+        case partial
+        case empty
+        case unavailable
+        case denied
+        case verificationShortfall = "verification_shortfall"
+    }
+
+    enum EvidenceOutcomeKind: String, Sendable, Equatable {
+        case mail
+        case web
+    }
+
+    enum EvidencePolishStatus: String, Sendable, Equatable {
+        case skipped, accepted, rejected
+        case timedOut = "timed_out"
+        case unavailable
+        case memoryIneligible = "memory_ineligible"
+    }
+
+    struct EvidencePolishEvent: Sendable, Equatable {
+        let turnId: String
+        let status: EvidencePolishStatus
+    }
+
+    struct EvidencePhaseEvent: Sendable, Equatable {
+        let turnId: String
+        let phase: EvidencePhase
+        let completed: Int?
+        let total: Int?
+    }
+
+    struct LogicalActivityEvent: Sendable, Equatable {
+        let turnId: String
+        let activityId: String
+        let normalizedOperation: String
+        let argumentHash: String
+        let executionStatus: EvidenceExecutionStatus
+        let contribution: EvidenceContribution
+        let evidenceCount: Int
+        let sourceDomains: [String]
+        let durationMs: Int
+        let attemptCount: Int
+        let retries: Int
+        let duplicatesSuppressed: Int
+        let failureReason: String?
+    }
+
+    struct EvidenceOutcomeEvent: Sendable, Equatable {
+        let turnId: String
+        let state: EvidenceOutcomeState
+        let kind: EvidenceOutcomeKind
+        let acquired: Int
+        let requested: Int
+        let sourceCount: Int
+        let message: String
+    }
+
+    struct EvidenceAcquisitionDiagnostic: Sendable, Equatable {
+        let status: String
+        let provider: String?
+        let providerStatus: String?
+    }
+
+    struct TranscriptSource: Identifiable, Sendable, Equatable {
+        let id: String
+        let title: String
+        let url: URL
+        let domain: String
+    }
+
     enum ChatEvent: Sendable {
         case token(String)
+        case activityStarted(ActivityEvent)
+        case activityCompleted(ActivityEvent)
+        case evidencePhase(EvidencePhaseEvent)
+        case logicalActivityStarted(LogicalActivityEvent)
+        case logicalActivityCompleted(LogicalActivityEvent)
+        case evidencePolish(EvidencePolishEvent)
+        case evidenceOutcome(EvidenceOutcomeEvent)
+        case evidenceAcquisitionDiagnostic(EvidenceAcquisitionDiagnostic)
+        case sourceDiscovered(TranscriptSource)
         case debugTrace(DebugTraceSummary)
         case memorySaved(id: String)
         case approvalRequested(id: String, tool: String, description: String?)
         case toolBlocked(tool: String)
+        /// The agent loop is executing a tool this turn (transient status).
+        case toolCall(tool: String)
         case mailAttachments([MailAttachmentRef])
         case mailFound(MailRef)
         case fileFound(FileRef)
@@ -292,6 +453,82 @@ struct DaemonClient: Sendable {
         /// Phase 11: WhatsApp chat found.
         case whatsappFound(WhatsappRef)
         case done(sessionId: String?)
+    }
+
+    static func evidenceChatEvent(from event: SSEEvent) -> ChatEvent? {
+        switch event.type {
+        case "evidence_phase":
+            guard let turnId = event.turn_id,
+                  let rawPhase = event.phase,
+                  let phase = EvidencePhase(rawValue: rawPhase)
+            else { return nil }
+            return .evidencePhase(.init(
+                turnId: turnId,
+                phase: phase,
+                completed: event.completed,
+                total: event.total
+            ))
+        case "logical_activity_started", "logical_activity_completed":
+            guard let turnId = event.turn_id,
+                  let activityId = event.activity_id,
+                  let operation = event.normalized_operation,
+                  let argumentHash = event.argument_hash,
+                  let rawExecution = event.execution_status,
+                  let execution = EvidenceExecutionStatus(rawValue: rawExecution),
+                  let rawContribution = event.contribution,
+                  let contribution = EvidenceContribution(rawValue: rawContribution)
+            else { return nil }
+            let activity = LogicalActivityEvent(
+                turnId: turnId,
+                activityId: activityId,
+                normalizedOperation: operation,
+                argumentHash: argumentHash,
+                executionStatus: execution,
+                contribution: contribution,
+                evidenceCount: event.evidence_count ?? 0,
+                sourceDomains: event.source_domains ?? [],
+                durationMs: event.duration_ms ?? 0,
+                attemptCount: event.attempt_count ?? 0,
+                retries: event.retries ?? 0,
+                duplicatesSuppressed: event.duplicates_suppressed ?? 0,
+                failureReason: event.failure_reason
+            )
+            return event.type == "logical_activity_started"
+                ? .logicalActivityStarted(activity)
+                : .logicalActivityCompleted(activity)
+        case "evidence_outcome":
+            guard let turnId = event.turn_id,
+                  let rawState = event.state,
+                  let state = EvidenceOutcomeState(rawValue: rawState),
+                  let rawKind = event.outcome_kind,
+                  let kind = EvidenceOutcomeKind(rawValue: rawKind),
+                  let message = event.message
+            else { return nil }
+            return .evidenceOutcome(.init(
+                turnId: turnId,
+                state: state,
+                kind: kind,
+                acquired: event.acquired ?? 0,
+                requested: event.requested ?? 0,
+                sourceCount: event.source_count ?? 0,
+                message: message
+            ))
+        case "evidence_polish":
+            guard let turnId = event.turn_id,
+                  let rawStatus = event.status,
+                  let status = EvidencePolishStatus(rawValue: rawStatus)
+            else { return nil }
+            return .evidencePolish(.init(turnId: turnId, status: status))
+        case "evidence_acquisition_diagnostic":
+            guard let status = event.status else { return nil }
+            return .evidenceAcquisitionDiagnostic(.init(
+                status: status,
+                provider: event.provider,
+                providerStatus: event.provider_status
+            ))
+        default:
+            return nil
+        }
     }
 
     /// Stable reference to a found Odoo record. Analogue of `MailRef` / `FileRef`.
@@ -398,13 +635,41 @@ struct DaemonClient: Sendable {
         }
     }
 
+    struct HistoryTurn: Encodable {
+        let role: String
+        let content: String
+    }
+
+    func configureStage8Acceptance(acquisition: String?, polish: String?) async throws {
+        guard ProcessInfo.processInfo.environment[Stage8AcceptanceCLI.environmentKey] == "1" else {
+            throw DaemonError.badStatus
+        }
+        let c = try await loadCreds()
+        var req = authedRequest("/acceptance/stage8/fixture", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Selection: Encodable {
+            let acquisition: String
+            let polish: String
+        }
+        struct Body: Encodable {
+            let selection: Selection?
+        }
+        req.httpBody = try JSONEncoder().encode(Body(selection: acquisition.map {
+            Selection(acquisition: $0, polish: polish ?? "unavailable")
+        }))
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try validateOK(data: data, response: response)
+    }
+
     func chatStream(
         text: String,
         sessionId: String?,
         model: String,
         attachmentIds: [String] = [],
         screenContext: ScreenContextFields? = nil,
-        sourceMode: SourceMode? = nil
+        sourceMode: SourceMode? = nil,
+        history: [HistoryTurn] = []
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -420,8 +685,9 @@ struct DaemonClient: Sendable {
                         let model: String
                         let session_id: String?
                         let attachment_ids: [String]
-                        // Screen context (Phase 7) — ephemeral, never persisted
-                        let screen_image_b64: String?
+                        // Sliding-window conversation history (oldest first)
+                        let history: [HistoryTurn]
+                        // OCR/selection context — ephemeral, never persisted
                         let screen_ocr_text: String?
                         let active_app: String?
                         let selected_text: String?
@@ -432,7 +698,7 @@ struct DaemonClient: Sendable {
                         model: model,
                         session_id: sessionId,
                         attachment_ids: attachmentIds,
-                        screen_image_b64: screenContext?.imagePNGBase64,
+                        history: history,
                         screen_ocr_text: screenContext?.ocrText.isEmpty == false ? screenContext?.ocrText : nil,
                         active_app: screenContext?.activeApp,
                         selected_text: screenContext?.selectedText,
@@ -450,6 +716,11 @@ struct DaemonClient: Sendable {
                         guard let data = json.data(using: .utf8),
                               let event = try? JSONDecoder().decode(SSEEvent.self, from: data)
                         else { continue }
+
+                        if let evidenceEvent = Self.evidenceChatEvent(from: event) {
+                            continuation.yield(evidenceEvent)
+                            continue
+                        }
 
                         switch event.type {
                         case "debug_trace":
@@ -470,6 +741,33 @@ struct DaemonClient: Sendable {
                             if let content = event.content {
                                 continuation.yield(.token(content))
                             }
+                        case "activity_started", "activity_completed":
+                            if let id = event.id, let kind = event.kind,
+                               let title = event.title {
+                                let activity = ActivityEvent(
+                                    id: id,
+                                    kind: kind,
+                                    tool: event.tool,
+                                    title: title,
+                                    detail: event.detail,
+                                    status: event.status,
+                                    durationMs: event.duration_ms
+                                )
+                                continuation.yield(event.type == "activity_started"
+                                    ? .activityStarted(activity)
+                                    : .activityCompleted(activity))
+                            }
+                        case "source_discovered":
+                            if let id = event.id, let title = event.title,
+                               let rawURL = event.url, let url = URL(string: rawURL),
+                               ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                                continuation.yield(.sourceDiscovered(TranscriptSource(
+                                    id: id,
+                                    title: title,
+                                    url: url,
+                                    domain: event.domain ?? url.host() ?? ""
+                                )))
+                            }
                         case "memory_saved":
                             if let id = event.id {
                                 continuation.yield(.memorySaved(id: id))
@@ -483,6 +781,10 @@ struct DaemonClient: Sendable {
                         case "tool_blocked":
                             if let tool = event.tool {
                                 continuation.yield(.toolBlocked(tool: tool))
+                            }
+                        case "tool_call":
+                            if let tool = event.tool {
+                                continuation.yield(.toolCall(tool: tool))
                             }
                         case "mail_attachments":
                             if let atts = event.attachments, !atts.isEmpty {
@@ -637,6 +939,134 @@ struct DaemonClient: Sendable {
             throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
         }
         return prettyJSONString(data)
+    }
+
+    // MARK: - Daemon-wide events (GET /events)
+
+    /// One typed envelope per daemon broadcast event. Payloads are concise —
+    /// callers refetch authoritative records instead of trusting them.
+    struct GlobalEvent: Decodable, Sendable {
+        let type: String
+        let automation_id: String?
+        let run_id: String?
+        let status: String?
+        let id: String?          // approval id for approval_requested
+    }
+
+    /// Long-lived SSE subscription to the daemon broadcast. Throws on
+    /// disconnect — callers loop with a backoff to reconnect.
+    func globalEvents() -> AsyncThrowingStream<GlobalEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let c = try await loadCreds()
+                    let req = authedRequest("/events", creds: c)
+                    let (bytes, response) = try await URLSession.shared.bytes(for: req)
+                    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                        throw DaemonError.badStatus
+                    }
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix("data: ") else { continue }
+                        let json = String(line.dropFirst(6))
+                        if let data = json.data(using: .utf8),
+                           let event = try? JSONDecoder().decode(GlobalEvent.self, from: data) {
+                            continuation.yield(event)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    // MARK: - Automations
+
+    func listAutomations() async throws -> [AutomationRecord] {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/automations", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
+        struct Resp: Decodable { let automations: [AutomationRecord] }
+        return try JSONDecoder().decode(Resp.self, from: data).automations
+    }
+
+    func getAutomation(id: String) async throws -> AutomationRecord {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(for: authedRequest("/automations/\(id)", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
+        return try JSONDecoder().decode(AutomationRecord.self, from: data)
+    }
+
+    struct AutomationDraft: Encodable {
+        var name: String
+        var prompt: String
+        var timezone: String
+        var schedule: AutomationSchedule
+        var enabled: Bool = true
+    }
+
+    func createAutomation(_ draft: AutomationDraft) async throws -> AutomationRecord {
+        try await automationRequest(path: "/automations", method: "POST", body: draft)
+    }
+
+    struct AutomationPatch: Encodable {
+        var name: String?
+        var prompt: String?
+        var timezone: String?
+        var schedule: AutomationSchedule?
+        var enabled: Bool?
+    }
+
+    func patchAutomation(id: String, _ patch: AutomationPatch) async throws -> AutomationRecord {
+        try await automationRequest(path: "/automations/\(id)", method: "PATCH", body: patch)
+    }
+
+    private struct APIErrorBody: Decodable { let error: String }
+
+    private func automationRequest<B: Encodable>(
+        path: String, method: String, body: B
+    ) async throws -> AutomationRecord {
+        let c = try await loadCreds()
+        var req = authedRequest(path, creds: c)
+        req.httpMethod = method
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            let message = (try? JSONDecoder().decode(APIErrorBody.self, from: data))?.error
+            throw DaemonError.serverError(message ?? "HTTP \(status)")
+        }
+        return try JSONDecoder().decode(AutomationRecord.self, from: data)
+    }
+
+    /// POST helper for enable/disable/run-now/delete-style endpoints.
+    private func automationAction(path: String, method: String = "POST") async throws {
+        let c = try await loadCreds()
+        var req = authedRequest(path, creds: c)
+        req.httpMethod = method
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            let message = (try? JSONDecoder().decode(APIErrorBody.self, from: data))?.error
+            throw DaemonError.serverError(message ?? "HTTP \(status)")
+        }
+    }
+
+    func enableAutomation(id: String) async throws { try await automationAction(path: "/automations/\(id)/enable") }
+    func disableAutomation(id: String) async throws { try await automationAction(path: "/automations/\(id)/disable") }
+    func deleteAutomation(id: String) async throws { try await automationAction(path: "/automations/\(id)", method: "DELETE") }
+    func runNowAutomation(id: String) async throws { try await automationAction(path: "/automations/\(id)/run-now") }
+
+    func automationRuns(id: String, limit: Int = 10) async throws -> [AutomationRunRecord] {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/automations/\(id)/runs?limit=\(limit)", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
+        struct Resp: Decodable { let runs: [AutomationRunRecord] }
+        return try JSONDecoder().decode(Resp.self, from: data).runs
     }
 
     // MARK: - Approvals
@@ -909,6 +1339,33 @@ struct DaemonClient: Sendable {
 
     // MARK: - Odoo (Phase 6B — MCP)
 
+    func configureTavily(apiKey: String?) async throws -> TavilyConfigurationStatus {
+        let c = try await loadCreds()
+        var req = authedRequest("/web/tavily/config", creds: c)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let api_key: String? }
+        req.httpBody = try JSONEncoder().encode(Body(api_key: apiKey))
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try validateOK(data: data, response: response)
+        struct Resp: Decodable { let status: TavilyConfigurationStatus }
+        return try JSONDecoder().decode(Resp.self, from: data).status
+    }
+
+    func recordTavilyConfigurationFailure() async -> Bool {
+        do {
+            let c = try await loadCreds()
+            var req = authedRequest("/web/tavily/config/failure", creds: c)
+            req.httpMethod = "POST"
+            let (data, response) = try await URLSession.shared.data(for: req)
+            try validateOK(data: data, response: response)
+            struct Resp: Decodable { let status: TavilyConfigurationStatus }
+            return try JSONDecoder().decode(Resp.self, from: data).status == .configurationFailed
+        } catch {
+            return false
+        }
+    }
+
     struct OdooConfigResult: Decodable, Sendable {
         let ok: Bool
         let version: String?
@@ -1133,6 +1590,18 @@ struct DaemonClient: Sendable {
         return prettyJSONString(data)
     }
 
+    func evidenceDiagnosticExport(turnId: String) async throws -> String {
+        let c = try await loadCreds()
+        let encoded = turnId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? turnId
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/diagnostics/evidence/\(encoded)/export", creds: c)
+        )
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
+        }
+        return prettyJSONString(data)
+    }
+
     func clearMailCache() async throws {
         let c = try await loadCreds()
         var req = authedRequest("/mail/cache/clear", creds: c)
@@ -1181,12 +1650,24 @@ struct ApprovalItem: Identifiable, Decodable, Sendable {
     let description: String?
     let expiresAt: String
     let createdAt: String
+    /// Provenance for approvals raised by unattended automations.
+    var origin: ApprovalOrigin?
 
     enum CodingKeys: String, CodingKey {
-        case id, description
+        case id, description, origin
         case toolName  = "tool_name"
         case expiresAt = "expires_at"
         case createdAt = "created_at"
+    }
+}
+
+struct ApprovalOrigin: Decodable, Sendable {
+    let kind: String
+    let automationName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case automationName = "automation_name"
     }
 }
 
@@ -1204,7 +1685,7 @@ enum DaemonError: LocalizedError {
     }
 }
 
-private struct SSEEvent: Decodable {
+struct SSEEvent: Decodable {
     let type: String
     let content: String?
     let message: String?
@@ -1212,6 +1693,33 @@ private struct SSEEvent: Decodable {
     let session_id: String?
     let tool: String?
     let description: String?
+    let title: String?
+    let detail: String?
+    let status: String?
+    let duration_ms: Int?
+    // Evidence event fields
+    let turn_id: String?
+    let phase: String?
+    let completed: Int?
+    let total: Int?
+    let activity_id: String?
+    let normalized_operation: String?
+    let argument_hash: String?
+    let execution_status: String?
+    let contribution: String?
+    let evidence_count: Int?
+    let source_domains: [String]?
+    let attempt_count: Int?
+    let retries: Int?
+    let duplicates_suppressed: Int?
+    let failure_reason: String?
+    let state: String?
+    let acquired: Int?
+    let requested: Int?
+    let source_count: Int?
+    let provider: String?
+    let provider_status: String?
+    let domain: String?
     let attachments: [DaemonClient.MailAttachmentRef]?
     // mail_found event fields
     let rowid: Int?
@@ -1247,4 +1755,9 @@ private struct SSEEvent: Decodable {
     let chat_id: String?
     let contact_name: String?
     let snippet: String?
+
+    var outcome_kind: String? {
+        guard type == "evidence_outcome" else { return nil }
+        return kind
+    }
 }

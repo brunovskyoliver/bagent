@@ -5,9 +5,11 @@ import Combine
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var notchController: NotchWindowController?
-    private var statusBar: StatusBarController?
     private var daemonLauncher: DaemonLauncher?
-    private var approvalObserver: AnyCancellable?
+    private var tavilyConfigurationManager: TavilyConfigurationManager?
+    private var chatViewModel: ChatViewModel?
+    private var browserCoordinator: BrowserCoordinator?
+    private var browserCommandServer: BrowserCommandServer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -16,81 +18,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         launcher.launch()
         daemonLauncher = launcher
 
-        let vm = ChatViewModel()
-        notchController = NotchWindowController(chatViewModel: vm)
+        let tavilyConfigurationManager = TavilyConfigurationManager()
+        tavilyConfigurationManager.start()
+        self.tavilyConfigurationManager = tavilyConfigurationManager
 
-        // On notch Mac the pill below the notch is the primary indicator;
-        // on external display keep the status item as a right-side fallback.
-        if !vm.hasNotch {
-            let sb = StatusBarController { [weak self] in
-                self?.notchController?.toggle()
-            }
-            statusBar = sb
-            approvalObserver = vm.$pendingApprovals.sink { [weak sb] items in
-                sb?.setBadge(items.count)
-            }
+        let vm = ChatViewModel()
+        chatViewModel = vm
+        let browserCoordinator = BrowserCoordinator()
+        browserCoordinator.start()
+        self.browserCoordinator = browserCoordinator
+        let nc = NotchWindowController(chatViewModel: vm, browserCoordinator: browserCoordinator)
+        notchController = nc
+
+        // Background automation approvals preempt everything: open the notch
+        // as soon as one arrives (the approval overlay renders before any
+        // ordinary mode inside InlineNotchContent).
+        vm.onApprovalArrived = { [weak nc] in
+            guard let nc, !nc.isNotchInteractionShowing else { return }
+            nc.presentInputOnly()
         }
+        vm.startEventsMonitor()
+
+        let browserCommandServer = BrowserCommandServer(coordinator: browserCoordinator)
+        browserCoordinator.onEnabledChanged = { [weak browserCommandServer] _ in
+            // Keep the user-only endpoint alive while the feature is disabled
+            // so MCP clients receive browser_disabled instead of an ambiguous
+            // startup timeout. The coordinator still creates no session or cue.
+            browserCommandServer?.start()
+        }
+        browserCommandServer.start()
+        self.browserCommandServer = browserCommandServer
 
         GlobalHotkey.register { [weak self] in
             DispatchQueue.main.async { self?.handleHotkey() }
         }
     }
 
-    /// ⌥Space behavior:
-    /// - voice disabled, chat closed → first ⌥Space opens Spotlight-style input;
-    ///   a second ⌥Space within the double-press window opens the full chat window.
-    /// - voice disabled, chat open → collapse (any subsequent tap).
-    /// - voice enabled, collapsed → open voice overlay instantly; a second ⌥Space
-    ///   within the double-press window dismisses voice and opens the chat window instead.
-    /// - voice enabled, chat open → collapse.
-    private var lastHotkeyAt: Date?
-    private let doublePressWindow: TimeInterval = 0.35
-
+    /// ⌥Space toggles the notch input surface.
     private func handleHotkey() {
         guard let nc = notchController else { return }
-        let now = Date()
-
-        if !nc.isVoiceModeEnabled {
-            // Second ⌥Space within the window while input bar is showing → upgrade to full chat.
-            if (nc.isInputShowing || nc.isExpanded),
-               let last = lastHotkeyAt,
-               now.timeIntervalSince(last) < doublePressWindow {
-                lastHotkeyAt = nil
-                nc.presentOutputChat()
-                return
-            }
-            // Slow second tap or chat already expanded → collapse.
-            if nc.isExpanded || nc.isInputShowing {
-                lastHotkeyAt = nil
-                nc.collapse()
-                return
-            }
-            // First ⌥Space → open the Spotlight-style input bar.
-            lastHotkeyAt = now
-            nc.presentInputOnly()
-            return
-        }
-
-        if nc.isExpanded || nc.isInputShowing {
-            lastHotkeyAt = nil
-            nc.collapse()
-            return
-        }
-
-        if nc.isVoiceShowing,
-           let last = lastHotkeyAt,
-           now.timeIntervalSince(last) < doublePressWindow {
-            lastHotkeyAt = nil
-            nc.openChatFromVoice()
-            return
-        }
-
-        lastHotkeyAt = now
-        nc.presentVoice()
+        nc.isNotchInteractionShowing ? nc.collapse() : nc.presentInputOnly()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        browserCommandServer?.stop()
+        if let browserCoordinator {
+            for session in browserCoordinator.sessions.values { session.terminate() }
+        }
         GlobalHotkey.unregister()
+        chatViewModel?.cmuxMonitor.stop()
+        tavilyConfigurationManager?.stop()
         daemonLauncher?.stop()
     }
 }

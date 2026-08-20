@@ -17,9 +17,9 @@
 │  │  Rules Engine · Memory · Audit Log · SQLite          │   │
 │  └──┬──────────┬──────────┬──────────────┬─────────────┘   │
 │     │          │          │              │                   │
-│  Ollama     Codex      Connectors    SQLite DB              │
-│  :11434      CLI      (Mail/Notes    (bagent.db +            │
-│  (local)  subprocess   Odoo/Shell    embeddings)            │
+│  BaseRT     Codex      Connectors    SQLite DB              │
+│  :8082       CLI      (Mail/Notes    (bagent.db + FTS5)      │
+│  (local)  subprocess   Odoo/Shell                            │
 │                        Screen)                               │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -42,8 +42,12 @@
 
 ### Chat View
 
-- `SwiftUI.TextEditor` for multi-line input, `ScrollView` with streaming token append for output.
-- SSE stream from daemon: each `data:` chunk appended to `@Published var tokens: [String]`.
+- The daemon emits semantic SSE events for answer deltas, activity lifecycle,
+  retained sources, approvals, errors, and completion.
+- `AdaptiveStreamPresenter` separates BaseRT transport chunks from the displayed
+  prefix, revealing complete words at an adaptive cadence with bounded catch-up.
+- Each assistant message owns its canonical text, displayed prefix, activity
+  transcript, and validated HTTP(S) sources for the current in-memory session.
 
 ### Approval Modals
 
@@ -60,7 +64,7 @@
 | Automation (Mail, Notes) | AppleScript/JXA bridge | Phase 4 |
 | Screen Recording | ScreenCaptureKit frames | Phase 7 |
 | Full Disk Access | Mail `.emlx` + `Envelope Index`, Notes SQLite | Phase 4 |
-| Network | Odoo API, Ollama, optional cloud | Phase 3 |
+| Network | Odoo API, BaseRT, optional cloud | Phase 3 |
 | Keychain | API keys, daemon bearer token | Phase 2 |
 
 > Request permissions lazily at first use; explain reason in native `NSAlert` before system prompt appears.
@@ -84,6 +88,29 @@
 - `serde` / `serde_json` for all wire formats.
 - `tracing` + `tracing-subscriber` for structured logs.
 
+### Daemon residency (launchd)
+
+The daemon is a per-user launchd agent, not a child of the notch app, so
+scheduled automations keep running after the app exits.
+
+- On every app launch, `DaemonLauncher` writes
+  `~/Library/LaunchAgents/com.bagent.daemon.plist` (current binary path +
+  model env from UserDefaults) and does `launchctl bootout` + `bootstrap` —
+  a deterministic restart into the current binary. This covers app relaunch,
+  packaging, and upgrades.
+- App exit does **not** stop the daemon.
+- Crashes are restarted by launchd (`KeepAlive.SuccessfulExit=false`); a
+  clean exit or explicit `launchctl bootout gui/$UID/com.bagent.daemon`
+  (`DaemonLauncher.shutdownDaemon()`) stays down.
+- Discovery contract unchanged: the daemon writes `daemon.port`,
+  `daemon.token`, and `daemon.pid` in Application Support regardless of who
+  started it. Daemon logs go to `~/Library/Logs/bagent/daemon.log`.
+- Migration: a pre-launchd daemon recorded in `daemon.pid` that launchd does
+  not own is SIGTERMed once at app launch.
+- The app also owns `com.bagent.basert`, serving Qwen3-4B on loopback port
+  8082. It survives normal UI exit and is stopped by explicit shutdown. The
+  independent BaseRT service on port 8080 is never touched.
+
 ### Core Crates
 
 ```
@@ -91,11 +118,11 @@ crates/
   daemon/        — axum server, startup, port/token mgmt, route handlers
   agent/         — PromptBuilder, ContextPlanner, MemoryExtractor, MailIntent, WindowIntent
   rules/         — rules engine (YAML loader + matcher, hot-reload)
-  memory/        — SQLite read/write, FTS5, embeddings, MemorySelector
+  memory/        — SQLite read/write, FTS5, MemorySelector
   skills/        — SKILL.md loader + selector (repo skills/ dir + app data override)
   attachments/   — file extraction pipeline (text/PDF/image)
   connectors/
-    ollama/      — chat stream, embeddings, generate_json (format:json mode)
+    basert/      — OpenAI-compatible chat SSE, tools, JSON generation
     apple_mail/  — Envelope Index SQLite + emlx parser + AppleScript fallback
     apple_notes/ — NoteStore SQLite + JXA body retrieval
 ```
@@ -107,9 +134,9 @@ crates/
 ### MVP — Local HTTP + SSE
 
 ```
-POST /chat           { messages, context, rules_override? }
-                     → 200 SSE stream: data: {"token":"…"}\n\n
-                     → 200 SSE stream: data: {"done":true,"tool_calls":[…]}\n\n
+POST /chat           { message, model, history, context }
+                     → 200 SSE: token/activity_started/activity_completed
+                     → 200 SSE: source_discovered/approval_requested/error/done
 
 POST /approve        { approval_id, decision: "allow"|"deny", reason? }
                      → 200 { ok: true }
@@ -118,7 +145,7 @@ GET  /approvals/pending   → 200 [ApprovalRequest]
 GET  /audit          { since?, limit? } → 200 [AuditEntry]
 GET  /connectors     → 200 [ConnectorStatus]
 POST /connectors/{id}/sync  → 200 { queued: true }
-GET  /health         → 200 { status:"ok", version, ollama_up }
+GET  /health         → 200 { status:"ok", model, basert }
 ```
 
 Auth: `Authorization: Bearer <token>` on all requests.
@@ -133,25 +160,65 @@ Replace HTTP with a UDS at `~/Library/Application Support/bagent/daemon.sock`. S
 
 ---
 
-## Model Router
+## Model selection
 
-See [`MODEL_ROUTER.md`](MODEL_ROUTER.md) for full routing table and prompt templates.
+There is no routing pipeline — it was replaced by an agentic tool-calling loop
+(the model sees native tool definitions and decides what to call). `MODEL_ROUTER.md`
+described the old design and has been removed.
 
-Summary:
-- Local Ollama → classification, summarization, embeddings, Slovak text, single-source tasks.
-- Codex CLI → advanced cross-source business/admin reasoning (Phase 8, approval-gated).
-- Cloud LLM → complex reasoning, user opt-in, privacy-filtered.
+The typed Mail/web evidence-answer path is the production default for deterministically
+classified latest-Mail Header Listings, latest-Mail Content Readings, direct pages,
+single-authority web facts, corroborated web facts, and their supported quoted-evidence
+wrappers. Its classifier is intentionally narrow. Targeted Mail, ambiguous Mail,
+mixed Mail/web, multi-page ambiguity, unrelated requests, unsupported classifications,
+and ordinary agentic tool use remain on the agentic loop.
+
+`BAGENT_EVIDENCE_ORCHESTRATOR` controls routing only. Absent or `1` selects the typed
+route; `0` immediately restores the previous agentic loop after daemon restart. Any
+other value uses the production default and emits a normalized warning that does not
+include the supplied value. Typed routing is decided before legacy Mail prefetch,
+guidance, prose-result heuristics, or agentic tools are prepared, preventing duplicate
+Mail/web operations. See [`STAGE9_ROUTING_ROLLBACK.md`](STAGE9_ROUTING_ROLLBACK.md).
+
+The bounded typed route uses Tavily Basic plus DuckDuckGo when the signed app supplies a
+Tavily key ephemerally from Keychain. Without a key it retains Wikipedia plus DuckDuckGo;
+the legacy tool stays on that keyless provider set. Tavily is discovery-only and is never
+retried; fetched pages still pass the complete DNS, redirect, SSRF, extraction, relevance,
+authority, and independent-source pipeline. See
+[`TAVILY_WEB_DISCOVERY.md`](TAVILY_WEB_DISCOVERY.md) for free-tier setup and budgets.
+
+For every validated Evidence Bundle, the daemon first builds a complete
+`CanonicalGroundedAnswer`. This deterministic record owns coverage, citations,
+conflicts, shortfalls, source identities, and evidence outcome. Qwen3.6-35B-A3B may
+optionally polish wording with context 4,096, KV4, 256 output tokens, batch size 1,
+and the 25%/8 GiB admission gate. Polished text replaces the canonical text only after
+bundle and canonical-invariant validation. Rejection, timeout, unavailability, memory
+ineligibility, or runtime poisoning preserves the canonical bytes. The 4B model is not
+a grounding-quality fallback. Structured synthesis remains a disabled experiment.
+
+- Local BaseRT (`basecompute/Qwen3-4B-Instruct-2507`) → chat, tool calls, and classifiers.
+- Retrieval uses SQLite FTS5 only. Screen frames are processed by Apple Vision
+  OCR locally and only extracted text reaches the model; image attachments are rejected.
+- Codex CLI → advanced cross-source tasks, approval-gated.
+- Cloud LLM → opt-in only.
+
+See the "Agentic tool loop" section of `CLAUDE.md` for the retained rollback and
+unsupported-intent loop.
 
 ---
 
-## Ollama Integration
+## BaseRT Integration
 
-- Base URL: `http://localhost:11434` (configurable).
-- Endpoints used: `POST /api/chat` (streaming), `POST /api/embeddings`, `GET /api/tags`.
-- Preflight on daemon start: `GET /api/tags` with 2 s timeout; set `ollama_up` flag; expose via `/health`.
-- Streaming: parse `ndjson` lines, emit as SSE tokens upstream.
-- Model selection: stored in `connectors` table config; default `qwen2.5:7b`.
-- Context window management: sliding window of last N tokens; summarize older turns with local model.
+- Base URL: `http://127.0.0.1:8082/v1`; API key: `basert-local`.
+- Endpoints used: `POST /v1/chat/completions`, `GET /v1/models`, `GET /health`,
+  and `POST /v1/models/unload`.
+- Streaming follows OpenAI SSE (`data: {...}` ending in `data: [DONE]`);
+  fragmented UTF-8 and tool-call names/arguments are reassembled before semantic
+  transcript events cross the daemon-to-app seam.
+- The configured model and classifier are both
+  `basecompute/Qwen3-4B-Instruct-2507`.
+- `/embeddings` remains as a compatibility route returning
+  `501 embeddings_disabled`.
 
 ---
 
@@ -167,8 +234,8 @@ not a coding tool. It is invoked only when the deterministic `TaskRater` returns
 
 | Level | Score | Meaning | Example |
 |---|---|---|---|
-| `LocalOnly` | 0–9 | Ollama handles it | "zhrň mi tento email" |
-| `LocalPreferred` | 10–29 | Ollama preferred | "navrhni krátky email" |
+| `LocalOnly` | 0–9 | BaseRT handles it | "zhrň mi tento email" |
+| `LocalPreferred` | 10–29 | BaseRT preferred | "navrhni krátky email" |
 | `CodexCandidate` | 30–59 | May benefit from Codex | "porovnaj dve zmluvy" |
 | `CodexRecommended` | 60–84 | Codex recommended | "priprav brief pre klienta z mailov a Odoo" |
 | `CodexRequired` | 85+ | Codex required | "hromadné odpovede na faktúry po splatnosti" |
@@ -276,11 +343,6 @@ rules:
       connector: mail
     action: ask
 
-  - id: allow-ollama-read
-    match:
-      connector: ollama
-    action: allow
-
   - id: block-root-shell
     match:
       tool: shell_exec
@@ -301,7 +363,7 @@ Before prompt assembly, every chat turn runs through three sequential stages:
 user_turn
   │
   ▼
-ContextPlanner::plan()          — deterministic rules + Ollama JSON-mode fallback
+ContextPlanner::plan()          — deterministic rules + BaseRT JSON-mode fallback
   │  produces ContextPlan { task_type, response_language_hint, needs_memory,
   │                         memory_namespaces, memory_kinds, needs_conversation_recall,
   │                         candidate_skill_names, confidence }
@@ -325,13 +387,12 @@ PromptBuilder::build()          — injects selected skills + memory into prompt
 ## Memory and Indexing
 
 - SQLite with FTS5 virtual tables for full-text search over `messages`, `notes`, `memory_items`.
-- `sqlite-vec` extension for cosine similarity search on embeddings.
-- Embedding model: `bge-m3` via Ollama (multilingual SK/EN).
+- Historical embedding rows remain in SQLite but are not consulted.
 - Per-source namespaces prevent cross-connector bleed.
 - `language` column on every text-storing table (`sk`, `en`, `und`).
-- Retrieval: hybrid BM25×0.35 + cosine×0.45 + importance×0.10 + recency×0.10; per-namespace cap 3; MMR near-dup filter.
+- Retrieval: BM25×0.70 + importance×0.15 + recency×0.15; per-namespace cap 3; near-duplicate text filter.
 - **Memory ledger fields** (V11): `confidence`, `importance`, `status` (`active`/`superseded`/`deleted`), `source` (`passive`/`explicit`/`user_edit`/`import`), `sensitivity` (`normal`/`sensitive`), `subject`, `supersedes_id`.
-- Hard retrieval filter: `status='active'` + `sensitivity='normal'`; explicit/user_edit insertion supersedes conflicting passive items.
+- Hard retrieval filter: `status='active'` + `sensitivity='normal'`; insertion uses normalized exact-text deduplication.
 - Passive extraction gates: `confidence ≥ 0.75`, `importance ≥ 0.60`, no sensitive-text indicators, no one-off content patterns.
 
 ## Skills

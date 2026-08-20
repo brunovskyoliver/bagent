@@ -1,191 +1,212 @@
-# bagent UI Design Reference
+# bagent UI Design Reference — the notch surface
 
-Living document. Future phases (7, 9, 10) and any new UI component should read this first.
-
----
-
-## Display modes
-
-| Mode | Condition | Resting UI |
-|---|---|---|
-| **Notch wrap** | `NSScreen.main?.auxiliaryTopLeftArea != nil` | Curved black bar hugging the physical notch |
-| **Menu-bar inline** | External display or non-notch Mac | Transparent pill inside menu bar at screen center |
-| **Status item fallback** | Non-notch Mac, no external display | `NSStatusItem` at right of menu bar |
-
-The `NotchWindowController.hasNotch` flag drives the branch. External display logic (`screensChanged`) fires on `NSApplication.didChangeScreenParametersNotification` and recomputes geometry.
+**Read this before adding any UI.** bagent has exactly one surface: a black shape
+that wraps the notch. There is no chat window, no settings window, no menu-bar
+status item, and no voice overlay. Everything the user sees is drawn inside that
+one shape, and anything new belongs inside it too.
 
 ---
 
-## Notch wrap anatomy
+## The one-panel rule
+
+| Thing | Where it lives |
+|---|---|
+| AppKit window | a single `BagentPanel` (`statusPanel`) — borderless, non-activating, `.statusBar` level |
+| Its frame | **fixed** at `pillFrame` = `2 × maxWingWidth + notchWidth` × `menuBarH + maxBridgeHeight` |
+| The visible shape | `NotchWrapShape`, animated by SwiftUI **inside** that fixed frame |
+| Content | `StatusPillView` → `NotchWrapView` → `InlineNotchContent` |
+
+The frame is deliberately oversized and never resized. AppKit resizing during a
+shape animation clips the bottom arcs into sharp corners, so the panel stays put
+and only the SwiftUI path moves. **Do not call `setFrame` to make the notch grow** —
+animate `wingWidth` / `bridgeHeight` instead.
+
+`computeGeometry()` recomputes `pillFrame` only on
+`NSApplication.didChangeScreenParametersNotification` (`screensChanged`).
+
+### Notch vs. non-notch displays
+
+The surface is always notch-style. Physical-notch displays use the measured
+`auxiliaryTopLeftArea` / `auxiliaryTopRightArea`; external and non-notch displays
+draw a centered synthetic 221 pt notch gap (`syntheticNotchWidth`, measured from
+Mac17,2). `hasNotch` records which case applies — it changes the geometry source,
+never the idiom.
+
+---
+
+## Anatomy
 
 ```
-┌──────────────────────────────────────────────────────────────────┐  ← top of screen / menu-bar top edge
+┌──────────────────────────────────────────────────────────────────┐  ← top of screen
 │  menu bar                                                        │
 │        ╔═══════╗              ╔═══════════════╗                  │
 │        ║ LEFT  ║  [  NOTCH  ] ║     RIGHT     ║                  │
-│        ║  ✦   ║              ║      ⌄         ║                  │
-│        ╚═══╤══╝              ╚══════╤═════════╝                  │
-│            └──────────────────────┘  ← bottom bridge (hover only)│
+│        ╚═══╤═══╝              ╚══════╤════════╝                  │
+│            └───────── bridge ────────┘                           │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-- **Left wing** — from `auxiliaryTopLeftArea.maxX - wingW` to `auxiliaryTopLeftArea.maxX`, full menu-bar height.
-- **Right wing** — from `auxiliaryTopRightArea.minX` to `auxiliaryTopRightArea.minX + wingW`, same height.
-- **Notch gap** — the physical camera cutout; `tr.minX - tl.maxX`. bagent draws nothing here (click-through).
-- **Bottom bridge** — thin strip below the notch connecting the two wings. Hidden at idle, appears on hover, becomes the top chrome when expanded.
+- **Left wing** — connector icons / page icon. Grows to fit its icon row: every
+  state clamps `targetWing = max(targetWing, requiredLeftWingWidth)`.
+- **Right wing** — status dot (hidden when idle + collapsed, so an idle notch is
+  pure black), cmux dot.
+- **Notch gap** — the physical cutout. bagent draws nothing here.
+- **Bridge** — the strip below the notch. Height 0 at idle; it *is* the content
+  area in every open state.
 
-Sizing constants (all in points):
+Two animatable inputs drive `NotchWrapShape`: `wingWidth` and `bridgeHeight`
+(plus `bulgeDepth` / `bulgeSweep` for the paste wheel's dome).
+
+---
+
+## States
+
+`NotchInteractionMode` (on `ChatViewModel`) is the single source of truth for what
+the notch is doing. There are no parallel `isExpanded` / `isInputShowing` flags —
+they were removed; do not reintroduce them.
+
+| Mode | Entered by | Shows |
+|---|---|---|
+| `.collapsed` | `collapse()`, Esc, click-away | nothing (black notch) |
+| `.input` | `⌥Space` / pill tap → `presentInputOnly()` | text field + source bubbles |
+| `.thinking` | submit → `collapseInputForThinking()` | thinking indicator |
+| `.output` | first assistant token → `presentOutputChat()` | streamed response |
+| `.settings` | `/settings` → `openNotchSettings()` | settings pages |
+| `.automations` | `/automations` → `openAutomations()` | automation list / detail / step editor |
+
+Two surfaces preempt the mode switch entirely, in `InlineNotchContent.body`:
+
+1. **A pending approval** — `pendingApprovals.first` beats everything. The daemon
+   auto-denies after 60 s, so `NotchWindowController` also opens the notch on its
+   own when one arrives (`approvalCancellable`). This is the only place a gated
+   write can be allowed; never gate it behind another surface.
+2. **WhatsApp QR pairing** — `showWhatsappPairing`.
+
+### Sizing
+
+All points, in `NotchWrapMetrics`:
 
 | State | `wingW` | `bridgeHeight` |
 |---|---|---|
 | Idle | 32 | 0 |
-| Hover | 96 | 8 |
-| Expanded | `chatWidth / 2` (200) | full chat height (520) |
+| Hover | 72 | 22 |
+| Input | 221 | 72 |
+| Output | 154 (min 72) | 96, grows to 280 |
+| Settings | 205 | 252 (setup page: 280) |
+| Automations | 205 | 214 |
+| cmux banner | 84 | 19 |
+| Paste wheel | 196 | 36 + 96 bulge dome |
+| **Ceiling** | **260** | **280** |
+
+Never exceed `maxWingWidth` / `maxBridgeHeight` — they define the fixed panel
+frame, and anything larger is clipped rather than shown.
+
+### Assistant transcript
+
+- While work is running, the output surface shows one gray current-action row.
+- Completed activity collapses to a one-line step count and expands on click
+  into chronological tool/search rows; it never exposes hidden chain-of-thought.
+- The answer streams independently at an adaptive word cadence.
+- Retained web sources appear as numbered links. Inline `[N]` citations are
+  clickable only when `N` maps to a daemon-validated HTTP(S) source.
 
 ---
 
-## `NotchWrapShape`
+## Animation
 
-Custom `Shape` in `NotchWrapShape.swift`. Inputs drive the path:
+`refreshSurface()` is the one place that resolves state → target geometry. Call it
+whenever something that affects size changes; add an `onChange` rather than
+setting `wingWidth` / `bridgeHeight` by hand.
 
-- `notchWidth` — fixed, from geometry.
-- `notchHeight` — fixed, equals `menuBarH`.
-- `wingWidth` — animatable (`AnimatablePair` left).
-- `bridgeHeight` — animatable (`AnimatablePair` right).
-- `outerCornerRadius` ≈ 10 pt — where the wing meets the outer menu-bar edge.
-- `innerCornerRadius` ≈ 8 pt — where the wing meets the notch cutout (matches physical notch rounding on M-series).
-
-The path draws a U-shape (open at the top) that wraps left wing → bridge → right wing. When `bridgeHeight == 0` the bridge segment degenerates to a point and the two wings are visually separate.
+- Surface morph: `surfaceDuration` 0.58 s ease.
+- Paste wheel: snappier `.spring(response: 0.34, dampingFraction: 0.82)` — the
+  0.5 s hold already cost the user time, so the reveal must feel instant.
+- Content fades in at ~62% of the surface morph, so the shape leads and the text
+  follows. Never fade content in at t=0; it looks like the notch is bulging around
+  already-present text.
+- **Reduced motion** (`accessibilityReduceMotion`): every animation has a
+  no-motion branch — opacity-only or `nil`. Match this in new code.
 
 ---
 
-## Animation language
+## Look
 
-Three-phase expand (total ≈ 320 ms):
+Text is soft off-white, **never pure white**:
 
-| Phase | Time | What happens |
+| Token | Value | Use |
 |---|---|---|
-| A — spread | 0–120 ms | Wings grow horizontally to full chat width; `wingWidth` springs out |
-| B — drop | 80–280 ms (overlaps A) | `bridgeHeight` springs down to full chat height; outer corner radius eases from 10 → 16 |
-| C — content | 180–320 ms | `ExpandedChatView` fades + scales in from 0.96 → 1.0, anchored at notch top-center |
+| `notchTextPrimary` | `white 0.80` | primary lines |
+| `notchTextSecondary` | `white 0.55` | subtitles, labels |
+| `notchTextFaint` | `white 0.42` | placeholders, hints |
 
-Collapse is phases in reverse: C → B → A.
-
-Spring params (both phases): `response: 0.32, dampingFraction: 0.72`.
-
-**Reduced-motion fallback** (`UIAccessibility.isReduceMotionEnabled` / AppKit equivalent): skip phases A+B entirely; do a simple cross-fade (opacity only) over 180 ms.
+Surfaces inside the notch are `Color.white.opacity(0.06)` fills with 5–6 pt
+corners; buttons are `white.opacity(0.12)`. The background is the notch's own
+black — do not add materials, blur, or shadows inside the shape.
 
 ---
 
-## Iconography slots
+## Settings
 
-| Slot | Idle | Hover | Expanded |
-|---|---|---|---|
-| **Left wing** | `sparkles` (0.7 opacity) | `sparkles` (1.0 opacity) | (hidden — panel chrome takes over) |
-| **Right wing** | `chevron.down` (0.7 opacity) | `chevron.down` (1.0 opacity) | `xmark.circle.fill` (tap to collapse) |
+`/settings` opens `.settings` mode. `NotchSettingsContent` renders one page at a
+time; `←`/`→` or the header icons switch pages, and the left wing mirrors the
+current page icon.
 
-Status overlays (appear on top of left-wing slot, not replacing it):
+| Page | Carries |
+|---|---|
+| `general` | paste wheel, cmux notifications |
+| `permissions` | Full Disk, mic, screen recording, Accessibility |
+| `model` | chat model picker |
+| `connectors` | connector status (read-only) |
+| `setup` | Odoo credentials, Codex path, WhatsApp pairing, `rules.yaml` editor |
 
-- `brain` badge — `memory_saved` ACK from daemon → fades out after 2 s.
-- `shield.lefthalf.filled` badge (orange) — pending approval count > 0.
-
-These badges live in `ChatViewModel` and are read by `NotchWrapView` directly.
-
----
-
-## Reference apps
-
-- **NotchNook** (Lo.cafe) — idle border only, hover/drag expands downward symmetrically. Inspiration for hover-expand idiom and bridge concept.
-- **Alcove** (Pranjal Satija) — permanent slim icon-flanked wrap, click expands with curved top edge retained. We mirror this exact pattern.
-
-We chose Alcove's always-visible idle state (confirmed by user preference: "thin black wrap, icons visible").
+`setup` is the only page that scrolls and the only one at full bridge height —
+credentials plus the rules editor do not fit otherwise.
 
 ---
 
-## Future hooks (reserved icon/badge slots)
+## Automations
 
-| Trigger | Slot | Phase |
-|---|---|---|
-| Screen context active (Phase 7) | Right wing: `viewfinder` icon while capturing | Phase 7 |
-| Codex artifact ready (Phase 8) | Bottom bridge: download strip with filename | Phase 8 |
-| Tool-call in flight | Left wing: progress spinner replaces sparkles | Phase 5+ |
-| Approval pending | Left wing: orange shield badge | Phase 5 ✅ already wired |
-
-Reserve the bridge area for transient content only — it should never carry permanent UI.
-
----
-
-## Spotlight input surface
-
-When the user opens bagent while no assistant output is being generated, the first surface is
-an input-only command field rather than the full chat panel.
-
-- **Idle open** — notch/status click opens a wide Spotlight-like input below the notch.
-- **Voice mode enabled** — single `⌥Space` opens voice; double `⌥Space` opens this input.
-- **Voice mode disabled** — single `⌥Space` opens this input.
-- **Send** — input collapses back into the notch; the existing blue status dot signals pre-token work.
-- **First token** — full chat opens automatically once assistant output begins.
-- **Thinking manual open** — during pre-token work, notch/status click or shortcut may open the full chat manually.
-- **Source modes** — the input can shrink from the right to reveal the four most-used source bubbles. Defaults are Mail, Files, WhatsApp, Odoo; `⌘1`-`⌘4` select the visible modes.
-
-The input uses a liquid-glass-style material on current macOS builds. Native Liquid Glass should replace the fallback material when the app is built with an SDK that exposes those APIs.
+`/automations` opens `.automations` mode. `AutomationsSurfaceState` (an enum on
+`ChatViewModel`, rendered by `AutomationsNotchContent`) selects what shows
+inside the mode: `.list` (≈3 upcoming rows + `+`), `.detail`,
+`.deleteConfirmation`, and the step editor
+(`.editorTask → .editorSchedule → .editorRecurrence → .editorReview →
+.editorSaving`). The editor is divided into steps instead of scrolling; every
+step fits the 214-pt bridge. Escape steps back one level before collapsing;
+↑/↓ + Return drive the list. Long run results are shown by reusing the normal
+`.output` presentation (tap the result box in detail). Approval and WhatsApp
+QR preemption order is unchanged. See `docs/AUTOMATIONS.md`.
 
 ---
 
-## What NOT to put in the wrap
+## What does NOT go in the notch
 
-The notch wrap is a **1-second UI surface**: glanceable, tappable, always visible. Do not put:
+It is a **1-second surface**: glanceable, tappable, always visible.
 
-- Long-lived free-form text input inside the always-visible wrap itself (idle entry belongs in the separate Spotlight input surface)
-- Long labels or multi-word messages
-- Anything requiring > 1 s of user attention
-- Scrollable content
-- Modal dialogs or confirmation flows (→ `ApprovalModalOverlay` inside expanded panel)
+- No long-lived free-form text outside `.input`.
+- No long labels or multi-word status messages.
+- Nothing needing more than a second of attention.
+- No scrollable content — `setup` is the deliberate exception.
+- **No new windows for ordinary features.** bagent Browser is the sole accepted
+  exception: each live Browser Session may own one chromeless, resizable,
+  floating Browser Panel because an interactive web page cannot fit the notch.
+  Browser Panels use `.floating`, support all Spaces/full-screen auxiliary
+  placement, and never replace or move the notch panel.
 
 ---
 
 ## Accessibility
 
-- Left wing: `accessibilityLabel("bagent — apliácia")`, `accessibilityHint("Otvoriť chat")`
-- Right wing: `accessibilityLabel("Rozbaliť chat")` / `"Zbaliť chat"` based on state
-- Bottom bridge: not focusable (decorative)
-- Full expanded panel: standard `accessibilityElement(children: .contain)` on the container
-- Reduced-motion: read via `NSWorkspace.shared.accessibilityDisplayShouldReduceMotion`; when `true`, skip shape morph, use `opacity` transition only
+- Wings carry `accessibilityLabel`; the bridge is decorative.
+- Reduced motion via `accessibilityReduceMotion` — shape morphs degrade to
+  opacity.
+- Toggles and page buttons carry explicit labels (icon-only controls otherwise
+  read as "button").
 
 ---
 
-## Voice Input (Phase 5G)
+## Reference apps
 
-Two distinct surfaces, one shared `SpeechController` (WhisperKit, on-device).
-
-### Voice-only overlay (⌥Space, collapsed)
-- Pops from the notch using the **same charge→pop timing as the chat panel**
-  (`pillHovered` spring, then panel after 150 ms) — `NotchWindowController.presentVoice()`.
-- `VoiceOverlayView` (360×240): `.regularMaterial` rounded rect, subtle white stroke.
-  - `waveform` SF Symbol with `.symbolEffect(.variableColor.iterative.dimInactiveLayers.reversing, options: .repeating, isActive:)`.
-    *(`.repeating` is the macOS-14 form of `.repeat(.continuous)`, which is macOS 15+.)*
-  - `SiriWaveView` — `TimelineView(.animation)` + `Canvas`, 3 layered translucent sine
-    bands whose height tracks `speech.amplitude` (from WhisperKit `bufferEnergy`).
-  - Live transcript: last ~2 sentences; each `Text` keyed by `.id(sentence)` with an
-    asymmetric fade+move transition (insertion from bottom, removal to top), animated with
-    `.spring(response: 0.32, dampingFraction: 0.78)`.
-- Auto-finalizes on ~1.2 s silence → **morphs into the chat window** (`voiceToChatHandoff`):
-  overlay hides, chat expands, transcript is submitted via the normal `send()` pipeline.
-- Escape / click-away cancels (`onExitCommand` + global mouse monitor, mirroring the chat panel).
-
-### Inline mic (chat input bar)
-- `VoiceAttachControl`: the existing `+` attachments button with a `mic.fill` button that
-  springs **up above it** on hover or while recording
-  (`.spring(response: 0.28, dampingFraction: 0.68)`) — two stacked icons, mic on top.
-- Clicking the mic does **not** open the overlay; it records inline, pulses the mic with
-  `.symbolEffect(.pulse.byLayer, options: .repeating, isActive:)`, and live-fills the text
-  field. The final transcript is editable like typed text; send normally.
-
-### Hotkey
-- Single ⌥Space (collapsed) → voice overlay **instantly**.
-- Second ⌥Space within ~350 ms → dismiss voice, open chat (`AppDelegate.handleHotkey`).
-- ⌥Space while chat open → collapse (unchanged).
-
-### Reduced motion
-- `SiriWaveView` falls back to a static amplitude capsule (no `Canvas`/`TimelineView`).
-- Transcript transitions drop to `nil` animation.
+- **Alcove** (Pranjal Satija) — always-visible slim icon-flanked wrap. The idiom
+  bagent follows.
+- **NotchNook** (Lo.cafe) — hover-expand and the bridge concept.

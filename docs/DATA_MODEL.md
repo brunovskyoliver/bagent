@@ -177,7 +177,7 @@ CREATE VIRTUAL TABLE memory_fts USING fts5(
 - Only `status='active'` rows are returned by `retrieve_filtered`.
 - Only `sensitivity='normal'` rows are returned (sensitive items require explicit opt-in never currently granted).
 - Passive extraction is blocked for `sensitivity='sensitive'` items regardless of confidence/importance.
-- Explicit/user_edit insertion against an active passive item in the same namespace (cosine > 0.75) → supersedes the passive item (`status='superseded'`).
+- Explicit/user_edit insertion supersedes an active passive item in the same namespace and kind when its subject or source reference matches, or normalized trigram similarity is at least 0.55 (`status='superseded'`).
 - `prune()` only hard-deletes rows with `status IN ('deleted','superseded')` older than the prune window.
 
 ---
@@ -188,7 +188,7 @@ Configuration and sync state for each connector instance.
 
 ```sql
 CREATE TABLE connectors (
-    id           TEXT PRIMARY KEY,            -- e.g. 'apple_mail', 'odoo_prod', 'ollama'
+    id           TEXT PRIMARY KEY,            -- e.g. 'apple_mail', 'odoo_prod', 'basert'
     kind         TEXT NOT NULL,               -- connector type enum
     display_name TEXT NOT NULL,
     enabled      INTEGER NOT NULL DEFAULT 1,
@@ -235,6 +235,15 @@ CREATE INDEX audit_entries_action     ON audit_entries(action, created_at DESC);
 Hash chain: `prev_hash = SHA256(JSON(previous_row))` where `JSON(row)` = canonical JSON of all columns except `prev_hash`. First row: `prev_hash = "genesis"`.
 
 ---
+
+### `automations` / `automation_runs` (V13, V14)
+
+Scheduled automations and their bounded run history — see
+`crates/daemon/migrations/V13__automations.sql` and `docs/AUTOMATIONS.md`.
+Schedules are typed JSON (`bagent-automations::AutomationSchedule`), instants
+UTC RFC3339, the user's IANA zone alongside. `automation_runs` keeps the
+newest 50 rows per automation (each cleanup audited); `pending_approvals`
+gained `origin_json` (V14) so approvals identify the originating automation.
 
 ### `embeddings`
 
@@ -288,7 +297,7 @@ Every table that stores user-derived text includes a `language` column with valu
 - `en` — English
 - `und` — undetermined / mixed
 
-Language is set during indexing by the language detector (Ollama local call). It is never changed after initial classification unless the user explicitly triggers re-classification.
+Language is set during indexing by the local BaseRT classifier. It is never changed after initial classification unless the user explicitly triggers re-classification.
 
 ---
 

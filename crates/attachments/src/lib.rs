@@ -41,7 +41,7 @@ pub struct ExtractResult {
     pub kind: AttachmentKind,
     /// Extracted text preview (UTF-8, max ~8 000 chars). None for images.
     pub extracted_text: Option<String>,
-    /// True for images — caller should route to a vision model.
+    /// True for images — the current text-only runtime must reject them.
     pub requires_vision: bool,
 }
 
@@ -50,7 +50,7 @@ const MAX_TEXT_CHARS: usize = 8_000;
 /// Classify and extract text from an attachment at `path`.
 /// `mime` is the MIME type reported by the HTTP multipart header.
 pub fn extract(path: &Path, mime: &str) -> Result<ExtractResult> {
-    // Images — pass through for vision model, no text extraction.
+    // Images have no text extraction and are rejected by the current runtime.
     if mime.starts_with("image/") {
         return Ok(ExtractResult {
             kind: AttachmentKind::Image,

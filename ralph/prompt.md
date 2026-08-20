@@ -49,9 +49,13 @@ Commit message must include:
 2. Files/crates changed
 3. Blockers or notes for next iteration
 
+# SPEC
+
+The full automation/scheduling spec is in `Scheduling.md` at the repo root. Read the sections relevant to your chosen issue before implementing. Respect issue "Blocked by" ordering — do not start an issue whose blockers are still in `issues/`.
+
 # THE ISSUE
 
-If the task is complete, move the issue file to `issues/done/`.
+If the task is complete, move the issue file to `issues/done/` and close the matching GitHub issue with `gh issue close <N> --comment "<one-line summary>"` (the number is in the file header).
 
 If not complete, append a progress note to the issue file.
 

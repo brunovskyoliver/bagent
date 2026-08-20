@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -48,6 +49,32 @@ pub struct MailMessage {
     /// Populated only when the emlx file is parsed locally.
     #[serde(default)]
     pub message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MailBodyHydrationState {
+    Readable,
+    Empty,
+    Unavailable,
+    AutomationDenied,
+    AutomationTimedOut,
+    AutomationFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailBodyOrigin {
+    LocalEmlx,
+    MailAutomation,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HydratedMailMessage {
+    pub message: MailMessage,
+    pub state: MailBodyHydrationState,
+    pub used_automation: bool,
+    pub body_origin: MailBodyOrigin,
 }
 
 /// Filter parameters for [`MailConnector::search_messages`].
@@ -114,7 +141,7 @@ impl MailConnector {
 
     /// True when Full Disk Access is granted and the Envelope Index is readable.
     pub fn is_accessible(&self) -> bool {
-        self.envelope_index.exists()
+        self.open_db().is_ok()
     }
 
     // ── Queries ──────────────────────────────────────────────────────────────
@@ -471,6 +498,25 @@ impl MailConnector {
         Ok(Some(msg))
     }
 
+    /// Load a message body through one local-first operation shared by daemon
+    /// callers. Mail.app Automation is used only when no local `.emlx` body is
+    /// available.
+    pub async fn hydrate_message(&self, rowid: i64) -> Result<Option<HydratedMailMessage>> {
+        let connector = self.clone();
+        let message = tokio::task::spawn_blocking(move || connector.get_message(rowid))
+            .await
+            .map_err(|error| anyhow!("Apple Mail local body task failed: {error}"))??;
+        let Some(message) = message else {
+            return Ok(None);
+        };
+        Ok(Some(
+            hydrate_loaded_message(message, |identity| async move {
+                body_via_mail_app(&identity).await
+            })
+            .await,
+        ))
+    }
+
     /// Fetch the raw (decoded) bytes for a single attachment by ROWID + part_index.
     /// First tries emlx-embedded bytes; falls back to the on-disk Attachments directory
     /// (used when the message is a .partial.emlx with separately-stored attachments).
@@ -515,7 +561,7 @@ impl MailConnector {
         ))
     }
 
-    /// Fetch attachment bytes as a base64-encoded string (for Ollama vision / JSON APIs).
+    /// Fetch attachment bytes as a base64-encoded string for connector APIs.
     pub fn get_message_attachment_base64(
         &self,
         rowid: i64,
@@ -906,47 +952,445 @@ fn strip_html(html: &str) -> String {
 
 // ── AppleScript body fallback ─────────────────────────────────────────────────
 
-/// Fetch the plain-text body via `osascript` when the emlx is not locally
-/// cached (typical for IMAP messages that Mail never fully downloaded).
-///
-/// Requires Automation → Mail permission (NOT Full Disk Access).
-/// Searches the inbox for the first message whose subject matches.
-pub async fn body_via_applescript(subject: &str) -> Option<String> {
-    let safe = subject.replace('\\', "\\\\").replace('"', "\\\"");
-    // Search all accounts/mailboxes, not just inbox — emails may be in subfolders.
-    let script = format!(
-        r#"tell application "Mail"
-    try
-        set allMessages to {{}}
-        repeat with acct in every account
-            repeat with mb in every mailbox of acct
-                try
-                    set found to (every message of mb whose subject is "{safe}")
-                    if (count of found) > 0 then
-                        return content of item 1 of found
+const MAIL_BODY_AUTOMATION_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTOMATION_FIELD_SEPARATOR: char = '\u{1f}';
+
+#[derive(Debug, Clone)]
+struct MailBodyIdentity {
+    subject: String,
+    sender: String,
+    received_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MailAutomationBody {
+    Content(String),
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MailAutomationError {
+    Denied,
+    TimedOut,
+    Failed,
+}
+
+#[derive(Debug)]
+struct AutomationOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+async fn hydrate_loaded_message<F, Fut>(
+    mut message: MailMessage,
+    fallback: F,
+) -> HydratedMailMessage
+where
+    F: FnOnce(MailBodyIdentity) -> Fut,
+    Fut: std::future::Future<Output = Result<MailAutomationBody, MailAutomationError>>,
+{
+    if let Some(body) = message.body.take() {
+        let bounded = body.chars().take(4_000).collect::<String>();
+        message.body = Some(bounded.clone());
+        let state = if bounded.trim().is_empty() {
+            MailBodyHydrationState::Empty
+        } else {
+            MailBodyHydrationState::Readable
+        };
+        return HydratedMailMessage {
+            message,
+            state,
+            used_automation: false,
+            body_origin: MailBodyOrigin::LocalEmlx,
+        };
+    }
+    if message.body_available {
+        message.body = Some(String::new());
+        return HydratedMailMessage {
+            message,
+            state: MailBodyHydrationState::Empty,
+            used_automation: false,
+            body_origin: MailBodyOrigin::LocalEmlx,
+        };
+    }
+
+    let identity = MailBodyIdentity {
+        subject: message.subject.clone(),
+        sender: message.sender.clone(),
+        received_at: message.received_at,
+    };
+    let state = match fallback(identity).await {
+        Ok(MailAutomationBody::Content(body)) => {
+            let bounded = body.chars().take(4_000).collect::<String>();
+            message.body_available = true;
+            message.language = detect_language(&bounded);
+            message.body = Some(bounded.clone());
+            if bounded.trim().is_empty() {
+                MailBodyHydrationState::Empty
+            } else {
+                MailBodyHydrationState::Readable
+            }
+        }
+        Ok(MailAutomationBody::Unavailable) => MailBodyHydrationState::Unavailable,
+        Err(MailAutomationError::Denied) => MailBodyHydrationState::AutomationDenied,
+        Err(MailAutomationError::TimedOut) => MailBodyHydrationState::AutomationTimedOut,
+        Err(MailAutomationError::Failed) => MailBodyHydrationState::AutomationFailed,
+    };
+    HydratedMailMessage {
+        message,
+        state,
+        used_automation: true,
+        body_origin: if matches!(
+            state,
+            MailBodyHydrationState::Readable | MailBodyHydrationState::Empty
+        ) {
+            MailBodyOrigin::MailAutomation
+        } else {
+            MailBodyOrigin::Unavailable
+        },
+    }
+}
+
+async fn body_via_mail_app(
+    identity: &MailBodyIdentity,
+) -> Result<MailAutomationBody, MailAutomationError> {
+    let script = mail_body_applescript(identity);
+    let output = run_automation_with_timeout(MAIL_BODY_AUTOMATION_TIMEOUT, async move {
+        let mut command = tokio::process::Command::new("osascript");
+        command.args(["-e", &script]).kill_on_drop(true);
+        command.output().await.map(|output| AutomationOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        })
+    })
+    .await?;
+    parse_mail_body_automation_output(output)
+}
+
+async fn run_automation_with_timeout<F>(
+    timeout: Duration,
+    operation: F,
+) -> Result<AutomationOutput, MailAutomationError>
+where
+    F: std::future::Future<Output = std::io::Result<AutomationOutput>>,
+{
+    match tokio::time::timeout(timeout, operation).await {
+        Err(_) => Err(MailAutomationError::TimedOut),
+        Ok(Err(_)) => Err(MailAutomationError::Failed),
+        Ok(Ok(output)) => Ok(output),
+    }
+}
+
+fn parse_mail_body_automation_output(
+    output: AutomationOutput,
+) -> Result<MailAutomationBody, MailAutomationError> {
+    if !output.success {
+        let error = output.stderr.to_ascii_lowercase();
+        return Err(
+            if error.contains("-1743")
+                || error.contains("not authorized to send apple events")
+                || error.contains("automation permission")
+            {
+                MailAutomationError::Denied
+            } else {
+                MailAutomationError::Failed
+            },
+        );
+    }
+    let stdout = output.stdout.trim_end_matches(['\r', '\n']);
+    let (status, body) = stdout
+        .split_once(AUTOMATION_FIELD_SEPARATOR)
+        .unwrap_or((stdout, ""));
+    match status {
+        "CONTENT" => Ok(MailAutomationBody::Content(body.to_string())),
+        "UNAVAILABLE" | "NOT_FOUND" => Ok(MailAutomationBody::Unavailable),
+        _ => Err(MailAutomationError::Failed),
+    }
+}
+
+fn mail_body_applescript(identity: &MailBodyIdentity) -> String {
+    let subject = escape_applescript_string(&identity.subject);
+    let sender = escape_applescript_string(&identity.sender);
+    let received_at = identity.received_at;
+    format!(
+        r#"set fieldSep to ASCII character 31
+set epochDate to date "Thursday, 1 January 1970 at 00:00:00"
+set successfulQueries to 0
+set lastQueryErrorMessage to ""
+set lastQueryErrorNumber to 0
+set fatalErrorMessage to ""
+set fatalErrorNumber to 0
+tell application "Mail"
+    repeat with acct in accounts
+        repeat with mbx in mailboxes of acct
+            try
+                set candidates to (every message of mbx whose subject is "{subject}")
+                set successfulQueries to successfulQueries + 1
+                repeat with m in candidates
+                    set snd to ""
+                    try
+                        set snd to (sender of m) as text
+                    end try
+                    set unixTs to ((((date received of m) - epochDate) as real) - (time to GMT))
+                    set dateDelta to unixTs - {received_at}
+                    if dateDelta < 0 then set dateDelta to -dateDelta
+                    ignoring case
+                        set senderMatches to ("{sender}" is "") or (snd contains "{sender}")
+                    end ignoring
+                    if senderMatches and dateDelta <= 2 then
+                        try
+                            set msgContent to content of m
+                            if msgContent is missing value then
+                                return "UNAVAILABLE" & fieldSep
+                            end if
+                            return "CONTENT" & fieldSep & (msgContent as text)
+                        on error errorMessage number errorNumber
+                            set fatalErrorMessage to errorMessage
+                            set fatalErrorNumber to errorNumber
+                            error errorMessage number errorNumber
+                        end try
                     end if
+                end repeat
+            on error errorMessage number errorNumber
+                if fatalErrorNumber is not 0 then
+                    error fatalErrorMessage number fatalErrorNumber
+                end if
+                if errorNumber is -1743 then
+                    error errorMessage number errorNumber
+                end if
+                set lastQueryErrorMessage to errorMessage
+                set lastQueryErrorNumber to errorNumber
+            end try
+        end repeat
+    end repeat
+end tell
+if successfulQueries is 0 and lastQueryErrorNumber is not 0 then
+    error lastQueryErrorMessage number lastQueryErrorNumber
+end if
+return "NOT_FOUND" & fieldSep"#
+    )
+}
+
+/// Search Mail.app through AppleScript Automation.
+///
+/// This is slower than the Envelope Index path, but works when Full Disk Access
+/// blocks direct SQLite reads and Automation access to Mail.app is available.
+/// It is intentionally targeted: an empty filter returns no rows.
+pub async fn search_messages_via_applescript(f: &MailSearchFilter) -> Result<Vec<MailMessage>> {
+    let mut terms = Vec::new();
+    push_term(&mut terms, f.sender.as_deref());
+    push_term(&mut terms, f.subject.as_deref());
+    for kw in &f.keywords {
+        push_term(&mut terms, Some(kw));
+    }
+    if terms.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let limit = if f.limit == 0 { 10 } else { f.limit };
+    let max_records = (limit * 8).clamp(10, 80);
+    let terms_script = terms
+        .iter()
+        .map(|term| format!("\"{}\"", escape_applescript_string(term)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let script = format!(
+        r#"set fieldSep to ASCII character 31
+set recSep to ASCII character 30
+set epochDate to date "Thursday, 1 January 1970 at 00:00:00"
+set searchTerms to {{{terms_script}}}
+set outputText to ""
+set foundCount to 0
+tell application "Mail"
+    repeat with acct in accounts
+        repeat with mbx in mailboxes of acct
+            repeat with termText in searchTerms
+                try
+                    set hits to (every message of mbx whose sender contains (termText as text) or subject contains (termText as text))
+                    repeat with m in hits
+                        set foundCount to foundCount + 1
+                        set mid to ""
+                        set subj to ""
+                        set snd to ""
+                        set rcpt to ""
+                        set readFlag to false
+                        try
+                            set mid to (message id of m) as text
+                        end try
+                        try
+                            set subj to (subject of m) as text
+                        end try
+                        try
+                            set snd to (sender of m) as text
+                        end try
+                        try
+                            set recipientBits to {{}}
+                            repeat with r in to recipients of m
+                                try
+                                    set end of recipientBits to (address of r) as text
+                                end try
+                            end repeat
+                            set oldDelims to AppleScript's text item delimiters
+                            set AppleScript's text item delimiters to ", "
+                            set rcpt to recipientBits as text
+                            set AppleScript's text item delimiters to oldDelims
+                        end try
+                        try
+                            set readFlag to (read status of m) as boolean
+                        end try
+                        set unixTs to (((date received of m) - epochDate) as real) as text
+                        set outputText to outputText & (foundCount as text) & fieldSep & mid & fieldSep & snd & fieldSep & subj & fieldSep & unixTs & fieldSep & (readFlag as text) & fieldSep & rcpt & recSep
+                        if foundCount >= {max_records} then return outputText
+                    end repeat
                 end try
             end repeat
         end repeat
-    end try
-    return ""
-end tell"#
+    end repeat
+end tell
+return outputText"#
     );
+
     let out = tokio::process::Command::new("osascript")
         .args(["-e", &script])
         .output()
-        .await
-        .ok()?;
-    if out.status.success() {
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !text.is_empty() && text != "missing value" {
-            Some(text)
-        } else {
-            None
-        }
-    } else {
-        None
+        .await?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "AppleScript Mail search failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut seen = std::collections::HashSet::new();
+    let mut messages = Vec::new();
+    for record in stdout.split('\u{1e}') {
+        let Some(msg) = parse_applescript_mail_record(record) else {
+            continue;
+        };
+
+        if let Some(from) = f.date_from {
+            if msg.received_at < from {
+                continue;
+            }
+        }
+        if let Some(to) = f.date_to {
+            if msg.received_at >= to {
+                continue;
+            }
+        }
+
+        let dedupe_key = msg.message_id.clone().unwrap_or_else(|| {
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                msg.sender, msg.subject, msg.received_at
+            )
+        });
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+
+        messages.push(msg);
+    }
+
+    messages.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+    messages.truncate(limit);
+    Ok(messages)
+}
+
+fn push_term(terms: &mut Vec<String>, term: Option<&str>) {
+    let Some(term) = term.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if !terms
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(term))
+    {
+        terms.push(term.to_string());
+    }
+}
+
+fn escape_applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn empty_to_none(value: &str) -> Option<String> {
+    if value.is_empty() || value == "missing value" {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_applescript_timestamp(value: &str) -> Option<i64> {
+    let normalized = value.trim().replace(',', ".");
+    let parsed = normalized.parse::<f64>().ok()?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return None;
+    }
+    Some(parsed.round() as i64)
+}
+
+fn parse_applescript_mail_record(record: &str) -> Option<MailMessage> {
+    let record = record.trim_matches(['\r', '\n']);
+    if record.trim().is_empty() {
+        return None;
+    }
+    let fields = record.split('\u{1f}').collect::<Vec<_>>();
+    if fields.len() < 6 {
+        return None;
+    }
+    let idx = fields[0].trim().parse::<i64>().unwrap_or(0);
+    let message_id = empty_to_none(fields[1].trim());
+    let sender_raw = fields[2].trim().to_string();
+    let subject = fields[3].trim().to_string();
+    let received_at = parse_applescript_timestamp(fields[4].trim()).unwrap_or(0);
+    let is_read = fields[5].trim().eq_ignore_ascii_case("true");
+    let recipient = fields.get(6).and_then(|value| empty_to_none(value.trim()));
+
+    let (sender_display, sender) = split_sender_display(&sender_raw);
+    Some(MailMessage {
+        // Synthetic negative rowid: the message came from Mail.app, not Envelope Index.
+        rowid: -idx.max(1),
+        subject,
+        sender,
+        sender_display,
+        recipient,
+        received_at,
+        is_read,
+        mailbox_url: "mail-app://automation-search".to_string(),
+        body: None,
+        body_available: false,
+        language: None,
+        attachments: vec![],
+        message_id,
+    })
+}
+
+fn split_sender_display(sender: &str) -> (Option<String>, String) {
+    let Some(start) = sender.rfind('<') else {
+        return (None, sender.to_string());
+    };
+    let Some(end) = sender[start..].find('>').map(|offset| start + offset) else {
+        return (None, sender.to_string());
+    };
+    let display = sender[..start].trim().trim_matches('"').trim();
+    let address = sender[start + 1..end].trim();
+    (
+        if display.is_empty() {
+            None
+        } else {
+            Some(display.to_string())
+        },
+        if address.is_empty() {
+            sender.to_string()
+        } else {
+            address.to_string()
+        },
+    )
 }
 
 /// Open a specific email message in Apple Mail.app.
@@ -1054,6 +1498,28 @@ pub fn detect_language(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    fn hydration_message(body: Option<&str>, body_available: bool) -> MailMessage {
+        MailMessage {
+            rowid: 42,
+            subject: "Duplicate subject".into(),
+            sender: "alice@example.com".into(),
+            sender_display: Some("Alice".into()),
+            recipient: Some("oliver@example.com".into()),
+            received_at: 1_785_300_000,
+            is_read: false,
+            mailbox_url: "imap://example/INBOX".into(),
+            body: body.map(str::to_string),
+            body_available,
+            language: None,
+            attachments: Vec::new(),
+            message_id: None,
+        }
+    }
 
     /// Verifies the emlx shard formula against the spike-documented example.
     /// ROWID=95804 → Data/5/9/Messages/95804.emlx   (confirmed in docs/spikes/apple_mail.md)
@@ -1116,6 +1582,203 @@ mod tests {
                   The total amount includes VAT at 20 percent. Please settle the \
                   payment before the due date. Kind regards, your supplier.";
         assert_eq!(detect_language(en).as_deref(), Some("en"), "text: {en}");
+    }
+
+    #[test]
+    fn applescript_timestamp_accepts_common_number_formats() {
+        assert_eq!(parse_applescript_timestamp("1780556527"), Some(1780556527));
+        assert_eq!(
+            parse_applescript_timestamp("1780556527.0"),
+            Some(1780556527)
+        );
+        assert_eq!(
+            parse_applescript_timestamp("1780556527,0"),
+            Some(1780556527)
+        );
+        assert_eq!(
+            parse_applescript_timestamp("1.780556527E+9"),
+            Some(1780556527)
+        );
+        assert_eq!(parse_applescript_timestamp("0"), None);
+        assert_eq!(parse_applescript_timestamp("missing value"), None);
+    }
+
+    #[test]
+    fn applescript_record_preserves_recipient() {
+        let record = [
+            "1",
+            "DB9PR10MB5572EAC11C1694817E4CC41991F42@DB9PR10MB5572.EURPRD10.PROD.OUTLOOK.COM",
+            "Radoslava Némethová <radoslava.nemethova@tenenet.sk>",
+            "AMB VSL SC a VG",
+            "1780556527,0",
+            "true",
+            "oliver@example.com",
+        ]
+        .join("\u{1f}");
+
+        let msg = parse_applescript_mail_record(&record).expect("parse AppleScript record");
+        assert_eq!(msg.rowid, -1);
+        assert_eq!(msg.sender_display.as_deref(), Some("Radoslava Némethová"));
+        assert_eq!(msg.sender, "radoslava.nemethova@tenenet.sk");
+        assert_eq!(msg.recipient.as_deref(), Some("oliver@example.com"));
+        assert_eq!(msg.received_at, 1780556527);
+        assert!(msg.is_read);
+    }
+
+    #[tokio::test]
+    async fn cached_body_is_used_without_automation_and_remains_bounded() {
+        let fallback_called = Arc::new(AtomicBool::new(false));
+        let called = fallback_called.clone();
+        let body = "x".repeat(4_100);
+        let hydrated =
+            hydrate_loaded_message(hydration_message(Some(&body), true), move |_| async move {
+                called.store(true, Ordering::SeqCst);
+                Ok(MailAutomationBody::Content("wrong fallback".into()))
+            })
+            .await;
+
+        assert_eq!(hydrated.state, MailBodyHydrationState::Readable);
+        assert_eq!(
+            hydrated.message.body.as_deref().unwrap().chars().count(),
+            4_000
+        );
+        assert!(!hydrated.used_automation);
+        assert_eq!(hydrated.body_origin, MailBodyOrigin::LocalEmlx);
+        assert!(!fallback_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn uncached_body_uses_successful_automation_fallback() {
+        let hydrated =
+            hydrate_loaded_message(hydration_message(None, false), |identity| async move {
+                assert_eq!(identity.subject, "Duplicate subject");
+                assert_eq!(identity.sender, "alice@example.com");
+                assert_eq!(identity.received_at, 1_785_300_000);
+                Ok(MailAutomationBody::Content(
+                    "Hydrated through Mail.app.".into(),
+                ))
+            })
+            .await;
+
+        assert_eq!(hydrated.state, MailBodyHydrationState::Readable);
+        assert_eq!(
+            hydrated.message.body.as_deref(),
+            Some("Hydrated through Mail.app.")
+        );
+        assert!(hydrated.message.body_available);
+        assert!(hydrated.used_automation);
+        assert_eq!(hydrated.body_origin, MailBodyOrigin::MailAutomation);
+    }
+
+    #[test]
+    fn body_fallback_disambiguates_duplicate_subjects_by_sender_and_date() {
+        let script = mail_body_applescript(&MailBodyIdentity {
+            subject: "Duplicate subject".into(),
+            sender: "alice@example.com".into(),
+            received_at: 1_785_300_000,
+        });
+
+        assert!(script.contains("whose subject is \"Duplicate subject\""));
+        assert!(script.contains("snd contains \"alice@example.com\""));
+        assert!(script.contains("dateDelta <= 2"));
+        assert!(script.contains("dateDelta to unixTs - 1785300000"));
+        assert!(script.contains("- (time to GMT)"));
+        assert!(script.contains("if errorNumber is -1743 then"));
+        assert!(script.contains("error errorMessage number errorNumber"));
+        assert!(script.contains("if fatalErrorNumber is not 0 then"));
+        assert!(!script.contains("content of item 1"));
+    }
+
+    #[tokio::test]
+    async fn empty_automation_fallback_is_typed_empty() {
+        let hydrated = hydrate_loaded_message(hydration_message(None, false), |_| async {
+            Ok(MailAutomationBody::Content("   ".into()))
+        })
+        .await;
+
+        assert_eq!(hydrated.state, MailBodyHydrationState::Empty);
+        assert_eq!(hydrated.body_origin, MailBodyOrigin::MailAutomation);
+        assert!(hydrated.message.body_available);
+        assert_eq!(hydrated.message.body.as_deref(), Some("   "));
+    }
+
+    #[tokio::test]
+    async fn unavailable_automation_has_unavailable_origin() {
+        let hydrated = hydrate_loaded_message(hydration_message(None, false), |_| async {
+            Ok(MailAutomationBody::Unavailable)
+        })
+        .await;
+
+        assert_eq!(hydrated.state, MailBodyHydrationState::Unavailable);
+        assert_eq!(hydrated.body_origin, MailBodyOrigin::Unavailable);
+    }
+
+    #[test]
+    fn automation_denial_is_typed_separately() {
+        let result = parse_mail_body_automation_output(AutomationOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "execution error: Not authorized to send Apple events to Mail. (-1743)".into(),
+        });
+
+        assert_eq!(result, Err(MailAutomationError::Denied));
+    }
+
+    #[test]
+    fn automation_failure_is_not_mislabeled_unavailable() {
+        let result = parse_mail_body_automation_output(AutomationOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "execution error: Mail got an error while reading content. (-1728)".into(),
+        });
+
+        assert_eq!(result, Err(MailAutomationError::Failed));
+    }
+
+    #[tokio::test]
+    async fn automation_fallback_timeout_is_typed_separately() {
+        let result = run_automation_with_timeout(
+            Duration::from_millis(5),
+            std::future::pending::<std::io::Result<AutomationOutput>>(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(MailAutomationError::TimedOut)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Full Disk Access, Mail.app Automation, and a currently uncached message"]
+    async fn real_mail_uncached_message_becomes_readable() {
+        let connector = MailConnector::new().expect("Apple Mail connector");
+        let headers = connector
+            .list_inbox(100, false)
+            .expect("read recent Mail headers");
+        let uncached = headers
+            .into_iter()
+            .find(|header| {
+                connector
+                    .get_message(header.rowid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|message| message.body.is_none() && !message.body_available)
+            })
+            .expect("at least one recent message must be uncached for this smoke test");
+
+        let hydrated = connector
+            .hydrate_message(uncached.rowid)
+            .await
+            .expect("shared body hydration")
+            .expect("message still exists");
+
+        assert_eq!(hydrated.state, MailBodyHydrationState::Readable);
+        assert!(hydrated.used_automation);
+        assert!(!hydrated
+            .message
+            .body
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty());
     }
 
     // ── Phase 5C — attachment extraction from raw .eml ───────────────────────
@@ -1181,12 +1844,14 @@ mod tests {
     }
 
     #[test]
-    fn eml_image_receipt_triggers_vision_route() {
-        // Simulate the daemon logic: if any attachment is image/* → vision model needed
+    fn eml_image_receipt_is_classified_as_image() {
         let eml = include_bytes!("../../../../fixtures/sk/mail_with_image_receipt.eml");
         let parsed = mailparse::parse_mail(eml).expect("parse mail_with_image_receipt.eml");
         let attachments = extract_attachments_from_parsed(&parsed);
         let has_image = attachments.iter().any(|a| a.mimetype.starts_with("image/"));
-        assert!(has_image, "vision route should trigger for image receipt");
+        assert!(
+            has_image,
+            "image receipt should be classified as an image attachment"
+        );
     }
 }

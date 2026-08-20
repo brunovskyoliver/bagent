@@ -18,13 +18,6 @@ Check off items as they are completed.
   - [ ] CPU/memory at 1 fps frame capture
   - [ ] CPU/memory at 5 fps
   - [ ] Confirm black-frame handling for DRM content
-- [x] Benchmark Ollama (Slovak) — see `docs/spikes/ollama.md`:
-  - [x] Latency on M5: TTFT ~269ms warm, ~26 tok/s (llama3.1:8b)
-  - [x] Roundtrip test: **llama3.1 FAILS** (62% diacritics, mixes Czech); **qwen2.5:7b PASSES** (16/16)
-  - [x] Invoice fixture: all 3 SK fixtures pass with qwen2.5:7b — DPH/faktúra/splatnosť preserved, zero Czech
-  - [x] `ollama pull qwen2.5:7b` — done; confirmed default model
-  - [ ] `ollama pull bge-m3` — needed for Phase 3 embeddings
-  - [ ] Benchmark qwen2.5:7b cold start time
 - [x] Snapshot Apple Mail SQLite schema — see `docs/spikes/apple_mail.md`:
   - [x] `Envelope Index` confirmed at `~/Library/Mail/V10/MailData/Envelope Index`
   - [x] Unread messages query confirmed (joins messages + subjects + addresses)
@@ -115,42 +108,39 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
 - [x] `crates/daemon/` (`bagentd`): axum 0.7 server on `127.0.0.1:0`
   - [x] Write port to `~/Library/Application Support/bagent/daemon.port`
   - [x] Generate bearer token on first run; written to `daemon.token` (Keychain: Phase 10)
-  - [x] `GET /health` endpoint (checks Ollama up/down, returns model)
-  - [x] `POST /chat` — SSE streaming to Ollama with ndjson → `data:` translation
+  - [x] `GET /health` endpoint (checks BaseRT up/down, returns model)
+  - [x] `POST /chat` — typed SSE events backed by BaseRT OpenAI-compatible streaming
   - [x] Bearer token auth middleware
 - [x] SQLite with refinery migrations (`migrations/V1__initial.sql`, `V2__full_schema.sql`)
   - [x] Schema: `audit_entries`, `approvals`, `messages`, `sessions`, `connectors`
 - [x] Swift `DaemonClient` — `DaemonClient.swift`
   - [x] Read port + token from files on app launch (40 × 100 ms retry)
   - [x] SSE streaming client via `URLSession.bytes(for:)`
-  - [x] `healthStatus()` → `DaemonHealth` (daemon up, Ollama up, model)
+  - [x] `healthStatus()` → `DaemonHealth` (daemon up, BaseRT up, model)
 - [x] `DaemonLauncher.swift` — auto-restarts on crash, max 3/min rolling window
 - [x] Audit entry on every chat request (SQLite `audit_entries`)
-- [x] Settings tab: daemon + Ollama status indicator with live indicator dots
+- [x] Settings tab: daemon + BaseRT status indicator with live indicator dots
 
 ---
 
-## Phase 3 — Ollama Integration ✅ COMPLETE
+## Phase 3 — BaseRT Integration ✅ COMPLETE
 
-- [x] `crates/connectors/ollama/` — standalone library crate (`OllamaClient`)
-  - [x] `models()` → sorted list from `/api/tags`
-  - [x] `chat_stream()` → `impl Stream<Item = Result<String>>` via async-stream
-  - [x] `embed()` → `Vec<f32>` from `/api/embeddings`
-  - [x] `summarize()` → single-shot summarisation call
-  - [x] `is_up()` → 2 s health ping
-- [x] Daemon uses `OllamaClient` for all Ollama I/O
-- [x] `POST /embeddings` endpoint in daemon (proxies to Ollama, uses `bge-m3` by default)
+- [x] `crates/connectors/basert/` — standalone library crate (`BaseRTClient`)
+  - [x] OpenAI-compatible `/v1/models` and `/v1/chat/completions`
+  - [x] Bearer-authenticated SSE content and fragmented tool-call parsing
+  - [x] 2 s health check and explicit model unload
+- [x] Daemon uses `BaseRTClient` for all BaseRT I/O
+- [x] Embeddings disabled until a dedicated BaseRT embedding model is configured
 - [x] System prompt — Slovak business assistant: formal tone, diacritics enforced, legal terms never translated
 - [x] Context window management:
   - [x] Sliding hard truncation (last 40 messages) for moderate histories
   - [x] Automatic summarisation when history > 60 messages (old turns → single summary system message)
-- [x] Model router: all requests → Ollama; client-supplied `model` field overrides default
+- [x] Model router: all requests → BaseRT; client-supplied `model` field overrides default
 - [x] Model picker in `SettingsView.swift` — fetches live from `/models`, persists to UserDefaults
-- [x] Default model: `qwen2.5:7b`
-- [x] Ollama up/down in `GET /health`
-- [x] Slovak diacritics regression tests — `crates/connectors/ollama/tests/diacritics.rs` (`#[ignore]`, run with `cargo test -p ollama-connector -- --include-ignored`)
-- [x] Streaming tokens appear in UI (TTFT < 1 s on warm Ollama)
-- [ ] `ollama pull bge-m3` — user must run once before embeddings work
+- [x] Default model: `basecompute/Qwen3-4B-Instruct-2507`
+- [x] BaseRT up/down in `GET /health`
+- [x] BaseRT protocol and ignored live regressions in `crates/connectors/basert/tests/`
+- [x] Streaming tokens appear in UI (TTFT < 1 s on warm BaseRT)
 
 ---
 
@@ -163,7 +153,7 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
   - [x] Tool: `GET /mail/message/:rowid` (includes body from emlx)
   - [x] Language detection per message (whatlang — sk/en/cs/de)
   - [x] Incremental sync: `POST /mail/sync` → upserts into `mail_cache` (V3 migration), updates `connectors.last_sync_at`; `fetch_tool_context` reads cache first, falls back to live Envelope Index
-  - [x] AppleScript body fallback for non-cached IMAP messages (`body_via_applescript` via osascript; requires Automation → Mail)
+  - [x] AppleScript body fallback for non-cached IMAP messages (`MailConnector::hydrate_message` via osascript; requires Automation → Mail)
 - [x] `crates/connectors/apple_notes/`:
   - [x] SQLite read path for metadata (title, snippet, folder, dates)
   - [x] JXA body retrieval via `osascript -l JavaScript`
@@ -177,9 +167,9 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
 - [x] Settings → Konektory section: Mail + Notes status dots from `/health`
 - [x] Privacy gate: `pii: true` field on body responses; system prompt instructs LLM to summarize, not quote raw email
 - [x] Daemon `/health` now includes `connectors: { mail, notes }` status
-- [x] `ollama pull bge-m3` — pulled by user
+- [x] `basert pull bge-m3` — pulled by user
 - [x] Background sync with progress indicator — "Sync" button in Settings → Konektory; shows spinner + result count
-- [x] Slovak email summarization regression test — `sk_email_body_summarization` in `crates/connectors/ollama/tests/diacritics.rs`
+- [x] Slovak email summarization regression test — `sk_email_body_summarization` in `crates/connectors/basert/tests/diacritics.rs`
 - [x] emlx path resolution unit tests — `emlx_shard_calc_*` in `crates/connectors/apple_mail/src/lib.rs` (6 tests, all pass)
 
 ---
@@ -207,20 +197,20 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
 - [ ] Load `sqlite-vec` extension at daemon startup (rusqlite `load_extension`; bundle `.dylib` in app resources)
 - [x] Migration `crates/daemon/migrations/V5__embeddings.sql`: `embeddings` table
 - [x] `crates/memory/` new crate:
-  - [x] `embed_and_store(item_id, namespace, text)` — calls `OllamaClient::embed` with `bge-m3`, writes float32 blob
+  - [x] `embed_and_store(item_id, namespace, text)` — calls `BaseRTClient::embed` with `bge-m3`, writes float32 blob
   - [x] `retrieve(query, namespace, k)` → `Vec<MemoryHit>` — BM25 + cosine merged with `0.4*bm25 + 0.6*cos`, recency-decayed
   - [ ] Backfill job: embed existing `memory_items` + `messages` + `notes` on startup if embedding missing
 - [x] `PromptBuilder` layer 5: calls `memory::retrieve(user_turn, ["global","user_pref","sk_glossary"], 8)` → `Message::system`
 - [x] Per-namespace cap: max 3 retrieved items per namespace to bound prompt size
 - [x] `GET /memory/search?q=&namespace=` endpoint for Settings debug view
-- [ ] `ollama pull bge-m3` — user must run once before embeddings work
+- [ ] `basert pull bge-m3` — user must run once before embeddings work
 
 ---
 
 ## Phase 4D — Self-Improvement / Feedback Loop ✅ COMPLETE
 
-- [x] Explicit capture: scan user turn for trigger phrases (SK: "pamätaj si", "od teraz", "už nikdy", "vždy"; EN: "remember", "from now on", "never", "always") → extract directive via Ollama call → insert `memory_items` kind=`preference` namespace=`user_pref`; ACK in stream: `{"type":"memory_saved","id":...}`
-- [x] Implicit capture (background post-turn): spawn task after `done` event; Ollama call classifies `{prev_assistant, user_turn}` → `{is_correction, what_was_wrong, correct_behavior, confidence}`. If `confidence > 0.7`: insert `kind='correction'`
+- [x] Explicit capture: scan user turn for trigger phrases (SK: "pamätaj si", "od teraz", "už nikdy", "vždy"; EN: "remember", "from now on", "never", "always") → extract directive via BaseRT call → insert `memory_items` kind=`preference` namespace=`user_pref`; ACK in stream: `{"type":"memory_saved","id":...}`
+- [x] Implicit capture (background post-turn): spawn task after `done` event; BaseRT call classifies `{prev_assistant, user_turn}` → `{is_correction, what_was_wrong, correct_behavior, confidence}`. If `confidence > 0.7`: insert `kind='correction'`
 - [x] Slovak glossary corrections: `kind='sk_glossary'` namespace — injected as layer 4 prompt
 - [x] Style profile: `kind='style_profile'` row — injected as layer 3 prompt
 - [x] `DELETE /memory/{id}` forget endpoint; audit logs `action='memory_forget'`
@@ -278,14 +268,14 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
   - [x] `application/pdf` → `pdftotext` / `textutil` fallback
   - [x] `image/*` → store path, flag `requires_vision: true`
 - [x] `PromptBuilder::build` gains `attachments_ctx: Option<String>` — Layer 6.5 between tool data and session summary
-- [x] Ollama `Message` extended with `images: Vec<String>` (base64, skip_serializing_if empty)
+- [x] BaseRT `Message` extended with `images: Vec<String>` (base64, skip_serializing_if empty)
 - [x] Auto-route to `qwen2.5vl:7b` when any attachment `kind=image` and no explicit model override; audit `model_swap`
 - [x] Migration V8: `attachments` + `chat_turn_attachments` link table
-- [x] Settings → Ollama: vision model status indicator + pull hint
+- [x] Settings → BaseRT: vision model status indicator + pull hint
 - [x] Privacy: `pii: true` on attachment-derived context; max 20 MB per file
 - [x] Onboarding: first image attachment triggers one-time alert if vision model not installed
 - [x] Resize glitch fixed: removed `Task { @MainActor }` hop in `NotchWindowController.swift`; `.regularMaterial` swapped for solid color during active drag; `layerContentsRedrawPolicy = .onSetNeedsDisplay` on chat hosting view
-- [ ] `ollama pull qwen2.5vl:7b` — in progress (large model ~6GB)
+- [ ] `basert pull qwen2.5vl:7b` — in progress (large model ~6GB)
 
 ---
 
@@ -333,7 +323,7 @@ Built-in display only (notch present). External / non-notch path unchanged. See 
   - [ ] `parse_date_to_range("2026-06-10")` → correct `[start, end)` bounds
   - [ ] `MailIntent` deserializes documented JSON shapes incl. `action:"none"` and `action:"open"`
   - [ ] `search_messages` filter combos (sender-only, subject+date, empty)
-  - [ ] Classifier round-trip (`#[ignore]`, needs live Ollama)
+  - [ ] Classifier round-trip (`#[ignore]`, needs live BaseRT)
   - [ ] `MailMessage.message_id` extracted from fixture emlx file
 
 ---
@@ -377,185 +367,11 @@ Classifiers previously saw only the current user turn. Pronoun references across
 
 ---
 
-## Phase 5G — Voice Input (Local Whisper STT)
+## Phase 5G — Voice Input (removed)
 
-On-device, English-only speech-to-text via WhisperKit (CoreML/ANE). Audio captured in Swift (AVAudioEngine); transcript becomes normal text and enters the **unchanged** `/chat` pipeline — no backend changes. See `docs/spikes/whisper.md` and the voice section of `docs/UI_DESIGN.md`. Decisions: instant-voice on single ⌥Space + double-press → chat; voice overlay morphs into chat on finalize; model `large-v3-turbo`.
-
-### Phase A — Capture + STT core ✅
-- [x] `Package.swift` — WhisperKit SPM dependency (`from: "0.9.0"`); link `AVFoundation`
-- [x] `Info.plist` + `Makefile` — `NSMicrophoneUsageDescription`
-- [x] `SpeechController.swift` — `@MainActor ObservableObject`; WhisperKit `AudioStreamTranscriber` (owns mic capture, `bufferEnergy` → amplitude); state machine `idle → loadingModel → listening → finalizing → done`; silence VAD (~1.2 s); `startSession(mode:)`; `@Published amplitude/partialText/sentences/state/isModelLoaded`
-- [x] `PermissionsManager.swift` — `hasMicrophoneAccess` via `AVCaptureDevice.authorizationStatus(for: .audio)` + `requestMicrophoneAccess()`; deep-link `…Privacy_Microphone`
-- [x] `SettingsView.swift` — Oprávnenia: mic permission dot + grant button; Whisper model status / first-run download indicator
-- [x] Raw audio kept in-memory only (WhisperKit AudioProcessor); never sent to daemon
-
-### Phase B — Inline mic in chat input ✅
-- [x] `ChatView.swift` `VoiceAttachControl` — hover `+` reveals `mic.fill` button springing up above it; `.spring(response: 0.28, dampingFraction: 0.68)`
-- [x] Inline recording state in `ChatViewModel` (`isVoiceRecording`, `toggleInlineVoice`); binds `speech.$partialText → inputText` live; `.symbolEffect(.pulse.byLayer, options: .repeating)` (macOS-14 form of `.repeat(.continuous)`)
-- [x] Auto-stop or second click finalizes; user edits then sends via existing send button / `⌘↩`
-
-### Phase C — Voice overlay UI ✅
-- [x] `NotchWindowController.swift` — `voicePanel` + `buildVoicePanel()`; `presentVoice()` / `dismissVoice()` reuse `expand()` charge→pop timing + click-away monitor (Escape via `onExitCommand`)
-- [x] `SiriWaveView.swift` — `TimelineView(.animation)` + `Canvas` layered sine bands driven by `amplitude`; reduced-motion fallback
-- [x] `VoiceOverlayView.swift` — Siri-wave bg + `waveform` symbol with `.symbolEffect(.variableColor.iterative.dimInactiveLayers.reversing, options: .repeating)` + live 2-sentence transcript (per-sentence `.id()` + fade/slide transition)
-- [x] Silence VAD auto-stop → finalize
-
-### Phase D — Hotkey + voice→chat handoff ✅
-- [x] `AppDelegate.handleHotkey` — single ⌥Space (collapsed) → `presentVoice()` instantly; second ⌥Space within ~350 ms → `openChatFromVoice()`; expanded ⌥Space collapses
-- [x] `voiceToChatHandoff(text:)` — hide voice, `expand()`, `ChatViewModel.submitTranscript` → existing `send()`
-
-### Phase E — Polish, tests, docs
-- [x] Reduced-motion fallbacks (SiriWaveView static capsule; transcript `nil` animation)
-- [ ] Unit tests: `lastSentences` (last-2 buffer), silence-VAD debounce, double-press window (fake clock)
-- [ ] Integration: finalize → `submitTranscript` → `send()` (mock `DaemonClient`); permission-denied path; `/chat` transcript-vs-typed parity fixture
-- [ ] Manual QA checklist (see plan): hotkey timing, waveform tracking, transcript fade, auto-stop, inline mic, first-run download, offline transcription, notch + non-notch geometry
-- [x] `docs/spikes/whisper.md`, voice section in `docs/UI_DESIGN.md`, `docs/ROADMAP.md` entry
-- [ ] `swift run` lacks Info.plist → mic denied; **voice QA must use `make bundle && open bagent.app`**
-
----
-
-## Phase 5H — Non-Notch Voice Display + Wave Redesign ✅ COMPLETE
-
-- [x] `WaveBackgroundView.swift` — replaces `SiriWaveView`; `TimelineView(.animation)` + `Canvas`; 4 randomized bands spread across full canvas height; each band uses two sine harmonics for irregular curves; dots/mesh pattern fill under each curve via `clipToLayer`; slowed motion (~0.12–0.25× time multiplier); amplitude-reactive with idle-ripple floor; dots/mesh pattern scrolls subtly per band; reduced-motion fallback renders static dotted curves; deleted `SiriWaveView.swift`
-- [x] Non-notch voice panel — `NotchWindowController.swift`: added `voicePanel: BagentPanel?` + `voiceFrame`; `buildVoicePanel()` wires `VoiceOverlayView`; `computeGeometry()` non-notch branch computes `voiceFrame` (width ≥ 440, height 190, 8 pt below pill); `presentVoice()` branches on `hasNotch` — non-notch: `orderFront` voice panel + install global mouse-down monitor (click-away → `dismissVoice`) + global key monitor (Escape); `teardownVoiceNotch()` branches — non-notch: removes both monitors, `orderOut` voice panel; `screensChanged()` rebuilds voice panel
-- [x] Pill icon + label react to voice — `ChatView.swift` `MenuBarPillView` observes `viewModel.isVoiceNotchActive`: icon morphs `sparkles` → `waveform` via `.contentTransition(.symbolEffect(.replace))` + `.variableColor` pulse while listening; label swaps to new `ListeningDotsView` ("Listening" + 3 sequentially-pulsing dots that drift side-to-side via `TimelineView`; reduced-motion → static "Listening…")
-- [x] `VoiceNotchContent.swift` — `SiriWaveView` swapped for `WaveBackgroundView(bandCount: 3)` in bridge
-- [x] `VoiceOverlayView.swift` — redesigned as non-notch panel content: `WaveBackgroundView` fills background, dark overlay for text legibility, white border, `waveform` symbol + live transcript float on top; size 440×190
-- [ ] Manual QA — non-notch: ⌥Space → pill icon morphs, "Listening •••" appears, panel drops, waves animate; silence/Escape/click-away dismisses; double ⌥Space opens chat; speaking → transcript → chat handoff
-- [ ] Manual QA — notch: bridge wave bg shows new randomized dot-filled curves; transcript readable on top; all prior voice paths unchanged
-
----
-
-## Phase 1B — Chat Scroll UX (✅ COMPLETE — test pending)
-
-- [x] Smart sticky-scroll: `userScrolledUp: Bool @State` in `ExpandedChatView`; `ScrollOffsetKey` `PreferenceKey` detects offset via content `GeometryReader` background; auto-scroll `.onChange(streamingChunk)` / `.onChange(messages.count)` gated on `!userScrolledUp`; new user-message send resets flag to false (`apps/macos/Sources/bagent/ChatView.swift`)
-- [x] Viewport persistence: `savedScrollAnchorId: UUID?` + `savedScrollWasAtBottom: Bool` on `ChatViewModel` (survive collapse — ViewModel is long-lived); saved on `onDisappear`, restored on `onAppear` inside `ScrollViewReader`; reset on `clear()` (`apps/macos/Sources/bagent/ChatViewModel.swift`, `ChatView.swift`)
-- [ ] Test: scroll up during streaming → content stays put; send new message → snaps to bottom; collapse + reopen → same scroll position
-
----
-
-## Phase 1C — Memory Panel UI
-
-- [ ] `MemoryPanelView.swift` — search box + kind filter chips (Preferencie / Opravy / Glosár SK / Všetko) + scrollable item list with delete
-- [ ] Brain icon button in `ExpandedChatView` header (next to gear); toggles `showMemory`; mutually exclusive with `showSettings`
-- [ ] `@Published var showMemory: Bool` + `searchMemory(query:)` debounced 300 ms in `ChatViewModel`
-- [ ] Remove Pamäť section from `SettingsView` (content moved to panel)
-- [ ] `DaemonClient.memorySearch` already exists — reuse for live search
-
----
-
-## Phase 4E — Passive Memory + Cross-Session Recall
-
-### Passive extraction (background, no LLM latency)
-- [x] `crates/agent/src/memory_extractor.rs` — `MemoryExtractor` struct; single Ollama call classifies `{user_turn, assistant_reply}` → `[{ kind, text, importance, namespace }]`; discard `importance < 0.6`; call `MemoryStore::insert` for remainder
-- [x] Export `MemoryExtractor` from `crates/agent/src/lib.rs`
-- [x] `crates/daemon/src/main.rs` — inside existing post-turn `tokio::spawn`: spawn `MemoryExtractor::run()` alongside correction classifier
-- [x] Session summarizer: after every 10 turns, spawn task that calls `ollama.summarize()` and upserts `sessions.summary`
-
-### Cross-session conversation recall
-- [ ] `V10__chat_turns_fts_embeddings.sql` migration — `chat_turns_fts` FTS5 table + triggers + `source` column on `embeddings` ✅
-- [x] `crates/memory/src/lib.rs` — `retrieve_turns(query, k=3)` — hybrid BM25+cosine over `chat_turns_fts`; returns `Vec<(role, content)>`; cap 3 turns × 300 chars
-- [x] `crates/agent/src/prompt.rs` — cross-session recall is diagnostic-only by default; candidates are traced but not injected into model prompts
-- [x] Startup backfill: `tokio::spawn` on daemon init embeds existing `chat_turns` missing from `embeddings`
-
----
-
-## Phase 4F — Automated Mail Sync
-
-- [ ] Extract `mail_sync_inner()` from `mail_sync` handler in `crates/daemon/src/main.rs`
-- [ ] Startup `tokio::spawn`: 60 s interval loop calls `mail_sync_inner()`
-- [ ] `notify` crate FSEvents watcher on `~/Library/Mail/V10/MailData/Envelope Index-wal` → immediate `mail_sync_inner()` on change
-- [ ] First-sync deeper history: if `last_sync_at IS NULL`, fetch 5 000 messages; incremental: 500
-- [ ] Post-sync embedding: `tokio::spawn` embeds new `mail_cache` rows into `embeddings` (source=`mail_cache`)
-- [ ] `SettingsView` Konektory section: show `last_sync_at` timestamp alongside sync button
-
----
-
-## Phase 4G — Disk Usage Panel
-
-- [ ] `GET /usage` endpoint in daemon: returns `db_bytes`, `attachments_bytes`, `memory_items_count`, `chat_turns_count`, `mail_cache_count`, `embeddings_count`, `total_bytes`
-- [ ] `UsageStats` struct + `usage()` in `DaemonClient.swift`
-- [ ] Settings → "Využitie disku" section: formatted size rows + "Vyčistiť vyrovnávaciu pamäť" button (clears `mail_cache` rows > 30 days)
-
-## Phase 4H — Prompt Trace Logging + Debug Panel
-
-- [x] Per-turn `prompt_trace_id` generated in daemon and emitted over SSE before response tokens
-- [x] Local rolling JSONL log at `~/Library/Application Support/bagent/debug/prompt-traces.jsonl`
-- [x] `GET /debug/traces/:id` returns a single prompt trace by ID
-- [x] `GET /debug/conversations/:id` returns conversation turns, stats, and matching traces
-- [x] Header bug icon opens current conversation debug panel
-- [x] Copy buttons for conversation ID, trace ID, expanded trace, and full debug payload
-- [x] `docs/PROMPT_DEBUG_LOGS.md` documents lookup flow for Codex / Claude Code
-
-## Phase 4I — Cross-Session Recall Gating + Simulation Tests
-
-- [x] Disable automatic cross-session chat recall injection by default
-- [x] Keep past chat retrieval visible as non-injected debug candidates
-- [x] Regression test: seeded prior TENENET/Katka chat is not included in fresh prompt messages
-- [ ] Add broader simulation fixture set: Ryanair, unread summaries, unrelated business queries, attachment follow-ups
-- [ ] Add UI screenshot test for collapsed/expanded trace rows and Debug panel copy actions
-
----
-
-## Phase 4J — Memory Ledger + Skills Refactor ✅ COMPLETE (deferred items below)
-
-Guiding rule: **store generously, retrieve conservatively, inject minimally.**
-Adds a planning layer (ContextPlanner → SkillSelector → MemorySelector) before prompt assembly.
-Memory extended with ledger fields; skills become loadable `SKILL.md` files; English-default persona.
-
-### Completed
-
-- [x] `OllamaClient::generate_json()` — `/api/chat` with `"format":"json"` for guaranteed parseable classifier output (`crates/connectors/ollama/src/lib.rs`)
-- [x] Migration `V11__memory_ledger_skills.sql` — ALTER `memory_items` to add: `confidence REAL DEFAULT 0.8`, `importance REAL DEFAULT 0.5`, `status TEXT DEFAULT 'active'`, `source TEXT DEFAULT 'passive'`, `sensitivity TEXT DEFAULT 'normal'`, `subject TEXT`, `supersedes_id TEXT`; new index `(status, namespace, kind)` (`crates/daemon/migrations/`)
-- [x] `MemoryItem` struct extended with all V11 fields (`crates/memory/src/lib.rs`)
-- [x] `InsertParams` struct + `insert_full()` — blocks sensitive+passive, deduplication against active-only, supersedes conflicting passive on explicit/user_edit insert (`crates/memory/src/lib.rs`)
-- [x] `RetrieveQuery` struct + `retrieve_filtered()` — hard filters: `status='active'`, `sensitivity='normal'`; score `0.45*sem + 0.35*bm25 + 0.10*importance + 0.10*recency`; near-dup MMR filter; optional kind filter (`crates/memory/src/lib.rs`)
-- [x] `supersede(old_id)` — soft-supersede via `status='superseded'`; `delete()` — soft-delete; `prune()` — hard-deletes only deleted/superseded stale rows (`crates/memory/src/lib.rs`)
-- [x] `crates/memory/src/selector.rs` — `select(store, SelectQuery)` thin layer over `retrieve_filtered`; MAX_MEMORY_CARDS=6, MAX_PER_NAMESPACE=3, MAX_MEMORY_CHARS=4800 token budget
-- [x] `crates/agent/src/context_planner.rs` — `ContextPlanner` with deterministic rules + Ollama JSON-mode fallback; `ResponseLanguageHint` enum; `ContextPlan` struct; 16 unit tests
-- [x] `crates/skills/` — new crate: `manifest.rs` (SkillManifest, LoadedSkill, RiskLevel), `loader.rs` (scan_dir/scan_dirs with last-wins override, YAML frontmatter parser), `selector.rs` (select up to 3 skills, keyword-match fallback)
-- [x] Added `crates/skills` to workspace `Cargo.toml` and `crates/daemon/Cargo.toml`
-- [x] `skills/sk-business-email/SKILL.md` — formal Slovak email: "Dobrý deň"/"S pozdravom", diacritics, no Czech
-- [x] `skills/mail-search/SKILL.md` — Apple Mail search; no invented content; coreference rules
-- [x] `skills/invoice-analysis/SKILL.md` — DPH/faktúra/splatnosť/IBAN/IČO/DIČ preservation; summary format
-- [x] `skills/odoo-readonly/SKILL.md` — doc-only (no Odoo connector yet); all writes forbidden
-- [x] `skills/aerospace-window-control/SKILL.md` — AeroSpace workspace control; graceful degrade
-- [x] `MemoryExtractor` rewrite — `generate_json()`, confidence/importance/sensitivity gates, `is_one_off_content()` filter, `insert_full(source="passive")` (`crates/agent/src/memory_extractor.rs`)
-- [x] `PromptBuilder` rewire — English-default `BASE_IDENTITY`; `ResponseLanguageHint` → `language_hint_instruction()`; selected_skills + selected_memory injected as pre-selected inputs; conversation recall only when `needs_conversation_recall=true`; extended `PromptTrace` (`crates/agent/src/prompt.rs`)
-- [x] Daemon planning layer — ContextPlanner → SkillSelector → `tokio::join!` MemorySelector+corrections+recall; new routes `GET /skills`, `GET /skills/:name`, `POST /debug/context-plan`; `AppState` gains `skills` + `context_planner` (`crates/daemon/src/main.rs`)
-- [x] `cargo build --workspace` clean; **56 tests pass, 10 `#[ignore]` (live Ollama), 0 failures**
-
-### Deferred — Markdown Memory Mirror ✅ COMPLETE
-
-- [x] `crates/memory/src/markdown_mirror.rs` — bidirectional sync SQLite ↔ `~/Library/Application Support/bagent/memories/`
-  - [x] Directory layout: `memories/{namespace}/{id}.md` with YAML frontmatter (id, kind, namespace, status, confidence, importance, source, created_at, updated_at)
-  - [x] On `insert_full` / `supersede` / soft-delete: export/update matching `.md` file
-  - [x] On startup: scan changed `.md` files, upsert SQLite, re-embed changed text
-  - [x] Invalid frontmatter: log + skip, never crash
-  - [x] Deleted memory: set `status='deleted'`, do not physically remove `.md` file
-  - [x] Sensitive items skipped in both export and import scan
-  - [x] Anti-loop: uses frontmatter `updated_at` (1 s epsilon) not file mtime; export → scan returns empty
-  - [x] 4 unit tests: `round_trip_parse`, `is_file_newer_detects_newer`, `export_then_scan_round_trips_and_does_not_loop`, `sensitive_skipped_in_scan`
-
-### Deferred — Swift UI updates ✅ COMPLETE
-
-- [x] `DaemonClient.swift` — new methods: `skills()`, `skill(name:)`, `debugContextPlan(message:)`
-- [x] Memory panel V11 fields: show `source` badge (non-passive) + `confidence`/`importance` per item
-- [x] Skills panel (`SkillsPanelView.swift`): list loaded skills with name/risk badge/description/tag chips, toggle body expand
-- [x] Debug/prompt trace panel: display `selected_skill_names`, `selected_memory_ids`, `conversation_recall_injected` from SSE `debug_trace` event
-
-### Deferred — HTTP API gaps ✅ COMPLETE
-
-- [x] `POST /memory` handler — accepts `confidence`, `importance`, `source`, `sensitivity`, `subject`; calls `insert_full()` (`crates/daemon/src/main.rs`)
-- [x] `GET /memory/search` — exposes `kind` query param; calls `retrieve_filtered(RetrieveQuery { kinds: &kind_filter, ... })`
-- [x] `DELETE /memory/:id` — already soft-deletes; wired to `mirror_export` so `.md` file reflects `status='deleted'`
-
-### Deferred — Live Ollama tests (currently `#[ignore]`)
-
-- [ ] `context_planner::tests::llm_fallback_parses_json` — needs Ollama + classifier model
-- [ ] `memory_extractor::tests::passive_extraction_returns_empty_for_one_off` — needs Ollama + classifier model
-- [ ] Mail intent classifier round-trip tests (3 existing `#[ignore]` tests in `crates/agent/`)
-- [ ] End-to-end acceptance scenarios via `/chat` SSE (Slovak invoice draft, English chat over SK source, explicit memory trigger, no memory for one-off content)
+Shipped, then removed in the notch-only refactor — the WhisperKit dependency,
+`SpeechController`, voice overlay and inline mic no longer exist. `⌥Space` opens
+the notch text input.
 
 ---
 
@@ -637,8 +453,8 @@ Daemon spawns `uvx mcp-server-odoo` as a child process and speaks MCP over stdio
 - [ ] Manual QA: `make bundle && open bagent.app` — grant Screen Recording + Accessibility in Settings; ask "čo je na obrazovke?" → vision model answers; "prečítaj výber" → AX selection used; verify no file written under `~/Library/Application Support/bagent/attachments` for screen frames
 - [ ] Image paste QA: ⌘V with image in clipboard → `[image #1]` token + chip; send → thumbnail in bubble
 - [ ] Unit tests: `is_screen_context` keyword combos; `ScreenIntent` JSON deserialisation incl. `action:"none"` (4 already in screen_intent.rs)
-- [ ] Live Ollama classifier round-trip test (`#[ignore]`)
-- [ ] `ollama pull qwen2.5vl:7b` — required for vision analysis (user must run once)
+- [ ] Live BaseRT classifier round-trip test (`#[ignore]`)
+- [ ] `basert pull qwen2.5vl:7b` — required for vision analysis (user must run once)
 
 ---
 
@@ -682,7 +498,7 @@ Daemon spawns `uvx mcp-server-odoo` as a child process and speaks MCP over stdio
 - [ ] SQLCipher encryption on `bagent.db`
 - [ ] Audit log hash-chain verification (`bagentd --verify-audit`)
 - [ ] Crash reporter (opt-in)
-- [ ] Onboarding flow (permissions, Ollama guide, language pref)
+- [ ] Onboarding flow (permissions, BaseRT guide, language pref)
 - [ ] Staged rollout config (10% → 50% → 100%)
 - [ ] OWASP LLM Top 10 checklist completed (see `SECURITY.md`)
 - [ ] Beta `.dmg` distributed to initial test users
@@ -725,7 +541,7 @@ Daemon spawns `uvx mcp-server-odoo` as a child process and speaks MCP over stdio
 - [x] `DANGEROUS_EXTENSIONS` list — blocks .app/.sh/.py/.scpt/.pkg/.dmg etc. from open
 - [x] `open.rs`: pure `build_*_argv` functions (test-safe) + async exec via `/usr/bin/open` only, never `sh -c`
 - [x] `search.rs`: WalkDir walk, filename/content/path scoring, Slovak diacritics, binary skip, 500-char line truncation
-- [x] `crates/agent/src/file_intent.rs`: `FileIntent`/`FileAction` + `FileIntentClassifier` (Ollama JSON, SK/EN few-shots)
+- [x] `crates/agent/src/file_intent.rs`: `FileIntent`/`FileAction` + `FileIntentClassifier` (BaseRT JSON, SK/EN few-shots)
 - [x] `crates/rules/src/lib.rs`: filesystem/macos rules (auto/ask/forbidden)
 - [x] `crates/agent/src/context_planner.rs`: `is_file_search()` (placed after `is_mail_search`), file skill names
 - [x] `crates/agent/src/prompt.rs`: `PromptTrace` file_* fields
@@ -756,3 +572,18 @@ Daemon spawns `uvx mcp-server-odoo` as a child process and speaks MCP over stdio
 - [ ] Kill switch: menu bar item immediately revokes all active session-scoped permits
 - [ ] Forbidden list: `sudo`, `rm -rf`, password fields (`AXIsPasswordField`), Keychain paths, system files
 - [ ] Hard per-minute action budget (default 20 actions/min); configurable in Settings
+
+---
+
+## Scheduled Automations (2026-07) — DONE
+
+Implemented end to end (see `docs/AUTOMATIONS.md`; issues #1–#14):
+
+- [x] `bagent-automations` crate: typed schedules, IANA-zone recurrence, DST policies, validation, catch-up window
+- [x] launchd daemon residency — scheduling continues after the app exits
+- [x] shared agent execution service (`agent_exec.rs`): one loop for chat + automations, unattended write gating, fail-closed unknown tools
+- [x] persistence + typed CRUD API (`V13`), approval provenance (`V14`), 50-run retention with audited cleanup
+- [x] daemon scheduler: atomic claims, 24h single catch-up, overlap/stale skip records, restart recovery, 2-run concurrency
+- [x] daemon-wide `/events` SSE + background approval preemption in the notch
+- [x] `/automations` notch surface: list, detail (runs + full-output reuse), step editor for once/hourly/daily/weekday/weekly
+- [ ] follow-ups: live manual validation of sleep/wake + unattended write approval paths; per-automation model selection; fixed-phase every-N-hours anchoring
