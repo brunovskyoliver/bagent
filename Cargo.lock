@@ -224,6 +224,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bagent-browser-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "bagent-memory"
 version = "0.1.0"
 dependencies = [
