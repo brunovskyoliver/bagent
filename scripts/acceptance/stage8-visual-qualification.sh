@@ -35,6 +35,18 @@ case "$fixture" in
 esac
 trap 'rm -rf -- "$fixture"' EXIT INT TERM
 
+transition_evidence="$fixture/notch-transition.json"
+BAGENT_NOTCH_TRANSITION_EVIDENCE="$transition_evidence" \
+    swift test --package-path "$root/apps/macos" --filter NotchTransitionTests
+[[ "$(jq -r .status "$transition_evidence")" == pass ]]
+[[ "$(jq -r .transition_count "$transition_evidence")" =~ ^[2-9][0-9]*$ ]]
+for field in interruption_reconciled status_pill_anchor_invariant normal_motion_recorded reduced_motion_recorded; do
+    [[ "$(jq -r ".$field" "$transition_evidence")" == true ]] || {
+        echo "A56 transition evidence is incomplete: $field" >&2
+        exit 1
+    }
+done
+
 for variant in light dark; do
     BAGENT_STAGE7B_SETTINGS_FIXTURE=1 \
         "$candidate/Contents/MacOS/bagent" \
@@ -53,4 +65,4 @@ rg -q 'NotchPillLayout\.origin' "$root/apps/macos/Tests/bagentTests/NotchStateCa
 rg -q 'acceptanceReduceMotionOverride' "$root/apps/macos/Sources/bagent/ChatView.swift"
 test "$(find "$root/apps/macos/.build/notch-state-catalog" -maxdepth 1 -name '*.png' ! -name 'contact-sheet.png' | wc -l | tr -d ' ')" = 11
 
-echo "A56 visual qualification: PASS (macOS $product_version; signed candidate; 11 notch states; 57 settings fixtures x 2 widths x light/dark/high-contrast/large-text/reduced-motion; signed identity and status-pill anchor verified)"
+echo "A56 visual qualification: PASS (macOS $product_version; signed candidate; 11 notch states; transition interruption reconciled in normal and reduced motion; 57 settings fixtures x 2 widths x light/dark/high-contrast/large-text/reduced-motion; signed identity and status-pill anchor verified)"

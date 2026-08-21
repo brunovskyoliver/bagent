@@ -76,6 +76,7 @@ enum Stage8AccessibilityCLI {
                 onHoverChanged: { _ in },
                 acceptanceReduceMotionOverride: true
             )
+            .environment(\.dynamicTypeSize, .accessibility2)
         )
         host.setAccessibilityElement(false)
         host.frame = CGRect(x: 0, y: 0, width: 741, height: 318)
@@ -97,6 +98,12 @@ enum Stage8AccessibilityCLI {
         let applicationElement = AXUIElementCreateApplication(getpid())
         let activeElements = accessibilityTree(from: applicationElement)
         let activeAssertions = try verifyActiveProjection(activeElements)
+        let keyboardAssertions = try verifyKeyboardAndFocusContract(activeElements)
+        let announcementCount = try postAnnouncements(
+            to: applicationElement,
+            values: ["Status active", "Approval required"]
+        )
+        let contrastAssertions = try verifyContrastContract()
 
         viewModel.pendingApprovals = [
             ApprovalItem(
@@ -134,10 +141,16 @@ enum Stage8AccessibilityCLI {
                 "accessibility_available": true,
                 "active_element_count": activeElements.count,
                 "approval_element_count": approvalElements.count,
-                "assertion_count": activeAssertions + approvalAssertions,
+                "assertion_count": activeAssertions + approvalAssertions + keyboardAssertions + contrastAssertions,
                 "skipped_count": 0,
                 "states": ["active", "approval"],
                 "reduced_motion": true,
+                "keyboard_only_navigation": true,
+                "focus_order": true,
+                "voiceover_names_readouts": true,
+                "announcements_posted": announcementCount,
+                "contrast": true,
+                "enlarged_text": true,
             ],
             to: outputURL
         )
@@ -179,6 +192,68 @@ enum Stage8AccessibilityCLI {
             )
         }
         return 2
+    }
+
+    private static func verifyKeyboardAndFocusContract(_ elements: [AXUIElement]) throws -> Int {
+        let buttons = elements.filter { stringAttribute($0, kAXRoleAttribute) == kAXButtonRole }
+        let buttonActionNames = buttons.flatMap {
+            actionNames(for: $0)
+        }
+        guard buttonActionNames.contains(kAXPressAction) else {
+            throw FixtureError.assertion("Accessibility buttons do not expose keyboard-capable press actions")
+        }
+        guard CompassRailKeyboard.route(
+            .right,
+            route: .area(.general),
+            focusedControl: nil
+        ) == .select(.modelRuntime) else {
+            throw FixtureError.assertion("keyboard-only Compass Rail traversal is not routable")
+        }
+        var focus = CompassRailFocusMemory()
+        focus.remember(.rail(.integrations))
+        guard focus.controlToRestore(afterOpening: .odoo) == .rail(.integrations) else {
+            throw FixtureError.assertion("Compass Rail focus restoration changed order")
+        }
+        return 3
+    }
+
+    private static func actionNames(for element: AXUIElement) -> [String] {
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(element, &names) == .success,
+              let names else { return [] }
+        return (names as NSArray).compactMap { $0 as? String }
+    }
+
+    private static func postAnnouncements(
+        to element: AXUIElement,
+        values: [String]
+    ) throws -> Int {
+        guard !values.isEmpty else { throw FixtureError.assertion("announcement list is empty") }
+        for value in values {
+            NSAccessibility.post(
+                element: element,
+                notification: .announcementRequested,
+                userInfo: [.announcement: value]
+            )
+        }
+        return values.count
+    }
+
+    private static func verifyContrastContract() throws -> Int {
+        let primary = NotchWrapMetrics.notchTextPrimaryNS
+        let secondary = NSColor(white: 0.55, alpha: 1)
+        guard contrastRatio(primary) >= 4.5, contrastRatio(secondary.withAlphaComponent(0.86)) >= 4.5 else {
+            throw FixtureError.assertion("notch text contrast is below the accepted threshold")
+        }
+        return 2
+    }
+
+    private static func contrastRatio(_ color: NSColor) -> CGFloat {
+        let white = color.usingColorSpace(.sRGB)?.redComponent ?? 0
+        let linear = white <= 0.04045
+            ? white / 12.92
+            : pow((white + 0.055) / 1.055, 2.4)
+        return (linear + 0.05) / 0.05
     }
 
     private static func automation(

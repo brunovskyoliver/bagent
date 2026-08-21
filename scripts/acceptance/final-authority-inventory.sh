@@ -17,6 +17,19 @@ swift_src = root / "apps/macos/Sources/bagent"
 cutover = src / "cutover.rs"
 migration = root / "crates/daemon/migrations/V23__stage8_canonical_cleanup.sql"
 
+# Legacy identifiers are allowed only inside the explicit, transactional
+# migration copy. Keep the allowance counted so a new compatibility route
+# cannot hide inside cutover.rs.
+cutover_legacy_sql_allowlist = {
+    "UPDATE AUTOMATION_RUNS": 1,
+    "UPDATE PENDING_APPROVALS": 1,
+    "FROM AUTOMATION_RUNS": 2,
+    "FROM PENDING_APPROVALS": 2,
+}
+work_coordinator_legacy_sql_allowlist = {
+    "DROP TABLE IF EXISTS AUTOMATION_SESSION_PENDING_APPROVALS": 1,
+}
+
 
 def strip_cfg_test_items(text: str) -> str:
     """Remove cfg(test) items before scanning the production graph."""
@@ -69,6 +82,9 @@ forbidden = {
         r"response_for_audit|append_prompt_debug|\bdebug_trace\b|"
         r"\bdebugTrace\b|debugPayload|prompt_trace_id"
     ),
+    "obsolete automation event shim": re.compile(
+        r"\bproject_automation_definition_event\b"
+    ),
     "computed notch compatibility accessor": re.compile(
         r"(?:\b(?:private\s+|internal\s+|public\s+)?var\s+"
         r"(?:isThinking|isExpanded|chatSurfaceMode|toolStatus)\b|"
@@ -87,12 +103,24 @@ def findings_for(path: pathlib.Path, text: str) -> list[str]:
     findings: list[str] = []
     for label, pattern in forbidden.items():
         for match in pattern.finditer(text):
-            if (
-                label == "obsolete lifecycle SQL"
-                and path.name == "work_coordinator.rs"
-                and match.group(0).lstrip().upper().startswith("DROP TABLE")
-            ):
-                continue
+            if label == "obsolete lifecycle SQL" and path in {
+                cutover,
+                src / "work_coordinator.rs",
+            }:
+                phrase = re.sub(r"\s+", " ", match.group(0)).upper()
+                allowlist = (
+                    cutover_legacy_sql_allowlist
+                    if path == cutover
+                    else work_coordinator_legacy_sql_allowlist
+                )
+                allowed_phrase = phrase in allowlist
+                seen_before = sum(
+                    1
+                    for prior in forbidden[label].finditer(text, 0, match.start())
+                    if re.sub(r"\s+", " ", prior.group(0)).upper() == phrase
+                )
+                if allowed_phrase and seen_before < allowlist[phrase]:
+                    continue
             line = text.count("\n", 0, match.start()) + 1
             findings.append(f"{path.relative_to(root)}:{line}: {label}: {match.group(0)}")
     return findings
@@ -114,6 +142,7 @@ case .debugTrace;
 let prompt_trace_id = "opaque";
 struct Presentation { var isThinking: Bool; }
 let old = \"SELECT * FROM automation_runs\";
+fn project_automation_definition_event() { }
 """
 seed_hits = findings_for(root / "__stage8_seed.rs", seed)
 seed_labels = {hit.split(": ", 2)[1] for hit in seed_hits}
@@ -126,9 +155,33 @@ print(f"A51 red capability: PASS ({len(seed_hits)} seeded forbidden matches)")
 
 findings: list[str] = []
 for path in production_files():
-    if path == cutover:
-        continue
     findings.extend(findings_for(path, source_text(path)))
+
+cutover_text = source_text(cutover)
+for phrase, expected_count in cutover_legacy_sql_allowlist.items():
+    actual_count = sum(
+        1
+        for match in forbidden["obsolete lifecycle SQL"].finditer(cutover_text)
+        if re.sub(r"\s+", " ", match.group(0)).upper() == phrase
+    )
+    if actual_count != expected_count:
+        findings.append(
+            f"{cutover.relative_to(root)}: explicit migration allowlist {phrase!r}: "
+            f"expected {expected_count}, found {actual_count}"
+        )
+
+work_coordinator_text = source_text(src / "work_coordinator.rs")
+for phrase, expected_count in work_coordinator_legacy_sql_allowlist.items():
+    actual_count = sum(
+        1
+        for match in forbidden["obsolete lifecycle SQL"].finditer(work_coordinator_text)
+        if re.sub(r"\s+", " ", match.group(0)).upper() == phrase
+    )
+    if actual_count != expected_count:
+        findings.append(
+            f"{(src / 'work_coordinator.rs').relative_to(root)}: explicit cleanup allowlist "
+            f"{phrase!r}: expected {expected_count}, found {actual_count}"
+        )
 
 required = {
     "forward migration": migration.exists()
@@ -163,6 +216,12 @@ if findings:
         print("A51 forbidden: " + finding)
     print(f"A51 production inventory: FAIL ({len(findings)} findings)")
     raise SystemExit(1)
+
+print(
+    "A51 cutover migration allowlist: PASS "
+    f"({sum(cutover_legacy_sql_allowlist.values())} counted legacy SQL matches; "
+    f"{sum(work_coordinator_legacy_sql_allowlist.values())} bootstrap cleanup match)"
+)
 
 
 checks = [

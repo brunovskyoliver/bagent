@@ -47,9 +47,6 @@ case "$capture_dir" in
     "${TMPDIR:-/tmp}"/bagent-stage7c-captures.*) ;;
     *) echo "refusing unexpected capture path: $capture_dir" >&2; exit 2 ;;
 esac
-BAGENT_STAGE7C_CAPTURE_DIR="$capture_dir" \
-    "$repo_root/scripts/acceptance/stage7c-production-ui-relaunch.sh" "$candidate"
-"$repo_root/scripts/acceptance/stage7c-privacy-scan.sh" "$capture_dir"
 
 canaries=(
     STAGE8_CANARY_HIDDEN_REASONING
@@ -62,6 +59,17 @@ canaries=(
     STAGE8_CANARY_DIAGNOSTIC_EXPORT
     STAGE8_CANARY_FAILURE_PAYLOAD
 )
+canary_terms=(
+    "hidden reasoning"
+    "raw arguments"
+    "credential"
+    "evidence content"
+    "private identity"
+    "unknown field"
+    "handoff data"
+    "diagnostic export"
+    "failure payload"
+)
 surfaces=(event ui log diagnostics export migration rollback crash failure)
 
 printf '%s\n' "${canaries[@]}" > "$fixture/canary-seed.txt"
@@ -70,11 +78,27 @@ jq -n --argjson canaries "$canary_json" \
     '{surface:"synthetic-scanner-seed",hidden_reasoning:$canaries[0],raw_arguments:$canaries[1],credential:$canaries[2],evidence_content:$canaries[3],private_identity:$canaries[4],unknown_field:$canaries[5],handoff_data:$canaries[6],diagnostic_export:$canaries[7],failure_payload:$canaries[8]}' \
     > "$fixture/raw-canaries.json"
 
-detected=0
-for canary in "${canaries[@]}"; do
-    rg -q --fixed-strings "$canary" "$fixture/raw-canaries.json"
-    detected=$((detected + 1))
+scanner_canary_dir="$fixture/scanner-canaries"
+mkdir -p "$scanner_canary_dir"
+for ((index = 0; index < ${#canaries[@]}; index++)); do
+    jq -n \
+        --arg value "${canaries[$index]}" \
+        --arg category "${canary_terms[$index]}" \
+        '{surface:"stage8-scanner-canary",category:$category,value:$value}' \
+        > "$scanner_canary_dir/$index.json"
 done
+
+BAGENT_STAGE7C_CAPTURE_DIR="$capture_dir" \
+    "$repo_root/scripts/acceptance/stage7c-production-ui-relaunch.sh" "$candidate"
+BAGENT_STAGE7C_CANARY_SCAN_DIR="$scanner_canary_dir" \
+BAGENT_STAGE7C_CANARY_RESULT_FILE="$fixture/scanner-canary-result.json" \
+BAGENT_STAGE7C_CANARY_EXPECTED_COUNT="${#canaries[@]}" \
+    "$repo_root/scripts/acceptance/stage7c-privacy-scan.sh" "$capture_dir"
+
+detected="$(jq -r .detected "$fixture/scanner-canary-result.json")"
+expected="$(jq -r .expected "$fixture/scanner-canary-result.json")"
+[[ "$expected" == "${#canaries[@]}" ]]
+[[ "$detected" == "$expected" ]]
 [[ "$detected" -eq "${#canaries[@]}" ]]
 
 for surface in "${surfaces[@]}"; do
@@ -93,7 +117,7 @@ done
 
 echo "A55 surfaces exercised: ${#surfaces[@]} (signed production capture plus sanitized projections)"
 echo "A55 synthetic canaries: ${#canaries[@]}"
-echo "A55 scanner detections: $detected"
+echo "A55 scanner detections: $detected (shared production privacy scanner)"
 echo "A55 sanitized projection matches: $sanitized_matches"
 echo "A55 disposable capture cleanup: secure-delete requested"
 echo "A55 privacy: PASS"

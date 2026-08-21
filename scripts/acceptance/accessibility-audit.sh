@@ -29,4 +29,5 @@ if rg -n 'onTapGesture|@FocusState' "$rail"; then
     exit 1
 fi
 
-echo "PASS: signed fixture verified; hosted controls, Return bindings, labels, values, decorative hiding, semantic text, contrast, and stable focus source checks passed"
+echo "PASS: signed fixture verified; Return bindings, labels, values, decorative hiding, semantic text, contrast, and stable focus source checks passed"
+echo "SKIPPED: hosted StageRailAccessibilityTests require Accessibility API permission for the test runner; signed-candidate AX evidence is the A57 qualification input"

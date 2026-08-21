@@ -14,7 +14,7 @@ tmp_root="${tmp_root:A}"
 scan() {
     local dir="$1"
     local matches=0
-    local pattern='(password|passwd|secret|token|credential|signed.?url|authorization|cookie|clipboard|stack.?trace|system prompt|model prompt|assistant output|model output|conversation content|transcript|connector.?native.?id|database row|provider error|raw event|native object archive|protected path|protected resource|private identifier|identity|raw arguments?|argument values?|bundle path|raw os error|mail content|notes content|reasoning)'
+    local pattern='(password|passwd|secret|token|credential|signed.?url|authorization|cookie|clipboard|stack.?trace|system prompt|model prompt|assistant output|model output|conversation content|transcript|connector.?native.?id|database row|provider error|raw event|native object archive|protected path|protected resource|private identifier|identity|raw arguments?|argument values?|bundle path|raw os error|mail content|notes content|reasoning|evidence content|unknown field|handoff data|diagnostic export|failure payload)'
     matches=$((rg -n -i --hidden --glob '!*.DS_Store' "$pattern" "$dir" 2>/dev/null || true) | wc -l | tr -d ' ')
     print "$matches"
 }
@@ -95,6 +95,33 @@ for surface in "${surfaces[@]}"; do
     }
 done
 (( canary_matches >= canary_assertions )) || { print -u2 "scanner failed to detect every synthetic canary"; exit 1; }
+
+if [[ -n "${BAGENT_STAGE7C_CANARY_SCAN_DIR:-}" || -n "${BAGENT_STAGE7C_CANARY_RESULT_FILE:-}" || -n "${BAGENT_STAGE7C_CANARY_EXPECTED_COUNT:-}" ]]; then
+    canary_scan_dir="${BAGENT_STAGE7C_CANARY_SCAN_DIR:-}"
+    canary_result_file="${BAGENT_STAGE7C_CANARY_RESULT_FILE:-}"
+    canary_expected="${BAGENT_STAGE7C_CANARY_EXPECTED_COUNT:-}"
+    [[ -d "$canary_scan_dir" && -n "$canary_result_file" && "$canary_expected" =~ '^[1-9][0-9]*$' ]] || {
+        print -u2 "Stage 8 canary scanner configuration is incomplete"
+        exit 2
+    }
+    canary_files=(${canary_scan_dir}/*.json(N))
+    [[ ${#canary_files[@]} -eq $canary_expected ]] || {
+        print -u2 "Stage 8 canary scanner file count is not exact"
+        exit 1
+    }
+    canary_files_detected=0
+    for canary_file in "${canary_files[@]}"; do
+        canary_file_matches=$(scan "$canary_file")
+        (( canary_file_matches > 0 )) || {
+            print -u2 "shared privacy scanner missed Stage 8 canary: $canary_file"
+            exit 1
+        }
+        ((canary_files_detected += 1))
+    done
+    jq -n --argjson expected "$canary_expected" --argjson detected "$canary_files_detected" \
+        '{expected:$expected,detected:$detected}' > "$canary_result_file"
+    print "A55 shared scanner canary files detected: $canary_files_detected"
+fi
 matches=$(scan "$capture_dir")
 capture_manifest=$(find "$capture_dir" -type f ! -name '.DS_Store' -print0 \
     | sort -z \

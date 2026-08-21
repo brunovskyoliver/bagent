@@ -25,9 +25,12 @@ fixtures.
 
 ## Candidate and environment
 
-The final candidate commit, signed bundle hash, toolchain versions, command
-timestamps, test counts, cleanup, and final runtime state are recorded in the
-A60 section below after the release commit is frozen.
+The final candidate commit is frozen before A60. Its signed bundle hash,
+toolchain versions, command timestamps, test counts, cleanup, and final
+runtime state are emitted by the reproducibility command and attached to the
+Stage 8 ticket's resolution comment. The command's output is kept outside the
+candidate commit so copying a run record into this file cannot change the
+commit that A60 validates.
 
 Observed qualification environment for signed/live gates:
 
@@ -45,16 +48,16 @@ conditional, blocked, or inferred result is called PASS.
 
 | Gate | Executed evidence | Current result |
 | --- | --- | --- |
-| A51 | `scripts/acceptance/final-authority-inventory.sh`; canonical authority subgates and production inventory | PASS: capability detector found 12 seeded forbidden matches, including the retired prompt/debug result path; four authority subgates passed; production inventory found 0 findings and 8 canonical assertions |
+| A51 | `scripts/acceptance/final-authority-inventory.sh`; canonical authority subgates and production inventory | PASS: capability detector found 13 seeded forbidden matches, including the retired prompt/debug result path and obsolete automation event shim; four authority subgates passed; production inventory found 0 findings and 8 canonical assertions |
 | A52 | `cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact` | PASS: 1 executed, 1 passed, 0 failed; disposable empty and V14 databases converged to the canonical schema and invariants, with kind-only approval provenance and no private automation identity |
 | A53 | `cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact`; `cargo test -p bagentd --test work_concurrency crash_recovery -- --exact` | PASS: 2 executed, 2 passed, 0 failed; before-transaction, during-copy, after-commit, before-admission, retry, canonical recovery, and crash-recovery checks ran |
 | A54 | `scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app` | PASS: disposable old/new signed candidates and databases; fixed-base refusal, pre-Work verified backup, post-Work archive-and-restore, hashes, and cleanup recorded; integration backup `39b40193d8583f0abe188a38dad1f9f8aa3ed011277b55cef182d7a43ac5e9f2`, pre-Work `623c1252a32eeac496129f0e4b45ae46da8bd1d5793ae3276e86289ca1f588f1`, archive `61d44bf0e6717743e97f832efea9144c65bb1d9c1e5a582e32ac5ecda766b7d0` |
 | A55 | `scripts/acceptance/stage8-privacy-scan.sh`; `cargo test -p bagentd --test privacy_contract -- --nocapture`; `swift test --package-path apps/macos --filter ProjectionPrivacyTests`; `swift test --package-path apps/macos --filter UIRelaunchHandoffTests` | PASS: 9 surfaces, 9 synthetic canaries, 9 scanner detections, 0 sanitized projection matches; disposable captures securely deleted; Rust privacy contract 1 executed and passed, Swift privacy projection 4 executed and passed, UI relaunch handoff privacy 5 executed and passed |
 | A56 | `scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app` | PASS: signed macOS 26 candidate; 11 notch states; 57 settings fixtures × 2 widths across light/dark/high-contrast/large-text/reduced-motion; status-pill anchor and identity verified |
-| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS: signed macOS 26 live AX fixture; 2 notch states, 5 notch assertions, 57 settings routes, 634 settings assertions, 0 skipped live assertions; hosted XCTest AX check is recorded as SKIPPED, not PASS |
+| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS: signed macOS 26 live AX fixture; 2 notch states, 10 notch assertions, 57 settings routes, 634 settings assertions, 0 skipped signed assertions; hosted XCTest AX check is recorded as SKIPPED, not PASS |
 | A58 | `scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app`; `scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app` | PASS: A18–A21, poison/8080 isolation, and signed A49 UI-only relaunch all executed nonzero; daemon/BaseRT stability, Work/model convergence, protected port sentinel, and historical A50 scanner verified |
-| A59 | `scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app` | PASS: signed macOS 26 candidate with real disposable daemon/BaseRT; preload, foreground chat, two automations, safe activity/tool presentation, result open, continuation, scoped `/clear`, permission reread, UI-only relaunch, idle retirement, later reload, and port isolation verified; safe external source ended in `verification_shortfall` (`acquired=0`, `requested=2`, `source_count=0`, 497 token bytes, capture SHA-256 `90c80a8fa11fe3b844879facb6f7b07230d533dc904ecdc56718925178636954`); no TCC mutation |
-| A60 | `scripts/acceptance/stage8-reproducibility.sh 1260480bc0b91bf8a447b88fcbae885f5f4e3cfe` | PASS: detached clean checkout at the frozen candidate; every gate returned status 0; record SHA-256 `02b3ce188e9d2b57e5fa3622d0a2a256e0154b48587571e02af66bc4863307c2`; no production database or port-8080 owner access |
+| A59 | `scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app` | PASS: signed macOS 26 candidate with real disposable daemon/BaseRT; preload, foreground chat, two canonical automation Works and sessions, safe activity/tool presentation, result open, continuation, scoped `/clear`, permission reread, UI-only relaunch, idle retirement, later reload, and port isolation verified; safe external source ended in `verification_shortfall` (`acquired=0`, `requested=2`, `source_count=0`, 489 token bytes, capture SHA-256 `32d06c60779de22c4f74d3ae96d2433edc339c99e88430d8a872ba8fdeb84bf5`); no TCC mutation |
+| A60 | `scripts/acceptance/stage8-reproducibility.sh <frozen-final-commit>` | The final clean-checkout record, including every gate status, nonzero execution count, log hash, signed bundle hash, timestamps, protected-port baseline, cleanup, and final runtime state, is attached to the Stage 8 ticket resolution comment. This row is not a substitute for that emitted record. |
 
 ### A51 final authority cleanup
 
@@ -98,13 +101,15 @@ accepted.
 
 ## A60 reproducibility record
 
-The frozen implementation candidate was validated from a separate detached
-checkout. The evidence document is updated after that run; the update contains
-no production or acceptance-code change. The exact candidate validated by A60
-is `1260480bc0b91bf8a447b88fcbae885f5f4e3cfe`.
+The earlier clean-checkout run below is retained as superseded development
+evidence only. It is not the current release qualification because later A51,
+A55, A57, and A59 fixes changed the candidate. The final A60 command is run
+after the last implementation and evidence commit; its complete emitted
+record is attached to the Stage 8 ticket resolution comment rather than copied
+back into the commit under test.
 
 ```text
-candidate=1260480bc0b91bf8a447b88fcbae885f5f4e3cfe
+superseded_candidate=1260480bc0b91bf8a447b88fcbae885f5f4e3cfe
 started_utc=2026-08-21T19:28:41Z
 ended_utc=2026-08-21T19:42:29Z
 os=26.5.2 (25F84)
@@ -166,13 +171,13 @@ cleanup=all gate-owned fixtures and processes cleaned; detached checkout and rec
 production_database=not used; production application and port-8080 owner untouched
 ```
 
-The A60 record itself has SHA-256
+The superseded record has SHA-256
 `02b3ce188e9d2b57e5fa3622d0a2a256e0154b48587571e02af66bc4863307c2`.
-Every listed command returned status 0. Nonzero counts in the record are
-execution metrics, not failures. The accessibility gate's hosted XCTest
+Its zero statuses and nonzero execution metrics are retained for traceability,
+not as current release evidence. The final A60 record is the one emitted by
+the frozen-candidate command and attached to ticket #38; the hosted XCTest
 Accessibility check remains explicitly SKIPPED because granting Accessibility
-to the production bagent app is outside this campaign; the signed macOS 26 AX
-fixture and its applicable assertions passed.
+to the production bagent app is outside this campaign.
 
 ## Review and closeout
 
@@ -192,8 +197,10 @@ or pull request is part of this stage.
 - A52 privacy boundary: both migration and live approval-origin tests failed
   red when a private automation name was retained, then passed after the
   canonical origin became kind-only.
-- Final Standards review against the fixed Stage 7C commit: PASS, zero
-  blockers, high findings, or lower-severity acceptance defects unresolved.
-- Final Stage 8/A51-A60 specification review against the fixed Stage 7C
-  commit: PASS, zero blockers, high findings, or lower-severity acceptance
-  defects unresolved.
+- Earlier review passes identified and were followed by fixes for the counted
+  A51 migration allowlist, shared A55 canary scanner, signed A56 transition
+  evidence, signed A57 accessibility evidence, signed A59 observation order,
+  and final-candidate A60 reproducibility.
+- The two final independent review reports and their zero-finding results are
+  attached to the Stage 8 ticket resolution comment after the final candidate
+  is frozen.

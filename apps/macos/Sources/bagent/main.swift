@@ -24,6 +24,26 @@ if (arguments.count == 3 || arguments.count == 4),
         exit(status)
     }
     RunLoop.main.run()
+} else if arguments.count == 6, arguments[1] == "--stage8-live-session" {
+    let runIdentity = arguments[2]
+    let workIdentity = arguments[3]
+    guard let workRevision = UInt64(arguments[4]) else { exit(64) }
+    let outputURL = URL(fileURLWithPath: arguments[5])
+    Task { @MainActor in
+        exit(await Stage8LiveSmokeCLI.run(
+            runIdentity: runIdentity,
+            workIdentity: workIdentity,
+            workRevision: workRevision,
+            outputURL: outputURL
+        ))
+    }
+    RunLoop.main.run()
+} else if arguments.count == 3, arguments[1] == "--stage8-live-projection" {
+    let outputURL = URL(fileURLWithPath: arguments[2])
+    Task { @MainActor in
+        exit(await Stage8LiveSmokeCLI.runProjection(outputURL: outputURL))
+    }
+    RunLoop.main.run()
 } else if (3...4).contains(arguments.count),
           arguments[1] == "--stage7b-settings-fixture",
           ProcessInfo.processInfo.environment[Stage7BSettingsAcceptanceCLI.environmentKey] == "1" {

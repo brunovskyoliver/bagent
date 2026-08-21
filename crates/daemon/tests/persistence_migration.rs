@@ -88,6 +88,81 @@ fn canonical_schema_checksum(connection: &Connection) -> String {
     format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
+fn assert_no_private_projection_values(connection: &Connection) {
+    let markers = [
+        "canary_private_identity",
+        "canary_raw_argument",
+        "stage8_canary",
+        "hidden reasoning",
+        "raw arguments",
+        "credential",
+        "evidence content",
+        "private identity",
+        "unknown field",
+        "handoff data",
+        "diagnostic export",
+        "failure payload",
+    ];
+    let projections = [
+        (
+            "legacy_run_records",
+            "SELECT COALESCE(summary, '') FROM legacy_run_records",
+        ),
+        (
+            "automation_run_records",
+            "SELECT COALESCE(result_summary, '') FROM automation_run_records",
+        ),
+        (
+            "work_approval_requests",
+            "SELECT COALESCE(description, '') || ' ' || COALESCE(origin_json, '')
+             FROM work_approval_requests",
+        ),
+        (
+            "automation_sessions",
+            "SELECT COALESCE(result_summary, '') || ' ' || COALESCE(final_output, '') || ' '
+                    || COALESCE(activity_timeline_json, '') || ' '
+                    || COALESCE(validated_sources_json, '') || ' '
+                    || COALESCE(connector_references_json, '') || ' '
+                    || COALESCE(historical_approvals_json, '')
+             FROM automation_sessions",
+        ),
+        (
+            "current_chat_turns",
+            "SELECT COALESCE(user_message, '') || ' ' || COALESCE(assistant_output, '')
+             FROM current_chat_turns",
+        ),
+        (
+            "current_chat_drafts",
+            "SELECT COALESCE(text, '') FROM current_chat_drafts",
+        ),
+    ];
+    for (table, query) in projections {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if !exists {
+            continue;
+        }
+        let mut statement = connection.prepare(query).unwrap();
+        let values = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for value in values {
+            let lower = value.to_ascii_lowercase();
+            assert!(
+                !markers.iter().any(|marker| lower.contains(marker)),
+                "private migration canary leaked into {table}: {value}"
+            );
+        }
+    }
+}
+
 fn canonicalize(path: &std::path::Path, backup_hash: &str) -> Connection {
     migrate_v14_copy(path, backup_hash, true).unwrap();
     finalize_stage8_cleanup(path).unwrap();
@@ -182,7 +257,7 @@ fn exercise_canonical_work_session(path: &std::path::Path) {
         )
         .unwrap();
     assert_eq!(session_count, 1);
-    assert!(!format!("{connection:?}").contains("raw"));
+    assert_no_private_projection_values(&connection);
 }
 
 fn v14_fixture() -> (TempDir, std::path::PathBuf) {
@@ -282,6 +357,7 @@ fn clean_and_v14() {
             )
             .unwrap();
         assert_eq!(pending_placeholder, 0);
+        assert_no_private_projection_values(connection);
     }
 
     let canonical_count: i64 = v14
@@ -479,7 +555,7 @@ fn legacy_run_records() {
         )
         .unwrap();
     assert_eq!(decision, "abandoned");
-    assert!(!format!("{connection:?}").contains("CANARY"));
+    assert_no_private_projection_values(&connection);
 }
 
 fn old_binary_can_open(path: &std::path::Path) -> bool {

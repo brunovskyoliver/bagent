@@ -163,7 +163,8 @@ struct DaemonClient: Sendable, NotchEventTransport {
     private static let dataDir: URL = {
         if (ProcessInfo.processInfo.environment["BAGENT_STAGE7A_ACCEPTANCE_FIXTURE"] == "1"
             || ProcessInfo.processInfo.environment["BAGENT_STAGE7B_SETTINGS_FIXTURE"] == "1"
-            || ProcessInfo.processInfo.environment["BAGENT_STAGE7C_ACCEPTANCE_FIXTURE"] == "1"),
+            || ProcessInfo.processInfo.environment["BAGENT_STAGE7C_ACCEPTANCE_FIXTURE"] == "1"
+            || ProcessInfo.processInfo.environment[Stage8AcceptanceCLI.environmentKey] == "1"),
            let path = ProcessInfo.processInfo.environment["BAGENT_DATA_DIR"] {
             return URL(fileURLWithPath: path, isDirectory: true)
         }

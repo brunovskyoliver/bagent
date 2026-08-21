@@ -13,7 +13,10 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use uuid::Uuid;
 
 use bagent_automations::{
@@ -441,18 +444,6 @@ pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
-/// Concise redacted lifecycle event: ids/status/next-run only, no prompts or
-/// summaries — clients refetch the authoritative record.
-fn project_automation_definition_event(
-    _state: &AppState,
-    _event_type: &str,
-    _a_id: &str,
-    _extra: serde_json::Value,
-) {
-    // Definition changes wake the scheduler. The canonical Work outbox is the
-    // only lifecycle event source; the old daemon-wide stream is gone.
-}
-
 fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
     match e {
         RepoError::NotFound => (
@@ -531,12 +522,6 @@ pub(crate) async fn automations_create(
                 &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
             );
             state.automations_changed.notify_waiters();
-            project_automation_definition_event(
-                &state,
-                "automation_created",
-                &a.id.to_string(),
-                json!({"next_run_at": a.next_run_at.map(ts)}),
-            );
             (
                 StatusCode::CREATED,
                 Json(serde_json::to_value(&a).unwrap_or_default()),
@@ -577,12 +562,6 @@ pub(crate) async fn automation_patch(
                 &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
             );
             state.automations_changed.notify_waiters();
-            project_automation_definition_event(
-                &state,
-                "automation_updated",
-                &a.id.to_string(),
-                json!({"next_run_at": a.next_run_at.map(ts)}),
-            );
             (
                 StatusCode::OK,
                 Json(serde_json::to_value(&a).unwrap_or_default()),
@@ -604,7 +583,6 @@ pub(crate) async fn automation_delete(
         Ok(()) => {
             audit_fs(&state.db, "automation_delete", &json!({"id": id}));
             state.automations_changed.notify_waiters();
-            project_automation_definition_event(&state, "automation_deleted", &id, json!({}));
             (StatusCode::OK, Json(json!({"ok": true})))
         }
         Err(e) => repo_error_response(e),
@@ -646,16 +624,6 @@ async fn set_enabled(
                 &json!({"id": id}),
             );
             state.automations_changed.notify_waiters();
-            project_automation_definition_event(
-                &state,
-                if enabled {
-                    "automation_enabled"
-                } else {
-                    "automation_disabled"
-                },
-                &id,
-                json!({"next_run_at": a.next_run_at.map(ts)}),
-            );
             (
                 StatusCode::OK,
                 Json(serde_json::to_value(&a).unwrap_or_default()),
@@ -978,6 +946,18 @@ pub(crate) fn outcome_to_status(
     }
 }
 
+fn stage8_live_automation_delay() -> Option<Duration> {
+    if std::env::var("BAGENT_STAGE8_ACCEPTANCE_FIXTURES").as_deref() != Ok("1") {
+        return None;
+    }
+    let millis = std::env::var("BAGENT_STAGE8_LIVE_AUTOMATION_DELAY_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()?
+        .min(10_000);
+    (millis > 0).then(|| Duration::from_millis(millis))
+}
+
 /// Execute a claimed run through the shared agent loop and persist the
 /// outcome. Holds no DB lock during model/connector work.
 pub(crate) async fn execute_automation_run(
@@ -1115,6 +1095,10 @@ pub(crate) async fn execute_automation_run(
             }
         }
     });
+
+    if let Some(delay) = stage8_live_automation_delay() {
+        tokio::time::sleep(delay).await;
+    }
 
     let result = agent_exec::run_agent_loop(
         &state,

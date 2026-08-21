@@ -57,7 +57,7 @@ run_gate() {
     local name=$1
     shift
     local log="$temp_root/$name.log"
-    local began ended status command_line metrics log_hash
+    local began ended status command_line metrics skipped_observations log_hash
     began=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     printf -v command_line '%q ' "$@"
     command_line=${command_line% }
@@ -86,15 +86,21 @@ for pattern in patterns:
 print(",".join(dict.fromkeys(values)) or "none-reported")
 PY
 )
+    skipped_observations=$(rg -i -c 'skipped|skip:' "$log" 2>/dev/null || true)
+    skipped_observations=${skipped_observations:-0}
     log_hash=$(shasum -a 256 "$log" | awk '{print $1}')
-    printf '%s command=%s status=%s started=%s ended=%s nonzero_metrics=%s log_sha256=%s\n' \
-        "$name" "$command_line" "$status" "$began" "$ended" "$metrics" "$log_hash" >>"$record"
+    printf '%s command=%s status=%s started=%s ended=%s nonzero_metrics=%s skipped_observations=%s log_sha256=%s\n' \
+        "$name" "$command_line" "$status" "$began" "$ended" "$metrics" "$skipped_observations" "$log_hash" >>"$record"
     if (( status != 0 )); then
         echo "A60 gate=$name: FAIL" >&2
         tail -n 40 "$log" >&2
         exit "$status"
     fi
-    echo "A60 gate=$name: PASS"
+    if (( skipped_observations > 0 )); then
+        echo "A60 gate=$name: PASS (executed checks passed; $skipped_observations skipped observation(s) recorded separately and not called PASS)"
+    else
+        echo "A60 gate=$name: PASS"
+    fi
 }
 
 run_gate cargo-fmt cargo fmt --all -- --check
@@ -137,8 +143,8 @@ run_gate stage8-rollback scripts/acceptance/stage8-rollback-qualification.sh app
 run_gate stage8-visual scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app
 run_gate stage8-accessibility scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app
 run_gate stage8-active-load-relaunch scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app
-run_gate stage8-live-smoke scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app
 run_gate signed-stage8-e2e scripts/acceptance/stage8-signed-e2e.sh apps/macos/bagent.app
+run_gate stage8-live-smoke scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app
 
 protected_8080_after=$(lsof -nP -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)
 protected_8082_after=$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)
@@ -154,8 +160,14 @@ protected_8082_after=$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | tr
     echo "A60 clean checkout is dirty after validation" >&2
     exit 1
 }
+signed_bundle_sha256=$(shasum -a 256 "$clean_checkout/apps/macos/bagent.app/Contents/MacOS/bagent" | awk '{print $1}')
+[[ "$signed_bundle_sha256" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "A60 signed bundle hash is missing" >&2
+    exit 1
+}
 end_timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 printf 'ended_utc=%s\n' "$end_timestamp" >>"$record"
+printf 'signed_bundle_executable_sha256=%s\n' "$signed_bundle_sha256" >>"$record"
 printf 'protected_8080_after=%s\n' "$protected_8080_after" >>"$record"
 printf 'protected_8082_after=%s\n' "$protected_8082_after" >>"$record"
 printf 'final_worktree=clean\n' >>"$record"

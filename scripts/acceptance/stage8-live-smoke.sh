@@ -91,6 +91,7 @@ kill -0 "$basert_pid"
 HOME="$fixture_root/home" \
 BAGENT_STAGE7A_ACCEPTANCE_FIXTURE=1 \
 BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 \
+BAGENT_STAGE8_LIVE_AUTOMATION_DELAY_MS=5000 \
 BAGENT_STAGE7C_FDA_FIXTURE=granted \
 BAGENT_DATA_DIR="$fixture_root/data" \
 BAGENT_BASERT_BASE_URL="http://127.0.0.1:$basert_port/v1" \
@@ -267,10 +268,32 @@ automation_b_id="$(jq -r .id <<<"$automation_b")"
 [[ "$automation_a_id" != "null" && "$automation_b_id" != "null" ]]
 
 run_a_response="$(curl -fsS -H "$auth_header" -X POST "http://127.0.0.1:$daemon_port/automations/$automation_a_id/run-now")"
-run_b_response="$(curl -fsS -H "$auth_header" -X POST "http://127.0.0.1:$daemon_port/automations/$automation_b_id/run-now")"
 run_a_id="$(jq -r .run.id <<<"$run_a_response")"
+[[ "$run_a_id" != "null" ]]
+
+# Observe the live Work projection through the signed candidate while both
+# disposable automations are active. This keeps the UI observation boundary
+# in the signed app instead of inferring it from daemon JSON alone.
+active_ui_observed=false
+for _ in {1..40}; do
+    if BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 BAGENT_DATA_DIR="$fixture_root/data" \
+        "$candidate/Contents/MacOS/bagent" --stage8-live-projection "$fixture_root/active-ui.json" \
+        >"$fixture_root/active-ui.log" 2>&1 && \
+        [[ "$(jq -r .status "$fixture_root/active-ui.json")" == pass ]]; then
+        active_ui_observed=true
+        break
+    fi
+    sleep 0.1
+done
+[[ "$active_ui_observed" == true ]]
+[[ "$(jq -r .active_automation_count "$fixture_root/active-ui.json")" =~ ^[1-9][0-9]*$ ]]
+[[ "$(jq -r .status_pill_anchor_invariant "$fixture_root/active-ui.json")" == true ]]
+
+# Admit the second controlled automation only after the signed UI has
+# observed the first active Work projection.
+run_b_response="$(curl -fsS -H "$auth_header" -X POST "http://127.0.0.1:$daemon_port/automations/$automation_b_id/run-now")"
 run_b_id="$(jq -r .run.id <<<"$run_b_response")"
-[[ "$run_a_id" != "null" && "$run_b_id" != "null" ]]
+[[ "$run_b_id" != "null" ]]
 
 automation_terminal=false
 last_snapshot='{}'
@@ -294,47 +317,52 @@ session_b="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/automati
 activity_count_a="$(jq '.activity_timeline | length' <<<"$session_a")"
 activity_count_b="$(jq '.activity_timeline | length' <<<"$session_b")"
 [[ "$activity_count_a" -gt 0 || "$activity_count_b" -gt 0 ]]
-if [[ "$activity_count_a" -gt 0 ]]; then
+canonical_automation_work_count="$(sqlite3 -readonly "$fixture_root/data/bagent.db" \
+    "SELECT COUNT(*) FROM works WHERE origin_kind='automation';")"
+canonical_automation_link_count="$(sqlite3 -readonly "$fixture_root/data/bagent.db" \
+    "SELECT COUNT(*) FROM work_automation_runs;")"
+canonical_automation_session_count="$(sqlite3 -readonly "$fixture_root/data/bagent.db" \
+    "SELECT COUNT(*) FROM automation_sessions;")"
+[[ "$canonical_automation_work_count" == 2 ]]
+[[ "$canonical_automation_link_count" == 2 ]]
+[[ "$canonical_automation_session_count" == 2 ]]
+
+# The signed candidate opens and inspects a terminal result, continues it into
+# a new Current Chat, and executes scoped /clear. It emits only structural
+# counts and enum values; no result body or private identity is retained.
+terminal_work_a="$(jq -r --arg session "automation-session:$run_a_id" \
+    '[.works[] | select(.automationSessionIdentity == $session) | .identity][0]' <<<"$last_snapshot")"
+terminal_revision_a="$(jq -r --arg session "automation-session:$run_a_id" \
+    '[.works[] | select(.automationSessionIdentity == $session) | .revision][0]' <<<"$last_snapshot")"
+terminal_work_b="$(jq -r --arg session "automation-session:$run_b_id" \
+    '[.works[] | select(.automationSessionIdentity == $session) | .identity][0]' <<<"$last_snapshot")"
+terminal_revision_b="$(jq -r --arg session "automation-session:$run_b_id" \
+    '[.works[] | select(.automationSessionIdentity == $session) | .revision][0]' <<<"$last_snapshot")"
+if [[ "$terminal_work_a" != "null" && "$terminal_work_a" != "" ]]; then
     inspect_run_id="$run_a_id"
+    terminal_work="$terminal_work_a"
+    terminal_revision="$terminal_revision_a"
 else
     inspect_run_id="$run_b_id"
+    terminal_work="$terminal_work_b"
+    terminal_revision="$terminal_revision_b"
 fi
-
-# Open and inspect a terminal result, then continue it into a new Current Chat
-# using a fixed disposable seed instead of copying model output to evidence.
-terminal_work="$(jq -r '[.works[] | select(.origin == "automation") | .identity][0]' <<<"$last_snapshot")"
-terminal_revision="$(jq -r '[.works[] | select(.origin == "automation") | .revision][0]' <<<"$last_snapshot")"
 [[ "$terminal_work" != "null" && "$terminal_work" != "" ]]
 [[ "$terminal_revision" =~ ^[0-9]+$ ]]
-curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
-    -d "$(jq -nc --arg command "stage8-open-$inspect_run_id" --argjson revision "$terminal_revision" \
-        '{commandIdentity:$command,expectedRevision:$revision}')" \
-    "http://127.0.0.1:$daemon_port/automation-sessions/automation-session:$inspect_run_id/open" >/dev/null
-opened_session="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/automation-sessions/automation-session:$inspect_run_id")"
-[[ "$(jq -r .attention <<<"$opened_session")" == "viewed" ]]
-[[ "$(jq '.activity_timeline | length' <<<"$opened_session")" -gt 0 ]]
+BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 BAGENT_DATA_DIR="$fixture_root/data" \
+    "$candidate/Contents/MacOS/bagent" --stage8-live-session \
+    "$inspect_run_id" "$terminal_work" "$terminal_revision" "$fixture_root/session-ui.json" \
+    >"$fixture_root/session-ui.log" 2>&1
+[[ "$(jq -r .status "$fixture_root/session-ui.json")" == pass ]]
+[[ "$(jq -r .result_opened "$fixture_root/session-ui.json")" == true ]]
+[[ "$(jq -r .continuation_target_changed "$fixture_root/session-ui.json")" == true ]]
+[[ "$(jq -r .clear_scoped "$fixture_root/session-ui.json")" == true ]]
+[[ "$(jq -r .cleared_turn_count "$fixture_root/session-ui.json")" == "0" ]]
+[[ "$(jq -r .cleared_draft "$fixture_root/session-ui.json")" == false ]]
+[[ "$(jq -r .permission_reread "$fixture_root/session-ui.json")" == true ]]
+[[ "$(jq -r .tcc_mutated "$fixture_root/session-ui.json")" == false ]]
 
-continuation="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
-    -d "$(jq -nc --arg seed 'Stage 8 disposable continuation' --arg command "stage8-continue-$inspect_run_id" \
-        '{seed:$seed,confirmedReplacement:true,commandIdentity:$command}')" \
-    "http://127.0.0.1:$daemon_port/automation-sessions/automation-session:$inspect_run_id/continue")"
-target_chat_identity="$(jq -r .target_current_chat_identity <<<"$continuation")"
-[[ "$target_chat_identity" != "null" && "$target_chat_identity" != "$baseline_chat_identity" ]]
-
-current_before_clear="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/current-chat")"
-clear_identity="$(jq -r .identity <<<"$current_before_clear")"
-clear_revision="$(jq -r .revision <<<"$current_before_clear")"
-cleared="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
-    -d "$(jq -nc --arg identity "$clear_identity" --argjson revision "$clear_revision" \
-        '{current_chat_identity:$identity,expected_revision:$revision,command_identity:"stage8-clear-current-chat",confirmed_non_empty:true}')" \
-    "http://127.0.0.1:$daemon_port/current-chat/clear")"
-[[ "$(jq -r .turn_count <<<"$cleared")" == "0" ]]
-[[ "$(jq -r .draft <<<"$cleared")" == "null" ]]
-[[ "$(jq -r .identity <<<"$cleared")" != "$target_chat_identity" ]]
-
-permission="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/permissions/full-disk-access")"
-[[ "$(jq -r .mail <<<"$permission")" == "granted" ]]
-[[ "$(jq -r .notes <<<"$permission")" == "granted" ]]
+cleared="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/current-chat")"
 
 # Post-clear signed UI-only relaunch; no TCC or production daemon mutation.
 BAGENT_STAGE7A_ACCEPTANCE_FIXTURE=1 BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 BAGENT_DATA_DIR="$fixture_root/data" \
@@ -355,4 +383,4 @@ protected_8082_after="$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | t
 # Explicit deterministic runtime proof for idle retirement and later reload.
 cargo test -p bagentd --test model_runtime idle_retirement -- --exact >/dev/null
 
-echo "A59 final observational live smoke: PASS (macOS $os_version; signed candidate; disposable real daemon/BaseRT stable; preload, foreground chat, two automation sessions, activity/tool presentation, result open, continuation, scoped /clear, permission reread, UI-only relaunch, idle-retirement regression, later reload, and port isolation verified; no TCC mutation)"
+echo "A59 final observational live smoke: PASS (macOS $os_version; signed candidate; disposable real daemon/BaseRT stable; preload, foreground chat, two canonical automation Works and sessions, activity/tool presentation, result open, continuation, scoped /clear, permission reread, UI-only relaunch, idle-retirement regression, later reload, and port isolation verified; no TCC mutation)"
