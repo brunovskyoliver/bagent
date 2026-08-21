@@ -17,6 +17,7 @@ sentinel="$fixture_root/ui-before.alive"
 # BaseRT is a separately launched fixture process whose loaded model must stay
 # resident across every disposable daemon/UI replacement in this flow.
 acceptance_restart=1
+ui_app=""
 
 cleanup() {
     rm -f -- "$sentinel"
@@ -53,14 +54,22 @@ fi
 swift build --package-path "$repo_root/apps/macos" -c release
 cargo build --manifest-path "$repo_root/Cargo.toml" -p bagentd --features stage7a-acceptance
 
-mkdir -p "$fixture_root/models" "$fixture_root/data" "$fixture_root/bagent-stage7a.app/Contents/MacOS"
+mkdir -p "$fixture_root/models" "$fixture_root/data"
 cp -R "$model_source" "$fixture_root/models/"
-cp "$repo_root/apps/macos/.build/release/bagent" "$fixture_root/bagent-stage7a.app/Contents/MacOS/bagent"
-cp "$repo_root/apps/macos/Info.plist" "$fixture_root/bagent-stage7a.app/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier sk.bagent.stage7a.fixture' "$fixture_root/bagent-stage7a.app/Contents/Info.plist"
-codesign --force --sign "$sign_identity" --identifier sk.bagent.stage7a.fixture "$fixture_root/bagent-stage7a.app"
-codesign --verify --deep --strict "$fixture_root/bagent-stage7a.app"
-designated_requirement="$(codesign -dr - "$fixture_root/bagent-stage7a.app" 2>&1 | tail -1)"
+if [[ -n "${BAGENT_STAGE7C_SIGNED_APP:-}" ]]; then
+    ui_app="$(cd "$BAGENT_STAGE7C_SIGNED_APP" && pwd)"
+    codesign --verify --deep --strict "$ui_app"
+    designated_requirement="$(codesign -dr - "$ui_app" 2>&1 | tail -1)"
+else
+    ui_app="$fixture_root/bagent-stage7a.app"
+    mkdir -p "$ui_app/Contents/MacOS"
+    cp "$repo_root/apps/macos/.build/release/bagent" "$ui_app/Contents/MacOS/bagent"
+    cp "$repo_root/apps/macos/Info.plist" "$ui_app/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier sk.bagent.stage7a.fixture' "$ui_app/Contents/Info.plist"
+    codesign --force --sign "$sign_identity" --identifier sk.bagent.stage7a.fixture "$ui_app"
+    codesign --verify --deep --strict "$ui_app"
+    designated_requirement="$(codesign -dr - "$ui_app" 2>&1 | tail -1)"
+fi
 
 basert_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 "$basert_binary" --model-dir "$fixture_root/models" --host 127.0.0.1 \
@@ -141,7 +150,7 @@ idle_restart_after="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port
 [[ "$(jq -S -c . <<<"$idle_restart_before")" == "$(jq -S -c . <<<"$idle_restart_after")" ]]
 
 BAGENT_STAGE7A_ACCEPTANCE_FIXTURE=1 BAGENT_DATA_DIR="$fixture_root/data" \
-    "$fixture_root/bagent-stage7a.app/Contents/MacOS/bagent" \
+    "$ui_app/Contents/MacOS/bagent" \
     --stage7a-relaunch-fixture "$fixture_root/ui-draft.json" &
 draft_ui_pid=$!
 wait "$draft_ui_pid"
@@ -189,7 +198,7 @@ relaunch_daemon_pid="$daemon_pid"
 
 touch "$sentinel"
 BAGENT_STAGE7A_ACCEPTANCE_FIXTURE=1 BAGENT_DATA_DIR="$fixture_root/data" \
-    "$fixture_root/bagent-stage7a.app/Contents/MacOS/bagent" \
+    "$ui_app/Contents/MacOS/bagent" \
     --stage7a-relaunch-fixture "$fixture_root/ui-before.json" "$sentinel" &
 ui_before_pid=$!
 for _ in {1..120}; do [[ -s "$fixture_root/ui-before.json" ]] && break; sleep 0.05; done
@@ -204,7 +213,7 @@ kill -0 "$daemon_pid"
 kill -0 "$basert_pid"
 
 BAGENT_STAGE7A_ACCEPTANCE_FIXTURE=1 BAGENT_DATA_DIR="$fixture_root/data" \
-    "$fixture_root/bagent-stage7a.app/Contents/MacOS/bagent" \
+    "$ui_app/Contents/MacOS/bagent" \
     --stage7a-relaunch-fixture "$fixture_root/ui-after.json" &
 ui_after_pid=$!
 wait "$ui_after_pid"
@@ -219,14 +228,23 @@ for field in submitted_attachment_count unavailable_attachment_count validated_s
     [[ "$(jq -r ".$field" "$fixture_root/ui-before.json")" == "1" ]]
     [[ "$(jq -r ".$field" "$fixture_root/ui-after.json")" == "1" ]]
 done
+[[ "$(jq -r .compass_rail_route "$fixture_root/ui-before.json")" == "child-full_disk_access" ]]
+[[ "$(jq -r .compass_rail_route "$fixture_root/ui-after.json")" == "child-full_disk_access" ]]
+[[ "$(jq -r .ui_consumer_count "$fixture_root/ui-before.json")" == "1" ]]
+[[ "$(jq -r .ui_consumer_count "$fixture_root/ui-after.json")" == "1" ]]
 [[ "$(jq -c .active_work <<<"$state_before")" == "$(jq -c .active_work <<<"$state_after")" ]]
 [[ "$(jq -c .active_work <<<"$state_before")" == "$(jq -c .active_work <<<"$state_between")" ]]
+work_identity_revisions_before="$(jq -c '[.active_work[] | {identity, revision}]' <<<"$state_before")"
+work_identity_revisions_after="$(jq -c '[.active_work[] | {identity, revision}]' <<<"$state_after")"
+[[ "$work_identity_revisions_before" != "[]" ]]
+[[ "$work_identity_revisions_before" == "$work_identity_revisions_after" ]]
 [[ "$(jq -r .lease_count <<<"$state_before")" == "$(jq -r .lease_count <<<"$state_after")" ]]
 [[ "$(jq -r .lease_count <<<"$state_before")" == "$(jq -r .lease_count <<<"$state_between")" ]]
 [[ "$(jq -r .runtime_generation <<<"$state_before")" == "$(jq -r .runtime_generation <<<"$state_after")" ]]
 [[ "$(jq -r .daemon_pid <<<"$state_before")" == "$daemon_pid" ]]
 [[ "$(jq -r .daemon_pid <<<"$state_after")" == "$daemon_pid" ]]
 [[ "$(jq -r .current_chat_identity <<<"$state_before")" == "$(jq -r .current_chat_identity <<<"$state_after")" ]]
+[[ "$(jq -r .current_chat_revision <<<"$state_before")" == "$(jq -r .current_chat_revision <<<"$state_after")" ]]
 [[ "$(jq -r .current_chat_content_sha256 <<<"$state_before")" == "$(jq -r .current_chat_content_sha256 <<<"$state_after")" ]]
 [[ "$(jq -r .draft_caret_utf16 "$fixture_root/ui-before.json")" == "$(jq -r .draft_bytes "$fixture_root/ui-before.json")" ]]
 [[ "$(jq -r .draft_selection_length "$fixture_root/ui-before.json")" == "0" ]]
@@ -258,8 +276,15 @@ protected_8082_after="$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | t
 [[ "$protected_8080_before" == "$protected_8080_after" ]]
 [[ "$protected_8082_before" == "$protected_8082_after" ]]
 
+fixture_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ui_app/Contents/Info.plist")"
+result_label="A41_SIGNED_UI_RELAUNCH_PASS"
+if [[ -n "${BAGENT_STAGE7C_SIGNED_APP:-}" ]]; then
+    result_label="A49_SIGNED_UI_RELAUNCH_PASS"
+fi
+
 jq -nc \
-    --arg fixture "sk.bagent.stage7a.fixture" \
+    --arg result "$result_label" \
+    --arg fixture "$fixture_bundle_id" \
     --arg requirement "$designated_requirement" \
     --argjson ui_before "$ui_before_recorded" \
     --argjson ui_after "$ui_after_pid" \
@@ -271,4 +296,4 @@ jq -nc \
     --arg current_chat_identity "$(jq -r .current_chat_identity <<<"$state_before")" \
     --arg protected_8080 "$protected_8080_after" \
     --arg protected_8082 "$protected_8082_after" \
-    '{result:"A41_SIGNED_UI_RELAUNCH_PASS",fixture:$fixture,designated_requirement:$requirement,ui_pid_before:$ui_before,ui_pid_after:$ui_after,daemon_pid_during_relaunch:$daemon,daemon_pid_before_restart:$daemon_before_restart,daemon_pid_after_restart:$daemon_after_restart,basert_pid:$basert,lease_count:$lease_count,current_chat_identity:$current_chat_identity,draft_caret_at_end:true,draft_selection_length:0,daemon_restart_interruption:true,protected_8080:$protected_8080,protected_8082:$protected_8082,cleanup:"trap removes signed bundle, database, logs, and fixture processes"}'
+    '{result:$result,fixture:$fixture,designated_requirement:$requirement,ui_pid_before:$ui_before,ui_pid_after:$ui_after,daemon_pid_during_relaunch:$daemon,daemon_pid_before_restart:$daemon_before_restart,daemon_pid_after_restart:$daemon_after_restart,basert_pid:$basert,lease_count:$lease_count,current_chat_identity:$current_chat_identity,draft_caret_at_end:true,draft_selection_length:0,daemon_restart_interruption:true,protected_8080:$protected_8080,protected_8082:$protected_8082,cleanup:"trap removes signed bundle, database, logs, and fixture processes"}'

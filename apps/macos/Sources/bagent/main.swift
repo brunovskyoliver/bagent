@@ -41,14 +41,21 @@ if (arguments.count == 3 || arguments.count == 4),
         exit(await Stage7BSettingsAcceptanceCLI.runLiveAccessibility(outputDirectory: outputDirectory))
     }
     RunLoop.main.run()
+} else if arguments.count == 3, arguments[1] == "--stage7c-drag-validation" {
+    let outputURL = URL(fileURLWithPath: arguments[2])
+    Task {
+        exit(await Stage7CApplicationDragAcceptanceCLI.run(outputURL: outputURL))
+    }
+    RunLoop.main.run()
 } else if (2...3).contains(arguments.count),
           arguments[1] == "--stage5-notch-fixture",
           ProcessInfo.processInfo.environment["BAGENT_STAGE5_ACCEPTANCE_FIXTURE"] == "1" {
     Stage5AcceptanceFixture.run(variant: arguments.count == 3 ? arguments[2] : "default")
 } else {
     // Retain delegate for the lifetime of the process.
-    let delegate = AppDelegate()
+    let delegate = AppDelegate(launchMode: AppLaunchMode.parse(arguments: arguments))
     NSApplication.shared.delegate = delegate
+    NSApplication.shared.finishLaunching()
     NSApp.run()
     withExtendedLifetime(delegate) {}
 }

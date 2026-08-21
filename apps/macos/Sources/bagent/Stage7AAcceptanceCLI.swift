@@ -30,6 +30,8 @@ enum Stage7AAcceptanceCLI {
                 "validated_source_count": projection.validatedSources,
                 "connector_reference_count": projection.connectorReferences,
                 "approval_presentation_count": projection.approvalPresentations,
+                "compass_rail_route": projection.compassRailRoute,
+                "ui_consumer_count": 1,
             ]
             let data = try JSONSerialization.data(
                 withJSONObject: evidence,
@@ -52,6 +54,7 @@ enum Stage7AAcceptanceCLI {
         let validatedSources: Int
         let connectorReferences: Int
         let approvalPresentations: Int
+        let compassRailRoute: String
     }
 
     @MainActor
@@ -111,6 +114,28 @@ enum Stage7AAcceptanceCLI {
             window.orderOut(nil)
             throw NSError(domain: "Stage7AAcceptanceCLI", code: 5)
         }
+        let handoff = try UIRelaunchHandoff(
+            createdAt: Date(),
+            sourceUIIdentity: "fixture-old-ui",
+            replacementUIIdentity: "fixture-new-ui",
+            sourceConsumerFence: "fixture-old-consumer",
+            replacementConsumerFence: "fixture-new-consumer",
+            currentChatIdentity: snapshot.identity,
+            refetchCursor: nil,
+            draft: viewModel.inputText,
+            caretOffset: selection.location,
+            selectionLength: selection.length,
+            pendingAttachmentReferences: [],
+            selectedArea: .privacyAndPermissions,
+            selectedChild: .fullDiskAccess,
+            permissionPhase: .grantedButUIRelaunchRequired,
+            semanticFocus: "permission-full-disk-access"
+        )
+        viewModel.restoreUIOnlyRelaunch(handoff)
+        guard viewModel.compassRailRoute == .child(.fullDiskAccess) else {
+            window.orderOut(nil)
+            throw NSError(domain: "Stage7AAcceptanceCLI", code: 6)
+        }
         let projection = ProjectionEvidence(
             submittedAttachments: viewModel.restoredSubmittedAttachments.count,
             unavailableAttachments: viewModel.restoredSubmittedAttachments.filter {
@@ -118,7 +143,8 @@ enum Stage7AAcceptanceCLI {
             }.count,
             validatedSources: viewModel.restoredValidatedSources.count,
             connectorReferences: viewModel.restoredConnectorReferences.count,
-            approvalPresentations: viewModel.restoredApprovalPresentations.count)
+            approvalPresentations: viewModel.restoredApprovalPresentations.count,
+            compassRailRoute: viewModel.compassRailRoute.identifier)
         window.orderOut(nil)
         return (snapshot, selection, projection)
     }

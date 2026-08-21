@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The bounded settings presentation inside the existing notch panel.
@@ -30,7 +31,7 @@ struct NotchSettingsContent: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        return VStack(alignment: .leading, spacing: 7) {
             rail
             Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1).accessibilityHidden(true)
             content
@@ -292,30 +293,56 @@ struct NotchSettingsContent: View {
     }
 
     private var fullDiskAccessPage: some View {
-        permissionAssistPage(title: "Full Disk Access", granted: permissionGranted(permissions.hasFullDiskAccess)) { permissions.openPrivacySettings() }
+        permissionAssistPage(kind: .fullDiskAccess, title: "Full Disk Access", granted: permissionGranted(permissions.hasFullDiskAccess)) { permissions.openPrivacySettings() }
     }
 
     private var screenRecordingPage: some View {
-        permissionAssistPage(title: "Screen Recording", granted: permissionGranted(permissions.hasScreenRecording)) {
-            permissions.requestScreenRecording()
-            if !permissions.hasScreenRecording { permissions.openScreenRecordingSettings() }
-        }
+        permissionAssistPage(kind: .screenRecording, title: "Screen Recording", granted: permissionGranted(permissions.hasScreenRecording)) { permissions.requestScreenRecording() }
     }
 
     private var accessibilityPage: some View {
-        permissionAssistPage(title: "Accessibility", granted: permissionGranted(permissions.hasAccessibility)) {
-            permissions.requestAccessibility()
-            if !permissions.hasAccessibility { permissions.openAccessibilitySettings() }
-        }
+        permissionAssistPage(kind: .accessibility, title: "Accessibility", granted: permissionGranted(permissions.hasAccessibility)) { permissions.requestAccessibility() }
     }
 
-    private func permissionAssistPage(title: LocalizedStringKey, granted: Bool, action: @escaping () -> Void) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
+    private func permissionAssistPage(kind: PermissionGrantKind, title: LocalizedStringKey, granted: Bool, action: @escaping () -> Void) -> some View {
+        let phase = permissions.phase(for: kind)
+        return VStack(alignment: .leading, spacing: 7) {
             SummaryRow(title: title, value: granted ? "Active" : "Needs setup")
-            if !granted { actionButton("Open", action: action) }
+            if granted && phase == .grantedButUIRelaunchRequired {
+                Text("The permission is granted, but this signed UI must be replaced before it can use it. The daemon remains running.")
+                    .settingsFont(size: 9)
+                    .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+                actionButton("Relaunch bagent") { viewModel.requestUIOnlyRelaunch(for: kind) }
+                if let error = viewModel.uiOnlyRelaunchError {
+                    Text(error)
+                        .settingsFont(size: 9)
+                        .foregroundStyle(.red.opacity(0.9))
+                }
+            } else if !granted {
+                Text("macOS requires your action. bagent cannot grant this permission automatically. Opening a pane does not prove success; returning from System Settings triggers an authoritative recheck. bagent never resets TCC.")
+                    .settingsFont(size: 9)
+                    .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+                actionButton("Open", action: action)
+                DraggableApplicationAffordance(kind: kind, permissions: permissions)
+                Text(permissionHint(for: kind))
+                    .settingsFont(size: 9)
+                    .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
+        .onAppear { permissions.beginAssist(for: kind) }
+    }
+
+    private func permissionHint(for kind: PermissionGrantKind) -> String {
+        switch kind {
+        case .fullDiskAccess: "Select Full Disk Access if the exact pane was not confirmed."
+        case .screenRecording: "Select Screen Recording if the exact pane was not confirmed."
+        case .accessibility: "Select Accessibility if the exact pane was not confirmed."
+        }
     }
 
     private func openChild(_ child: CompassRailChild, opener: CompassRailFocusedControl? = nil) {
@@ -372,8 +399,11 @@ struct NotchSettingsContent: View {
     }
 
     private func localPermissionConnectorState(_ connected: Bool?) -> String {
-        guard permissions.hasFullDiskAccess else { return "Permission required" }
-        return localConnectorState(connected)
+        guard let connected else { return "Testing" }
+        // The UI probe is only evidence for this signed UI process. Mail and
+        // Notes are read by the daemon, so its connector projection remains
+        // the authority for connector readiness.
+        return connected ? "Connected" : "Permission required"
     }
 
     private func normalizedValidation(_ result: String?, isTesting: Bool, serviceAvailable: Bool?) -> String {
@@ -519,6 +549,44 @@ private extension NotchModelPhase {
         case .loadedNotReady: "Loaded"
         case .ready: "Ready"
         case .retiring: "Unloading"
+        }
+    }
+}
+
+private struct DraggableApplicationAffordance: View {
+    let kind: PermissionGrantKind
+    @ObservedObject var permissions: PermissionsManager
+    private let bundleURL = Bundle.main.bundleURL
+    @State private var hasValidSignedBundle = false
+
+    var body: some View {
+        Group {
+            if hasValidSignedBundle {
+                Label("Drag bagent.app to the selected pane", systemImage: "app.badge")
+                    .settingsFont(size: 9, weight: .medium)
+                    .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                    .onDrag {
+                        permissions.dragBegan(for: kind)
+                        return NSItemProvider(object: ApplicationDragRepresentation.writer(for: bundleURL))
+                    } preview: {
+                        Image(nsImage: NSWorkspace.shared.icon(forFile: bundleURL.path))
+                            .resizable()
+                            .frame(width: 64, height: 64)
+                    }
+            } else {
+                Text("Use System Settings' native Add flow for the signed running application.")
+                    .settingsFont(size: 9)
+                    .foregroundStyle(NotchWrapMetrics.notchTextFaint)
+            }
+        }
+        .accessibilityLabel(ApplicationDragRepresentation.accessibilityLabel)
+        .accessibilityHint(ApplicationDragRepresentation.accessibilityHint)
+        .task(id: bundleURL.path) {
+            let valid = await Task.detached {
+                ApplicationDragRepresentation.hasValidSignedBundle(at: bundleURL)
+            }.value
+            guard !Task.isCancelled else { return }
+            hasValidSignedBundle = valid
         }
     }
 }

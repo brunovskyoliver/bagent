@@ -129,6 +129,30 @@ struct DaemonClient: Sendable, NotchEventTransport {
         case unavailable
     }
 
+    enum UIRelaunchTransferError: Error, Equatable {
+        case staleConsumer
+        case duplicateReplacement
+        case expired
+        case notReady
+        case unavailable
+    }
+
+    struct UIRelaunchTransferStatus: Decodable, Sendable, Equatable {
+        let status: String
+        let timeoutSeconds: Int
+
+        enum CodingKeys: String, CodingKey {
+            case status
+            case timeoutSeconds = "timeoutSeconds"
+        }
+    }
+
+    private struct UIRelaunchTransferRequest: Encodable {
+        let transferIdentity: String
+        let oldConsumerFence: String?
+        let replacementConsumerFence: String?
+    }
+
     enum TavilyConfigurationStatus: String, Codable, Sendable, Equatable {
         case pending
         case absent
@@ -138,7 +162,8 @@ struct DaemonClient: Sendable, NotchEventTransport {
 
     private static let dataDir: URL = {
         if (ProcessInfo.processInfo.environment["BAGENT_STAGE7A_ACCEPTANCE_FIXTURE"] == "1"
-            || ProcessInfo.processInfo.environment["BAGENT_STAGE7B_SETTINGS_FIXTURE"] == "1"),
+            || ProcessInfo.processInfo.environment["BAGENT_STAGE7B_SETTINGS_FIXTURE"] == "1"
+            || ProcessInfo.processInfo.environment["BAGENT_STAGE7C_ACCEPTANCE_FIXTURE"] == "1"),
            let path = ProcessInfo.processInfo.environment["BAGENT_DATA_DIR"] {
             return URL(fileURLWithPath: path, isDirectory: true)
         }
@@ -192,6 +217,21 @@ struct DaemonClient: Sendable, NotchEventTransport {
     }
 
     // MARK: Health
+
+    /// The daemon opens the exact Mail and Notes resources it owns. Only the
+    /// normalized per-resource outcome crosses into the UI.
+    func fullDiskAccessProbe() async -> DaemonFullDiskAccessSnapshot {
+        do {
+            let c = try await loadCreds()
+            var request = authedRequest("/permissions/full-disk-access", creds: c)
+            request.timeoutInterval = 3
+            let (data, response) = try await URLSession.shared.data(for: request)
+            try validateOK(data: data, response: response)
+            return try JSONDecoder().decode(DaemonFullDiskAccessSnapshot.self, from: data)
+        } catch {
+            return DaemonFullDiskAccessSnapshot(mail: .indeterminate, notes: .indeterminate)
+        }
+    }
 
     func healthStatus() async -> DaemonHealth {
         do {
@@ -1034,6 +1074,159 @@ struct DaemonClient: Sendable, NotchEventTransport {
             for: authedRequest("/current-chat", creds: c))
         try validateOK(data: data, response: response)
         return try JSONDecoder().decode(CurrentChatSnapshot.self, from: data)
+    }
+
+    func reserveUIRelaunch(
+        transferIdentity: String,
+        oldConsumerFence: String,
+        replacementConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/reserve",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: oldConsumerFence,
+                replacementConsumerFence: replacementConsumerFence
+            )
+        )
+    }
+
+    func uiRelaunchStatus(transferIdentity: String) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/status",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: nil,
+                replacementConsumerFence: nil
+            )
+        )
+    }
+
+    func fetchReservedUIRelaunchSnapshot(
+        transferIdentity: String,
+        replacementConsumerFence: String
+    ) async throws -> NotchWorkSnapshot {
+        let c = try await loadCreds()
+        var request = authedRequest("/work/ui-relaunch/snapshot", creds: c)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(UIRelaunchTransferRequest(
+            transferIdentity: transferIdentity,
+            oldConsumerFence: nil,
+            replacementConsumerFence: replacementConsumerFence
+        ))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateUIRelaunchResponse(data: data, response: response)
+        return try NotchProjectionDecoder.decodeSnapshot(data)
+    }
+
+    func fetchAuthoritativeSnapshot() async throws -> NotchWorkSnapshot {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/work/snapshot/read", creds: c)
+        )
+        try validateOK(data: data, response: response)
+        return try NotchProjectionDecoder.decodeSnapshot(data)
+    }
+
+    func markUIRelaunchReady(
+        transferIdentity: String,
+        replacementConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/ready",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: nil,
+                replacementConsumerFence: replacementConsumerFence
+            )
+        )
+    }
+
+    func fenceOldUI(
+        transferIdentity: String,
+        oldConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/fence-old",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: oldConsumerFence,
+                replacementConsumerFence: nil
+            )
+        )
+    }
+
+    func activateUIRelaunch(
+        transferIdentity: String,
+        replacementConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/activate",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: nil,
+                replacementConsumerFence: replacementConsumerFence
+            )
+        )
+    }
+
+    func acknowledgeUIRelaunch(
+        transferIdentity: String,
+        replacementConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/acknowledge",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: nil,
+                replacementConsumerFence: replacementConsumerFence
+            )
+        )
+    }
+
+    func rollbackUIRelaunch(
+        transferIdentity: String,
+        oldConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/rollback",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: oldConsumerFence,
+                replacementConsumerFence: nil
+            )
+        )
+    }
+
+    private func uiRelaunchRequest(
+        path: String,
+        body: UIRelaunchTransferRequest
+    ) async throws -> UIRelaunchTransferStatus {
+        let c = try await loadCreds()
+        var request = authedRequest(path, creds: c)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateUIRelaunchResponse(data: data, response: response)
+        return try JSONDecoder().decode(UIRelaunchTransferStatus.self, from: data)
+    }
+
+    private func validateUIRelaunchResponse(data: Data, response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw UIRelaunchTransferError.unavailable
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String
+            switch code {
+            case "stale_consumer_fence": throw UIRelaunchTransferError.staleConsumer
+            case "duplicate_replacement": throw UIRelaunchTransferError.duplicateReplacement
+            case "takeover_expired": throw UIRelaunchTransferError.expired
+            case "takeover_not_ready", "takeover_already_acknowledged": throw UIRelaunchTransferError.notReady
+            default: throw UIRelaunchTransferError.unavailable
+            }
+        }
     }
 
     func saveCurrentChatDraft(identity: String, expectedRevision: UInt64, text: String,

@@ -442,10 +442,14 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var currentChatSnapshot: DaemonClient.CurrentChatSnapshot?
     @Published var clearCurrentChatConfirmationPresented = false
     @Published var currentChatFocusRequestID = UUID()
+    @Published private(set) var uiOnlyRelaunchError: String? = nil
     private var pendingCurrentChatCaretRestoration = false
+    private var pendingInputSelection: (caretOffset: Int, selectionLength: Int)?
     private var clearCurrentChatCommandIdentity: String?
     private var draftPersistenceTask: Task<Void, Never>?
     private var isApplyingCurrentChatSnapshot = false
+    private let uiOnlyRelaunchCoordinator = UIOnlyRelaunchCoordinator()
+    var currentInputSelectionProvider: (() -> (caretOffset: Int, selectionLength: Int))?
 
     /// Set to true by NotchWindowController before expanding so the pill
     /// animates to its hover state before the chat panel appears.
@@ -468,6 +472,116 @@ final class ChatViewModel: ObservableObject {
 
     func openCompassRailChild(_ child: CompassRailChild) {
         compassRailRoute = .child(child)
+    }
+
+    /// Restores only the allowlisted presentation fields from a validated
+    /// permission handoff. Current Chat content and Work remain daemon-owned.
+    func restoreUIOnlyRelaunch(_ handoff: UIRelaunchHandoff) {
+        inputText = handoff.draft
+        restoredPendingAttachmentReferences = handoff.pendingAttachmentReferences
+        pendingCurrentChatCaretRestoration = true
+        pendingInputSelection = (handoff.caretOffset, handoff.selectionLength)
+        currentChatFocusRequestID = UUID()
+        compassRailRoute = handoff.selectedChild.map(CompassRailRoute.child)
+            ?? .area(handoff.selectedArea)
+        permissions.restore(
+            phase: handoff.permissionPhase,
+            for: handoff.selectedChild.map { child in
+                switch child {
+                case .fullDiskAccess: return .fullDiskAccess
+                case .screenRecording: return .screenRecording
+                case .accessibility: return .accessibility
+                default: return .fullDiskAccess
+                }
+            } ?? .fullDiskAccess
+        )
+        if handoff.selectedChild != nil || handoff.selectedArea == .privacyAndPermissions {
+            applyNotchIntent(.openSettings)
+        }
+    }
+
+    func recordUIOnlyRelaunchFailure() {
+        uiOnlyRelaunchError = "The relaunch handoff was invalid or expired. Try again from Permission Grant Assist."
+    }
+
+    var activeConsumerFence: String { notchEventConsumer.activeConsumerFence }
+
+    func pauseForUIOnlyTakeover() {
+        stopEventsMonitor()
+        notchEventConsumer.pauseForTakeover()
+    }
+
+    func resumeAfterUIOnlyTakeoverRollback() {
+        notchEventConsumer.resumeAfterTakeover()
+        startEventsMonitor()
+    }
+
+    func fenceUIOnlyTakeover(
+        transferIdentity: String,
+        oldConsumerFence: String
+    ) async throws -> DaemonClient.UIRelaunchTransferStatus {
+        try await client.fenceOldUI(
+            transferIdentity: transferIdentity,
+            oldConsumerFence: oldConsumerFence
+        )
+    }
+
+    func requestUIOnlyRelaunch(for kind: PermissionGrantKind) {
+        uiOnlyRelaunchError = nil
+        let acceptanceFixture = ProcessInfo.processInfo.environment["BAGENT_STAGE7C_ACCEPTANCE_FIXTURE"] == "1"
+        guard acceptanceFixture || UIOnlyRelaunchEligibility.isAllowed(
+            activeConversationTurn: isThinking,
+            pendingApproval: !pendingApprovals.isEmpty
+        ) else {
+            uiOnlyRelaunchError = "Relaunch is unavailable during an active turn or pending approval."
+            return
+        }
+        guard let snapshot = currentChatSnapshot else {
+            uiOnlyRelaunchError = "Current Chat is not ready to hand off."
+            return
+        }
+        let selection = currentInputSelectionProvider?()
+            ?? (inputText.utf16.count, 0)
+        let sourceBundleIdentifier = Bundle.main.bundleIdentifier ?? "sk.bagent.app"
+        let sourceIdentity = sourceBundleIdentifier + ":" + String(ProcessInfo.processInfo.processIdentifier)
+        do {
+            let handoff = try UIRelaunchHandoff(
+                createdAt: Date(),
+                sourceUIIdentity: sourceIdentity,
+                replacementUIIdentity: Bundle.main.bundleIdentifier ?? "sk.bagent.app",
+                sourceConsumerFence: activeConsumerFence,
+                replacementConsumerFence: UUID().uuidString,
+                currentChatIdentity: snapshot.identity,
+                refetchCursor: notchPresentation.revision.cursor,
+                draft: inputText,
+                caretOffset: selection.caretOffset,
+                selectionLength: selection.selectionLength,
+                pendingAttachmentReferences: Array(Set(
+                    pendingAttachments.map(\.id) + restoredPendingAttachmentReferences
+                )).sorted(),
+                selectedArea: compassRailRoute.area,
+                selectedChild: compassRailRoute.child,
+                permissionPhase: .daemonPreservingRelaunchHandoff,
+                semanticFocus: "permission-" + kind.rawValue
+            )
+            permissions.restore(phase: .daemonPreservingRelaunchHandoff, for: kind)
+            uiOnlyRelaunchCoordinator.launchReplacement(
+                handoff: handoff,
+                applicationURL: Bundle.main.bundleURL
+            ) { [weak self] result in
+                guard let self else { return }
+                if case .failure(.failed(let message)) = result {
+                    Stage7CAcceptanceMarker.write("relaunch-launch-failed")
+                    self.uiOnlyRelaunchError = message
+                    self.permissions.restore(phase: .grantedButUIRelaunchRequired, for: kind)
+                } else if case .success = result {
+                    Stage7CAcceptanceMarker.write("relaunch-launch-succeeded")
+                    self.onUIOnlyRelaunchLaunched?(handoff)
+                }
+            }
+        } catch {
+            uiOnlyRelaunchError = "Relaunch could not be prepared."
+        }
     }
 
     @discardableResult
@@ -1607,10 +1721,13 @@ final class ChatViewModel: ObservableObject {
     private let isSettingsFixture: Bool
     private let notchEventConsumer: NotchEventConsumer
     private var projectionCancellable: AnyCancellable?
-    let permissions = PermissionsManager()
+    let permissions: PermissionsManager
 
     /// Invoked after an input-only turn is submitted so AppKit can collapse the panel.
     var onInputOnlySubmitted: (() -> Void)?
+    /// Called only after the replacement process was launched successfully.
+    /// The application delegate then owns the daemon-preserving fence.
+    var onUIOnlyRelaunchLaunched: ((UIRelaunchHandoff) -> Void)?
     /// Invoked when output becomes displayable, or completion must recover a
     /// missed first-token transition, so AppKit can reveal the output surface.
 
@@ -1812,9 +1929,15 @@ final class ChatViewModel: ObservableObject {
     }
     // MARK: - Init
 
-    init(startMonitoring: Bool = true, client: DaemonClient = DaemonClient(), settingsFixture: Bool = false) {
+    init(
+        startMonitoring: Bool = true,
+        client: DaemonClient = DaemonClient(),
+        settingsFixture: Bool = false,
+        consumerFence: String? = nil
+    ) {
         self.client = client
         self.isSettingsFixture = settingsFixture
+        self.permissions = PermissionsManager(probesOnAssistStart: !settingsFixture)
         if settingsFixture {
             codexBinaryPath = ""
             odooURL = ""
@@ -1822,7 +1945,10 @@ final class ChatViewModel: ObservableObject {
             odooUser = ""
             odooUvxPath = ""
         }
-        notchEventConsumer = NotchEventConsumer(transport: client)
+        notchEventConsumer = NotchEventConsumer(
+            transport: client,
+            consumerFence: consumerFence ?? UUID().uuidString
+        )
         projectionCancellable = notchEventConsumer.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
@@ -2045,7 +2171,15 @@ final class ChatViewModel: ObservableObject {
     }
 
     func restoreCurrentChatCaret(in editor: NSTextView) {
-        CurrentChatTextRestoration.placeCaretAtEnd(in: editor)
+        if let selection = pendingInputSelection {
+            let length = editor.string.utf16.count
+            let location = min(max(selection.caretOffset, 0), length)
+            let selectedLength = min(max(selection.selectionLength, 0), length - location)
+            editor.setSelectedRange(NSRange(location: location, length: selectedLength))
+            pendingInputSelection = nil
+        } else {
+            CurrentChatTextRestoration.placeCaretAtEnd(in: editor)
+        }
     }
 
     private func scheduleDraftPersistence() {

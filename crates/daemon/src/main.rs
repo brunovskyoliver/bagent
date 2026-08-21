@@ -28,6 +28,10 @@ use bagentd::current_chat::{
     ClearCurrentChatCommand, SubmittedAttachmentMetadata, ValidatedSourceMetadata,
 };
 use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig, RuntimePhase};
+use bagentd::permission_probe::DaemonFullDiskAccessProbe;
+use bagentd::ui_relaunch::{
+    TransferStatus, UiConsumerAuthority, UiConsumerTransferError, TRANSFER_TIMEOUT,
+};
 use bagentd::unified_work::UnifiedWorkAuthority;
 use bagentd::work_coordinator::{
     ApprovalState, CommandError, ConversationTurnIdentity, CoordinatorConfig, CurrentChatIdentity,
@@ -118,7 +122,10 @@ struct AppState {
     legacy_projection_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// The current Swift projection consumer. A newer snapshot claim fences
     /// every older UI process without affecting daemon-owned Work.
-    ui_consumer_fence: Arc<Mutex<Option<String>>>,
+    ui_consumer_authority: Arc<Mutex<UiConsumerAuthority>>,
+    ui_consumer_authority_path: PathBuf,
+    /// The daemon process that owns Mail and Notes access performs this probe.
+    full_disk_access_probe: Arc<DaemonFullDiskAccessProbe>,
 }
 
 impl AppState {
@@ -707,6 +714,23 @@ async fn main() -> Result<()> {
         });
     }
 
+    let ui_consumer_authority_path = data_dir.join("ui-consumer-authority.json");
+    let ui_consumer_authority =
+        UiConsumerAuthority::load(&ui_consumer_authority_path, std::time::Instant::now())?;
+    let full_disk_access_probe = {
+        #[cfg(feature = "stage7a-acceptance")]
+        {
+            if std::env::var("BAGENT_STAGE7C_FDA_FIXTURE").as_deref() == Ok("granted") {
+                DaemonFullDiskAccessProbe::acceptance_granted()
+            } else {
+                DaemonFullDiskAccessProbe::production()
+            }
+        }
+        #[cfg(not(feature = "stage7a-acceptance"))]
+        {
+            DaemonFullDiskAccessProbe::production()
+        }
+    };
     let state = AppState {
         db,
         db_path,
@@ -737,7 +761,9 @@ async fn main() -> Result<()> {
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
         legacy_projection_tx: tokio::sync::broadcast::channel(256).0,
-        ui_consumer_fence: Arc::new(Mutex::new(None)),
+        ui_consumer_authority: Arc::new(Mutex::new(ui_consumer_authority)),
+        ui_consumer_authority_path,
+        full_disk_access_probe: Arc::new(full_disk_access_probe),
     };
     state.synthesis.start_maintenance().await;
 
@@ -775,9 +801,22 @@ async fn main() -> Result<()> {
     #[allow(unused_mut)]
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/permissions/full-disk-access", get(full_disk_access))
         .route("/events", get(events_stream))
         .route("/work/snapshot", get(work_snapshot))
+        .route("/work/snapshot/read", get(work_snapshot_read))
         .route("/work/events", get(work_events))
+        .route("/work/ui-relaunch/reserve", post(ui_relaunch_reserve))
+        .route("/work/ui-relaunch/status", post(ui_relaunch_status))
+        .route("/work/ui-relaunch/snapshot", post(ui_relaunch_snapshot))
+        .route("/work/ui-relaunch/ready", post(ui_relaunch_ready))
+        .route("/work/ui-relaunch/fence-old", post(ui_relaunch_fence_old))
+        .route("/work/ui-relaunch/activate", post(ui_relaunch_activate))
+        .route(
+            "/work/ui-relaunch/acknowledge",
+            post(ui_relaunch_acknowledge),
+        )
+        .route("/work/ui-relaunch/rollback", post(ui_relaunch_rollback))
         .route(
             "/work/attention/acknowledge",
             post(acknowledge_work_attention),
@@ -2071,6 +2110,10 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+async fn full_disk_access(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.full_disk_access_probe.probe())
+}
+
 #[derive(Deserialize)]
 struct WorkSnapshotQuery {
     consumer_fence: String,
@@ -2092,16 +2135,245 @@ struct AcknowledgeWorkAttentionRequest {
     expected_revision: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UIRelaunchTransferRequest {
+    transfer_identity: String,
+    old_consumer_fence: Option<String>,
+    replacement_consumer_fence: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UIRelaunchTransferResponse {
+    status: String,
+    timeout_seconds: u64,
+}
+
+fn ui_relaunch_error_response(
+    error: UiConsumerTransferError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, code) = match error {
+        UiConsumerTransferError::StaleConsumer => (StatusCode::CONFLICT, "stale_consumer_fence"),
+        UiConsumerTransferError::DuplicateReplacement => {
+            (StatusCode::CONFLICT, "duplicate_replacement")
+        }
+        UiConsumerTransferError::Expired => (StatusCode::CONFLICT, "takeover_expired"),
+        UiConsumerTransferError::AlreadyAcknowledged => {
+            (StatusCode::CONFLICT, "takeover_already_acknowledged")
+        }
+        UiConsumerTransferError::InvalidTransfer | UiConsumerTransferError::NotReady => {
+            (StatusCode::CONFLICT, "takeover_not_ready")
+        }
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "code": code,
+            "error": "UI takeover could not proceed"
+        })),
+    )
+}
+
+fn ui_relaunch_transfer_response(status: TransferStatus) -> Json<UIRelaunchTransferResponse> {
+    Json(UIRelaunchTransferResponse {
+        status: status.as_str().to_owned(),
+        timeout_seconds: TRANSFER_TIMEOUT.as_secs(),
+    })
+}
+
+fn persist_ui_consumer_authority(state: &AppState, authority: &UiConsumerAuthority) {
+    if let Err(error) = authority.save(&state.ui_consumer_authority_path) {
+        tracing::error!(%error, "failed to persist UI consumer authority; stopping daemon");
+        // Serving after an authority write failure could create two consumers
+        // after restart. Keep the old durable record authoritative and fail
+        // closed instead of acknowledging a mutation that was not persisted.
+        std::process::exit(1);
+    }
+}
+
+async fn ui_relaunch_reserve(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(old_fence) = request.old_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.reserve(
+        &request.transfer_identity,
+        old_fence,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::Reserved).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_status(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let status = authority.status(&request.transfer_identity, std::time::Instant::now());
+    persist_ui_consumer_authority(&state, &authority);
+    ui_relaunch_transfer_response(status).into_response()
+}
+
+async fn ui_relaunch_snapshot(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.refetch_reserved(
+        &request.transfer_identity,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    if let Err(error) = result {
+        return ui_relaunch_error_response(error).into_response();
+    }
+    drop(authority);
+    match authoritative_notch_snapshot(&state) {
+        Ok((snapshot, context)) => Json(notch_snapshot_value(&snapshot, &context)).into_response(),
+        Err(_error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "daemon_unavailable",
+                "error": "authoritative UI state is unavailable"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn ui_relaunch_ready(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.ready(
+        &request.transfer_identity,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::Ready).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_activate(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.activate(
+        &request.transfer_identity,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::Active).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_fence_old(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(old_fence) = request.old_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.fence_old(
+        &request.transfer_identity,
+        old_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::OldFenced).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_acknowledge(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.acknowledge(
+        &request.transfer_identity,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::Acknowledged).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_rollback(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(old_fence) = request.old_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.rollback(
+        &request.transfer_identity,
+        old_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::RolledBack).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
 async fn acknowledge_work_attention(
     State(state): State<AppState>,
     Json(request): Json<AcknowledgeWorkAttentionRequest>,
 ) -> impl IntoResponse {
-    let fence_matches = state
-        .ui_consumer_fence
-        .lock()
-        .await
-        .as_deref()
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let fence_matches = authority
+        .active_fence(std::time::Instant::now())
         .is_some_and(|active| active == request.consumer_fence);
+    persist_ui_consumer_authority(&state, &authority);
     if !fence_matches {
         return (
             StatusCode::CONFLICT,
@@ -2156,18 +2428,45 @@ async fn work_snapshot(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "missing consumer fence" })),
-        );
+        )
+            .into_response();
     }
-    *state.ui_consumer_fence.lock().await = Some(query.consumer_fence);
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.claim_snapshot(&query.consumer_fence, std::time::Instant::now());
+    persist_ui_consumer_authority(&state, &authority);
+    drop(authority);
+    if let Err(error) = result {
+        return ui_relaunch_error_response(error).into_response();
+    }
     match authoritative_notch_snapshot(&state) {
         Ok((snapshot, context)) => (
             StatusCode::OK,
             Json(notch_snapshot_value(&snapshot, &context)),
-        ),
+        )
+            .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("{error}") })),
-        ),
+        )
+            .into_response(),
+    }
+}
+
+async fn work_snapshot_read(State(state): State<AppState>) -> impl IntoResponse {
+    match authoritative_notch_snapshot(&state) {
+        Ok((snapshot, context)) => (
+            StatusCode::OK,
+            Json(notch_snapshot_value(&snapshot, &context)),
+        )
+            .into_response(),
+        Err(_error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "daemon_unavailable",
+                "error": "authoritative UI state is unavailable"
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -2175,12 +2474,11 @@ async fn work_events(
     State(state): State<AppState>,
     Query(query): Query<WorkEventsQuery>,
 ) -> impl IntoResponse {
-    let fence_matches = state
-        .ui_consumer_fence
-        .lock()
-        .await
-        .as_deref()
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let fence_matches = authority
+        .active_fence(std::time::Instant::now())
         .is_some_and(|active| active == query.consumer_fence);
+    persist_ui_consumer_authority(&state, &authority);
     if !fence_matches {
         return (
             StatusCode::CONFLICT,

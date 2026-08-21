@@ -26,6 +26,8 @@ final class NotchEventConsumer: ObservableObject {
     @Published private(set) var presentation: NotchPresentation = .idle
     private var hasAuthoritativeSnapshot = false
     private var reduceMotion = false
+    private(set) var isConsuming = true
+    private var consumptionGeneration = 0
 
     var activeConsumerFence: String { consumerFence }
 
@@ -38,9 +40,11 @@ final class NotchEventConsumer: ObservableObject {
     }
 
     func synchronize(reduceMotion: Bool = false) async throws {
+        guard isConsuming else { return }
+        let generation = consumptionGeneration
         self.reduceMotion = reduceMotion || self.reduceMotion
         guard hasAuthoritativeSnapshot else {
-            try await replaceFromSnapshot(reduceMotion: reduceMotion)
+            try await replaceFromSnapshot(reduceMotion: reduceMotion, generation: generation)
             return
         }
 
@@ -49,8 +53,10 @@ final class NotchEventConsumer: ObservableObject {
             daemonGeneration: presentation.revision.daemonGeneration,
             consumerFence: consumerFence
         )
+        guard isConsuming, consumptionGeneration == generation else { return }
         switch batch {
         case .gap(let snapshot):
+            guard isConsuming, consumptionGeneration == generation else { return }
             try install(snapshot, reduceMotion: self.reduceMotion)
         case .events(let events):
             do {
@@ -65,7 +71,7 @@ final class NotchEventConsumer: ObservableObject {
                 switch error {
                 case .unsupportedSchema, .cursorGap, .daemonGenerationChanged, .revisionMismatch,
                      .missingSnapshot:
-                    try await replaceFromSnapshot(reduceMotion: self.reduceMotion)
+                    try await replaceFromSnapshot(reduceMotion: self.reduceMotion, generation: generation)
                 }
             }
         }
@@ -93,19 +99,32 @@ final class NotchEventConsumer: ObservableObject {
     }
 
     func invalidateConsumerFence() {
+        consumptionGeneration += 1
         hasAuthoritativeSnapshot = false
     }
 
+    func pauseForTakeover() {
+        consumptionGeneration += 1
+        isConsuming = false
+        hasAuthoritativeSnapshot = false
+    }
+
+    func resumeAfterTakeover() {
+        isConsuming = true
+    }
+
     func reconcileSnapshot(reduceMotion: Bool = false) async throws {
-        try await replaceFromSnapshot(reduceMotion: reduceMotion)
+        guard isConsuming else { return }
+        try await replaceFromSnapshot(reduceMotion: reduceMotion, generation: consumptionGeneration)
     }
 
     func replace(with snapshot: NotchWorkSnapshot, reduceMotion: Bool = false) throws {
         try install(snapshot, reduceMotion: reduceMotion)
     }
 
-    private func replaceFromSnapshot(reduceMotion: Bool) async throws {
+    private func replaceFromSnapshot(reduceMotion: Bool, generation: Int) async throws {
         let snapshot = try await transport.fetchSnapshot(consumerFence: consumerFence)
+        guard isConsuming, consumptionGeneration == generation else { return }
         try install(snapshot, reduceMotion: reduceMotion)
     }
 

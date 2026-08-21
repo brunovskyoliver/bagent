@@ -12,7 +12,7 @@ extension EnvironmentValues {
     }
 }
 
-enum CompassRailArea: String, CaseIterable, Hashable, Sendable {
+enum CompassRailArea: String, Codable, CaseIterable, Hashable, Sendable {
     case general
     case modelRuntime = "model_runtime"
     case integrations
@@ -48,7 +48,7 @@ enum CompassRailArea: String, CaseIterable, Hashable, Sendable {
     var index: Int { Self.allCases.firstIndex(of: self) ?? 0 }
 }
 
-enum CompassRailChild: String, CaseIterable, Hashable, Sendable {
+enum CompassRailChild: String, Codable, CaseIterable, Hashable, Sendable {
     case whatsapp
     case odoo
     case codex

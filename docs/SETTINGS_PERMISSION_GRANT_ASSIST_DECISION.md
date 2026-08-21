@@ -393,6 +393,15 @@ With Reduce Motion enabled:
 
 ## Implementation and acceptance boundary
 
+For the current Stage 7C and Stage 8 campaign, signed/live qualification is
+limited to macOS 26. macOS 14 and 15 remain compile targets when existing
+configuration permits them, but this campaign claims no runtime, System
+Settings, TCC, visual, or accessibility qualification on those versions. Live
+grant, denial, revocation, and drag-to-System-Settings mutation are out of
+scope. Deterministic permission adapters, signed-bundle and drag-payload
+validation, privacy tests, and daemon-preserving relaunch remain required;
+omitted evidence is never PASS.
+
 Production implementation must rewrite the selected structure under production
 standards rather than copy prototype code. At minimum, acceptance must separate:
 
@@ -406,16 +415,18 @@ standards rather than copy prototype code. At minimum, acceptance must separate:
    state, and reduced motion;
 5. signed-bundle validation for stable identity, icon resources, nested code,
    and `public.file-url` drag payload;
-6. live macOS 14, 15, and 26 checks for exact pane plus root fallback;
-7. disposable-account or VM permission transition checks without
-   `tccutil reset` on the developer account;
+6. macOS 26 observation-only checks for exact pane plus root fallback;
+7. deterministic permission-transition adapters; live TCC grant, denial,
+   revocation, and drag-to-System-Settings mutation are outside this campaign;
 8. an active Automation Run relaunch test proving unchanged daemon and BaseRT
    PIDs, uninterrupted completion, restored UI state, one event subscription,
    and an authoritative post-relaunch probe.
 
-Static, automated, signed-build, visual, and live results must be reported as
-separate evidence. Opening System Settings, rendering the helper, or launching
-a replacement process is not by itself a permission or relaunch PASS.
+Static, automated, signed-build, visual, and macOS 26 observational results
+must be reported as separate evidence. macOS 14/15 runtime evidence and live
+TCC mutation must be listed as omitted. Opening System Settings, rendering the
+helper, or launching a replacement process is not by itself a permission or
+relaunch PASS.
 
 ## Prototype disposition
 

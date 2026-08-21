@@ -2,6 +2,16 @@
 
 Each phase follows the structure: **Goal · Deliverables · Risks · Acceptance Criteria**.
 
+Current release qualification boundary: Stage 7C and Stage 8 signed/live
+qualification covers macOS 26 only. macOS 14 and 15 remain compile targets
+when existing configuration permits them, but this campaign makes no runtime,
+System Settings, TCC, visual, or accessibility qualification claim for those
+versions. Live TCC grant, denial, revocation, and drag-to-System-Settings
+mutation are out of scope; omitted checks are never PASS. Deterministic
+permission adapters, signed-bundle and drag-payload validation, privacy tests,
+and daemon-preserving relaunch remain required, and release evidence must
+carry this limitation.
+
 ---
 
 ## Phase 0 — Research / Spike

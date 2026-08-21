@@ -73,7 +73,7 @@ reject_pattern "$view_model" 'NotchSettingsPage|notchSettingsPage|setupBridgeHei
   'production mode and geometry have no Setup route'
 reject_pattern "$settings" 'ScrollView|LazyV|TextEditor' \
   'settings presentation has no scrolling or raw editor'
-reject_pattern "$settings" 'rules\.yaml|Ollama|provider|availableModels|selectedClassifierModel' \
+reject_pattern "$settings" 'rules\.yaml|Ollama|availableModels|selectedClassifierModel|provider(Name|URL|Model|Config)|fallback' \
   'settings presentation has no legacy provider/fallback controls'
 reject_pattern "$settings" 'settingsGroup|rulesGroup|odooGroup|codexGroup|whatsappGroup|legacyConnector' \
   'legacy connector/setup layout is absent'
