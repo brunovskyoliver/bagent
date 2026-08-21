@@ -54,7 +54,6 @@ final class NotchWindowController: NSObject {
     private var hasNotch = false
     private var localKeyMonitor: Any?
     private var compassRailKeyMonitor: Any?
-    private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
     /// Clipboard paste wheel (hold right ⌘).
     private let clipboardHistory = ClipboardHistory()
@@ -177,7 +176,6 @@ final class NotchWindowController: NSObject {
         pasteTap.stop()
         if let m = localKeyMonitor { NSEvent.removeMonitor(m); localKeyMonitor = nil }
         if let m = compassRailKeyMonitor { NSEvent.removeMonitor(m); compassRailKeyMonitor = nil }
-        if let m = localMouseMonitor { NSEvent.removeMonitor(m); localMouseMonitor = nil }
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
         statusPanel.styleMask = [.borderless, .nonactivatingPanel]
         statusPanel.orderOut(nil)
@@ -388,7 +386,7 @@ final class NotchWindowController: NSObject {
     func presentInputOnly() {
         guard presentationActive else { return }
         guard chatViewModel.notchInteractionMode == .collapsed else { return }
-        if chatViewModel.isThinking {
+        if chatViewModel.notchPresentation.hasActiveForegroundWork {
             presentOutputChat()
             return
         }
@@ -431,16 +429,6 @@ final class NotchWindowController: NSObject {
                     self.collapse()
                 }
             }
-        }
-
-        // Option+click anywhere in the notch panel copies the debug trace.
-        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
-            guard let self,
-                  event.modifierFlags.contains(.option),
-                  event.window === self.statusPanel
-            else { return event }
-            self.chatViewModel.copyDebugTrace()
-            return nil
         }
 
         compassRailKeyMonitor = Self.installCompassRailKeyMonitor(
@@ -668,7 +656,6 @@ final class NotchWindowController: NSObject {
 
         if let m = localKeyMonitor    { NSEvent.removeMonitor(m); localKeyMonitor    = nil }
         if let m = compassRailKeyMonitor { NSEvent.removeMonitor(m); compassRailKeyMonitor = nil }
-        if let m = localMouseMonitor  { NSEvent.removeMonitor(m); localMouseMonitor  = nil }
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
         statusPanel.styleMask = [.borderless, .nonactivatingPanel]
         reconcileStatusPanelVisibility()

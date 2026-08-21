@@ -358,6 +358,100 @@ impl SynthesisService {
         }
     }
 
+    #[cfg(feature = "stage8-acceptance")]
+    pub(crate) async fn synthesize_acceptance(
+        &self,
+        contract: &dyn SynthesisContract,
+        observer: &dyn SynthesisObserver,
+        polish: super::AcceptancePolish,
+    ) -> SynthesisOutcome {
+        let correlated = CorrelatedObserver {
+            turn_id: contract.turn_id(),
+            inner: observer,
+        };
+        let observer = &correlated;
+        let canonical = contract.canonical_answer();
+        let canonical_text = canonical.text.clone();
+        let model = self.config.preferred_model.as_str();
+
+        observer
+            .record(phase_event(
+                Some(model),
+                SynthesisPhase::PreparingAnswer,
+                0,
+                false,
+                false,
+                false,
+                None,
+            ))
+            .await;
+
+        match polish {
+            super::AcceptancePolish::Passthrough => {
+                self.canonical(canonical_text, observer, PolishStatus::Skipped, None)
+                    .await
+            }
+            super::AcceptancePolish::Accepted => {
+                observer
+                    .record(phase_event(
+                        None,
+                        SynthesisPhase::Validating,
+                        0,
+                        false,
+                        false,
+                        false,
+                        None,
+                    ))
+                    .await;
+                SynthesisOutcome {
+                    text: canonical.text,
+                    route: SynthesisRoute::Preferred,
+                    polish_status: PolishStatus::Accepted,
+                }
+            }
+            super::AcceptancePolish::Rejected => {
+                observer
+                    .record(phase_event(
+                        None,
+                        SynthesisPhase::Validating,
+                        0,
+                        false,
+                        false,
+                        false,
+                        Some("acceptance_rejected"),
+                    ))
+                    .await;
+                self.canonical(
+                    canonical_text,
+                    observer,
+                    PolishStatus::Rejected,
+                    Some("acceptance_rejected"),
+                )
+                .await
+            }
+            super::AcceptancePolish::Unavailable => {
+                observer
+                    .record(phase_event(
+                        Some(model),
+                        SynthesisPhase::PreparingAnswer,
+                        0,
+                        false,
+                        false,
+                        false,
+                        Some("acceptance_unavailable"),
+                    ))
+                    .await;
+                self.canonical(
+                    canonical_text,
+                    observer,
+                    PolishStatus::Unavailable,
+                    Some("acceptance_unavailable"),
+                )
+                .await
+            }
+        }
+    }
+
     async fn validate(
         &self,
         contract: &dyn SynthesisContract,
@@ -692,5 +786,40 @@ mod tests {
         assert_eq!(outcome.route, SynthesisRoute::Deterministic);
         assert_eq!(outcome.text, "deterministic answer");
         assert_eq!(outcome.polish_status, PolishStatus::Unavailable);
+    }
+
+    #[cfg(feature = "stage8-acceptance")]
+    #[tokio::test]
+    async fn signed_acceptance_polish_modes_are_deterministic_and_canonical() {
+        let runtime = ModelRuntime::for_test(Arc::new(LowMemoryAdapter));
+        let service = SynthesisService::new(
+            runtime,
+            SynthesisConfig {
+                preferred_model: PREFERRED_SYNTHESIS_MODEL.into(),
+                warm_timeout: Duration::from_secs(1),
+                maintenance_interval: Duration::from_secs(60),
+            },
+        );
+
+        for (polish, expected) in [
+            (
+                super::super::AcceptancePolish::Accepted,
+                PolishStatus::Accepted,
+            ),
+            (
+                super::super::AcceptancePolish::Rejected,
+                PolishStatus::Rejected,
+            ),
+            (
+                super::super::AcceptancePolish::Unavailable,
+                PolishStatus::Unavailable,
+            ),
+        ] {
+            let outcome = service
+                .synthesize_acceptance(&Contract, &NoopSynthesisObserver, polish)
+                .await;
+            assert_eq!(outcome.polish_status, expected);
+            assert_eq!(outcome.text, "deterministic answer");
+        }
     }
 }

@@ -22,7 +22,7 @@ final class StageRailTests: XCTestCase {
         XCTAssertEqual(presentation.runPosition, 1)
         XCTAssertEqual(presentation.rail.selectedStage, .tool)
         XCTAssertEqual(presentation.statusPill.label, "2 ACTIVE")
-        XCTAssertFalse(presentation.isThinking, "background work must not block Current Chat input")
+        XCTAssertFalse(presentation.hasActiveForegroundWork, "background work must not block Current Chat input")
         XCTAssertEqual(presentation.geometry, .init(wingWidth: 248, bridgeHeight: 150))
         XCTAssertEqual(NotchPillLayout.size, .init(width: 74, height: 18))
         XCTAssertEqual(NotchPillLayout.origin(maxPanelWidth: 741), .init(x: 643, y: 9))

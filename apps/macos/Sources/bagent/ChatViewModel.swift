@@ -49,15 +49,6 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     var odooRef: DaemonClient.OdooRef? = nil
     /// Set when the assistant's response found a WhatsApp chat (Phase 11).
     var whatsappRef: DaemonClient.WhatsappRef? = nil
-    var debugTraceId: String? = nil
-    var debugPreview: String? = nil
-    var debugPromptChars: Int? = nil
-    var debugTokenEstimate: Int? = nil
-    var debugMessageCount: Int? = nil
-    var debugPayload: String? = nil
-    var debugSelectedSkills: [String]? = nil
-    var debugSelectedMemoryIds: [String]? = nil
-    var debugConversationRecallInjected: Bool? = nil
     /// Codex task complexity rating (Phase 8). Set from `task_rating` SSE event.
     var taskRating: (level: String, score: Int, reasons: [String], privacyRisk: String)? = nil
 
@@ -409,11 +400,6 @@ final class ChatViewModel: ObservableObject {
         notchEventConsumer.$presentation.eraseToAnyPublisher()
     }
     var notchInteractionMode: NotchInteractionMode { notchPresentation.interactionMode }
-    var isThinking: Bool { notchPresentation.isThinking }
-    var isExpanded: Bool { notchPresentation.isExpanded }
-    var toolStatus: String? {
-        notchPresentation.rail.selectedStage == .tool ? notchPresentation.rail.caption : nil
-    }
     var authoritativePendingApproval: ApprovalItem? {
         guard let identity = notchPresentation.pendingApprovalIdentity else { return nil }
         return pendingApprovals.first(where: { $0.id == identity })
@@ -530,7 +516,7 @@ final class ChatViewModel: ObservableObject {
         uiOnlyRelaunchError = nil
         let acceptanceFixture = ProcessInfo.processInfo.environment["BAGENT_STAGE7C_ACCEPTANCE_FIXTURE"] == "1"
         guard acceptanceFixture || UIOnlyRelaunchEligibility.isAllowed(
-            activeConversationTurn: isThinking,
+            activeConversationTurn: notchPresentation.hasActiveForegroundWork,
             pendingApproval: !pendingApprovals.isEmpty
         ) else {
             uiOnlyRelaunchError = "Relaunch is unavailable during an active turn or pending approval."
@@ -1238,7 +1224,7 @@ final class ChatViewModel: ObservableObject {
 
     var agentStatus: AgentStatus {
         if notchPresentation.pendingApprovalIdentity != nil { return .awaitingApproval }
-        if isThinking { return .thinking }
+        if notchPresentation.hasActiveForegroundWork { return .thinking }
         return .ready
     }
 
@@ -1290,7 +1276,7 @@ final class ChatViewModel: ObservableObject {
 
     /// ↑ on empty input: step to an older response. Returns true if consumed.
     func browseOlderResponse() -> Bool {
-        guard inputText.isEmpty, !isThinking else { return false }
+        guard inputText.isEmpty, !notchPresentation.hasActiveForegroundWork else { return false }
         guard notchInteractionMode == .input || historyBrowseIndex != nil else { return false }
         let list = assistantResponses
         guard !list.isEmpty else { return false }
@@ -1902,31 +1888,6 @@ final class ChatViewModel: ObservableObject {
         connectorDeparting.removeAll { $0.id == id }
     }
 
-    // MARK: - Debug trace copy (option+click on the notch)
-
-    /// Transient "copied" checkmark in the left wing after option+click.
-    @Published var traceCopiedFlash = false
-    private var traceFlashTask: Task<Void, Never>?
-
-    /// Option+click anywhere on the notch/panel: copy the latest session +
-    /// debug trace to the clipboard and flash the left-wing checkmark.
-    func copyDebugTrace() {
-        traceFlashTask?.cancel()
-        traceFlashTask = Task {
-            let payload = await latestDebugClipboardPayload()
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.setString(payload, forType: .string)
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.68)) {
-                traceCopiedFlash = true
-            }
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.3)) {
-                traceCopiedFlash = false
-            }
-        }
-    }
     // MARK: - Init
 
     init(
@@ -2222,7 +2183,7 @@ final class ChatViewModel: ObservableObject {
             slashCommandError = String(localized: "currentChat.loading", defaultValue: "Current Chat is still loading")
             return
         }
-        guard !isThinking, authoritativePendingApproval == nil else {
+        guard !notchPresentation.hasActiveForegroundWork, authoritativePendingApproval == nil else {
             slashCommandError = String(localized: "currentChat.clear.active", defaultValue: "Finish the active turn or approval before clearing Current Chat")
             return
         }
@@ -2366,75 +2327,6 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    func loadDebugTrace(for messageId: UUID) async {
-        guard let idx = messages.firstIndex(where: { $0.id == messageId }),
-              let traceId = messages[idx].debugTraceId
-        else { return }
-        let currentPayload = messages[idx].debugPayload ?? ""
-        guard currentPayload.isEmpty || currentPayload.contains("trace not found") || currentPayload.hasPrefix("Chyba:") else {
-            return
-        }
-        messages[idx].debugPayload = "Načítavam trace…"
-        for attempt in 0..<6 {
-            do {
-                messages[idx].debugPayload = try await client.debugTrace(id: traceId)
-                return
-            } catch {
-                if attempt == 5 {
-                    messages[idx].debugPayload = "Chyba: \(error.localizedDescription)"
-                } else {
-                    try? await Task.sleep(for: .seconds(1))
-                }
-            }
-        }
-    }
-
-    func latestDebugClipboardPayload() async -> String {
-        guard let latest = latestAssistantMessage,
-              let traceId = latest.debugTraceId
-        else {
-            return "No debug trace is available for the latest assistant message."
-        }
-
-        await loadDebugTrace(for: latest.id)
-        let tracePayload = messages
-            .first(where: { $0.id == latest.id })?
-            .debugPayload ?? "Trace payload unavailable."
-
-        let conversationPayload: String
-        if let identity = currentChatSnapshot?.identity {
-            do {
-                conversationPayload = try await client.debugConversation(id: identity)
-            } catch {
-                conversationPayload = "Conversation debug unavailable: \(error.localizedDescription)"
-            }
-        } else {
-            conversationPayload = "No conversation id yet."
-        }
-
-        let sessionLine = currentChatSnapshot?.identity ?? "(none)"
-        let assistantText = messages
-            .first(where: { $0.id == latest.id })?
-            .content ?? latest.content
-
-        return """
-        bagent debug payload
-        generated_at: \(Date().ISO8601Format())
-        session_id: \(sessionLine)
-        prompt_trace_id: \(traceId)
-
-        latest_assistant_response:
-        \(assistantText)
-
-        debug_trace:
-        \(tracePayload)
-
-        conversation_debug:
-        \(conversationPayload)
-        """
-
-    }
-
     func send() {
         let text = inputText
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2451,7 +2343,7 @@ final class ChatViewModel: ObservableObject {
             execute(cmd)
             return
         }
-        guard !isThinking else { return }
+        guard !notchPresentation.hasActiveForegroundWork else { return }
         let sourceMode = selectedSourceMode
         let wasInputOnly = notchInteractionMode == .input
         guard let currentChatSnapshot else {
@@ -2535,19 +2427,10 @@ final class ChatViewModel: ObservableObject {
                 for try await event in stream {
                     admissionWasObserved = true
                     switch event {
-                    case .debugTrace(let trace):
-                        messages[idx].debugTraceId = trace.prompt_trace_id
-                        messages[idx].debugPreview = trace.preview
-                        messages[idx].debugPromptChars = trace.prompt_chars
-                        messages[idx].debugTokenEstimate = trace.prompt_token_estimate
-                        messages[idx].debugMessageCount = trace.message_count
-                        messages[idx].debugSelectedSkills = trace.selected_skill_names
-                        messages[idx].debugSelectedMemoryIds = trace.selected_memory_ids
-                        messages[idx].debugConversationRecallInjected = trace.conversation_recall_injected
                     case .token(let t):
                         messages[idx].content += t
                         presenter.enqueue(t)
-                        // toolStatus intentionally NOT cleared here — the action chip
+                        // The canonical rail caption intentionally remains visible — the action chip
                         // stays visible while the answer streams; cleared on .done.
                         // Auto-open Mail after the first sentence has appeared in the response.
                         if !didAutoOpen,
@@ -2653,7 +2536,6 @@ final class ChatViewModel: ObservableObject {
                             messages[idx].activities[activityIndex].status = "completed"
                         }
                         streamingAssistantMessageId = nil
-                        Task { await loadDebugTrace(for: messages[idx].id) }
                     }
                 }
                 await presenter.finish()

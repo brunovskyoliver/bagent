@@ -738,44 +738,8 @@ fn requested_mail_summary_count(user_message: &str) -> Option<usize> {
     Some(explicit.unwrap_or(if plural_or_recent { 3 } else { 1 }))
 }
 
-pub(crate) const EVIDENCE_ORCHESTRATOR_FLAG_ENV: &str = "BAGENT_EVIDENCE_ORCHESTRATOR";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EvidenceOrchestratorFlag {
-    Disabled,
-    Enabled,
-}
-
-impl EvidenceOrchestratorFlag {
-    pub(crate) fn from_local_value(value: Option<&str>) -> Self {
-        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            Some("0") => Self::Disabled,
-            None | Some("1") => Self::Enabled,
-            Some(_) => Self::Enabled,
-        }
-    }
-
-    pub(crate) fn from_local_env() -> Self {
-        let value = std::env::var(EVIDENCE_ORCHESTRATOR_FLAG_ENV).ok();
-        if matches!(
-            value.as_deref().map(str::trim),
-            Some(value) if value != "0" && value != "1"
-        ) {
-            tracing::warn!(
-                env = EVIDENCE_ORCHESTRATOR_FLAG_ENV,
-                default = "enabled",
-                "invalid evidence routing configuration; using production default"
-            );
-        }
-        Self::from_local_value(value.as_deref())
-    }
-}
-
-fn routed_evidence_intent(
-    flag: EvidenceOrchestratorFlag,
-    user_message: &str,
-) -> Option<EvidenceIntent> {
-    if flag != EvidenceOrchestratorFlag::Enabled {
+fn routed_evidence_intent(enabled: bool, user_message: &str) -> Option<EvidenceIntent> {
+    if !enabled {
         return None;
     }
     match EvidenceIntentClassifier.classify(user_message) {
@@ -1623,12 +1587,12 @@ struct TurnRouting {
 }
 
 fn routed_evidence_turn(
-    flag: EvidenceOrchestratorFlag,
+    enabled: bool,
     origin: &ExecOrigin,
     session_id: &str,
     user_message: &str,
 ) -> Option<RoutedEvidenceTurn> {
-    let intent = routed_evidence_intent(flag, user_message)?;
+    let intent = routed_evidence_intent(enabled, user_message)?;
     Some(RoutedEvidenceTurn {
         request: EvidenceRequest {
             version: EVIDENCE_SCHEMA_VERSION,
@@ -1642,13 +1606,13 @@ fn routed_evidence_turn(
 }
 
 fn prepare_turn_routing(
-    flag: EvidenceOrchestratorFlag,
+    enabled: bool,
     origin: &ExecOrigin,
     session_id: &str,
     user_message: &str,
     tools: Vec<ToolDef>,
 ) -> TurnRouting {
-    let evidence = routed_evidence_turn(flag, origin, session_id, user_message);
+    let evidence = routed_evidence_turn(enabled, origin, session_id, user_message);
     if evidence.is_some() {
         return TurnRouting {
             evidence,
@@ -3503,7 +3467,8 @@ async fn run_web_evidence_synthesis(
     })
 }
 
-async fn run_shared_synthesis(
+async fn run_shared_synthesis_for_state(
+    state: &AppState,
     service: &std::sync::Arc<SynthesisService>,
     demand: ModelDemand,
     sink: &EventSink,
@@ -3512,9 +3477,70 @@ async fn run_shared_synthesis(
     approvals_denied: usize,
     terminal_outcome: crate::evidence::EvidenceOutcomeEvent,
 ) -> Result<ExecOutcome, ExecError> {
+    #[cfg(feature = "stage8-acceptance")]
+    {
+        let acceptance_polish = state
+            .acceptance
+            .as_ref()
+            .and_then(|control| control.selection())
+            .map(|selection| selection.polish);
+        return run_shared_synthesis(
+            service,
+            demand,
+            sink,
+            contract,
+            tool_calls_used,
+            approvals_denied,
+            terminal_outcome,
+            acceptance_polish,
+        )
+        .await;
+    }
+
+    #[cfg(not(feature = "stage8-acceptance"))]
+    {
+        let _ = state;
+        run_shared_synthesis(
+            service,
+            demand,
+            sink,
+            contract,
+            tool_calls_used,
+            approvals_denied,
+            terminal_outcome,
+        )
+        .await
+    }
+}
+
+async fn run_shared_synthesis(
+    service: &std::sync::Arc<SynthesisService>,
+    demand: ModelDemand,
+    sink: &EventSink,
+    contract: &dyn SynthesisContract,
+    tool_calls_used: usize,
+    approvals_denied: usize,
+    terminal_outcome: crate::evidence::EvidenceOutcomeEvent,
+    #[cfg(feature = "stage8-acceptance")] acceptance_polish: Option<
+        crate::evidence::AcceptancePolish,
+    >,
+) -> Result<ExecOutcome, ExecError> {
     let terminal_outcome = terminal_outcome.with_canonical_answer(&contract.canonical_answer());
     let observer = EventSinkSynthesisObserver { sink: sink.clone() };
-    let outcome = service.synthesize(demand, contract, &observer).await;
+    let outcome = {
+        #[cfg(feature = "stage8-acceptance")]
+        if let Some(polish) = acceptance_polish {
+            service
+                .synthesize_acceptance(contract, &observer, polish)
+                .await
+        } else {
+            service.synthesize(demand, contract, &observer).await
+        }
+        #[cfg(not(feature = "stage8-acceptance"))]
+        {
+            service.synthesize(demand, contract, &observer).await
+        }
+    };
     let _ = sink
         .emit(json!({
             "type": "evidence_polish",
@@ -3667,13 +3693,7 @@ pub(crate) async fn run_agent_loop(
         evidence: routed_evidence_turn,
         mut tools,
         guidance,
-    } = prepare_turn_routing(
-        state.evidence_orchestrator,
-        origin,
-        session_id,
-        user_message,
-        tools,
-    );
+    } = prepare_turn_routing(true, origin, session_id, user_message, tools);
     let focused_mail_turn = guidance.is_some();
     let summary_read_target = focused_mail_turn
         .then(|| desired_mail_read_count(user_message))
@@ -3752,7 +3772,8 @@ pub(crate) async fn run_agent_loop(
                         original_request: user_message,
                         bundle: &bundle,
                     };
-                    return run_shared_synthesis(
+                    return run_shared_synthesis_for_state(
+                        state,
                         &state.synthesis,
                         inference.demand(ModelClass::Synthesis35B),
                         sink,
@@ -3767,7 +3788,8 @@ pub(crate) async fn run_agent_loop(
                     original_request: user_message,
                     bundle: &bundle,
                 };
-                return run_shared_synthesis(
+                return run_shared_synthesis_for_state(
+                    state,
                     &state.synthesis,
                     inference.demand(ModelClass::Synthesis35B),
                     sink,
@@ -5245,7 +5267,7 @@ mod tests {
 
     async fn run_routing_acceptance(
         prompt: &str,
-        flag: EvidenceOrchestratorFlag,
+        flag: bool,
         origin: &ExecOrigin,
         results: EvidenceResults,
         mut gate: ScriptedGate,
@@ -5409,35 +5431,13 @@ mod tests {
     }
 
     #[test]
-    fn evidence_feature_flag_defaults_on_with_explicit_local_rollback() {
+    fn evidence_routing_is_enabled_in_production_and_rollback_is_local() {
         assert_eq!(
-            EvidenceOrchestratorFlag::from_local_value(None),
-            EvidenceOrchestratorFlag::Enabled
-        );
-        assert_eq!(
-            EvidenceOrchestratorFlag::from_local_value(Some("0")),
-            EvidenceOrchestratorFlag::Disabled
-        );
-        assert_eq!(
-            EvidenceOrchestratorFlag::from_local_value(Some("1")),
-            EvidenceOrchestratorFlag::Enabled
-        );
-        assert_eq!(
-            EvidenceOrchestratorFlag::from_local_value(Some("invalid")),
-            EvidenceOrchestratorFlag::Enabled
-        );
-        assert_eq!(
-            routed_evidence_intent(
-                EvidenceOrchestratorFlag::Disabled,
-                "can you read me the 3 latest emails?"
-            ),
+            routed_evidence_intent(false, "can you read me the 3 latest emails?"),
             None
         );
         assert_eq!(
-            routed_evidence_intent(
-                EvidenceOrchestratorFlag::Enabled,
-                "can you read me the 3 latest emails?"
-            ),
+            routed_evidence_intent(true, "can you read me the 3 latest emails?"),
             Some(EvidenceIntent::MailLatestContent {
                 count: 3,
                 requested_count: 3,
@@ -5445,7 +5445,7 @@ mod tests {
             })
         );
         assert_eq!(
-            routed_evidence_intent(EvidenceOrchestratorFlag::Enabled, "show my latest 3 emails"),
+            routed_evidence_intent(true, "show my latest 3 emails"),
             Some(EvidenceIntent::MailLatestHeaders {
                 count: 3,
                 unread_only: false,
@@ -5470,16 +5470,13 @@ mod tests {
             "what is in my project notes?",
         ] {
             assert_eq!(
-                routed_evidence_intent(EvidenceOrchestratorFlag::Enabled, prompt),
+                routed_evidence_intent(true, prompt),
                 None,
                 "must remain on legacy routing: {prompt}"
             );
         }
         assert!(matches!(
-            routed_evidence_intent(
-                EvidenceOrchestratorFlag::Enabled,
-                "what is the latest weather?"
-            ),
+            routed_evidence_intent(true, "what is the latest weather?"),
             Some(EvidenceIntent::WebFact { .. })
         ));
     }
@@ -5540,7 +5537,7 @@ mod tests {
             "read and analyze as quoted: \"write a reply\" in my latest email",
         ];
         for value in [None, Some("1"), Some("invalid")] {
-            let flag = EvidenceOrchestratorFlag::from_local_value(value);
+            let flag = value != Some("0");
             for prompt in supported {
                 assert!(
                     routed_evidence_intent(flag, prompt).is_some(),
@@ -5550,10 +5547,7 @@ mod tests {
         }
         for prompt in supported {
             assert_eq!(
-                routed_evidence_intent(
-                    EvidenceOrchestratorFlag::from_local_value(Some("0")),
-                    prompt,
-                ),
+                routed_evidence_intent(false, prompt,),
                 None,
                 "rollback must retain legacy routing for {prompt:?}"
             );
@@ -5637,7 +5631,7 @@ mod tests {
             "compare prices of Apple and Microsoft open weather app",
         ];
         for value in [None, Some("1"), Some("0"), Some("invalid")] {
-            let flag = EvidenceOrchestratorFlag::from_local_value(value);
+            let flag = value != Some("0");
             for prompt in legacy {
                 assert_eq!(
                     routed_evidence_intent(flag, prompt),
@@ -5651,7 +5645,7 @@ mod tests {
     #[test]
     fn typed_route_bypasses_legacy_guidance_prefetch_and_tool_loop() {
         let typed = prepare_turn_routing(
-            EvidenceOrchestratorFlag::from_local_value(None),
+            true,
             &ExecOrigin::Chat,
             "routing-session",
             "summarize my latest 3 emails",
@@ -5662,7 +5656,7 @@ mod tests {
         assert!(typed.guidance.is_none());
 
         let rollback = prepare_turn_routing(
-            EvidenceOrchestratorFlag::from_local_value(Some("0")),
+            false,
             &ExecOrigin::Chat,
             "routing-session",
             "summarize my latest 3 emails",
@@ -5683,7 +5677,7 @@ mod tests {
         // no AppState, database, connector, Keychain, or filesystem handle, so
         // selecting rollback cannot migrate or persist anything.
         let rollback = prepare_turn_routing(
-            EvidenceOrchestratorFlag::from_local_value(Some("0")),
+            false,
             &ExecOrigin::Chat,
             "rollback-no-write-session",
             "summarize my latest 3 emails",
@@ -5713,13 +5707,10 @@ mod tests {
 
         let message = "summarize my latest 3 emails";
         let mut disabled_adapter = FakeMailAdapter::with_three_readable_messages();
-        assert_eq!(
-            routed_evidence_intent(EvidenceOrchestratorFlag::Disabled, message),
-            None
-        );
+        assert_eq!(routed_evidence_intent(false, message), None);
         assert!(disabled_adapter.operations().is_empty());
 
-        let intent = routed_evidence_intent(EvidenceOrchestratorFlag::Enabled, message)
+        let intent = routed_evidence_intent(true, message)
             .expect("flagged latest Mail content should use typed routing");
         let plan = EvidencePlanner::plan(intent);
         let outcome =
@@ -5749,9 +5740,7 @@ mod tests {
             }
         }
 
-        let intent =
-            routed_evidence_intent(EvidenceOrchestratorFlag::Enabled, "show my latest 3 emails")
-                .unwrap();
+        let intent = routed_evidence_intent(true, "show my latest 3 emails").unwrap();
         let plan = EvidencePlanner::plan(intent);
         let mut adapter = FakeMailAdapter::with_three_readable_messages();
         let outcome = execute_mail_plan(&mut adapter, &mut AllowAll, "turn-headers", &plan).await;
@@ -5800,7 +5789,7 @@ mod tests {
         for (origin, expected_origin) in origins {
             let run = run_routing_acceptance(
                 "can you read me the 3 latest emails?",
-                EvidenceOrchestratorFlag::Enabled,
+                true,
                 &origin,
                 fixtures::three_readable_messages(),
                 ScriptedGate::default(),
@@ -6327,7 +6316,7 @@ mod tests {
 
         let run = run_routing_acceptance(
             "can you read me the 3 latest emails?",
-            EvidenceOrchestratorFlag::Enabled,
+            true,
             &ExecOrigin::Chat,
             fixtures::three_readable_messages(),
             ScriptedGate::default(),
@@ -6378,7 +6367,7 @@ mod tests {
 
         let run = run_routing_acceptance(
             "can you read me the 20 latest emails?",
-            EvidenceOrchestratorFlag::Enabled,
+            true,
             &ExecOrigin::Chat,
             fixtures::ten_readable_messages(),
             ScriptedGate::default(),
@@ -6523,7 +6512,7 @@ mod tests {
 
         let run = run_routing_acceptance(
             "can you read me the 3 latest emails?",
-            EvidenceOrchestratorFlag::Enabled,
+            true,
             &ExecOrigin::Chat,
             fixtures::one_unavailable_of_three(),
             ScriptedGate::default(),
@@ -6548,7 +6537,7 @@ mod tests {
 
         let run = run_routing_acceptance(
             "show my latest 3 emails",
-            EvidenceOrchestratorFlag::Enabled,
+            true,
             &ExecOrigin::Chat,
             fixtures::empty_mailbox(),
             ScriptedGate::default(),
@@ -6569,7 +6558,7 @@ mod tests {
 
         let run = run_routing_acceptance(
             "can you read me the 3 latest emails?",
-            EvidenceOrchestratorFlag::Enabled,
+            true,
             &ExecOrigin::Chat,
             fixtures::mail_connector_unavailable(),
             ScriptedGate::default(),
@@ -6591,7 +6580,7 @@ mod tests {
 
         let run = run_routing_acceptance(
             "can you read me the 3 latest emails?",
-            EvidenceOrchestratorFlag::Enabled,
+            true,
             &ExecOrigin::Chat,
             fixtures::three_readable_messages(),
             ScriptedGate {
@@ -6616,7 +6605,7 @@ mod tests {
 
         let run = run_routing_acceptance(
             "can you read me the 3 latest emails?",
-            EvidenceOrchestratorFlag::Enabled,
+            true,
             &ExecOrigin::Chat,
             fixtures::three_readable_messages(),
             ScriptedGate {
@@ -6645,7 +6634,7 @@ mod tests {
 
         let run = run_routing_acceptance(
             "can you read me the 3 latest emails?",
-            EvidenceOrchestratorFlag::Disabled,
+            false,
             &ExecOrigin::Chat,
             fixtures::three_readable_messages(),
             ScriptedGate::default(),
@@ -6669,7 +6658,7 @@ mod tests {
         ] {
             let run = run_routing_acceptance(
                 prompt,
-                EvidenceOrchestratorFlag::Enabled,
+                true,
                 &ExecOrigin::Chat,
                 fixtures::three_readable_messages(),
                 ScriptedGate::default(),
@@ -6686,7 +6675,7 @@ mod tests {
     fn routing_contract_is_identical_for_chat_and_automation_in_every_mode() {
         let prompt = "compare prices of Acme service and Contoso service online";
         for value in [None, Some("1"), Some("invalid")] {
-            let flag = EvidenceOrchestratorFlag::from_local_value(value);
+            let flag = value != Some("0");
             let chat = routed_evidence_turn(flag, &ExecOrigin::Chat, "shared-session", prompt)
                 .expect("chat should route deterministic web facts");
             let automation = routed_evidence_turn(
@@ -6704,7 +6693,7 @@ mod tests {
             assert_eq!(chat.request.origin, EvidenceOrigin::Chat);
             assert_eq!(automation.request.origin, EvidenceOrigin::Automation);
         }
-        let rollback = EvidenceOrchestratorFlag::from_local_value(Some("0"));
+        let rollback = false;
         assert!(
             routed_evidence_turn(rollback, &ExecOrigin::Chat, "shared-session", prompt).is_none()
         );
@@ -6725,7 +6714,7 @@ mod tests {
             "what is in my project notes?",
         ] {
             assert_eq!(
-                routed_evidence_intent(EvidenceOrchestratorFlag::Enabled, legacy),
+                routed_evidence_intent(true, legacy),
                 None,
                 "ambiguous, mixed, and unrelated requests remain legacy: {legacy}"
             );

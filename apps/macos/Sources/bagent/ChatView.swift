@@ -362,7 +362,7 @@ struct NotchWrapView: View {
         NotchOutputLayout.responseText(
             latestText: viewModel.latestAssistantText,
             isStreaming: viewModel.isLatestAssistantStreaming,
-            isThinking: viewModel.isThinking
+            isThinking: viewModel.notchPresentation.hasActiveForegroundWork
         )
     }
 
@@ -404,7 +404,7 @@ struct NotchWrapView: View {
         // Browse header row (‹n/N› + prompt) sits above the response text.
         let browseExtra: CGFloat = viewModel.historyBrowseIndex == nil ? 0 : 20
         // Tool-status chip also sits above the response text during streaming.
-        let toolChipExtra: CGFloat = viewModel.toolStatus == nil ? 0 : 20
+        let toolChipExtra: CGFloat = viewModel.notchPresentation.rail.selectedStage == .tool ? 20 : 0
         let activityExtra = NotchActivityLayout.extraHeight(
             activityCount: viewModel.latestTranscriptActivityCount,
             expanded: viewModel.isActivityTranscriptExpanded
@@ -707,7 +707,8 @@ struct NotchWrapView: View {
     @ViewBuilder
     private var statusDotLayer: some View {
         if viewModel.notchPresentation.statusPill.label == nil,
-           status != .ready || (viewModel.isExpanded && !isInlineActive) {
+           status != .ready || ((viewModel.notchPresentation.interactionMode != .collapsed
+                && viewModel.notchPresentation.interactionMode != .thinking) && !isInlineActive) {
             StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
                 .position(statusDotPos)
                 .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
@@ -743,7 +744,10 @@ struct NotchWrapView: View {
     @ViewBuilder
     private var cmuxDotLayer: some View {
         if let kind = viewModel.cmuxDotKind,
-           !isInlineActive, !viewModel.isExpanded, status == .ready {
+           !isInlineActive,
+           viewModel.notchPresentation.interactionMode == .collapsed
+                || viewModel.notchPresentation.interactionMode == .thinking,
+           status == .ready {
             CmuxStatusDotView(kind: kind, reduceMotion: reduceMotion)
                 .position(rightIconPos)
                 .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
@@ -783,16 +787,6 @@ struct NotchWrapView: View {
                 if showsCmuxLeftIcon, let notification = displayedCmuxNotification {
                     CmuxIconView(kind: notification.kind, reduceMotion: reduceMotion)
                         .opacity(isCmuxSurfaceActive ? cmuxContentOpacity : 1)
-                }
-                // Transient "trace copied" confirmation (option+click).
-                if viewModel.traceCopiedFlash {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: Self.leftWingIconSize * 0.8, weight: .semibold))
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, .green)
-                        .frame(width: Self.leftWingIconSize, height: Self.leftWingIconSize)
-                        .transition(.scale(scale: 0.4).combined(with: .opacity))
-                        .accessibilityLabel("Trace skopírovaný do schránky")
                 }
             }
             .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.68),
@@ -847,7 +841,6 @@ struct NotchWrapView: View {
     private var leftWingIconCount: Int {
         visibleConnectorActions.count
             + (showsCmuxLeftIcon ? 1 : 0)
-            + (viewModel.traceCopiedFlash ? 1 : 0)
     }
 
     private var leftWingRowWidth: CGFloat {
@@ -882,7 +875,9 @@ struct NotchWrapView: View {
     /// The left cmux icon shows while any cmux event is pending and the notch is in
     /// its collapsed presentation (not inline/expanded).
     private var showsCmuxLeftIcon: Bool {
-        guard !isInlineActive, !viewModel.isExpanded else { return false }
+        guard !isInlineActive,
+              viewModel.notchPresentation.interactionMode == .collapsed
+                || viewModel.notchPresentation.interactionMode == .thinking else { return false }
         return displayedCmuxNotification != nil
     }
 
@@ -925,12 +920,7 @@ struct NotchWrapView: View {
     }
 
     /// Click-through on a cmux banner/reveal focuses the cmux workspace/tab.
-    /// Option+click in any state copies the session/debug trace instead.
     private func handleTap() {
-        if NSApp.currentEvent?.modifierFlags.contains(.option) == true {
-            viewModel.copyDebugTrace()
-            return
-        }
         if isCmuxSurfaceActive, let notification = displayedCmuxNotification {
             viewModel.focusCmux(notification)
             refreshSurface()
@@ -969,7 +959,8 @@ struct NotchWrapView: View {
         !isInlineActive
             && !isCmuxSurfaceActive
             && viewModel.notchInteractionMode != .thinking
-            && (viewModel.isExpanded || isHovered)
+            && ((viewModel.notchPresentation.interactionMode != .collapsed
+                && viewModel.notchPresentation.interactionMode != .thinking) || isHovered)
     }
 
     private func isNearVisibleSurface(_ point: CGPoint) -> Bool {
@@ -1169,9 +1160,6 @@ struct NotchWrapView: View {
         .onChange(of: viewModel.pendingConnectorActions) {
             refreshSurface()
         }
-        .onChange(of: viewModel.traceCopiedFlash) {
-            refreshSurface()
-        }
         .onChange(of: viewModel.isActivityTranscriptExpanded) {
             deferOutputSurfaceRefresh(force: true)
         }
@@ -1332,7 +1320,7 @@ struct InlineNotchContent: View {
     private var canSend: Bool {
         (!viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !viewModel.pendingAttachments.isEmpty)
-            && !viewModel.isThinking
+            && !viewModel.notchPresentation.hasActiveForegroundWork
     }
 
     var body: some View {
@@ -1501,15 +1489,18 @@ struct InlineNotchContent: View {
     }
 
     private var thinkingRow: some View {
-        HStack(spacing: 10) {
+        let toolCaption = viewModel.notchPresentation.rail.selectedStage == .tool
+            ? viewModel.notchPresentation.rail.caption
+            : nil
+        return HStack(spacing: 10) {
             ThinkingIndicator()
                 .scaleEffect(0.74)
             VStack(alignment: .leading, spacing: 3) {
-                Text(viewModel.latestEvidenceStatus ?? viewModel.toolStatus ?? "Thinking")
+                Text(viewModel.latestEvidenceStatus ?? toolCaption ?? "Thinking")
                     .font(.system(size: 14, weight: .regular))
                     .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
                     .lineLimit(1)
-                    .animation(.easeOut(duration: 0.18), value: viewModel.toolStatus)
+                    .animation(.easeOut(duration: 0.18), value: viewModel.notchPresentation.rail.caption)
                 if !viewModel.latestUserText.isEmpty {
                     Text(viewModel.latestUserText)
                         .font(.system(size: 12, weight: .regular))
@@ -1526,7 +1517,7 @@ struct InlineNotchContent: View {
         let text = NotchOutputLayout.responseText(
             latestText: viewModel.latestAssistantText,
             isStreaming: viewModel.isLatestAssistantStreaming,
-            isThinking: viewModel.isThinking
+            isThinking: viewModel.notchPresentation.hasActiveForegroundWork
         )
         return VStack(alignment: .leading, spacing: 6) {
             // History-browse header (↑/↓ on empty input): position + the prompt

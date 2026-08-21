@@ -307,7 +307,7 @@ pub(crate) fn repo_recent_runs(
     limit: usize,
 ) -> Result<Vec<AutomationRun>, RepoError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {RUN_COLS} FROM automation_runs WHERE automation_id=?1 \
+        "SELECT {RUN_COLS} FROM automation_run_records WHERE automation_id=?1 \
          ORDER BY created_at DESC LIMIT ?2"
     ))?;
     let rows = stmt
@@ -322,7 +322,7 @@ pub(crate) fn repo_run(
     run_id: &str,
 ) -> Result<AutomationRun, RepoError> {
     conn.query_row(
-        &format!("SELECT {RUN_COLS} FROM automation_runs WHERE automation_id=?1 AND id=?2"),
+        &format!("SELECT {RUN_COLS} FROM automation_run_records WHERE automation_id=?1 AND id=?2"),
         params![automation_id, run_id],
         row_to_run,
     )
@@ -334,7 +334,7 @@ pub(crate) fn repo_run(
 pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<(), RepoError> {
     conn.execute(
         &format!(
-            "INSERT OR IGNORE INTO automation_runs ({RUN_COLS}, created_at) \
+            "INSERT OR IGNORE INTO automation_run_records ({RUN_COLS}, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
         ),
         params![
@@ -353,6 +353,34 @@ pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<
     Ok(())
 }
 
+/// Commit an Automation Run outcome through the canonical run record.
+pub(crate) fn repo_finish_run_record(
+    conn: &Connection,
+    run_id: &str,
+    automation_id: &str,
+    status: AutomationRunStatus,
+    result_summary: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(), RepoError> {
+    let summary = result_summary.map(policy::clamp_result_summary);
+    let changed = conn.execute(
+        "UPDATE automation_run_records
+         SET status=?3, finished_at=?4, result_summary=?5
+         WHERE id=?1 AND automation_id=?2 AND status='running'",
+        params![run_id, automation_id, status.as_str(), ts(now), summary],
+    )?;
+    if changed != 1 {
+        return Err(RepoError::NotFound);
+    }
+    conn.execute(
+        "UPDATE automations
+         SET last_run_at=?2, last_run_status=?3, last_result_summary=?4
+         WHERE id=?1",
+        params![automation_id, ts(now), status.as_str(), summary],
+    )?;
+    Ok(())
+}
+
 /// Finish a run and mirror the outcome onto the automation row, then prune
 /// history past the retention cap. Audit entries are untouched (append-only).
 #[cfg(test)]
@@ -366,7 +394,7 @@ pub(crate) fn repo_finish_run(
 ) -> Result<(), RepoError> {
     let current_status: Option<String> = conn
         .query_row(
-            "SELECT status FROM automation_runs WHERE id=?1 AND automation_id=?2",
+            "SELECT status FROM automation_run_records WHERE id=?1 AND automation_id=?2",
             params![run_id, automation_id],
             |row| row.get(0),
         )
@@ -377,15 +405,7 @@ pub(crate) fn repo_finish_run(
     if current_status != AutomationRunStatus::Running.as_str() {
         return Err(RepoError::Immutable);
     }
-    let summary = result_summary.map(policy::clamp_result_summary);
-    conn.execute(
-        "UPDATE automation_runs SET status=?2, finished_at=?3, result_summary=?4 WHERE id=?1",
-        params![run_id, status.as_str(), ts(now), summary],
-    )?;
-    conn.execute(
-        "UPDATE automations SET last_run_at=?2, last_run_status=?3, last_result_summary=?4 WHERE id=?1",
-        params![automation_id, ts(now), status.as_str(), summary],
-    )?;
+    repo_finish_run_record(conn, run_id, automation_id, status, result_summary, now)?;
     repo_prune_runs(conn, automation_id)?;
     Ok(())
 }
@@ -395,17 +415,17 @@ pub(crate) fn repo_finish_run(
 /// pruned here.
 pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<(), RepoError> {
     let deleted = conn.execute(
-        "DELETE FROM automation_runs
+        "DELETE FROM automation_run_records
          WHERE automation_id=?1
            AND status <> 'running'
            AND (julianday(finished_at) < julianday('now', '-90 days') OR id NOT IN (
-             SELECT id FROM automation_runs WHERE automation_id=?1
+             SELECT id FROM automation_run_records WHERE automation_id=?1
              ORDER BY created_at DESC LIMIT ?2
            ))
            AND NOT EXISTS (
              SELECT 1 FROM work_automation_runs wr
              JOIN work_approvals wa ON wa.work_identity = wr.work_identity
-             WHERE wr.automation_run_identity = automation_runs.id
+             WHERE wr.automation_run_identity = automation_run_records.id
                AND wa.state = 'pending'
            )",
         params![automation_id, policy::RUN_HISTORY_RETAINED as i64],
@@ -424,18 +444,13 @@ pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<
 /// Concise redacted lifecycle event: ids/status/next-run only, no prompts or
 /// summaries — clients refetch the authoritative record.
 fn project_automation_definition_event(
-    state: &AppState,
-    event_type: &str,
-    a_id: &str,
-    extra: serde_json::Value,
+    _state: &AppState,
+    _event_type: &str,
+    _a_id: &str,
+    _extra: serde_json::Value,
 ) {
-    let mut ev = json!({"type": event_type, "automation_id": a_id});
-    if let (Some(obj), Some(x)) = (ev.as_object_mut(), extra.as_object()) {
-        for (k, v) in x {
-            obj.insert(k.clone(), v.clone());
-        }
-    }
-    state.project_legacy_event(ev);
+    // Definition changes wake the scheduler. The canonical Work outbox is the
+    // only lifecycle event source; the old daemon-wide stream is gone.
 }
 
 fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
@@ -798,23 +813,12 @@ use bagentd::automation_sessions::{
 };
 use basert_connector::Message;
 
-fn is_evidence_event(event: &serde_json::Value) -> bool {
-    matches!(
-        event.get("type").and_then(serde_json::Value::as_str),
-        Some(
-            "evidence_phase"
-                | "logical_activity_started"
-                | "logical_activity_completed"
-                | "evidence_validation"
-                | "evidence_polish"
-                | "evidence_outcome"
-        )
-    )
-}
-
 fn safe_activity_from_event(event: &serde_json::Value) -> Option<SafeActivity> {
     let category = match event.get("type").and_then(serde_json::Value::as_str)? {
         "evidence_phase" => "evidence_phase",
+        "activity_started" => "activity_started",
+        "activity_completed" => "activity_completed",
+        "tool_call" => "tool_call",
         "logical_activity_started" => "activity_started",
         "logical_activity_completed" => "activity_completed",
         "evidence_validation" => "evidence_validation",
@@ -827,6 +831,26 @@ fn safe_activity_from_event(event: &serde_json::Value) -> Option<SafeActivity> {
         caption: "Bezpečná aktivita automatizácie".to_owned(),
         safety_relevant: category == "activity_completed" || category == "evidence_outcome",
     })
+}
+
+fn safe_activity_timeline(
+    result: &Result<ExecOutcome, ExecError>,
+    timeline: Vec<SafeActivity>,
+) -> Vec<SafeActivity> {
+    if timeline.is_empty()
+        && result
+            .as_ref()
+            .map(|outcome| outcome.tool_calls_used > 0)
+            .unwrap_or(false)
+    {
+        vec![SafeActivity {
+            category: "tool_call".to_owned(),
+            caption: "Bezpečná aktivita automatizácie".to_owned(),
+            safety_relevant: false,
+        }]
+    } else {
+        timeline
+    }
 }
 
 /// Prepare an occurrence for authoritative admission by Work Coordinator.
@@ -1076,11 +1100,10 @@ pub(crate) async fn execute_automation_run(
 
     let tools = agent_exec::build_tools(&state, false).await;
 
-    // Automations have no attached chat stream. Evidence events still use the
-    // same contract and are forwarded onto the daemon-wide event stream.
+    // Automations have no attached chat stream. Their privacy-safe activity
+    // timeline is retained in the canonical Automation Session.
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
     let sink = EventSink::with_diagnostics(ev_tx, state.evidence_diagnostics.clone());
-    let event_state = state.clone();
     let activity_timeline = Arc::new(Mutex::new(Vec::<SafeActivity>::new()));
     let activity_timeline_for_drain = activity_timeline.clone();
     let drain = tokio::spawn(async move {
@@ -1089,9 +1112,6 @@ pub(crate) async fn execute_automation_run(
                 if let Ok(mut timeline) = activity_timeline_for_drain.lock() {
                     timeline.push(activity);
                 }
-            }
-            if is_evidence_event(&event) {
-                event_state.project_legacy_event(event);
             }
         }
     });
@@ -1140,6 +1160,10 @@ pub(crate) async fn execute_automation_run(
         Ok(outcome) if !outcome.final_text.trim().is_empty() => Some(outcome.final_text.clone()),
         _ => None,
     };
+    let activity_timeline = activity_timeline
+        .lock()
+        .map(|timeline| timeline.clone())
+        .unwrap_or_default();
     let terminalization = AutomationTerminalization {
         snapshot: AutomationTaskSnapshot {
             automation_identity: automation.id.to_string(),
@@ -1156,10 +1180,7 @@ pub(crate) async fn execute_automation_run(
         finished_at: now.to_rfc3339(),
         result_summary: Some(summary.clone()),
         final_output,
-        activity_timeline: activity_timeline
-            .lock()
-            .map(|timeline| timeline.clone())
-            .unwrap_or_default(),
+        activity_timeline: safe_activity_timeline(&result, activity_timeline),
         validated_sources: Vec::new(),
         connector_references: Vec::new(),
         historical_approvals: Vec::new(),
@@ -1178,8 +1199,18 @@ pub(crate) async fn execute_automation_run(
     }
     {
         let conn = state.db.lock().await;
+        if let Err(error) = repo_finish_run_record(
+            &conn,
+            &run.id.to_string(),
+            &automation.id.to_string(),
+            status,
+            Some(&summary),
+            now,
+        ) {
+            tracing::warn!(?error, "automation run terminal record update failed");
+        }
         if let Err(error) = repo_prune_runs(&conn, &automation.id.to_string()) {
-            tracing::warn!(?error, "legacy automation run retention cleanup failed");
+            tracing::warn!(?error, "automation run retention cleanup failed");
         }
     }
     audit_fs(
@@ -1284,22 +1315,6 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 17, 10, 0, 0).unwrap()
-    }
-
-    #[test]
-    fn automation_stream_forwards_only_the_shared_evidence_contract() {
-        for event_type in [
-            "evidence_phase",
-            "logical_activity_started",
-            "logical_activity_completed",
-            "evidence_validation",
-            "evidence_polish",
-            "evidence_outcome",
-        ] {
-            assert!(is_evidence_event(&json!({"type": event_type})));
-        }
-        assert!(!is_evidence_event(&json!({"type": "token"})));
-        assert!(!is_evidence_event(&json!({"type": "activity_completed"})));
     }
 
     fn once_at(h: u32) -> AutomationSchedule {
@@ -1472,7 +1487,7 @@ mod tests {
             };
             repo_insert_run(&conn, &r).unwrap();
             conn.execute(
-                "UPDATE automation_runs SET status='completed' WHERE id=?1",
+                "UPDATE automation_run_records SET status='completed' WHERE id=?1",
                 params![r.id.to_string()],
             )
             .unwrap();
@@ -1480,7 +1495,7 @@ mod tests {
         repo_prune_runs(&conn, &id).unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM automation_runs WHERE automation_id=?1",
+                "SELECT COUNT(*) FROM automation_run_records WHERE automation_id=?1",
                 params![id],
                 |r| r.get(0),
             )
@@ -1490,7 +1505,9 @@ mod tests {
         // historical run data for the Automation Session history surface.
         repo_delete(&conn, &id).unwrap();
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM automation_runs", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM automation_run_records", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(left, policy::RUN_HISTORY_RETAINED as i64);
     }
@@ -1697,5 +1714,45 @@ mod tests {
             repo_run(&conn, &other.id.to_string(), &target.id.to_string()),
             Err(RepoError::NotFound)
         ));
+    }
+
+    #[test]
+    fn safe_activity_projection_keeps_tool_lifecycle_without_tool_payload() {
+        let activity = safe_activity_from_event(&json!({
+            "type": "activity_started",
+            "tool": "filesystem_read_text",
+            "detail": "/private/disposable/path"
+        }))
+        .expect("tool lifecycle should be retained as safe activity");
+        assert_eq!(activity.category, "activity_started");
+        assert_eq!(activity.caption, "Bezpečná aktivita automatizácie");
+        assert!(!activity.safety_relevant);
+    }
+
+    #[test]
+    fn safe_activity_projection_keeps_tool_marker_without_tool_payload() {
+        let activity = safe_activity_from_event(&json!({
+            "type": "tool_call",
+            "tool": "filesystem_read_text"
+        }))
+        .expect("tool marker should be retained as safe activity");
+        assert_eq!(activity.category, "tool_call");
+        assert_eq!(activity.caption, "Bezpečná aktivita automatizácie");
+        assert!(!activity.safety_relevant);
+    }
+
+    #[test]
+    fn safe_activity_timeline_records_generic_tool_use_when_events_are_missing() {
+        let result = Ok(ExecOutcome {
+            final_text: "done".to_owned(),
+            tool_calls_used: 1,
+            approvals_denied: 0,
+            validated_sources: Vec::new(),
+        });
+        let timeline = safe_activity_timeline(&result, Vec::new());
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].category, "tool_call");
+        assert_eq!(timeline[0].caption, "Bezpečná aktivita automatizácie");
+        assert!(!timeline[0].safety_relevant);
     }
 }

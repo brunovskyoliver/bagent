@@ -26,9 +26,6 @@ enum DaemonLaunchAgent {
             "BAGENT_SYNTHESIS_MODEL_PATH":
                 ModelRuntimeConfiguration.cachedModelURL(ModelRuntimeConfiguration.synthesisModel).path,
         ]
-        if let evidenceRouting = processEnvironment["BAGENT_EVIDENCE_ORCHESTRATOR"] {
-            environment["BAGENT_EVIDENCE_ORCHESTRATOR"] = evidenceRouting
-        }
         if processEnvironment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"] == "1" {
             environment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"] = "1"
         }
@@ -143,9 +140,6 @@ final class DaemonLauncher {
     // MARK: - launchd
 
     private func installAndStart(binary: URL) async {
-        // The evidence value is passed through so an explicit local `0` can
-        // roll routing back and invalid values can be normalized by the daemon.
-        // Acceptance fixtures still require the exact opt-in value.
         let processEnvironment = ProcessInfo.processInfo.environment
         let env = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: processEnvironment)
         let plist = DaemonLaunchAgent.plistContent(binaryPath: binary.path, environment: env)

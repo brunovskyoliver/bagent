@@ -2,28 +2,13 @@ import XCTest
 @testable import bagent
 
 final class DaemonLaunchAgentTests: XCTestCase {
-    func testRuntimeEnvironmentPreservesExplicitEvidenceRollbackOnly() {
-        let rollback = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "0",
+    func testRuntimeEnvironmentDropsRemovedAuthoritySwitch() {
+        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
             "BAGENT_STAGE8_ACCEPTANCE_FIXTURES": "0",
         ])
-        XCTAssertEqual(rollback["BAGENT_EVIDENCE_ORCHESTRATOR"], "0")
-        XCTAssertNil(rollback["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
-
-        let invalid = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "unexpected",
-        ])
-        XCTAssertEqual(invalid["BAGENT_EVIDENCE_ORCHESTRATOR"], "unexpected")
-
-        let ordinary = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [:])
-        XCTAssertNil(ordinary["BAGENT_EVIDENCE_ORCHESTRATOR"])
-        XCTAssertNil(ordinary["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
-        XCTAssertNil(ordinary["BAGENT_SYNTHESIS_FALLBACK_MODEL_PATH"])
-        XCTAssertNotNil(ordinary["BAGENT_CHAT_MODEL_PATH"])
-
-        var rollbackWithoutRouting = rollback
-        rollbackWithoutRouting.removeValue(forKey: "BAGENT_EVIDENCE_ORCHESTRATOR")
-        XCTAssertEqual(rollbackWithoutRouting, ordinary)
+        XCTAssertNil(environment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+        XCTAssertNil(environment["BAGENT_SYNTHESIS_FALLBACK_MODEL_PATH"])
+        XCTAssertNotNil(environment["BAGENT_CHAT_MODEL_PATH"])
     }
 
     func testPlistContainsBinaryLabelAndSortedEnv() throws {
@@ -49,16 +34,17 @@ final class DaemonLaunchAgentTests: XCTestCase {
         XCTAssertEqual(parsed?["Label"] as? String, "com.bagent.daemon")
     }
 
-    func testPlistEscapesExplicitInvalidEvidenceValueWithoutChangingIt() throws {
-        let value = "unexpected<&\"value"
+    func testPlistDoesNotAddRemovedAuthoritySwitch() throws {
         let plist = DaemonLaunchAgent.plistContent(
             binaryPath: "/Applications/bagent.app/Contents/MacOS/bagentd",
-            environment: ["BAGENT_EVIDENCE_ORCHESTRATOR": value]
+            environment: DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
+                "BAGENT_STAGE8_ACCEPTANCE_FIXTURES": "0",
+            ])
         )
         let parsed = try PropertyListSerialization.propertyList(
             from: Data(plist.utf8), options: [], format: nil
         ) as? [String: Any]
         let environment = parsed?["EnvironmentVariables"] as? [String: String]
-        XCTAssertEqual(environment?["BAGENT_EVIDENCE_ORCHESTRATOR"], value)
+        XCTAssertNil(environment?["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
     }
 }

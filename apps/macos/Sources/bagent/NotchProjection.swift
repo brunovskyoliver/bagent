@@ -340,12 +340,6 @@ struct NotchPresentation: Equatable, Sendable, CustomDebugStringConvertible, Cus
         )
     }()
 
-    var isThinking: Bool {
-        hasActiveForegroundWork
-    }
-
-    var isExpanded: Bool { interactionMode != .collapsed && interactionMode != .thinking }
-
     var canOpenFocusedDestination: Bool { focusedDestination != nil }
 
     var debugDescription: String {

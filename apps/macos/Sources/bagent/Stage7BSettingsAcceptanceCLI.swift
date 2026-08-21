@@ -88,7 +88,13 @@ enum Stage7BSettingsAcceptanceCLI {
                     // without changing the user's display preference.
                     .environment(\.compassRailHighContrast, variant == "high-contrast")
                     .contrast(variant == "high-contrast" ? 1.5 : 1)
-                    let host = NSHostingView(rootView: root)
+                    let themedRoot: AnyView
+                    switch variant {
+                    case "light": themedRoot = AnyView(root.environment(\.colorScheme, .light))
+                    case "dark": themedRoot = AnyView(root.environment(\.colorScheme, .dark))
+                    default: themedRoot = AnyView(root)
+                    }
+                    let host = NSHostingView(rootView: themedRoot)
                     host.frame = CGRect(x: 0, y: 0, width: CGFloat(panelWidth), height: 318)
                     host.layoutSubtreeIfNeeded()
                     try await Task.sleep(for: .milliseconds(40))
@@ -119,6 +125,7 @@ enum Stage7BSettingsAcceptanceCLI {
 
         let evidence: [String: Any] = [
             "variant": variant,
+            "color_scheme": ["light", "dark"].contains(variant) ? variant : "system",
             "route_count": CompassRailStateCatalog.routes.count,
             "rendered_image_count": renderedRoutes.count,
             "routes": renderedRoutes,
@@ -370,7 +377,7 @@ enum Stage7BSettingsAcceptanceCLI {
             valuesByLabel[label] = value
         }
         guard labelledValues == expected else {
-            throw LiveAccessibilityError.assertion("AX value set mismatch for \(route.identifier)")
+            throw LiveAccessibilityError.assertion("AX value set mismatch for \(route.identifier): actual=\(labelledValues), expected=\(expected)")
         }
         assertions += expected.count
         if expected.isEmpty {
@@ -397,7 +404,7 @@ enum Stage7BSettingsAcceptanceCLI {
                 "Changed-PID recovery": state.changedPIDRecovery,
             ]
         case .area(.integrations):
-            return ["Apple Mail": "Permission required", "Apple Notes": "Permission required", "WhatsApp": "Not tested", "Odoo": "Testing", "Codex": "Testing", "Connector service": "Local service unavailable"]
+            return ["Apple Mail": "Testing", "Apple Notes": "Testing", "WhatsApp": "Not tested", "Odoo": "Testing", "Codex": "Testing", "Connector service": "Local service unavailable"]
         case .area(.privacyAndPermissions):
             return ["Full Disk Access": "Needs setup", "Screen Recording": "Needs setup", "Accessibility": "Needs setup", "Rules and approval policy": "Daemon-owned"]
         case .child(.whatsapp), .child(.odoo), .child(.codex):

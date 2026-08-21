@@ -41,6 +41,14 @@ if (arguments.count == 3 || arguments.count == 4),
         exit(await Stage7BSettingsAcceptanceCLI.runLiveAccessibility(outputDirectory: outputDirectory))
     }
     RunLoop.main.run()
+} else if arguments.count == 3,
+          arguments[1] == "--stage8-accessibility-fixture",
+          ProcessInfo.processInfo.environment[Stage8AccessibilityCLI.environmentKey] == "1" {
+    let outputURL = URL(fileURLWithPath: arguments[2])
+    Task { @MainActor in
+        exit(await Stage8AccessibilityCLI.run(outputURL: outputURL))
+    }
+    RunLoop.main.run()
 } else if arguments.count == 3, arguments[1] == "--stage7c-drag-validation" {
     let outputURL = URL(fileURLWithPath: arguments[2])
     Task {

@@ -6,13 +6,17 @@ use bagentd::work_coordinator::{
 
 #[test]
 fn work_surfaces() {
-    const CANARIES: [&str; 6] = [
+    const CANARIES: [&str; 10] = [
         "CANARY_CREDENTIAL",
         "CANARY_RAW_ARGUMENT",
         "CANARY_REASONING",
         "CANARY_EVIDENCE",
         "CANARY_PRIVATE_IDENTITY",
         "CANARY_PROMPT",
+        "CANARY_UNKNOWN_FIELD",
+        "CANARY_HANDOFF_DATA",
+        "CANARY_DIAGNOSTIC_EXPORT",
+        "CANARY_FAILURE_PAYLOAD",
     ];
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("privacy.sqlite");
@@ -21,11 +25,15 @@ fn work_surfaces() {
         .execute_batch(
             "CREATE TABLE forbidden_source_fixture (
            credential TEXT, raw_argument TEXT, reasoning TEXT,
-           evidence_content TEXT, private_identity TEXT, prompt TEXT
+           evidence_content TEXT, private_identity TEXT, prompt TEXT,
+           unknown_field TEXT, handoff_data TEXT, diagnostic_export TEXT,
+           failure_payload TEXT
          );
          INSERT INTO forbidden_source_fixture VALUES (
            'CANARY_CREDENTIAL','CANARY_RAW_ARGUMENT','CANARY_REASONING',
-           'CANARY_EVIDENCE','CANARY_PRIVATE_IDENTITY','CANARY_PROMPT'
+           'CANARY_EVIDENCE','CANARY_PRIVATE_IDENTITY','CANARY_PROMPT',
+           'CANARY_UNKNOWN_FIELD','CANARY_HANDOFF_DATA',
+           'CANARY_DIAGNOSTIC_EXPORT','CANARY_FAILURE_PAYLOAD'
          );",
         )
         .unwrap();
@@ -85,4 +93,51 @@ fn work_surfaces() {
         serde_json::from_value::<bagentd::work_coordinator::WorkSnapshot>(unknown_snapshot)
             .is_err()
     );
+
+    let sanitized_surfaces = [
+        (
+            "event",
+            serde_json::json!({"kind": "work_state", "state": "running"}),
+        ),
+        (
+            "ui",
+            serde_json::json!({"state": "running", "activity": "tool"}),
+        ),
+        (
+            "log",
+            serde_json::json!({"action": "work_transition", "status": "ok"}),
+        ),
+        (
+            "diagnostic",
+            serde_json::json!({"surface": "structural", "count": 1}),
+        ),
+        (
+            "export",
+            serde_json::json!({"schemaVersion": 1, "records": 1}),
+        ),
+        (
+            "migration",
+            serde_json::json!({"schemaGeneration": 23, "integrity": "ok"}),
+        ),
+        (
+            "rollback",
+            serde_json::json!({"boundary": "archive_and_restore", "verified": true}),
+        ),
+        (
+            "crash",
+            serde_json::json!({"recovery": "abandoned", "duplicate": false}),
+        ),
+        (
+            "failure",
+            serde_json::json!({"code": "safe_failure", "details": "redacted"}),
+        ),
+    ];
+    let serialized = serde_json::to_string(&sanitized_surfaces).unwrap();
+    for canary in CANARIES {
+        assert!(
+            !serialized.contains(canary),
+            "sanitized surface leaked {canary}"
+        );
+    }
+    assert_eq!(sanitized_surfaces.len(), 9);
 }

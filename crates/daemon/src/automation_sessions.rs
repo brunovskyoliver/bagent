@@ -282,9 +282,6 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), AutomationSessio
             source_deleted INTEGER NOT NULL DEFAULT 0 CHECK (source_deleted IN (0, 1)),
             created_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS automation_session_pending_approvals (
-            automation_session_identity TEXT PRIMARY KEY
-        );
         CREATE TABLE IF NOT EXISTS automation_retention_audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             deleted_count INTEGER NOT NULL
@@ -320,6 +317,15 @@ fn ensure_safe_record_columns(connection: &Connection) -> Result<(), AutomationS
         }
     }
     Ok(())
+}
+
+fn work_approvals_table_exists(connection: &Connection) -> Result<bool, AutomationSessionError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='work_approvals')",
+        [],
+        |row| Ok(row.get::<_, i64>(0)? != 0),
+    )?)
 }
 
 pub fn register_definition(
@@ -688,51 +694,6 @@ pub(crate) fn terminalize_automation_session_in_transaction(
         ));
     }
 
-    // The legacy run table remains a compatibility record, but its terminal
-    // outcome is committed in the same transaction when it exists. Standalone
-    // contract tests intentionally omit that table.
-    let has_legacy_runs: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master
-             WHERE type='table' AND name='automation_runs')",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_legacy_runs {
-        let current_status: Option<String> = transaction
-            .query_row(
-                "SELECT status FROM automation_runs WHERE id=?1",
-                params![snapshot.automation_run_identity],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(current_status) = current_status {
-            if current_status == "running" {
-                transaction.execute(
-                    "UPDATE automation_runs
-                     SET status=?1, finished_at=?2, result_summary=?3
-                     WHERE id=?4 AND status='running'",
-                    params![
-                        outcome,
-                        bounded.finished_at,
-                        bounded.result_summary,
-                        snapshot.automation_run_identity
-                    ],
-                )?;
-            } else if !matches!(bounded.outcome, AutomationRunOutcome::Skipped) {
-                return Err(AutomationSessionError::Immutable);
-            }
-        }
-        transaction.execute(
-            "UPDATE automations SET last_run_at=?1, last_run_status=?2, last_result_summary=?3
-             WHERE id=?4",
-            params![
-                bounded.finished_at,
-                outcome,
-                bounded.result_summary,
-                snapshot.automation_identity,
-            ],
-        )?;
-    }
     transaction.execute(
         "INSERT INTO automation_terminal_outbox
          (automation_session_identity, automation_run_identity, outcome, emitted_at)
@@ -831,12 +792,23 @@ pub fn delete_automation_session(
         )
         .optional()?
         .ok_or(AutomationSessionError::NotFound)?;
-    let pending: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM automation_session_pending_approvals
-             WHERE automation_session_identity=?1)",
-        params![automation_session_identity],
-        |row| Ok(row.get::<_, i64>(0)? != 0),
-    )?;
+    let pending = if work_approvals_table_exists(connection)? {
+        connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM automation_work_states w
+                 JOIN work_approvals p ON p.work_identity=w.work_identity
+                 WHERE w.automation_run_identity=(
+                     SELECT automation_run_identity FROM automation_sessions
+                     WHERE automation_session_identity=?1
+                 ) AND p.state='pending'
+             )",
+            params![automation_session_identity],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )?
+    } else {
+        false
+    };
     if pending {
         return Err(AutomationSessionError::ActiveWork(
             "pending approval".to_owned(),
@@ -1010,18 +982,28 @@ pub fn prune_automation_sessions(
         })?
         .with_timezone(&Utc);
     let cutoff = now - Duration::days(90);
-    let mut statement = connection.prepare(
+    let pending_expression = if work_approvals_table_exists(connection)? {
+        "EXISTS(
+            SELECT 1
+            FROM automation_work_states wp
+            JOIN work_approvals p ON p.work_identity=wp.work_identity
+            WHERE wp.automation_run_identity=s.automation_run_identity
+              AND p.state='pending'
+        )"
+    } else {
+        "0"
+    };
+    let mut statement = connection.prepare(&format!(
         "SELECT s.automation_session_identity, s.automation_run_identity, s.finished_at,
                 (SELECT work_identity FROM automation_work_states w
                  WHERE w.automation_run_identity=s.automation_run_identity),
-                EXISTS(SELECT 1 FROM automation_session_pending_approvals p
-                       WHERE p.automation_session_identity=s.automation_session_identity)
+                {pending_expression}
          FROM automation_sessions s
          JOIN automation_task_snapshots t
            ON t.automation_session_identity=s.automation_session_identity
          WHERE t.automation_identity=?1
-         ORDER BY s.finished_at DESC, s.automation_run_identity ASC",
-    )?;
+         ORDER BY s.finished_at DESC, s.automation_run_identity ASC"
+    ))?;
     let candidates = statement
         .query_map(params![automation_identity], |row| {
             Ok((

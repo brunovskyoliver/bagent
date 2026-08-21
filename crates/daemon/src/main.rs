@@ -14,7 +14,7 @@ use axum::{
     Json, Router,
 };
 use bagent_agent::{
-    AgentInference, PromptBuilder, PromptTrace, ScreenIntentClassifier, SelectedSkill, TaskRater,
+    AgentInference, PromptBuilder, ScreenIntentClassifier, SelectedSkill, TaskRater,
 };
 use bagent_attachments::extract as extract_attachment;
 use bagent_memory::MemoryStore;
@@ -50,7 +50,7 @@ use odoo_connector::{OdooConfig, OdooConnector, OdooError, OdooRecordRef};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, convert::Infallible, io::Write, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
@@ -73,11 +73,9 @@ struct AppState {
     db_path: PathBuf,
     token: String,
     default_model: String,
-    debug_dir: PathBuf,
     /// Small fast model for intent/correction classifiers — never blocks chat TTFT.
     classifier_model: String,
     /// Local opt-in rollback flag for deterministic typed Mail/web evidence routing.
-    evidence_orchestrator: agent_exec::EvidenceOrchestratorFlag,
     attachments_dir: PathBuf,
     model_runtime: Arc<ModelRuntime>,
     work_authority: Arc<UnifiedWorkAuthority>,
@@ -116,23 +114,12 @@ struct AppState {
     /// Pinged whenever an automation is created/edited/enabled/disabled/deleted
     /// so the scheduler recomputes its next wake-up immediately.
     automations_changed: Arc<tokio::sync::Notify>,
-    /// Daemon-wide event broadcast (GET /events): automation lifecycle +
-    /// background approval notifications. Payloads are concise and redacted —
-    /// clients refetch authoritative records.
-    legacy_projection_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// The current Swift projection consumer. A newer snapshot claim fences
     /// every older UI process without affecting daemon-owned Work.
     ui_consumer_authority: Arc<Mutex<UiConsumerAuthority>>,
     ui_consumer_authority_path: PathBuf,
     /// The daemon process that owns Mail and Notes access performs this probe.
     full_disk_access_probe: Arc<DaemonFullDiskAccessProbe>,
-}
-
-impl AppState {
-    /// Fire-and-forget daemon-wide event. Lagging/absent subscribers are fine.
-    fn project_legacy_event(&self, event: serde_json::Value) {
-        let _ = self.legacy_projection_tx.send(event);
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -166,31 +153,6 @@ struct ChatRequest {
     /// Values: mail, filesystem, whatsapp, odoo.
     #[serde(default)]
     source_mode: Option<String>,
-}
-
-#[derive(Serialize)]
-struct PromptDebugRecord {
-    prompt_trace_id: String,
-    session_id: String,
-    created_at: String,
-    user_message: String,
-    model: String,
-    language: String,
-    prompt_chars: usize,
-    prompt_token_estimate: usize,
-    message_count: usize,
-    prompt_messages: Vec<PromptDebugMessage>,
-    trace: PromptTrace,
-    response_preview: String,
-    response_chars: usize,
-    elapsed_ms: u128,
-}
-
-#[derive(Serialize)]
-struct PromptDebugMessage {
-    role: String,
-    content: String,
-    images_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -260,8 +222,8 @@ fn default_limit() -> usize {
 }
 
 /// Stable reference to a found mail message — surfaced to the frontend so
-/// Stable reference to the most recently found local file/folder, persisted in
-/// `sessions.metadata_json` so cross-turn references ("open it", "otvor ho") resolve correctly.
+/// Stable reference to the most recently found local file/folder used by the
+/// current chat's bounded runtime reference store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileRef {
     path: String,
@@ -382,8 +344,6 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let attachments_dir = data_dir.join("attachments");
     std::fs::create_dir_all(&attachments_dir)?;
-    let debug_dir = data_dir.join("debug");
-    std::fs::create_dir_all(&debug_dir)?;
     let evidence_diagnostics = Arc::new(evidence::DiagnosticRecorder::new(
         data_dir.join("evidence-diagnostics"),
     )?);
@@ -409,6 +369,8 @@ async fn main() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("recover Current Chat: {error}"))?;
     open_or_create_current_chat(&conn)
         .map_err(|error| anyhow::anyhow!("open Current Chat: {error}"))?;
+    bagentd::cutover::finalize_legacy_boundary(&db_path)
+        .map_err(|error| anyhow::anyhow!("finalize Stage 8 authority boundary: {error}"))?;
     let db = Arc::new(Mutex::new(conn));
 
     let token_path = data_dir.join("daemon.token");
@@ -484,8 +446,6 @@ async fn main() -> Result<()> {
         .initialize()
         .await
         .context("initialize daemon-owned Model Runtime")?;
-    bagentd::cutover::finalize_legacy_boundary(&db_path)
-        .map_err(|error| anyhow::anyhow!("finalize Stage 4 legacy boundary: {error}"))?;
     let daemon_generation = DaemonGeneration::new(Uuid::new_v4().to_string());
     let work_authority = Arc::new(UnifiedWorkAuthority::new(
         Arc::new(
@@ -523,13 +483,6 @@ async fn main() -> Result<()> {
     let mem_db = Arc::new(std::sync::Mutex::new(mem_conn));
     let memory = Arc::new(MemoryStore::new(mem_db).with_data_dir(data_dir.clone()));
     let prompt_builder = Arc::new(PromptBuilder::new());
-
-    let evidence_orchestrator = agent_exec::EvidenceOrchestratorFlag::from_local_env();
-    tracing::info!(
-        enabled = evidence_orchestrator == agent_exec::EvidenceOrchestratorFlag::Enabled,
-        env = agent_exec::EVIDENCE_ORCHESTRATOR_FLAG_ENV,
-        "typed evidence production routing"
-    );
 
     // Automated mail sync: battery-aware interval poller
     // On AC power:      every 5 minutes
@@ -736,9 +689,7 @@ async fn main() -> Result<()> {
         db_path,
         token,
         default_model,
-        debug_dir,
         classifier_model,
-        evidence_orchestrator,
         attachments_dir,
         model_runtime,
         work_authority,
@@ -760,38 +711,11 @@ async fn main() -> Result<()> {
         whatsapp,
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
-        legacy_projection_tx: tokio::sync::broadcast::channel(256).0,
         ui_consumer_authority: Arc::new(Mutex::new(ui_consumer_authority)),
         ui_consumer_authority_path,
         full_disk_access_probe: Arc::new(full_disk_access_probe),
     };
     state.synthesis.start_maintenance().await;
-
-    let work_projection_state = state.clone();
-    tokio::spawn(async move {
-        let mut cursor = work_projection_state
-            .work_authority
-            .coordinator()
-            .snapshot()
-            .map(|snapshot| snapshot.cursor)
-            .unwrap_or_default();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if let Ok(bagentd::work_coordinator::EventRead::Events(events)) =
-                work_projection_state.work_authority.coordinator().events(
-                    Some(cursor),
-                    work_projection_state.work_authority.generation(),
-                )
-            {
-                for event in events {
-                    cursor = event.event_cursor;
-                    if let Ok(value) = serde_json::to_value(event) {
-                        work_projection_state.project_legacy_event(value);
-                    }
-                }
-            }
-        }
-    });
 
     // Daemon-owned automation scheduler: recovery at startup, then sleeps
     // until the next due instant (woken immediately by automations_changed).
@@ -802,7 +726,6 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/permissions/full-disk-access", get(full_disk_access))
-        .route("/events", get(events_stream))
         .route("/work/snapshot", get(work_snapshot))
         .route("/work/snapshot/read", get(work_snapshot_read))
         .route("/work/events", get(work_events))
@@ -903,9 +826,6 @@ async fn main() -> Result<()> {
         // Phase 4G — Disk usage
         .route("/usage", get(disk_usage))
         .route("/mail/cache/clear", post(mail_cache_clear))
-        // Phase 4H — Prompt trace debug
-        .route("/debug/conversations/:id", get(debug_conversation))
-        .route("/debug/traces/:id", get(debug_trace))
         .route(
             "/diagnostics/evidence/:turn_id/export",
             get(evidence_diagnostic_export),
@@ -1658,7 +1578,7 @@ async fn disk_usage(State(state): State<AppState>) -> impl IntoResponse {
 
     let attachments_bytes = dir_size(&state.attachments_dir);
 
-    let (memory_items_count, chat_turns_count, mail_cache_count, embeddings_count): (
+    let (memory_items_count, current_chat_turns_count, mail_cache_count, embeddings_count): (
         i64,
         i64,
         i64,
@@ -1669,7 +1589,7 @@ async fn disk_usage(State(state): State<AppState>) -> impl IntoResponse {
             .query_row("SELECT COUNT(*) FROM memory_items", [], |r| r.get(0))
             .unwrap_or(0);
         let ct: i64 = db
-            .query_row("SELECT COUNT(*) FROM chat_turns", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM current_chat_turns", [], |r| r.get(0))
             .unwrap_or(0);
         let mail: i64 = db
             .query_row("SELECT COUNT(*) FROM mail_cache", [], |r| r.get(0))
@@ -1688,7 +1608,7 @@ async fn disk_usage(State(state): State<AppState>) -> impl IntoResponse {
             "db_bytes": db_bytes,
             "attachments_bytes": attachments_bytes,
             "memory_items_count": memory_items_count,
-            "chat_turns_count": chat_turns_count,
+            "current_chat_turns_count": current_chat_turns_count,
             "mail_cache_count": mail_cache_count,
             "embeddings_count": embeddings_count,
             "total_bytes": total_bytes
@@ -1705,40 +1625,6 @@ async fn mail_cache_clear(State(state): State<AppState>) -> impl IntoResponse {
         )
         .unwrap_or(0);
     (StatusCode::OK, Json(serde_json::json!({ "deleted": n })))
-}
-
-async fn debug_trace(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    match find_prompt_debug_record(&state.debug_dir, |v| {
-        v.get("prompt_trace_id").and_then(|x| x.as_str()) == Some(id.as_str())
-    }) {
-        Ok(Some(record)) => (StatusCode::OK, Json(record)),
-        Ok(None) => {
-            let matching_session_traces = read_prompt_debug_records(&state.debug_dir)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|v| v.get("session_id").and_then(|x| x.as_str()) == Some(id.as_str()))
-                .map(|v| {
-                    serde_json::json!({
-                        "prompt_trace_id": v.get("prompt_trace_id").cloned().unwrap_or_default(),
-                        "created_at": v.get("created_at").cloned().unwrap_or_default(),
-                        "user_message": v.get("user_message").cloned().unwrap_or_default(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "trace not found",
-                    "hint": "This may be a conversation/session id. Use /debug/conversations/:id, or one of matching_prompt_traces with /debug/traces/:prompt_trace_id.",
-                    "matching_prompt_traces": matching_session_traces,
-                })),
-            )
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
 }
 
 async fn evidence_diagnostic_export(
@@ -1796,154 +1682,6 @@ async fn skills_get(State(state): State<AppState>, Path(name): Path<String>) -> 
     }
 }
 
-// ── Debug: context plan ───────────────────────────────────────────────────────
-
-async fn debug_conversation(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let (session, turns, stats) = {
-        let db = state.db.lock().await;
-        let session: Option<serde_json::Value> = db
-            .query_row(
-                "SELECT id, started_at, ended_at, language, summary, metadata_json \
-                 FROM sessions WHERE id = ?1",
-                rusqlite::params![id],
-                |r| {
-                    Ok(serde_json::json!({
-                        "id": r.get::<_, String>(0)?,
-                        "started_at": r.get::<_, String>(1)?,
-                        "ended_at": r.get::<_, Option<String>>(2)?,
-                        "language": r.get::<_, Option<String>>(3)?,
-                        "summary": r.get::<_, Option<String>>(4)?,
-                        "metadata_json": r.get::<_, Option<String>>(5)?,
-                    }))
-                },
-            )
-            .ok();
-
-        let turns: Vec<serde_json::Value> = db
-            .prepare(
-                "SELECT id, role, content, language, model, created_at FROM chat_turns \
-                 WHERE session_id = ?1 ORDER BY created_at",
-            )
-            .ok()
-            .and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![id], |r| {
-                    let content: String = r.get(2)?;
-                    Ok(serde_json::json!({
-                        "id": r.get::<_, String>(0)?,
-                        "role": r.get::<_, String>(1)?,
-                        "content_preview": preview_text(&content, 500),
-                        "chars": content.len(),
-                        "language": r.get::<_, String>(3)?,
-                        "model": r.get::<_, Option<String>>(4)?,
-                        "created_at": r.get::<_, String>(5)?,
-                    }))
-                })
-                .ok()
-                .map(|rows| rows.flatten().collect())
-            })
-            .unwrap_or_default();
-
-        let stats = serde_json::json!({
-            "memory_items_count": db.query_row("SELECT COUNT(*) FROM memory_items", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
-            "chat_turns_count": db.query_row("SELECT COUNT(*) FROM chat_turns WHERE session_id = ?1", rusqlite::params![id], |r| r.get::<_, i64>(0)).unwrap_or(0),
-            "embeddings_count": db.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
-            "mail_cache_count": db.query_row("SELECT COUNT(*) FROM mail_cache", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
-        });
-        (session, turns, stats)
-    };
-
-    let traces = read_prompt_debug_records(&state.debug_dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|v| v.get("session_id").and_then(|x| x.as_str()) == Some(id.as_str()))
-        .collect::<Vec<_>>();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "conversation_id": id,
-            "session": session,
-            "stats": stats,
-            "turns": turns,
-            "traces": traces,
-        })),
-    )
-}
-
-fn append_prompt_debug_record(
-    debug_dir: &std::path::Path,
-    record: &PromptDebugRecord,
-) -> Result<()> {
-    std::fs::create_dir_all(debug_dir)?;
-    let path = debug_dir.join("prompt-traces.jsonl");
-    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 5 * 1024 * 1024 {
-        let rotated = debug_dir.join("prompt-traces.1.jsonl");
-        let _ = std::fs::remove_file(&rotated);
-        let _ = std::fs::rename(&path, rotated);
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let line = serde_json::to_string(record)?;
-    writeln!(file, "{line}")?;
-    Ok(())
-}
-
-fn read_prompt_debug_records(debug_dir: &std::path::Path) -> Result<Vec<serde_json::Value>> {
-    let path = debug_dir.join("prompt-traces.jsonl");
-    let content = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(e.into()),
-    };
-    Ok(content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .collect())
-}
-
-fn find_prompt_debug_record<F>(
-    debug_dir: &std::path::Path,
-    pred: F,
-) -> Result<Option<serde_json::Value>>
-where
-    F: Fn(&serde_json::Value) -> bool,
-{
-    Ok(read_prompt_debug_records(debug_dir)?
-        .into_iter()
-        .rev()
-        .find(pred))
-}
-
-fn debug_trace_preview(trace: &PromptTrace) -> String {
-    let layers = trace
-        .layers
-        .iter()
-        .filter(|l| l.included)
-        .map(|l| l.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let recall = if trace.past_turn_candidates.is_empty() {
-        "no past-chat candidates".to_string()
-    } else {
-        format!(
-            "{} past-chat candidates not injected",
-            trace.past_turn_candidates.len()
-        )
-    };
-    let mail = trace
-        .mail_search_trace
-        .as_ref()
-        .and_then(|v| v.get("attempts").and_then(|a| a.as_array()).map(Vec::len))
-        .map(|n| format!("; mail search attempts={n}"))
-        .unwrap_or_default();
-    preview_text(&format!("{layers}; {recall}{mail}"), 180)
-}
-
 fn preview_text(s: &str, max: usize) -> String {
     let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.len() <= max {
@@ -1952,24 +1690,6 @@ fn preview_text(s: &str, max: usize) -> String {
         let end = compact.floor_char_boundary(max);
         format!("{}…", &compact[..end])
     }
-}
-
-fn redact_debug_text(s: &str) -> String {
-    s.split_whitespace()
-        .map(|part| {
-            let lower = part.to_ascii_lowercase();
-            if lower.starts_with("bearer")
-                || lower.starts_with("sk-")
-                || lower.contains("api_key")
-                || lower.contains("authorization:")
-            {
-                "[REDACTED]"
-            } else {
-                part
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Returns true when the Mac is connected to AC power (not running on battery).
@@ -2830,33 +2550,6 @@ fn notch_work_value(
     })
 }
 
-/// Daemon-wide SSE stream: automation lifecycle + approval notifications.
-/// Typed envelopes only — clients refetch authoritative records on receipt.
-async fn events_stream(
-    State(state): State<AppState>,
-) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
-    let mut sub = state.legacy_projection_tx.subscribe();
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
-    tokio::spawn(async move {
-        loop {
-            match sub.recv().await {
-                Ok(v) => {
-                    if tx
-                        .send(Ok(Event::default().data(v.to_string())))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
-}
-
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
     match state.model_runtime.models().await {
         Ok(models) => {
@@ -2881,8 +2574,8 @@ async fn approvals_pending(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.lock().await;
     let items: Vec<serde_json::Value> = db
         .prepare(
-            "SELECT id, tool_name, description, expires_at, created_at, origin_json \
-             FROM pending_approvals \
+            "SELECT identity, tool_name, description, expires_at, created_at, origin_json \
+             FROM work_approval_requests \
              WHERE decision IS NULL AND expires_at > datetime('now') \
              ORDER BY created_at",
         )
@@ -2914,19 +2607,16 @@ async fn approval_decide(
 ) -> impl IntoResponse {
     let decision = if req.allow { "allow" } else { "deny" };
     let decided_at = chrono::Utc::now().to_rfc3339();
-    // Read both the compatibility projection and canonical approval before
-    // mutating either.  When this is a Work approval, the coordinator commit
-    // must win first: a failed/stale command must never leave Swift observing
-    // an accepted legacy decision that the authoritative state machine
-    // rejected.
+    // Read the canonical presentation and Work approval before mutating
+    // either. For Work approvals, the coordinator commit wins first.
     let canonical = {
         let db = state.db.lock().await;
         db.query_row(
             "SELECT a.work_identity, w.revision, w.origin_kind
-             FROM pending_approvals p
-             LEFT JOIN work_approvals a ON a.identity=p.id AND a.state='pending'
+             FROM work_approval_requests p
+             LEFT JOIN work_approvals a ON a.identity=p.identity AND a.state='pending'
              LEFT JOIN works w ON w.identity=a.work_identity
-             WHERE p.id=?1 AND p.decision IS NULL AND p.expires_at > ?2",
+             WHERE p.identity=?1 AND p.decision IS NULL AND p.expires_at > ?2",
             rusqlite::params![id, decided_at],
             |row| {
                 Ok((
@@ -2976,8 +2666,8 @@ async fn approval_decide(
     let changed = {
         let db = state.db.lock().await;
         db.execute(
-            "UPDATE pending_approvals SET decision = ?1, decided_at = ?2
-             WHERE id = ?3 AND decision IS NULL AND expires_at > ?2",
+            "UPDATE work_approval_requests SET decision = ?1, decided_at = ?2
+             WHERE identity = ?3 AND decision IS NULL AND expires_at > ?2",
             rusqlite::params![decision, decided_at, id],
         )
         .unwrap_or(0)
@@ -3050,7 +2740,6 @@ async fn chat(
     let db = state.db.clone();
     let user_message = req.message.clone();
     let prompt_builder = state.prompt_builder.clone();
-    let debug_dir = state.debug_dir.clone();
     let attachment_ids = req.attachment_ids.clone();
     // Screen context is text-only: screenshot bytes are intentionally ignored.
     let screen_ocr_text = req.screen_ocr_text.clone();
@@ -3428,8 +3117,6 @@ async fn chat(
         );
 
         // ── Build layered prompt ──────────────────────────────────────────────
-        let prompt_trace_id = Uuid::new_v4().to_string();
-        let mut prompt_trace: Option<PromptTrace> = None;
         let messages = match prompt_builder
             .build(
                 &user_message,
@@ -3477,25 +3164,6 @@ async fn chat(
                     chars: user_message.len(),
                     preview: preview_text(&user_message, 240),
                 });
-                let prompt_chars: usize = built.messages.iter().map(|m| m.content.len()).sum();
-                let _ = tx
-                    .send(Ok(Event::default().data(
-                        serde_json::json!({
-                            "type": "debug_trace",
-                            "prompt_trace_id": &prompt_trace_id,
-                            "session_id": &session_id,
-                            "preview": debug_trace_preview(&built.trace),
-                            "prompt_chars": prompt_chars,
-                            "prompt_token_estimate": prompt_chars / 4,
-                            "message_count": built.messages.len(),
-                            "selected_skill_names": built.trace.selected_skill_names,
-                            "selected_memory_ids": built.trace.selected_memory_ids,
-                            "conversation_recall_injected": built.trace.conversation_recall_injected,
-                        })
-                        .to_string(),
-                    )))
-                    .await;
-                prompt_trace = Some(built.trace);
                 built.messages
             }
             Err(_) => {
@@ -3515,8 +3183,6 @@ async fn chat(
             prompt_chars,
             prompt_chars / 4
         );
-        let prompt_messages_for_log = messages.clone();
-
         // ── Agentic tool loop (shared execution service) ─────────────────────
         // One loop for chat and automations lives in agent_exec. Guardrails
         // live in its dispatcher: rules engine verdicts on the actual args,
@@ -3607,7 +3273,7 @@ async fn chat(
         .await;
         drop(sink);
         let _ = forwarder.await;
-        let full_response = match loop_result {
+        match loop_result {
             Ok(outcome) => {
                 let sources = outcome
                     .validated_sources
@@ -3705,43 +3371,19 @@ async fn chat(
             }
         };
 
-        let response_for_audit = full_response.clone();
         if let Ok(db) = db.try_lock() {
             let _ = db.execute(
                 "INSERT INTO audit_entries (action, payload, model) VALUES (?1, ?2, ?3)",
-                rusqlite::params!["chat", &user_message, &effective_model],
+                rusqlite::params![
+                    "chat",
+                    serde_json::json!({
+                        "message_chars": user_message.chars().count(),
+                        "message_sha256": sha256_str(&user_message),
+                    })
+                    .to_string(),
+                    &effective_model,
+                ],
             );
-        }
-
-        if !acceptance_runtime_active {
-            if let Some(trace) = prompt_trace {
-                let record = PromptDebugRecord {
-                    prompt_trace_id: prompt_trace_id.clone(),
-                    session_id: session_id.clone(),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    user_message: redact_debug_text(&user_message),
-                    model: effective_model.clone(),
-                    language: lang.to_string(),
-                    prompt_chars,
-                    prompt_token_estimate: prompt_chars / 4,
-                    message_count: prompt_messages_for_log.len(),
-                    prompt_messages: prompt_messages_for_log
-                        .iter()
-                        .map(|m| PromptDebugMessage {
-                            role: m.role.clone(),
-                            content: redact_debug_text(&m.content),
-                            images_count: 0,
-                        })
-                        .collect(),
-                    trace,
-                    response_preview: redact_debug_text(&preview_text(&response_for_audit, 600)),
-                    response_chars: response_for_audit.len(),
-                    elapsed_ms: t0.elapsed().as_millis(),
-                };
-                if let Err(e) = append_prompt_debug_record(&debug_dir, &record) {
-                    tracing::warn!("prompt debug log write failed: {e}");
-                }
-            }
         }
 
         let _ = tx
@@ -4392,6 +4034,21 @@ async fn notes_get(State(state): State<AppState>, Path(pk): Path<i64>) -> impl I
 
 // ── Approval helpers ─────────────────────────────────────────────────────────
 
+fn safe_approval_description(tool_name: &str) -> String {
+    format!("Approval required for {}", tool_name.trim())
+}
+
+fn safe_approval_origin(raw: Option<&str>) -> Option<serde_json::Value> {
+    let value = raw.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())?;
+    let kind = value.get("kind").and_then(serde_json::Value::as_str)?;
+    if kind != "automation" {
+        return None;
+    }
+    // Provenance kind is enough for routing. User-authored automation names
+    // are private identities and must not enter the approval projection.
+    Some(serde_json::json!({"kind": kind}))
+}
+
 /// Core approval logic: persist one authoritative request, then observe its
 /// durable decision until the user decides or the 60 s deadline wins.
 ///
@@ -4401,12 +4058,11 @@ async fn notes_get(State(state): State<AppState>, Path(pk): Path<i64>) -> impl I
 async fn request_approval_core(
     state: &AppState,
     tool_name: &str,
-    description: &str,
+    _description: &str,
     sink: Option<&agent_exec::EventSink>,
     origin_json: Option<String>,
     work_context: Option<(CanonicalApprovalWork, agent_exec::ExecOrigin)>,
 ) -> bool {
-    let db = &state.db;
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
@@ -4435,37 +4091,57 @@ async fn request_approval_core(
             .map(|revision| (context.work_identity.clone(), revision, execution_origin))
     });
 
-    if let Ok(db) = db.try_lock() {
-        let _ = db.execute(
-            "INSERT INTO pending_approvals (id, tool_name, description, expires_at, created_at, origin_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![id, tool_name, description, expires_at, now, origin_json],
-        );
+    if work_context.is_some() && canonical_approval.is_none() {
+        return false;
+    }
+    let safe_description = safe_approval_description(tool_name);
+    let safe_origin = safe_approval_origin(origin_json.as_deref());
+    let work_identity = canonical_approval
+        .as_ref()
+        .map(|(work, _, _)| work.as_str().to_owned());
+    {
+        let db = state.db.lock().await;
+        if db
+            .execute(
+                "INSERT INTO work_approval_requests
+                 (identity, work_identity, tool_name, description, expires_at,
+                  created_at, origin_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    id,
+                    work_identity,
+                    tool_name,
+                    safe_description,
+                    expires_at,
+                    now,
+                    safe_origin.as_ref().map(serde_json::Value::to_string),
+                ],
+            )
+            .is_err()
+        {
+            return false;
+        }
     }
 
     let approval_event = serde_json::json!({
         "type":        "approval_requested",
         "id":          id,
         "tool":        tool_name,
-        "description": description,
+        "description": safe_approval_description(tool_name),
         "expires_in":  60,
-        "origin":      origin_json
-            .as_deref()
-            .and_then(|o| serde_json::from_str::<serde_json::Value>(o).ok()),
+        "origin":      safe_origin,
     });
-    // Chat streams get it inline; the daemon-wide broadcast reaches the app
-    // even when no chat stream is open (background automation approvals).
+    // Chat streams get the sanitized event inline. Background approvals are
+    // surfaced by the canonical approval projection.
     if let Some(s) = sink {
         let _ = s.emit(approval_event.clone()).await;
     }
-    state.project_legacy_event(approval_event);
-
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
     loop {
         let decision = {
             let db = state.db.lock().await;
             db.query_row(
-                "SELECT decision FROM pending_approvals WHERE id=?1",
+                "SELECT decision FROM work_approval_requests WHERE identity=?1",
                 rusqlite::params![id],
                 |row| row.get::<_, Option<String>>(0),
             )
@@ -4507,7 +4183,7 @@ async fn request_approval_core(
     let now2 = chrono::Utc::now().to_rfc3339();
     let db = state.db.lock().await;
     let _ = db.execute(
-        "UPDATE pending_approvals SET decision='deny', decided_at=?1 WHERE id=?2 AND decision IS NULL",
+        "UPDATE work_approval_requests SET decision='deny', decided_at=?1 WHERE identity=?2 AND decision IS NULL",
         rusqlite::params![now2, id],
     );
     let _ = db.execute(
@@ -5645,6 +5321,14 @@ mod tests {
         assert!(chat_acceptance_fixture_active(true, false));
         assert!(chat_acceptance_fixture_active(false, true));
         assert!(!chat_acceptance_fixture_active(false, false));
+    }
+
+    #[test]
+    fn approval_origin_drops_private_automation_identity() {
+        let origin = safe_approval_origin(Some(
+            r#"{"kind":"automation","automation_name":"PRIVATE_AUTOMATION"}"#,
+        ));
+        assert_eq!(origin, Some(serde_json::json!({"kind": "automation"})));
     }
 
     #[test]

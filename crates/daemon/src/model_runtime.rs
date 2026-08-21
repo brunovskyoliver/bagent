@@ -1069,7 +1069,14 @@ impl ModelRuntime {
         self.adapter
             .perform(RuntimeAction::VerifyZeroLoadedWeights)
             .await?;
-        self.state.lock().expect("model runtime state").phase = RuntimePhase::Unloaded;
+        let mut state = self.state.lock().expect("model runtime state");
+        state.phase = RuntimePhase::Unloaded;
+        // A newly started disposable BaseRT process has already crossed the
+        // changed-PID/zero-weights boundary.  Requiring another restart would
+        // incorrectly route an external fixture through the managed 8082
+        // lifecycle path.  Retained Chat4B fixtures leave this false because
+        // switching away from a resident model still requires a real restart.
+        state.clean_changed_pid_boundary = true;
         Ok(())
     }
 
@@ -1737,6 +1744,29 @@ mod tests {
         .expect("delayed listener proof");
         release.notify_one();
         delayed_listener.await.expect("delayed listener task");
+    }
+
+    #[cfg(feature = "stage7a-acceptance")]
+    #[tokio::test]
+    async fn fresh_external_fixture_is_a_clean_changed_pid_boundary() {
+        struct ExternalFixtureAdapter;
+
+        #[async_trait::async_trait]
+        impl super::ModelRuntimeAdapter for ExternalFixtureAdapter {
+            async fn perform(&self, _action: super::RuntimeAction) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let runtime = super::ModelRuntime::production(Arc::new(ExternalFixtureAdapter));
+        runtime
+            .initialize_external_fixture(false)
+            .await
+            .expect("fresh external fixture initialization");
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.phase, super::RuntimePhase::Unloaded);
+        assert!(snapshot.clean_changed_pid_boundary);
     }
 }
 

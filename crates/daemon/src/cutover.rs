@@ -10,8 +10,17 @@ use std::{collections::HashMap, fs, path::Path};
 
 const WORK_SCHEMA: &str = include_str!("../migrations/V15__work_coordinator_foundations.sql");
 const CUTOVER_SCHEMA: &str = include_str!("../migrations/V16__unified_work_cutover.sql");
+const STAGE8_SCHEMA: &str = include_str!("../migrations/V23__stage8_canonical_cleanup.sql");
 pub const LEGACY_UNAVAILABLE: &str =
     "Legacy result content is unavailable because its privacy provenance cannot be verified.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage8MigrationFailpoint {
+    BeforeTransaction,
+    DuringCopy,
+    AfterCommit,
+    BeforeRouteAdmission,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RollbackBoundary {
@@ -91,7 +100,8 @@ pub fn finalize_legacy_boundary(path: &Path) -> Result<(), String> {
         .flatten()
         .unwrap_or_else(|| "fresh-install".to_owned());
     drop(connection);
-    migrate_v14_copy(path, &backup_hash, true)
+    migrate_v14_copy(path, &backup_hash, true)?;
+    finalize_stage8_cleanup(path)
 }
 
 pub fn record_pre_cutover_backup(path: &Path, backup_hash: &str) -> Result<(), String> {
@@ -170,7 +180,11 @@ pub fn migrate_v14_copy(
         )
         .map_err(storage)?;
 
-    if safe_changed_pid_boundary {
+    let has_legacy_runs = transaction
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='automation_runs'")
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(storage)?;
+    if safe_changed_pid_boundary && has_legacy_runs {
         transaction.execute(
             "UPDATE automation_runs SET status='abandoned', finished_at=COALESCE(finished_at, created_at),
              result_summary='Daemon restarted during execution.' WHERE status='running'",
@@ -188,7 +202,7 @@ pub fn migrate_v14_copy(
         }
     }
 
-    let rows = {
+    let rows = if has_legacy_runs {
         let mut statement = transaction
             .prepare(
                 "SELECT id, automation_id, status, result_summary, created_at, finished_at
@@ -212,6 +226,8 @@ pub fn migrate_v14_copy(
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage)?;
         rows
+    } else {
+        Vec::new()
     };
     let mut counts = HashMap::<String, usize>::new();
     for (id, automation, outcome, summary, created, finished) in rows {
@@ -256,6 +272,232 @@ pub fn migrate_v14_copy(
         )
         .map_err(storage)?;
     transaction.commit().map_err(storage)
+}
+
+fn safe_approval_description(tool_name: &str, _description: &str) -> String {
+    // Approval presentations are status data, not a second raw-argument
+    // channel. The detailed proposal stays in the short-lived tool call.
+    format!("Approval required for {}", tool_name.trim())
+}
+
+fn safe_approval_origin(raw: Option<&str>) -> Option<String> {
+    let value = raw.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())?;
+    let kind = value.get("kind").and_then(serde_json::Value::as_str)?;
+    if kind != "automation" {
+        return None;
+    }
+    // The approval projection needs provenance kind only. Automation names
+    // are user-authored identities and must not cross the migration boundary.
+    Some(serde_json::json!({"kind": kind}).to_string())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(storage)
+}
+
+fn table_exists_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+) -> Result<bool, String> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(storage)
+}
+
+pub fn finalize_stage8_cleanup(path: &Path) -> Result<(), String> {
+    finalize_stage8_cleanup_with_optional_failpoint(path, None)
+}
+
+pub fn finalize_stage8_cleanup_with_failpoint(
+    path: &Path,
+    failpoint: Stage8MigrationFailpoint,
+) -> Result<(), String> {
+    finalize_stage8_cleanup_with_optional_failpoint(path, Some(failpoint))
+}
+
+fn finalize_stage8_cleanup_with_optional_failpoint(
+    path: &Path,
+    failpoint: Option<Stage8MigrationFailpoint>,
+) -> Result<(), String> {
+    if failpoint == Some(Stage8MigrationFailpoint::BeforeTransaction) {
+        return Err("Stage 8 failpoint before transaction".to_owned());
+    }
+    let mut connection = Connection::open(path).map_err(storage)?;
+    connection
+        .execute_batch("PRAGMA foreign_keys=ON;")
+        .map_err(storage)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage)?;
+    transaction.execute_batch(STAGE8_SCHEMA).map_err(storage)?;
+
+    let has_legacy_runs = table_exists_in_transaction(&transaction, "automation_runs")?;
+    if has_legacy_runs {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, automation_id, scheduled_for, started_at, finished_at,
+                        status, result_summary, is_catch_up, is_manual, created_at
+                 FROM automation_runs ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        drop(statement);
+        for (
+            id,
+            automation_id,
+            scheduled_for,
+            started_at,
+            finished_at,
+            status,
+            summary,
+            is_catch_up,
+            is_manual,
+            created_at,
+        ) in rows
+        {
+            let (safe_summary, available) = safe_legacy_summary(summary);
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO automation_run_records
+                     (id, automation_id, scheduled_for, started_at, finished_at, status,
+                      result_summary, is_catch_up, is_manual, created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    params![
+                        id,
+                        automation_id,
+                        scheduled_for,
+                        started_at,
+                        finished_at,
+                        status,
+                        safe_summary,
+                        is_catch_up,
+                        is_manual,
+                        created_at,
+                    ],
+                )
+                .map_err(storage)?;
+            let _ = available;
+        }
+    }
+
+    if failpoint == Some(Stage8MigrationFailpoint::DuringCopy) {
+        return Err("Stage 8 failpoint during copy".to_owned());
+    }
+
+    if table_exists_in_transaction(&transaction, "pending_approvals")? {
+        let mut statement = transaction
+            .prepare(
+                "SELECT p.id, p.tool_name, p.description, p.expires_at, p.created_at,
+                        p.origin_json, a.work_identity
+                 FROM pending_approvals p
+                 LEFT JOIN work_approvals a ON a.identity=p.id",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        drop(statement);
+        for (id, tool, description, expires, created, origin, work) in rows {
+            let safe_description = safe_approval_description(&tool, &description);
+            let safe_origin = safe_approval_origin(origin.as_deref());
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO work_approval_requests
+                     (identity, work_identity, tool_name, description, expires_at,
+                      created_at, origin_json, decision, decided_at)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, p.decision, p.decided_at
+                     FROM pending_approvals p WHERE p.id=?1",
+                    params![
+                        id,
+                        work,
+                        tool,
+                        safe_description,
+                        expires,
+                        created,
+                        safe_origin
+                    ],
+                )
+                .map_err(storage)?;
+        }
+    }
+
+    // Drop FTS triggers before their external-content table, then remove the
+    // old lifecycle tables. `legacy_run_records` is intentionally retained.
+    for trigger in ["chat_turns_ai", "chat_turns_ad", "chat_turns_au"] {
+        transaction
+            .execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger};"))
+            .map_err(storage)?;
+    }
+    for table in [
+        "chat_turns_fts",
+        "chat_turns",
+        "sessions",
+        "pending_approvals",
+        "automation_session_pending_approvals",
+        "automation_runs",
+    ] {
+        transaction
+            .execute_batch(&format!("DROP TABLE IF EXISTS {table};"))
+            .map_err(storage)?;
+    }
+    transaction
+        .execute(
+            "UPDATE stage8_cleanup_state SET committed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE singleton=1",
+            [],
+        )
+        .map_err(storage)?;
+    transaction.commit().map_err(storage)?;
+
+    if failpoint == Some(Stage8MigrationFailpoint::AfterCommit) {
+        return Err("Stage 8 failpoint after commit".to_owned());
+    }
+    if failpoint == Some(Stage8MigrationFailpoint::BeforeRouteAdmission) {
+        return Err("Stage 8 failpoint before route admission".to_owned());
+    }
+    if !table_exists(&connection, "automation_run_records")? {
+        return Err("canonical automation run records are missing".to_owned());
+    }
+    Ok(())
 }
 
 pub fn mark_first_post_cutover_work(path: &Path, committed_at: &str) -> Result<(), String> {

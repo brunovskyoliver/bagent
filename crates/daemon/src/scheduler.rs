@@ -310,9 +310,8 @@ pub(crate) async fn run_scheduler(state: AppState) {
             }
             pass
         };
-        for event in pass.events {
-            state.project_legacy_event(event);
-        }
+        // Scheduler lifecycle records are read from canonical automation and
+        // Work projections. No compatibility event broadcast is emitted.
         for (automation, run) in pass.claimed {
             let st = state.clone();
             tokio::spawn(async move {

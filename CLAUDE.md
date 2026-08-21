@@ -82,7 +82,7 @@ BaseRT  ·  Connectors  ·  SQLite/FTS5 (refinery migrations)
 
 - Daemon writes its port to `~/Library/Application Support/bagent/daemon.port` and bearer token to `daemon.token`.
 - Swift `DaemonLauncher` starts `bagentd`, polls port file (40 × 100 ms), then `DaemonClient` attaches.
-- Chat uses `POST /chat` → SSE stream of typed JSON events (`delta`, `done`, `mail_found`, `file_found`, `task_rating`, `debug_trace`, `memory_saved`, …).
+- Chat uses `POST /chat` → SSE stream of typed JSON events (`delta`, `done`, `mail_found`, `file_found`, `task_rating`, `memory_saved`, …).
 - Every write action goes through `GET /approvals/pending` + `POST /approvals/:id/decide` before execution.
 
 ### Rust crates

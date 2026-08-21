@@ -1067,6 +1067,9 @@ impl WorkCoordinator {
         connection
             .execute_batch("DROP TABLE IF EXISTS automation_current_chats;")
             .map_err(CommandError::storage)?;
+        connection
+            .execute_batch("DROP TABLE IF EXISTS automation_session_pending_approvals;")
+            .map_err(CommandError::storage)?;
         initialize_generation(
             &connection,
             &generation,

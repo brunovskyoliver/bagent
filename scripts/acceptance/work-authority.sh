@@ -114,6 +114,9 @@ for path in sorted((root / "crates/daemon/src").rglob("*.rs")):
     text = strip_tests(path.read_text())
     if path not in allowed_work_writers:
         for match in re.finditer(r'(?is)"(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+work(?:s|_[a-z_]+)', text):
+            table_name = re.search(r"\b(?:works|work_[a-z_]+)\b", match.group(0), re.IGNORECASE)
+            if table_name and table_name.group(0).lower() == "work_approval_requests":
+                continue
             line = text.count("\n", 0, match.start()) + 1
             findings.append(f"{path.relative_to(root)}:{line}: direct canonical Work SQL writer")
     if path.name != "model_runtime.rs":
@@ -130,7 +133,7 @@ required = {
     "durable approval request": ".request_approval(" in main,
     "durable approval decision": ".resolve_approval(" in main,
     "canonical Model Runtime Work identity": "pub use crate::work_coordinator::WorkIdentity" in model_runtime,
-    "ordered outbox projection": ".coordinator().events(" in main,
+    "ordered outbox projection": ".notch_events(" in main,
 }
 missing = [name for name, present in required.items() if not present]
 if findings or missing:

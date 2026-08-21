@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+python3 - "$repo_root" <<'PY'
+from __future__ import annotations
+
+import pathlib
+import re
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+src = root / "crates/daemon/src"
+swift_src = root / "apps/macos/Sources/bagent"
+cutover = src / "cutover.rs"
+migration = root / "crates/daemon/migrations/V23__stage8_canonical_cleanup.sql"
+
+
+def strip_cfg_test_items(text: str) -> str:
+    """Remove cfg(test) items before scanning the production graph."""
+    marker = re.compile(r"#\[cfg\(test\)\]")
+    while True:
+        match = marker.search(text)
+        if match is None:
+            return text
+        start = match.start()
+        brace = text.find("{", match.end())
+        semi = text.find(";", match.end())
+        if semi != -1 and (brace == -1 or semi < brace):
+            text = text[:start] + text[semi + 1 :]
+            continue
+        if brace == -1:
+            text = text[:start]
+            continue
+        depth = 0
+        end = brace
+        while end < len(text):
+            if text[end] == "{":
+                depth += 1
+            elif text[end] == "}":
+                depth -= 1
+                if depth == 0:
+                    end += 1
+                    break
+            end += 1
+        text = text[:start] + text[end:]
+
+
+def production_files() -> list[pathlib.Path]:
+    return sorted(src.rglob("*.rs")) + sorted(swift_src.rglob("*.swift"))
+
+
+def source_text(path: pathlib.Path) -> str:
+    text = path.read_text()
+    return strip_cfg_test_items(text) if path.suffix == ".rs" else text
+
+
+forbidden = {
+    "daemon-wide legacy event authority": re.compile(
+        r"\blegacy_projection_tx\b|\bproject_legacy_event\b|route\s*\(\s*[\"']/?events"
+    ),
+    "removed evidence authority switch": re.compile(
+        r"BAGENT_EVIDENCE_ORCHESTRATOR|EvidenceOrchestrator|evidence_orchestrator"
+    ),
+    "obsolete prompt/debug result injection": re.compile(
+        r"PromptDebugRecord|PromptDebugMessage|prompt_debug|debug_conversation|"
+        r"response_for_audit|append_prompt_debug|\bdebug_trace\b|"
+        r"\bdebugTrace\b|debugPayload|prompt_trace_id"
+    ),
+    "computed notch compatibility accessor": re.compile(
+        r"(?:\b(?:private\s+|internal\s+|public\s+)?var\s+"
+        r"(?:isThinking|isExpanded|chatSurfaceMode|toolStatus)\b|"
+        r"\b(?:notchPresentation|viewModel|self)\.(?:isThinking|isExpanded)\b)"
+    ),
+    "obsolete lifecycle SQL": re.compile(
+        r"\b(?:FROM|INTO|UPDATE|JOIN|TABLE|ALTER\s+TABLE|DROP\s+TABLE(?:\s+IF\s+EXISTS)?)\s+"
+        r"(?:automation_runs|pending_approvals|sessions|chat_turns|chat_turns_fts|"
+        r"automation_session_pending_approvals)\b",
+        re.IGNORECASE,
+    ),
+}
+
+
+def findings_for(path: pathlib.Path, text: str) -> list[str]:
+    findings: list[str] = []
+    for label, pattern in forbidden.items():
+        for match in pattern.finditer(text):
+            if (
+                label == "obsolete lifecycle SQL"
+                and path.name == "work_coordinator.rs"
+                and match.group(0).lstrip().upper().startswith("DROP TABLE")
+            ):
+                continue
+            line = text.count("\n", 0, match.start()) + 1
+            findings.append(f"{path.relative_to(root)}:{line}: {label}: {match.group(0)}")
+    return findings
+
+
+# Red capability: each forbidden category must be observable by the same
+# detector used against production. A detector that cannot reject these seeds
+# is not a qualification gate.
+seed = """
+let legacy_projection_tx = 1;
+fn project_legacy_event() { }
+router.route(\"/events\", get(events));
+let switch_name = \"BAGENT_EVIDENCE_ORCHESTRATOR\";
+struct EvidenceOrchestratorFlag;
+struct PromptDebugRecord;
+let response_for_audit = true;
+let event = "debug_trace";
+case .debugTrace;
+let prompt_trace_id = "opaque";
+struct Presentation { var isThinking: Bool; }
+let old = \"SELECT * FROM automation_runs\";
+"""
+seed_hits = findings_for(root / "__stage8_seed.rs", seed)
+seed_labels = {hit.split(": ", 2)[1] for hit in seed_hits}
+if seed_labels != set(forbidden):
+    missing = sorted(set(forbidden) - seed_labels)
+    print("A51 red capability: FAIL; detector missed: " + ", ".join(missing))
+    raise SystemExit(1)
+print(f"A51 red capability: PASS ({len(seed_hits)} seeded forbidden matches)")
+
+
+findings: list[str] = []
+for path in production_files():
+    if path == cutover:
+        continue
+    findings.extend(findings_for(path, source_text(path)))
+
+required = {
+    "forward migration": migration.exists()
+    and "stage8_cleanup_state" in migration.read_text()
+    and "schema_generation" in migration.read_text(),
+    "explicit old-table removal": all(
+        f'"{table}"' in cutover.read_text()
+        for table in (
+            "automation_runs",
+            "pending_approvals",
+            "sessions",
+            "chat_turns",
+            "chat_turns_fts",
+        )
+    ),
+    "canonical run record table": any(
+        "automation_run_records" in source_text(path) for path in production_files()
+    ),
+    "canonical approval projection": "work_approval_requests" in (src / "main.rs").read_text(),
+    "canonical interaction mode": "NotchInteractionMode" in (swift_src / "NotchProjection.swift").read_text(),
+    "canonical foreground activity": "hasActiveForegroundWork" in (swift_src / "NotchProjection.swift").read_text(),
+    "stage 8 finalizer": "finalize_stage8_cleanup" in cutover.read_text(),
+    "canonical legacy record preservation": "legacy_run_records" in cutover.read_text(),
+}
+missing = sorted(name for name, present in required.items() if not present)
+if missing:
+    print("A51 missing canonical edge(s): " + ", ".join(missing))
+    raise SystemExit(1)
+
+if findings:
+    for finding in findings:
+        print("A51 forbidden: " + finding)
+    print(f"A51 production inventory: FAIL ({len(findings)} findings)")
+    raise SystemExit(1)
+
+
+checks = [
+    ("work authority", root / "scripts/acceptance/work-authority.sh", []),
+    ("model runtime authority", root / "scripts/acceptance/model-runtime-authority.sh", []),
+    ("settings authority", root / "scripts/acceptance/settings-authority.sh", [str(root)]),
+    ("notch mode authority", root / "scripts/acceptance/notch-mode-authority.sh", []),
+]
+for label, command, args in checks:
+    result = subprocess.run(
+        ["bash", str(command), *args],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(f"A51 authority subgate: FAIL ({label})")
+        raise SystemExit(1)
+    print(f"A51 authority subgate: PASS ({label})")
+
+print(f"A51 production inventory: PASS (0 findings; {len(required)} canonical assertions)")
+PY

@@ -507,7 +507,6 @@ struct DaemonClient: Sendable, NotchEventTransport {
         case evidenceOutcome(EvidenceOutcomeEvent)
         case evidenceAcquisitionDiagnostic(EvidenceAcquisitionDiagnostic)
         case sourceDiscovered(TranscriptSource)
-        case debugTrace(DebugTraceSummary)
         case memorySaved(id: String)
         case approvalRequested(id: String, tool: String, description: String?)
         case toolBlocked(tool: String)
@@ -617,18 +616,6 @@ struct DaemonClient: Sendable, NotchEventTransport {
         let chat_id: String
         let contact_name: String?
         let snippet: String?
-    }
-
-    struct DebugTraceSummary: Decodable, Sendable {
-        let prompt_trace_id: String
-        let session_id: String?
-        let preview: String
-        let prompt_chars: Int?
-        let prompt_token_estimate: Int?
-        let message_count: Int?
-        let selected_skill_names: [String]?
-        let selected_memory_ids: [String]?
-        let conversation_recall_injected: Bool?
     }
 
     /// Upload a local file to `POST /attachments` and return a `ChatAttachment`.
@@ -919,20 +906,6 @@ struct DaemonClient: Sendable, NotchEventTransport {
                         }
 
                         switch event.type {
-                        case "debug_trace":
-                            if let id = event.prompt_trace_id {
-                                continuation.yield(.debugTrace(DebugTraceSummary(
-                                    prompt_trace_id: id,
-                                    session_id: event.session_id,
-                                    preview: event.preview ?? "",
-                                    prompt_chars: event.prompt_chars,
-                                    prompt_token_estimate: event.prompt_token_estimate,
-                                    message_count: event.message_count,
-                                    selected_skill_names: event.selected_skill_names,
-                                    selected_memory_ids: event.selected_memory_ids,
-                                    conversation_recall_injected: event.conversation_recall_injected
-                                )))
-                            }
                         case "token":
                             if let content = event.content {
                                 continuation.yield(.token(content))
@@ -1323,20 +1296,6 @@ struct DaemonClient: Sendable, NotchEventTransport {
         let (data, response) = try await URLSession.shared.data(for: authedRequest("/skills/\(name)", creds: c))
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
         return try JSONDecoder().decode(SkillItem.self, from: data)
-    }
-
-    func debugContextPlan(message: String) async throws -> String {
-        let c = try await loadCreds()
-        var req = authedRequest("/debug/context-plan", creds: c)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        struct Body: Encodable { let message: String }
-        req.httpBody = try JSONEncoder().encode(Body(message: message))
-        let (data, response) = try await URLSession.shared.data(for: req)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
-        }
-        return prettyJSONString(data)
     }
 
     // MARK: - Authoritative Work projection
@@ -2093,7 +2052,7 @@ struct DaemonClient: Sendable, NotchEventTransport {
         let db_bytes: Int
         let attachments_bytes: Int
         let memory_items_count: Int
-        let chat_turns_count: Int
+        let current_chat_turns_count: Int
         let mail_cache_count: Int
         let embeddings_count: Int
         let total_bytes: Int
@@ -2115,24 +2074,6 @@ struct DaemonClient: Sendable, NotchEventTransport {
         let c = try await loadCreds()
         let (data, _) = try await URLSession.shared.data(for: authedRequest("/usage", creds: c))
         return try JSONDecoder().decode(UsageStats.self, from: data)
-    }
-
-    func debugTrace(id: String) async throws -> String {
-        let c = try await loadCreds()
-        let (data, response) = try await URLSession.shared.data(for: authedRequest("/debug/traces/\(id)", creds: c))
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
-        }
-        return prettyJSONString(data)
-    }
-
-    func debugConversation(id: String) async throws -> String {
-        let c = try await loadCreds()
-        let (data, response) = try await URLSession.shared.data(for: authedRequest("/debug/conversations/\(id)", creds: c))
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
-        }
-        return prettyJSONString(data)
     }
 
     func evidenceDiagnosticExport(turnId: String) async throws -> String {
@@ -2284,15 +2225,6 @@ struct SSEEvent: Decodable {
     let record_id: Int?
     let name: String?
     let url: String?
-    // debug_trace event fields
-    let prompt_trace_id: String?
-    let preview: String?
-    let prompt_chars: Int?
-    let prompt_token_estimate: Int?
-    let message_count: Int?
-    let selected_skill_names: [String]?
-    let selected_memory_ids: [String]?
-    let conversation_recall_injected: Bool?
     // task_rating event fields (Phase 8)
     let level: String?
     let score: Int?

@@ -260,6 +260,58 @@ fn automation_capacity_two() {
 }
 
 #[test]
+fn crash_recovery() {
+    let (dir, authority) = fixture(&["crash-work"]);
+    conversation(&authority, 0, 0);
+    let identity = authority.dispatch_next(0).unwrap().unwrap().work_identity;
+    drop(authority);
+
+    let generation = DaemonGeneration::new("crash-recovered-generation");
+    let reopened = WorkCoordinator::open(
+        dir.path().join("work.sqlite"),
+        CoordinatorConfig::default(),
+        generation,
+    )
+    .unwrap();
+    let snapshot = reopened.snapshot().unwrap();
+    let work = snapshot
+        .works
+        .iter()
+        .find(|work| work.identity == identity)
+        .expect("crashed Work remains addressable");
+    assert!(
+        work.state.is_terminal(),
+        "crashed Work must be terminalized"
+    );
+    assert_eq!(work.state, WorkState::Abandoned);
+    assert_eq!(
+        snapshot
+            .works
+            .iter()
+            .filter(|candidate| candidate.identity == identity)
+            .count(),
+        1,
+        "recovery must not duplicate Work"
+    );
+    let connection = rusqlite::Connection::open(dir.path().join("work.sqlite")).unwrap();
+    connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .map(|value| assert_eq!(value, "ok"))
+        .unwrap();
+    let obsolete_placeholder: i64 = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='automation_session_pending_approvals')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        obsolete_placeholder, 0,
+        "bootstrap must not resurrect removed authority"
+    );
+}
+
+#[test]
 fn approval_restart_capacity() {
     let (dir, authority) = fixture(&["approval-work", "other-work"]);
     automation(&authority, 1, 0);
