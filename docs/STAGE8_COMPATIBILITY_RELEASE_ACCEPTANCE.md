@@ -54,7 +54,7 @@ conditional, blocked, or inferred result is called PASS.
 | A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS: signed macOS 26 live AX fixture; 2 notch states, 5 notch assertions, 57 settings routes, 634 settings assertions, 0 skipped live assertions; hosted XCTest AX check is recorded as SKIPPED, not PASS |
 | A58 | `scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app`; `scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app` | PASS: A18–A21, poison/8080 isolation, and signed A49 UI-only relaunch all executed nonzero; daemon/BaseRT stability, Work/model convergence, protected port sentinel, and historical A50 scanner verified |
 | A59 | `scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app` | PASS: signed macOS 26 candidate with real disposable daemon/BaseRT; preload, foreground chat, two automations, safe activity/tool presentation, result open, continuation, scoped `/clear`, permission reread, UI-only relaunch, idle retirement, later reload, and port isolation verified; safe external source ended in `verification_shortfall` (`acquired=0`, `requested=2`, `source_count=0`, 497 token bytes, capture SHA-256 `90c80a8fa11fe3b844879facb6f7b07230d533dc904ecdc56718925178636954`); no TCC mutation |
-| A60 | `scripts/acceptance/stage8-reproducibility.sh <frozen-commit>` | PENDING until the final implementation commit is frozen and validated from a separate clean checkout |
+| A60 | `scripts/acceptance/stage8-reproducibility.sh 1260480bc0b91bf8a447b88fcbae885f5f4e3cfe` | PASS: detached clean checkout at the frozen candidate; every gate returned status 0; record SHA-256 `02b3ce188e9d2b57e5fa3622d0a2a256e0154b48587571e02af66bc4863307c2`; no production database or port-8080 owner access |
 
 ### A51 final authority cleanup
 
@@ -98,18 +98,81 @@ accepted.
 
 ## A60 reproducibility record
 
-The initial A60 run is performed against the frozen implementation candidate;
-the final evidence commit reruns A60 so the exact commit recorded below is the
-one delivered. The final clean-checkout run must retain:
+The frozen implementation candidate was validated from a separate detached
+checkout. The evidence document is updated after that run; the update contains
+no production or acceptance-code change. The exact candidate validated by A60
+is `1260480bc0b91bf8a447b88fcbae885f5f4e3cfe`.
 
-- frozen candidate commit and exact clean-checkout identity;
-- OS, architecture, Rust/Cargo, Swift, Xcode, and signing identity;
-- exact commands, UTC timestamps, nonzero execution counts, log hashes, and
-  the final evidence-record hash;
-- clean builds, full Rust and Swift suites, formatting, lint, diff, links,
-  authority, privacy, migration, regression, localization, signed bundle,
-  nested-code, identity, and strict codesign checks; and
-- disposable checkout/build cleanup and the final runtime/port state.
+```text
+candidate=1260480bc0b91bf8a447b88fcbae885f5f4e3cfe
+started_utc=2026-08-21T19:28:41Z
+ended_utc=2026-08-21T19:42:29Z
+os=26.5.2 (25F84)
+arch=arm64
+rust=rustc 1.91.1 (ed61e7d7e 2025-11-07)
+cargo=cargo 1.91.1 (ea2d97820 2025-10-10)
+swift=Apple Swift version 6.3.1 (swiftlang-6.3.1.1.2 clang-2100.0.123.102)
+xcode=Xcode 26.4.1;Build version 17E202;
+protected_8080_before=
+protected_8082_before=62597,
+
+cargo-fmt command=cargo fmt --all -- --check status=0 started=2026-08-21T19:28:41Z ended=2026-08-21T19:28:42Z nonzero_metrics=none-reported log_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+cargo-clippy command=cargo clippy --workspace --all-targets -- -D warnings status=0 started=2026-08-21T19:28:42Z ended=2026-08-21T19:29:29Z nonzero_metrics=none-reported log_sha256=fecc12686f6f9e9ab1f8de4649e3219a1678ebe450c60cd22324429da5015671
+daemon-acceptance-clippy command=cargo clippy -p bagentd --features stage7a-acceptance\,stage8-acceptance --all-targets -- -D warnings status=0 started=2026-08-21T19:29:29Z ended=2026-08-21T19:29:42Z nonzero_metrics=none-reported log_sha256=e507d798451eb0bfa4ef7822fa3c6ca1a545a145c162d3e02050590f9c9f9cca
+cargo-test command=cargo test --workspace --no-fail-fast status=0 started=2026-08-21T19:29:42Z ended=2026-08-21T19:31:23Z nonzero_metrics=21,39,17,19,10,239,9,5,8,4,1,12,2,14,27,30,15,13 log_sha256=1241d9053274f6968948650e84db559714221ea11ae279e1b3a93118586b2e55
+daemon-acceptance-tests command=cargo test -p bagentd --features stage7a-acceptance\,stage8-acceptance --bin bagentd --no-fail-fast status=0 started=2026-08-21T19:31:23Z ended=2026-08-21T19:31:50Z nonzero_metrics=241 log_sha256=8a11aa92546895ad2653e766f4f350196bdf8408c16d03825ca6337c39d405e1
+swift-build command=swift build --package-path apps/macos status=0 started=2026-08-21T19:31:50Z ended=2026-08-21T19:32:23Z nonzero_metrics=none-reported log_sha256=0f5da3ba589c0af5041945877d805b02f1fa78510c3bd009fab8fcbee62528b6
+swift-test command=swift test --package-path apps/macos status=0 started=2026-08-21T19:32:23Z ended=2026-08-21T19:32:40Z nonzero_metrics=3,1,4,2,6,11,7,9,12,5,20,149 log_sha256=682845a0fc94ccfeae8c7cb078ea850ac41a2173c0b1172422c92c56611f297e
+git-diff-check command=git -C /var/folders/wc/d2tp_dbj12lbq389yxv649lh0000gn/T//bagent-stage8-reproducibility.5ThLcW/checkout diff --check status=0 started=2026-08-21T19:32:40Z ended=2026-08-21T19:32:40Z nonzero_metrics=none-reported log_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+documentation-links command=scripts/acceptance/documentation-links.sh status=0 started=2026-08-21T19:32:40Z ended=2026-08-21T19:32:41Z nonzero_metrics=none-reported log_sha256=2e3d5a72062f7b45b1b95a09618a9a564d67503dd5b4eae64a44f159a838b062
+authority-inventory command=scripts/acceptance/final-authority-inventory.sh status=0 started=2026-08-21T19:32:41Z ended=2026-08-21T19:32:44Z nonzero_metrics=none-reported log_sha256=f57bf6b969b6ca14bb9b9c00c194ad3da2cd05a577ef9564f7182a59d237efab
+work-authority command=scripts/acceptance/work-authority.sh status=0 started=2026-08-21T19:32:44Z ended=2026-08-21T19:32:46Z nonzero_metrics=none-reported log_sha256=d92801aeff81ddd675ebebf6528fd4c0d501b4fb3ce80b523368bc6b85be6e7c
+model-runtime-authority command=scripts/acceptance/model-runtime-authority.sh status=0 started=2026-08-21T19:32:46Z ended=2026-08-21T19:32:47Z nonzero_metrics=none-reported log_sha256=8974b912a8f7922d81ed12ac55ee5bc6c7b9984f940dde0c1e9278413ec21795
+current-chat-authority command=scripts/acceptance/current-chat-authority.sh status=0 started=2026-08-21T19:32:47Z ended=2026-08-21T19:32:49Z nonzero_metrics=none-reported log_sha256=ec5b6d64d96e2c554ee76bca25066dff77e9b84b8ce39594cc142b9090cd6e41
+settings-authority command=scripts/acceptance/settings-authority.sh status=0 started=2026-08-21T19:32:49Z ended=2026-08-21T19:32:50Z nonzero_metrics=5,12 log_sha256=a530fa60f6c4e036d112bf25d2d908312c4205233cbf3b1d8a7ce499f89db98e
+notch-mode-authority command=scripts/acceptance/notch-mode-authority.sh status=0 started=2026-08-21T19:32:50Z ended=2026-08-21T19:32:50Z nonzero_metrics=none-reported log_sha256=6c0949a956ce2c7ad48f631d94af6f2200c122441d708c2a439ff21012096de5
+work-cutover-rollback command=scripts/acceptance/work-cutover-rollback.sh status=0 started=2026-08-21T19:32:50Z ended=2026-08-21T19:32:51Z nonzero_metrics=1 log_sha256=d84d5c916aedea3e5e8e953c1b0b622f2239f484509caea1294f98a6f236fd8a
+accessibility-audit command=scripts/acceptance/accessibility-audit.sh status=0 started=2026-08-21T19:32:51Z ended=2026-08-21T19:35:39Z nonzero_metrics=1,3,5,9 log_sha256=52ae7ace238b888ab82609934de2e0a6d760ed6cf6103b6ea15ef7297e59c66f
+settings-localization command=scripts/acceptance/settings-localization.sh status=0 started=2026-08-21T19:35:40Z ended=2026-08-21T19:35:40Z nonzero_metrics=none-reported log_sha256=dea208fe82ff90ea375f25ef434338dd98a6dc1dd696e4a4b6c41939592ccb2b
+automation-sessions-regression command=cargo test -p bagentd --test automation_sessions --no-fail-fast status=0 started=2026-08-21T19:35:40Z ended=2026-08-21T19:35:41Z nonzero_metrics=9 log_sha256=6a4b24c6e17d4b7b526cfc0079ef8993046c42c21ab88c2be65d15742ab29c00
+current-chat-regression command=cargo test -p bagentd --test current_chat --no-fail-fast status=0 started=2026-08-21T19:35:41Z ended=2026-08-21T19:35:48Z nonzero_metrics=5 log_sha256=3ef52a43d33fba311829b916f95c52d77fd17fb819e303f5aa93b49bc7c379b6
+work-coordinator-regression command=cargo test -p bagentd --test work_coordinator --no-fail-fast status=0 started=2026-08-21T19:35:48Z ended=2026-08-21T19:35:49Z nonzero_metrics=12,1 log_sha256=0e71303d9ad1de8ec9c2fe03fe19d021d7aba760bebf7faf1d8f5a94c34d2657
+work-failure-regression command=cargo test -p bagentd --test work_failure_injection --no-fail-fast status=0 started=2026-08-21T19:35:50Z ended=2026-08-21T19:35:50Z nonzero_metrics=1 log_sha256=cb5c679a3179e32fb4d2aa14185d5f3ada6147d0da8cca751aa022092bfe8aa7
+model-runtime-regression command=cargo test -p bagentd --test model_runtime --no-fail-fast status=0 started=2026-08-21T19:35:50Z ended=2026-08-21T19:35:51Z nonzero_metrics=8 log_sha256=547fb8537b3d7bd8dec555b266de6c1f0e9ba6f32c58b9f83e4ef77c4546b036
+migration-clean-v14 command=cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact status=0 started=2026-08-21T19:35:52Z ended=2026-08-21T19:35:52Z nonzero_metrics=1 log_sha256=85bd6dd12baba1cbfad7c3b72cbe0b270be1911ef20276e117b719abb80cbbad
+migration-interruption command=cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact status=0 started=2026-08-21T19:35:52Z ended=2026-08-21T19:35:53Z nonzero_metrics=1 log_sha256=98586e388163d945fd9d68cff648ded7982cd8ee6e41c339663c479c84428143
+work-crash-recovery command=cargo test -p bagentd --test work_concurrency crash_recovery -- --exact status=0 started=2026-08-21T19:35:53Z ended=2026-08-21T19:35:53Z nonzero_metrics=1 log_sha256=415075ddfe994d55356b6e58f0a85fa7c12ac6d9cc1052f4348432968a4392a6
+work-fairness command=cargo test -p bagentd --test work_concurrency fairness_foreground -- --exact status=0 started=2026-08-21T19:35:53Z ended=2026-08-21T19:35:54Z nonzero_metrics=1 log_sha256=dd3b7ad3a909870e6dc253791d89bf0767e0a3c7189c83cdbc064da48b701b0e
+model-poison command=cargo test -p bagentd --test model_runtime poison_changed_pid -- --exact status=0 started=2026-08-21T19:35:54Z ended=2026-08-21T19:35:54Z nonzero_metrics=1 log_sha256=082d3efd565787ea16581a93a09e6b373653763c5b721fc4759e4f0e08100ed5
+signed-bundle-make command=make -C apps/macos bundle status=0 started=2026-08-21T19:35:54Z ended=2026-08-21T19:35:58Z nonzero_metrics=none-reported log_sha256=8bfb77de3ecb6a0407a23c15ee2a1559de3f108184f7089c1fa671a5fa0dbd54
+signed-bundle-verification command=scripts/acceptance/signed-bundle-verification.sh apps/macos/bagent.app status=0 started=2026-08-21T19:35:58Z ended=2026-08-21T19:36:01Z nonzero_metrics=4 log_sha256=bfa66f9eb6601707d6015778d28c6c064550de8b51c995e0d672ce02f27aefa3
+signed-bundle-codesign command=codesign --verify --deep --strict apps/macos/bagent.app status=0 started=2026-08-21T19:36:01Z ended=2026-08-21T19:36:01Z nonzero_metrics=none-reported log_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+signed-bundle-designated-requirement command=codesign -dr - apps/macos/bagent.app status=0 started=2026-08-21T19:36:01Z ended=2026-08-21T19:36:01Z nonzero_metrics=none-reported log_sha256=c33fa27cb1d66cd6a691c2ec814d06bf9a50c9dc66c0f1a56888ebe36b2d38b9
+privacy-scan command=scripts/acceptance/stage8-privacy-scan.sh apps/macos/bagent.app status=0 started=2026-08-21T19:36:01Z ended=2026-08-21T19:36:49Z nonzero_metrics=1,4,5 log_sha256=fc17ba09dcb2c46221edc497d007b7ec0a6fa1fcfae5763be3b599a748cc20e4
+notch-state-capture command=scripts/acceptance/capture-notch-states.sh apps/macos/bagent.app status=0 started=2026-08-21T19:36:49Z ended=2026-08-21T19:36:57Z nonzero_metrics=1 log_sha256=039de609072de43e9c70a9ee6ff60f1776bd6454e83042fc7757ffaa11197d06
+settings-catalog command=scripts/acceptance/settings-catalog.sh apps/macos/bagent.app status=0 started=2026-08-21T19:36:57Z ended=2026-08-21T19:37:30Z nonzero_metrics=11,5,12,57 log_sha256=60ff75ff00ce402aeeae0f1501356c5ddc727a758ab0d89f65b1392ff34ad91b
+signed-ui-relaunch command=scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app status=0 started=2026-08-21T19:37:30Z ended=2026-08-21T19:37:54Z nonzero_metrics=5,10 log_sha256=6206cb733a6d31b1c12401fe279a3f69a977a8b39d649e4e023670234ebfe76b
+stage8-rollback command=scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app status=0 started=2026-08-21T19:37:54Z ended=2026-08-21T19:39:45Z nonzero_metrics=1 log_sha256=a27cbca9c54f43ec44e56092cac969ff5048142c5b5800abc8cf32acfc4ff92e
+stage8-visual command=scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app status=0 started=2026-08-21T19:39:45Z ended=2026-08-21T19:40:52Z nonzero_metrics=5,3,4,11,1,12,57 log_sha256=cb29b2d11415d8fbe06b2ab116d58db69065c16aa2ea7b7956b0aabbe2b83cb4
+stage8-accessibility command=scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app status=0 started=2026-08-21T19:40:52Z ended=2026-08-21T19:41:34Z nonzero_metrics=11,1 log_sha256=55ffb1ad043551e89970c17662e499bb1e56b35e77a81decf89437067713300a
+stage8-active-load-relaunch command=scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app status=0 started=2026-08-21T19:41:34Z ended=2026-08-21T19:41:52Z nonzero_metrics=1 log_sha256=5d6d54975a660fd495ecb87f235d7d9798d1a99c9076708c0b7996bd080aa556
+stage8-live-smoke command=scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app status=0 started=2026-08-21T19:41:52Z ended=2026-08-21T19:42:21Z nonzero_metrics=none-reported log_sha256=f30d6440a2c25aac1cb90dec2ff6335f074b6c1986d3d14b76903296d35b65cb
+signed-stage8-e2e command=scripts/acceptance/stage8-signed-e2e.sh apps/macos/bagent.app status=0 started=2026-08-21T19:42:21Z ended=2026-08-21T19:42:29Z nonzero_metrics=21 log_sha256=ce1805f434eed183fcd29d0311323474497ad1f041d5d438be31c0f71f9bc405
+
+protected_8080_after=
+protected_8082_after=62597,
+final_worktree=clean
+cleanup=all gate-owned fixtures and processes cleaned; detached checkout and record directory removed by EXIT trap
+production_database=not used; production application and port-8080 owner untouched
+```
+
+The A60 record itself has SHA-256
+`02b3ce188e9d2b57e5fa3622d0a2a256e0154b48587571e02af66bc4863307c2`.
+Every listed command returned status 0. Nonzero counts in the record are
+execution metrics, not failures. The accessibility gate's hosted XCTest
+Accessibility check remains explicitly SKIPPED because granting Accessibility
+to the production bagent app is outside this campaign; the signed macOS 26 AX
+fixture and its applicable assertions passed.
 
 ## Review and closeout
 
