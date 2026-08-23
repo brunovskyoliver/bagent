@@ -52,11 +52,11 @@ conditional, blocked, or inferred result is called PASS.
 | A52 | `cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact` | PASS: 1 executed, 1 passed, 0 failed; disposable empty and V14 databases converged to the canonical schema and invariants, with kind-only approval provenance and no private automation identity |
 | A53 | `scripts/acceptance/stage8-migration-restart.sh`; `cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact`; `cargo test -p bagentd --test work_concurrency crash_recovery -- --exact` | PASS: 4 external `SIGKILL` cases and 2 exact tests executed; before-migration, during-copy, after-commit, and before-route-admission recovery preserved integrity, changed the daemon PID, admitted routes only after restart, converted 8 records without duplicates, and left protected ports unchanged |
 | A54 | `scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app` | PASS: disposable old/new signed candidates and databases; pre-Work verified backup and old reader, signed migration and first post-cutover Work, old-binary refusal of the post-Work database, archive-and-restore, hashes, protected-port checks, and cleanup all executed |
-| A55 | `scripts/acceptance/stage8-privacy-scan.sh`; `cargo test -p bagentd --test privacy_contract -- --nocapture`; `swift test --package-path apps/macos --filter ProjectionPrivacyTests`; `swift test --package-path apps/macos --filter UIRelaunchHandoffTests` | PASS: 9 surfaces, 9 synthetic canaries, 9 scanner detections, 0 sanitized projection matches; disposable captures securely deleted; Rust privacy contract 1 executed and passed, Swift privacy projection 4 executed and passed, UI relaunch handoff privacy 5 executed and passed |
-| A56 | `scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app` | PASS: signed macOS 26 candidate; 11 notch states; 57 settings fixtures × 2 widths across light/dark/high-contrast/large-text/reduced-motion; status-pill anchor and identity verified |
-| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS: signed macOS 26 live AX fixture; 2 notch states, 10 notch assertions, 57 settings routes, 634 settings assertions, and 0 skipped signed assertions; the environment-dependent hosted XCTest probe is not a qualification input |
-| A58 | `scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app`; `scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app` | PASS: A18–A21, poison/8080 isolation, and signed A49 UI-only relaunch all executed nonzero; daemon/BaseRT stability, Work/model convergence, protected port sentinel, and historical A50 scanner verified |
-| A59 | `scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app` | PASS: signed macOS 26 candidate with real disposable daemon/BaseRT; preload, foreground chat, two canonical automation Works and sessions, safe activity/tool presentation, result open, continuation, scoped `/clear`, permission reread, UI-only relaunch, idle retirement, later reload, and port isolation verified; safe external source ended in `verification_shortfall` (`acquired=0`, `requested=2`, `source_count=0`, 489 token bytes, capture SHA-256 `32d06c60779de22c4f74d3ae96d2433edc339c99e88430d8a872ba8fdeb84bf5`); no TCC mutation |
+| A55 | `scripts/acceptance/stage8-privacy-scan.sh`; privacy contract and Swift privacy suites | PASS: 9 canaries entered the signed disposable workload, the shared scanner detected all 9 raw seeds, and the 9 actual production capture files contained 0 canary matches; disposable captures were securely deleted; Rust 1, Swift projection 4, and handoff privacy 5 tests passed |
+| A56 | `scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app` | PASS: signed candidate rendered 11 notch-state PNGs and executed 22 normal/reduced-motion transitions; 57 settings fixtures × 2 widths across the accepted variants; status-pill anchor and identity verified |
+| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS: signed live AX fixture exercised active and approval states, 1 AX press action, 2 keyboard events, 1 destination change, observed AX names/values and enlarged-layout frames, 2 contrast checks, 2 posted announcements, and 0 skips |
+| A58 | `scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app`; `scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app` | PASS: signed UI-only relaunch preserved 1 foreground Work, 2 real run-now automation Works, and 1 canonical pending approval while daemon/BaseRT PIDs, Work revisions, protected ports, and the active UI consumer converged |
+| A59 | `scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app` | Pending final frozen-candidate rerun. Development runs proved live retirement through the daemon maintenance loop; the final run must also record accepted post-retirement model polish, unchanged daemon/BaseRT PIDs, 2 automation Works/links/sessions, and port isolation. |
 | A60 | `scripts/acceptance/stage8-reproducibility.sh <frozen-final-commit>` | The final clean-checkout record, including every gate status, nonzero execution count, log hash, signed bundle hash, timestamps, protected-port baseline, cleanup, and final runtime state, is attached to the Stage 8 ticket resolution comment. This row is not a substitute for that emitted record. |
 
 ### A51 final authority cleanup
@@ -78,19 +78,21 @@ Legacy Run Records, Current Chat, Work/session conversion, authority ownership,
 and privacy. Unit failpoints and external process kills cover pre-commit retry,
 post-commit recovery, and route admission. Rollback is before first
 post-cutover Work only; after cutover it uses archive-and-restore and the old
-binary never reads the new database. Privacy canaries cover event, UI, logs,
-diagnostics, export, migration, rollback, crash, and failure surfaces without
-retaining disposable captures.
+binary never reads the new database. Privacy canaries enter the signed
+disposable relaunch workload. The gate scans the nine resulting production
+capture files and securely removes them; it does not manufacture separate
+sanitized placeholder files.
 
 ### A56–A58 signed visual, accessibility, and active-load evidence
 
 Signed/live visual and accessibility qualification is macOS 26 only and follows
-`docs/UI_DESIGN.md`. The invariant status pill remains top-right. Keyboard,
-focus, VoiceOver names/readouts, announcements, contrast, enlarged-text, and
-reduced-motion checks are represented by executed deterministic and signed
-fixture evidence. No TCC state is changed. Active-load relaunch changes only
-the UI consumer PID except for the explicit disposable port-8082 poison case;
-the port-8080 owner is never touched.
+`docs/UI_DESIGN.md`. The invariant status pill remains top-right. The signed
+fixture records AX names/values, an AX action and destination change, delivered
+keyboard events, posted announcements, contrast, enlarged-layout frames, and
+reduced motion. It does not claim to observe VoiceOver speech. No TCC state is
+changed. Active-load relaunch changes only the UI consumer PID and preserves
+one foreground Work, two automation Works, and one pending approval; the
+port-8080 owner is never touched.
 
 ### A59 observational live smoke
 
@@ -213,6 +215,13 @@ or pull request is part of this stage.
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,
   and final-candidate A60 reproducibility.
+- The first fixed-base final reviews rejected synthetic A55 files, unsigned
+  A56 captures, asserted A57 booleans, separated A58 load checks, unit-only A59
+  retirement, shipped Stage 8 mutation controls, weak PID cleanup, and missing
+  A60 metrics. The corrected candidate uses live signed captures, measured AX
+  evidence, a combined relaunch load, compile-time Swift acceptance isolation,
+  executable-bound cleanup, live retirement/reload, and named nonzero gate
+  checks. A fresh two-axis review is still required after the final A60 run.
 - The two final independent review reports and their zero-finding results are
   attached to the Stage 8 ticket resolution comment after the final candidate
   is frozen.
