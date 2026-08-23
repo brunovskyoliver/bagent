@@ -237,6 +237,10 @@ or pull request is part of this stage.
   reruns exposed all 11 expected approval elements, confirming a low-rate panel
   exposure race. The disposable fixture now re-presents a missing panel within
   a bounded ten-second poll while retaining the same content assertions.
+- A60 live-smoke metric accounting: the corrected A59 behavior passed with two
+  chats, two Works/links/sessions, one retirement, and one reload, but those
+  human-readable nouns did not match A60's metric parser. A59 now emits explicit
+  nonzero case, work, link, session, and lifecycle-transition counts.
 - Earlier review passes identified and were followed by fixes for the counted
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,
