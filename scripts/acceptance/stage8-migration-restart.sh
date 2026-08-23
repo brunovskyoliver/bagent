@@ -11,7 +11,7 @@ seed_data="$fixture/seed-data"
 seed_db="$seed_data/bagent.db"
 stub_pid=""
 daemon_pid=""
-python_binary="$(command -v python3)"
+python_binary="$(python3 -c 'import os,sys; app=os.path.join(sys.prefix,"Resources/Python.app/Contents/MacOS/Python"); print(app if os.path.isfile(app) else os.path.realpath(sys.executable))')"
 
 process_matches() {
     local pid=$1 expected_executable=$2 required_argument=${3:-} command executable
