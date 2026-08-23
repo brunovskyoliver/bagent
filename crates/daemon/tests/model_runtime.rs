@@ -666,6 +666,40 @@ async fn idle_retirement() {
 }
 
 #[tokio::test]
+async fn maintenance_recovers_idle_poisoned_runtime() {
+    let adapter = Arc::new(RecordingAdapter::default());
+    let runtime = ModelRuntime::for_test(adapter.clone());
+
+    runtime
+        .enqueue(ModelDemand::foreground(
+            WorkIdentity::new("idle-poison-recovery"),
+            ModelClass::Chat4B,
+        ))
+        .await;
+    runtime
+        .dispatch_next()
+        .await
+        .expect("lease")
+        .complete()
+        .await;
+    runtime.poison(RuntimeFault::IndeterminateTimeout).await;
+
+    runtime.maintain().await.expect("maintenance recovery");
+
+    assert_eq!(
+        adapter.recorded_actions(),
+        vec![
+            RuntimeAction::Restart,
+            RuntimeAction::VerifyHealthyChangedPid,
+            RuntimeAction::VerifyZeroLoadedWeights,
+        ]
+    );
+    assert_eq!(runtime.snapshot().phase, RuntimePhase::Unloaded);
+    assert_eq!(runtime.snapshot().lease_count, 0);
+    assert!(runtime.snapshot().clean_changed_pid_boundary);
+}
+
+#[tokio::test]
 async fn retirement_35b() {
     let adapter = Arc::new(RecordingAdapter::default());
     let clock = Arc::new(FakeClock::default());

@@ -227,6 +227,11 @@ or pull request is part of this stage.
   replacement published readiness but before it fetched the reserved snapshot.
   The replacement now fetches and applies that snapshot before publishing
   readiness; two consecutive signed privacy campaigns passed afterward.
+- A60 live-smoke poison recovery: the next frozen run reached A59 but found an
+  idle poisoned runtime that periodic maintenance never recovered. A focused
+  regression failed before the fix and passed after maintenance adopted the
+  existing clean changed-PID recovery path; the original signed live smoke then
+  passed with one observed idle retirement and one live reload.
 - Earlier review passes identified and were followed by fixes for the counted
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,

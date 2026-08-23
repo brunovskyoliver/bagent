@@ -1575,7 +1575,14 @@ impl ModelRuntime {
 
     pub async fn maintain(&self) -> Result<()> {
         let idle_retirement = Duration::from_secs(self.policy.shared_idle_timeout_seconds);
-        let _transition = self.transition.lock().await;
+        let transition = self.transition.lock().await;
+        if matches!(
+            self.state.lock().expect("model runtime state").phase,
+            RuntimePhase::Poisoned(_)
+        ) {
+            drop(transition);
+            return self.recover().await;
+        }
         let action = {
             let state = self.state.lock().expect("model runtime state");
             match (
