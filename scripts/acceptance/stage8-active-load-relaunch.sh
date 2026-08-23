@@ -22,4 +22,4 @@ cargo test -p bagentd --test model_runtime port_isolation -- --exact
 # preservation, timeout rollback, and the protected 8080 sentinel.
 "$root/scripts/acceptance/stage7c-production-ui-relaunch.sh" "$candidate"
 
-echo "A58 active-load relaunch: PASS (macOS $product_version; A18-A21 nonzero; changed-PID poison and 8080 isolation nonzero; signed A49 UI-only relaunch with disposable daemon/BaseRT and protected port sentinel)"
+echo "A58 active-load relaunch: PASS (macOS $product_version; A18-A21 nonzero; changed-PID poison and 8080 isolation nonzero; signed UI-only relaunch preserved one foreground Work, two live automation Works, and one canonical pending approval with disposable daemon/BaseRT and protected port sentinel)"

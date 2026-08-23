@@ -874,10 +874,15 @@ async fn main() -> Result<()> {
         .route("/whatsapp/send", post(whatsapp_send_handler));
     #[cfg(feature = "stage8-acceptance")]
     if state.acceptance.is_some() {
-        app = app.route(
-            "/acceptance/stage8/fixture",
-            post(stage8_acceptance_fixture_handler),
-        );
+        app = app
+            .route(
+                "/acceptance/stage8/fixture",
+                post(stage8_acceptance_fixture_handler),
+            )
+            .route(
+                "/acceptance/stage8/approval",
+                post(stage8_acceptance_approval_handler),
+            );
     } else {
         app = app.route(
             "/acceptance/stage8/fixture",
@@ -4747,6 +4752,13 @@ struct Stage8AcceptanceFixtureRequest {
     selection: Option<evidence::AcceptanceFixtureSelection>,
 }
 
+#[cfg(feature = "stage8-acceptance")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Stage8AcceptanceApprovalRequest {
+    work_identity: String,
+}
+
 /// Acceptance-only authenticated control. Both the compile-time feature and
 /// exact runtime environment flag are required before the route is registered.
 #[cfg(feature = "stage8-acceptance")]
@@ -4762,6 +4774,48 @@ async fn stage8_acceptance_fixture_handler(
     };
     control.set(body.selection);
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+/// Moves an already-running disposable Work through the production approval
+/// authority. The caller must supply a Work created through a normal API.
+#[cfg(feature = "stage8-acceptance")]
+async fn stage8_acceptance_approval_handler(
+    State(state): State<AppState>,
+    Json(body): Json<Stage8AcceptanceApprovalRequest>,
+) -> impl IntoResponse {
+    if state.acceptance.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false })),
+        );
+    }
+    let work = WorkIdentity::new(body.work_identity);
+    let result = state.work_authority.current(&work).and_then(|record| {
+        record
+            .ok_or_else(|| CommandError::CorruptState("acceptance Work missing".into()))
+            .and_then(|record| {
+                state.work_authority.request_approval(
+                    format!("stage8-live-approval:{}", work.as_str()),
+                    work.clone(),
+                    record.revision,
+                    bagentd::work_coordinator::ApprovalIdentity::new(format!(
+                        "stage8-live-approval:{}",
+                        work.as_str()
+                    )),
+                    "filesystem.write",
+                )
+            })
+    });
+    match result {
+        Ok(revision) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "workRevision": revision.value() })),
+        ),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": error.to_string() })),
+        ),
+    }
 }
 
 /// Receives the Tavily credential from the signed app's Keychain and keeps it

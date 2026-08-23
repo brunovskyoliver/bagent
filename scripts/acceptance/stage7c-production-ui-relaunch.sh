@@ -92,7 +92,7 @@ model_source="/Users/oliver/Library/Application Support/bagent/basert-models/bas
 
 codesign --verify --deep --strict "$candidate"
 swift build --package-path "$repo_root/apps/macos" -c release
-cargo build --manifest-path "$repo_root/Cargo.toml" -p bagentd --features stage7a-acceptance
+cargo build --manifest-path "$repo_root/Cargo.toml" -p bagentd --features stage7a-acceptance,stage8-acceptance
 
 drag_evidence="$fixture_root/drag.json"
 "$candidate/Contents/MacOS/bagent" --stage7c-drag-validation "$drag_evidence"
@@ -119,6 +119,8 @@ basert_pid_before="$basert_pid"
 
 BAGENT_STAGE7A_ACCEPTANCE_FIXTURE=1 \
 BAGENT_STAGE7A_ACCEPTANCE_RESTART=1 \
+BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 \
+BAGENT_STAGE8_LIVE_AUTOMATION_DELAY_MS=10000 \
 BAGENT_STAGE7C_FDA_FIXTURE=granted \
 BAGENT_DATA_DIR="$fixture_root/data" \
 BAGENT_BASERT_BASE_URL="http://127.0.0.1:$basert_port/v1" \
@@ -160,6 +162,40 @@ done
 [[ "$(jq -r .lease_count <<<"$fixture_state")" -gt 0 ]]
 [[ "$(jq '.active_work | length' <<<"$fixture_state")" -gt 0 ]]
 kill -STOP "$basert_pid"
+
+# Add two real run-now automations while the foreground Work remains blocked
+# in BaseRT, then move one of those canonical Works to an approval boundary.
+automation_at="$(python3 -c 'from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)+timedelta(seconds=120)).isoformat().replace("+00:00","Z"))')"
+automation_payload="$(jq -nc --arg at "$automation_at" \
+    '{name:"Stage 8 relaunch automation A",prompt:"Controlled relaunch work",timezone:"UTC",schedule:{kind:"once",at:$at},enabled:true}')"
+automation_a="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' -d "$automation_payload" "http://127.0.0.1:$daemon_port/automations")"
+automation_b="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
+    -d "$(jq '.name="Stage 8 relaunch automation B"' <<<"$automation_payload")" \
+    "http://127.0.0.1:$daemon_port/automations")"
+run_a="$(curl -fsS -H "$auth_header" -X POST "http://127.0.0.1:$daemon_port/automations/$(jq -r .id <<<"$automation_a")/run-now" | jq -r .run.id)"
+run_b="$(curl -fsS -H "$auth_header" -X POST "http://127.0.0.1:$daemon_port/automations/$(jq -r .id <<<"$automation_b")/run-now" | jq -r .run.id)"
+combined_snapshot='{}'
+for _ in {1..200}; do
+    combined_snapshot="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/work/snapshot/read")"
+    [[ "$(jq '[.works[] | select(.origin == "automation")] | length' <<<"$combined_snapshot")" == 2 ]] && break
+    sleep 0.05
+done
+[[ "$(jq '[.works[] | select(.origin == "automation")] | length' <<<"$combined_snapshot")" == 2 ]]
+[[ "$(jq '[.works[] | select(.origin == "conversation")] | length' <<<"$combined_snapshot")" -ge 1 ]]
+approval_work="$(jq -r --arg session "automation-session:$run_b" '.works[] | select(.automationSessionIdentity == $session) | .identity' <<<"$combined_snapshot")"
+[[ -n "$approval_work" && "$approval_work" != null ]]
+curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg work "$approval_work" '{workIdentity:$work}')" \
+    "http://127.0.0.1:$daemon_port/acceptance/stage8/approval" >/dev/null
+for _ in {1..100}; do
+    combined_snapshot="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/work/snapshot/read")"
+    [[ "$(jq '.pendingApprovals | length' <<<"$combined_snapshot")" == 1 ]] && break
+    sleep 0.05
+done
+[[ "$(jq '.pendingApprovals | length' <<<"$combined_snapshot")" == 1 ]]
+combined_works_before="$(jq -c '[.works[] | {identity,revision,state,origin,automationSessionIdentity}] | sort_by(.identity)' <<<"$combined_snapshot")"
+combined_approvals_before="$(jq -c '.pendingApprovals | sort_by(.identity)' <<<"$combined_snapshot")"
+
 curl -fsS -X POST -H "$auth_header" "http://127.0.0.1:$daemon_port/acceptance/stage7a/seed-retained" >"$fixture_root/retained.json"
 state_before="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/acceptance/stage7a/state")"
 current_before="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/current-chat")"
@@ -227,6 +263,9 @@ write_capture "failure-path.json" "$(jq -nc \
     '{captured:true,surface:"failure",surface_canary:$surface_canary,stale_fence_rejection_observed:($stale_code == "409"),failure_values_redacted:true}')"
 state_after="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/acceptance/stage7a/state")"
 current_after="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/current-chat")"
+combined_after="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/work/snapshot/read")"
+[[ "$(jq -c '[.works[] | {identity,revision,state,origin,automationSessionIdentity}] | sort_by(.identity)' <<<"$combined_after")" == "$combined_works_before" ]]
+[[ "$(jq -c '.pendingApprovals | sort_by(.identity)' <<<"$combined_after")" == "$combined_approvals_before" ]]
 [[ "$(jq -c .active_work <<<"$state_before")" == "$(jq -c .active_work <<<"$state_after")" ]]
 [[ "$(jq -r .lease_count <<<"$state_before")" == "$(jq -r .lease_count <<<"$state_after")" ]]
 [[ "$(jq -r .runtime_generation <<<"$state_before")" == "$(jq -r .runtime_generation <<<"$state_after")" ]]
@@ -280,4 +319,5 @@ protected_8082_after="$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | t
 [[ "$protected_8082_before" == "$protected_8082_after" ]]
 
 echo "A49 production AppDelegate takeover: PASS"
+echo "A58 combined live Works: foreground=1 automations=2 pending_approvals=1"
 echo "A49 evidence: signed replacement, daemon/BaseRT PID preservation, Work/model lease and identities/revisions, Current Chat identity/revision, Compass Rail restoration, old-UI fence and post-ack exit, stale-fence rejection, timeout rollback, one active consumer, and port isolation"
