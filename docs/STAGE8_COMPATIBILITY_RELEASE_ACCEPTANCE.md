@@ -219,6 +219,10 @@ or pull request is part of this stage.
 - A60 A51 metric accounting: the first amended-candidate run stopped after all
   authority checks passed because A51 emitted no parser-recognized count. A51
   now emits explicit nonzero `case_count` and `assertion_count` fields.
+- A60 notch-capture metric accounting: the next frozen run stopped after 11
+  state PNGs and 22 transitions passed because their nouns were not recognized
+  as metrics. The gate now emits explicit `case_count` and `transition_count`
+  fields.
 - Earlier review passes identified and were followed by fixes for the counted
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,

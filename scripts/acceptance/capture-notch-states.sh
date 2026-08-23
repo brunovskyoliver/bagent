@@ -34,4 +34,4 @@ if rg -n '\.(blur|shadow)\(|Material|material\)' \
     exit 1
 fi
 
-echo "PASS: signed candidate rendered 11 deterministic notch-state PNGs and executed 22 normal/reduced-motion transitions in $catalog"
+echo "PASS: signed candidate rendered 11 deterministic notch-state PNGs and executed 22 normal/reduced-motion transitions in $catalog; case_count=11 transition_count=22"
