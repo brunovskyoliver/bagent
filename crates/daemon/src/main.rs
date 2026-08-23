@@ -27,8 +27,6 @@ use bagentd::current_chat::{
     read_current_chat, recover_after_daemon_restart, save_draft, upsert_connector_reference,
     ClearCurrentChatCommand, SubmittedAttachmentMetadata, ValidatedSourceMetadata,
 };
-#[cfg(feature = "stage8-acceptance")]
-use bagentd::model_runtime::{ModelClass, ModelDemand};
 use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig, RuntimePhase};
 use bagentd::permission_probe::DaemonFullDiskAccessProbe;
 use bagentd::ui_relaunch::{
@@ -4849,15 +4847,10 @@ async fn stage8_acceptance_model_reload_handler(
     }
     let result = state
         .model_runtime
-        .complete_bounded(
-            ModelDemand::foreground(
-                WorkIdentity::new(format!("stage8-reload-demand:{}", Uuid::new_v4())),
-                ModelClass::Chat4B,
-            ),
-            vec![Message::user("Reply with the single word ready.")],
-            0.0,
-            16,
-        )
+        .complete_stage8_acceptance_reload(WorkIdentity::new(format!(
+            "stage8-reload-demand:{}",
+            Uuid::new_v4()
+        )))
         .await;
     match result {
         Ok(output) => (

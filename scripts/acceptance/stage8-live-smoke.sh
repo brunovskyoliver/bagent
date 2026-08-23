@@ -22,13 +22,15 @@ basert_port=""
 auth_header=""
 reload_ui_pid=""
 reload_request_pid=""
+basert_binary=""
+curl_binary="$(command -v curl)"
 
 process_matches() {
     local pid="$1" expected="$2"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     local command_path
     command_path="$(ps -p "$pid" -o command= 2>/dev/null | sed 's/^[[:space:]]*//' | awk '{print $1}')"
-    [[ "${command_path##*/}" == "$expected" ]]
+    [[ "$command_path" == "$expected" ]]
 }
 
 safe_signal() {
@@ -39,10 +41,10 @@ safe_signal() {
 }
 
 cleanup() {
-    safe_signal "$reload_ui_pid" bagent -TERM
-    safe_signal "$reload_request_pid" curl -TERM
-    safe_signal "$daemon_pid" bagentd -TERM
-    safe_signal "$basert_pid" basert-serve -TERM
+    safe_signal "$reload_ui_pid" "$acceptance_candidate/Contents/MacOS/bagent" -TERM
+    safe_signal "$reload_request_pid" "$curl_binary" -TERM
+    safe_signal "$daemon_pid" "$repo_root/target/debug/bagentd" -TERM
+    safe_signal "$basert_pid" "$basert_binary" -TERM
     for pid in "$daemon_pid" "$basert_pid"; do
         [[ "$pid" =~ ^[0-9]+$ ]] && wait "$pid" 2>/dev/null || true
     done

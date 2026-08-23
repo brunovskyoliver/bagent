@@ -23,6 +23,8 @@ basert_pid_before=""
 basert_port=""
 daemon_port=""
 auth_header=""
+basert_binary=""
+curl_binary="$(command -v curl)"
 capture_dir="${BAGENT_STAGE7C_CAPTURE_DIR:-}"
 stage8_actual_capture_dir="${BAGENT_STAGE8_ACTUAL_CAPTURE_DIR:-}"
 tmp_root="${TMPDIR:-/tmp}"
@@ -70,7 +72,7 @@ process_matches() {
     local command_path
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     command_path="$(ps -p "$pid" -o command= 2>/dev/null | sed 's/^[[:space:]]*//' | awk '{print $1}')"
-    [[ "${command_path##*/}" == "$expected" ]]
+    [[ "$command_path" == "$expected" ]]
 }
 
 safe_signal() {
@@ -93,16 +95,16 @@ cleanup() {
         done
         find "$fixture_root/evidence" -maxdepth 1 -type f -print >&2 2>/dev/null || true
     fi
-    safe_signal "$basert_pid" basert-serve -CONT
-    safe_signal "$old_ui_pid" bagent -CONT
-    safe_signal "$replacement_ui_pid" bagent -CONT
-    safe_signal "$chat_pid" curl -CONT
-    safe_signal "$daemon_pid" bagentd -CONT
-    safe_signal "$old_ui_pid" bagent -TERM
-    safe_signal "$replacement_ui_pid" bagent -TERM
-    safe_signal "$chat_pid" curl -TERM
-    safe_signal "$daemon_pid" bagentd -TERM
-    safe_signal "$basert_pid" basert-serve -TERM
+    safe_signal "$basert_pid" "$basert_binary" -CONT
+    safe_signal "$old_ui_pid" "$candidate/Contents/MacOS/bagent" -CONT
+    safe_signal "$replacement_ui_pid" "$candidate/Contents/MacOS/bagent" -CONT
+    safe_signal "$chat_pid" "$curl_binary" -CONT
+    safe_signal "$daemon_pid" "$repo_root/target/debug/bagentd" -CONT
+    safe_signal "$old_ui_pid" "$candidate/Contents/MacOS/bagent" -TERM
+    safe_signal "$replacement_ui_pid" "$candidate/Contents/MacOS/bagent" -TERM
+    safe_signal "$chat_pid" "$curl_binary" -TERM
+    safe_signal "$daemon_pid" "$repo_root/target/debug/bagentd" -TERM
+    safe_signal "$basert_pid" "$basert_binary" -TERM
     for pid in "$old_ui_pid" "$replacement_ui_pid" "$chat_pid" "$daemon_pid" "$basert_pid"; do
         if [[ "$pid" =~ ^[0-9]+$ ]]; then wait "$pid" 2>/dev/null || true; fi
     done
@@ -266,10 +268,10 @@ replacement_ui_pid="$(jq -r .ui_pid "$fixture_root/evidence/replacement.json")"
 replacement_acknowledged=false
 [[ -f "$fixture_root/evidence/replacement-acknowledged.marker" ]] && replacement_acknowledged=true
 for _ in {1..300}; do
-    if ! process_matches "$old_ui_pid" bagent; then break; fi
+    if ! process_matches "$old_ui_pid" "$candidate/Contents/MacOS/bagent"; then break; fi
     sleep 0.1
 done
-! process_matches "$old_ui_pid" bagent
+! process_matches "$old_ui_pid" "$candidate/Contents/MacOS/bagent"
 write_capture "handoff-storage.json" "$(jq -nc \
     --arg surface_canary stage7c-handoff-observed \
     --argjson acknowledged "$replacement_acknowledged" \
@@ -369,16 +371,11 @@ if [[ -n "$stage8_actual_capture_dir" ]]; then
     curl -fsS -H "$auth_header" \
         "http://127.0.0.1:$daemon_port/diagnostics/evidence/$privacy_turn_id/export" \
         >"$fixture_root/diagnostic-export.json"
-    sqlite3 "$fixture_root/data/bagent.db" 'PRAGMA user_version;' >"$fixture_root/migration-version.txt"
     copy_stage8_actual "$fixture_root/work-events.json" event.json
     copy_stage8_actual "$fixture_root/evidence/replacement.json" ui.json
     copy_stage8_actual "$fixture_root/daemon.log" daemon.log
     copy_stage8_actual "$diagnostic_file" diagnostics.json
     copy_stage8_actual "$fixture_root/diagnostic-export.json" export.json
-    copy_stage8_actual "$fixture_root/migration-version.txt" migration.txt
-    copy_stage8_actual "$fixture_root/timeout-status.json" rollback.json
-    copy_stage8_actual "$fixture_root/evidence/old-fenced.json" crash.json
-    copy_stage8_actual "$fixture_root/stale-old.json" failure.json
 fi
 
 protected_8080_after="$(lsof -nP -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)"

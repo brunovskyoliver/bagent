@@ -1415,6 +1415,20 @@ impl ModelRuntime {
         .await
     }
 
+    #[cfg(feature = "stage8-acceptance")]
+    pub async fn complete_stage8_acceptance_reload(
+        self: &Arc<Self>,
+        work: WorkIdentity,
+    ) -> Result<String> {
+        self.complete_bounded(
+            ModelDemand::foreground(work, ModelClass::Chat4B),
+            vec![Message::user("Reply with the single word ready.")],
+            0.0,
+            16,
+        )
+        .await
+    }
+
     pub async fn complete_json(
         self: &Arc<Self>,
         demand: ModelDemand,

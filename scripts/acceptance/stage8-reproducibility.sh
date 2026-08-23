@@ -79,7 +79,7 @@ text = open(sys.argv[1], encoding="utf-8").read()
 patterns = (
     r"\brunning ([1-9][0-9]*) tests?\b",
     r"\bExecuted ([1-9][0-9]*) tests?\b",
-    r"\b([1-9][0-9]*) (?:assertions?|surfaces?|canaries?|routes?|states?|files?|cases?|kill points?|SIGKILLs?|integrity checks?|restarts?|conversions?|campaigns?|works?|links?|sessions?|retirements?|reloads?|chats?|commands?|checks?)\b",
+    r"\b([1-9][0-9]*) (?:repository-relative )?(?:assertions?|surfaces?|canaries?|routes?|states?|files?|cases?|keys?|kill points?|SIGKILLs?|integrity checks?|restarts?|conversions?|campaigns?|works?|links?(?: checked)?|sessions?|retirements?|reloads?|chats?|commands?|checks?)\b",
     r"\b(?:assertion_count|route_count|case_count|transition_count|work_count|link_count|session_count)=([1-9][0-9]*)\b",
 )
 values = []
@@ -175,8 +175,8 @@ run_gate model-runtime-authority evidence scripts/acceptance/model-runtime-autho
 run_gate current-chat-authority evidence scripts/acceptance/current-chat-authority.sh
 run_gate settings-authority evidence scripts/acceptance/settings-authority.sh
 run_gate notch-mode-authority command scripts/acceptance/notch-mode-authority.sh
-run_gate work-cutover-rollback command scripts/acceptance/work-cutover-rollback.sh
-run_gate accessibility-audit command scripts/acceptance/accessibility-audit.sh
+run_gate work-cutover-rollback tests scripts/acceptance/work-cutover-rollback.sh
+run_gate accessibility-audit tests scripts/acceptance/accessibility-audit.sh
 run_gate settings-localization evidence scripts/acceptance/settings-localization.sh
 run_gate automation-sessions-regression tests cargo test -p bagentd --test automation_sessions --no-fail-fast
 run_gate current-chat-regression tests cargo test -p bagentd --test current_chat --no-fail-fast

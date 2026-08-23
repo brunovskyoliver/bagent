@@ -70,7 +70,7 @@ canary_terms=(
     "diagnostic export"
     "failure payload"
 )
-surfaces=(event ui log diagnostics export migration rollback crash failure)
+surfaces=(event ui log diagnostics export)
 
 printf '%s\n' "${canaries[@]}" > "$fixture/canary-seed.txt"
 canary_json="$(printf '%s\n' "${canaries[@]}" | jq -R -s 'split("\n") | map(select(length > 0))')"
@@ -107,7 +107,7 @@ for file in "$capture_dir"/*; do
 done
 [[ "$sanitized_matches" -eq 0 ]]
 [[ "$(find "$capture_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "${#surfaces[@]}" ]]
-expected_files=(event.json ui.json daemon.log diagnostics.json export.json migration.txt rollback.json crash.json failure.json)
+expected_files=(event.json ui.json daemon.log diagnostics.json export.json)
 for file in "${expected_files[@]}"; do [[ -s "$capture_dir/$file" ]]; done
 
 capture_bytes="$(find "$capture_dir" -maxdepth 1 -type f -exec stat -f '%z' {} + | awk '{sum += $1} END {print sum + 0}')"

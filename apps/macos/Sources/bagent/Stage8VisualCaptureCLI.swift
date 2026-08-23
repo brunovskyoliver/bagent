@@ -152,13 +152,20 @@ enum Stage8VisualCaptureCLI {
             try await Task.sleep(for: reduceMotion ? .milliseconds(70) : .milliseconds(700))
             let settledInterruption = try capturePNG(host, name: "\(mode)-interruption-settled")
             try settledInterruption.write(to: modeDirectory.appendingPathComponent("interruption-settled.png"))
-            for data in [beforeInterruption, afterInterruption, settledInterruption] {
+            let expectedFailed = try await captureSettledHistory(
+                fixtures.map(\.presentation.snapshot) + [loading, failed],
+                reduceMotion: reduceMotion,
+                name: "\(mode)-expected-failed"
+            )
+            try expectedFailed.write(to: modeDirectory.appendingPathComponent("interruption-expected-failed.png"))
+            for data in [beforeInterruption, afterInterruption, settledInterruption, expectedFailed] {
                 frameData.insert(data)
                 frameCount += 1
                 if reduceMotion { reducedFrameCount += 1 } else { normalFrameCount += 1 }
             }
             guard viewModel.notchPresentation.snapshot.works.first?.state == .failed,
-                  viewModel.notchPresentation.revision.cursor == failed.cursor else {
+                  viewModel.notchPresentation.revision.cursor == failed.cursor,
+                  settledInterruption == expectedFailed else {
                 throw CaptureError.transition
             }
             interruptionsReconciled += 1
@@ -191,6 +198,42 @@ enum Stage8VisualCaptureCLI {
             throw CaptureError.render(name)
         }
         return png
+    }
+
+    private static func captureSettledHistory(
+        _ snapshots: [NotchWorkSnapshot],
+        reduceMotion: Bool,
+        name: String
+    ) async throws -> Data {
+        let viewModel = ChatViewModel(startMonitoring: false)
+        viewModel.setNotchReduceMotion(reduceMotion)
+        let host = NSHostingView(
+            rootView: NotchWrapView(
+                notchWidth: 221,
+                notchHeight: 38,
+                viewModel: viewModel,
+                onTap: {},
+                onHoverChanged: { _ in },
+                acceptanceReduceMotionOverride: reduceMotion
+            )
+        )
+        host.frame = CGRect(x: 0, y: 0, width: 741, height: 312)
+        let panel = NSPanel(
+            contentRect: CGRect(x: -10_000, y: -10_000, width: 741, height: 312),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isReleasedWhenClosed = false
+        panel.contentView = host
+        panel.orderFront(nil)
+        defer { panel.close() }
+        for snapshot in snapshots {
+            try viewModel.applyAuthoritativeSnapshot(snapshot)
+            host.layoutSubtreeIfNeeded()
+        }
+        try await Task.sleep(for: reduceMotion ? .milliseconds(300) : .milliseconds(700))
+        return try capturePNG(host, name: name)
     }
 
     private static func catalogView(_ presentation: NotchPresentation) -> some View {
