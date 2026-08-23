@@ -27,7 +27,9 @@ use bagentd::current_chat::{
     read_current_chat, recover_after_daemon_restart, save_draft, upsert_connector_reference,
     ClearCurrentChatCommand, SubmittedAttachmentMetadata, ValidatedSourceMetadata,
 };
-use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig, RuntimePhase};
+use bagentd::model_runtime::{
+    ModelClass, ModelDemand, ModelRuntime, ProductionModelConfig, RuntimePhase,
+};
 use bagentd::permission_probe::DaemonFullDiskAccessProbe;
 use bagentd::ui_relaunch::{
     TransferStatus, UiConsumerAuthority, UiConsumerTransferError, TRANSFER_TIMEOUT,
@@ -882,6 +884,10 @@ async fn main() -> Result<()> {
             .route(
                 "/acceptance/stage8/approval",
                 post(stage8_acceptance_approval_handler),
+            )
+            .route(
+                "/acceptance/stage8/model-reload",
+                post(stage8_acceptance_model_reload_handler),
             );
     } else {
         app = app.route(
@@ -4813,6 +4819,42 @@ async fn stage8_acceptance_approval_handler(
         ),
         Err(error) => (
             StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": error.to_string() })),
+        ),
+    }
+}
+
+/// Issues one bounded demand through the production Model Runtime and the real
+/// disposable BaseRT adapter. Generated text is neither returned nor retained.
+#[cfg(feature = "stage8-acceptance")]
+async fn stage8_acceptance_model_reload_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    if state.acceptance.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false })),
+        );
+    }
+    let result = state
+        .model_runtime
+        .complete_bounded(
+            ModelDemand::foreground(
+                WorkIdentity::new(format!("stage8-reload-demand:{}", Uuid::new_v4())),
+                ModelClass::Chat4B,
+            ),
+            vec![Message::user("Reply with the single word ready.")],
+            0.0,
+            16,
+        )
+        .await;
+    match result {
+        Ok(output) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "outputBytes": output.len() })),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "ok": false, "error": error.to_string() })),
         ),
     }

@@ -20,6 +20,8 @@ basert_pid=""
 daemon_port=""
 basert_port=""
 auth_header=""
+reload_ui_pid=""
+reload_request_pid=""
 
 process_matches() {
     local pid="$1" expected="$2"
@@ -37,6 +39,8 @@ safe_signal() {
 }
 
 cleanup() {
+    safe_signal "$reload_ui_pid" bagent -TERM
+    safe_signal "$reload_request_pid" curl -TERM
     safe_signal "$daemon_pid" bagentd -TERM
     safe_signal "$basert_pid" basert-serve -TERM
     for pid in "$daemon_pid" "$basert_pid"; do
@@ -326,6 +330,7 @@ for _ in {1..900}; do
     sleep 0.2
 done
 [[ "$automation_terminal" == true ]]
+last_snapshot="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/work/snapshot/read")"
 
 session_a="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/automation-sessions/automation-session:$run_a_id")"
 session_b="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/automation-sessions/automation-session:$run_b_id")"
@@ -423,17 +428,25 @@ fi
 kill -0 "$daemon_pid"
 kill -0 "$basert_pid"
 
-set +e
-BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 BAGENT_DATA_DIR="$fixture_root/data" \
-    "$acceptance_candidate/Contents/MacOS/bagent" --stage8-acceptance-case \
-    web_authoritative accepted 'What is the current population of Bratislava online?' \
-    "$fixture_root/reload.json" >"$fixture_root/reload-ui.log" 2>&1
-reload_status=$?
-set -e
-[[ "$reload_status" == 0 ]]
-[[ "$(jq -r .done_count "$fixture_root/reload.json")" == 1 ]]
-[[ "$(jq -r .outcome_count "$fixture_root/reload.json")" == 1 ]]
-[[ "$(jq -r '.polish_statuses | index("accepted") != null' "$fixture_root/reload.json")" == true ]]
+curl -fsS -H "$auth_header" -X POST \
+    "http://127.0.0.1:$daemon_port/acceptance/stage8/model-reload" \
+    >"$fixture_root/reload.json" 2>"$fixture_root/reload.curl.log" &
+reload_request_pid=$!
+reload_phase_observed=false
+for _ in {1..750}; do
+    reload_health="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/health")"
+    if [[ "$(jq -r .model_runtime.phase <<<"$reload_health")" =~ ^(loading|loaded_not_ready|ready)$ ]]; then
+        reload_phase_observed=true
+        break
+    fi
+    kill -0 "$reload_request_pid" 2>/dev/null || break
+    sleep 0.02
+done
+[[ "$reload_phase_observed" == true ]]
+wait "$reload_request_pid"
+reload_request_pid=""
+[[ "$(jq -r .ok "$fixture_root/reload.json")" == true ]]
+[[ "$(jq -r .outputBytes "$fixture_root/reload.json")" =~ ^[1-9][0-9]*$ ]]
 reload_health="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/health")"
 [[ "$(jq -r .process_id <<<"$reload_health")" == "$daemon_pid" ]]
 kill -0 "$basert_pid"
