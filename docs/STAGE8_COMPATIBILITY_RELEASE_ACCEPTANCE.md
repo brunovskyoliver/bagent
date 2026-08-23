@@ -223,6 +223,10 @@ or pull request is part of this stage.
   state PNGs and 22 transitions passed because their nouns were not recognized
   as metrics. The gate now emits explicit `case_count` and `transition_count`
   fields.
+- A60 signed privacy relaunch: a later frozen run exposed a race after the
+  replacement published readiness but before it fetched the reserved snapshot.
+  The replacement now fetches and applies that snapshot before publishing
+  readiness; two consecutive signed privacy campaigns passed afterward.
 - Earlier review passes identified and were followed by fixes for the counted
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,

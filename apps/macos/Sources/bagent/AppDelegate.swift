@@ -125,16 +125,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 oldConsumerFence: handoff.sourceConsumerFence,
                 replacementConsumerFence: handoff.replacementConsumerFence
             )
+            let reservedProjection = try await client.fetchReservedUIRelaunchSnapshot(
+                transferIdentity: handoff.nonce,
+                replacementConsumerFence: handoff.replacementConsumerFence
+            )
+            writeStage7CAcceptanceMarker("replacement-fetched-reserved")
+            try viewModel.applyAuthoritativeSnapshot(reservedProjection)
+            writeStage7CAcceptanceMarker("replacement-applied-reserved")
             _ = try await client.markUIRelaunchReady(
                 transferIdentity: handoff.nonce,
                 replacementConsumerFence: handoff.replacementConsumerFence
             )
             writeStage7CAcceptanceMarker("replacement-ready")
-            let reservedProjection = try await client.fetchReservedUIRelaunchSnapshot(
-                transferIdentity: handoff.nonce,
-                replacementConsumerFence: handoff.replacementConsumerFence
-            )
-            try viewModel.applyAuthoritativeSnapshot(reservedProjection)
 
             var oldFenced = false
             var readyObservedAt: Date?
