@@ -7,6 +7,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 candidate="$(cd "$1" && pwd)"
+acceptance_candidate=""
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture_root="$(mktemp -d "${TMPDIR:-/tmp}/bagent-stage8-live-smoke.XXXXXX")"
 case "$fixture_root" in
@@ -55,6 +56,22 @@ sign_identity="$(security find-identity -v -p codesigning 2>/dev/null | sed -n '
 [[ -n "$sign_identity" ]] || { echo "BLOCKED: no Apple Development signing identity"; exit 1; }
 codesign --verify --deep --strict "$candidate"
 
+# The release candidate must not ship the mutation-capable live-smoke CLI.
+# Build that CLI behind a compile-time flag, place it in a disposable copy of
+# the same candidate bundle, and sign the copy before it crosses the UI gate.
+if strings "$candidate/Contents/MacOS/bagent" | rg -q -- '--stage8-live-(session|projection)'; then
+    echo "FAIL: release candidate contains Stage 8 live acceptance commands"
+    exit 1
+fi
+swift_acceptance_build="$fixture_root/swift-acceptance-build"
+swift build --package-path "$repo_root/apps/macos" --scratch-path "$swift_acceptance_build" \
+    -c release -Xswiftc -DBAGENT_ACCEPTANCE >/dev/null
+acceptance_candidate="$fixture_root/bagent-stage8-acceptance.app"
+cp -R "$candidate" "$acceptance_candidate"
+cp "$swift_acceptance_build/release/bagent" "$acceptance_candidate/Contents/MacOS/bagent"
+codesign --force --deep --sign "$sign_identity" --options runtime "$acceptance_candidate" >/dev/null
+codesign --verify --deep --strict "$acceptance_candidate"
+
 protected_8080_before="$(lsof -nP -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)"
 protected_8082_before="$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)"
 
@@ -65,7 +82,6 @@ model_source="/Users/oliver/Library/Application Support/bagent/basert-models/bas
     exit 1
 }
 
-swift build --package-path "$repo_root/apps/macos" -c release >/dev/null
 cargo build --manifest-path "$repo_root/Cargo.toml" -p bagentd --features stage7a-acceptance,stage8-acceptance >/dev/null
 
 mkdir -p "$fixture_root/models" "$fixture_root/data" "$fixture_root/home/Downloads"
@@ -91,6 +107,7 @@ kill -0 "$basert_pid"
 HOME="$fixture_root/home" \
 BAGENT_STAGE7A_ACCEPTANCE_FIXTURE=1 \
 BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 \
+BAGENT_STAGE8_IDLE_TIMEOUT_SECONDS=1 \
 BAGENT_STAGE8_LIVE_AUTOMATION_DELAY_MS=5000 \
 BAGENT_STAGE7C_FDA_FIXTURE=granted \
 BAGENT_DATA_DIR="$fixture_root/data" \
@@ -277,7 +294,7 @@ run_a_id="$(jq -r .run.id <<<"$run_a_response")"
 active_ui_observed=false
 for _ in {1..40}; do
     if BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 BAGENT_DATA_DIR="$fixture_root/data" \
-        "$candidate/Contents/MacOS/bagent" --stage8-live-projection "$fixture_root/active-ui.json" \
+        "$acceptance_candidate/Contents/MacOS/bagent" --stage8-live-projection "$fixture_root/active-ui.json" \
         >"$fixture_root/active-ui.log" 2>&1 && \
         [[ "$(jq -r .status "$fixture_root/active-ui.json")" == pass ]]; then
         active_ui_observed=true
@@ -351,7 +368,7 @@ fi
 [[ "$terminal_revision" =~ ^[0-9]+$ ]]
 set +e
 BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 BAGENT_DATA_DIR="$fixture_root/data" \
-    "$candidate/Contents/MacOS/bagent" --stage8-live-session \
+    "$acceptance_candidate/Contents/MacOS/bagent" --stage8-live-session \
     "$inspect_run_id" "$terminal_work" "$terminal_revision" "$fixture_root/session-ui.json" \
     >"$fixture_root/session-ui.log" 2>&1
 session_ui_status=$?
@@ -383,13 +400,53 @@ kill -0 "$basert_pid"
 
 runtime_health="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/health")"
 [[ "$(jq -r .process_id <<<"$runtime_health")" == "$daemon_pid" ]]
+[[ "$(jq -r .model_runtime.shared_idle_timeout_seconds <<<"$runtime_health")" == "1" ]]
+
+# Observe the real maintenance loop retire the resident model after its final
+# lease, then make another signed request and observe a live reload. Neither
+# process is replaced across the lifecycle boundary.
+retirement_observed=false
+for _ in {1..240}; do
+    runtime_health="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/health")"
+    if [[ "$(jq -r .model_runtime.phase <<<"$runtime_health")" == unloaded ]] && \
+       [[ "$(jq -r .model_runtime.lease_count <<<"$runtime_health")" == 0 ]]; then
+        retirement_observed=true
+        break
+    fi
+    sleep 0.25
+done
+if [[ "$retirement_observed" != true ]]; then
+    echo "A59 retirement observation failed: $(jq -c .model_runtime <<<"$runtime_health")" >&2
+    tail -n 80 "$fixture_root/daemon.log" >&2 || true
+fi
+[[ "$retirement_observed" == true ]]
+kill -0 "$daemon_pid"
+kill -0 "$basert_pid"
+
+set +e
+BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 BAGENT_DATA_DIR="$fixture_root/data" \
+    "$acceptance_candidate/Contents/MacOS/bagent" --stage8-acceptance-case \
+    web_authoritative accepted 'What is the current population of Bratislava online?' \
+    "$fixture_root/reload.json" >"$fixture_root/reload-ui.log" 2>&1
+reload_status=$?
+set -e
+[[ "$reload_status" == 0 ]]
+[[ "$(jq -r .done_count "$fixture_root/reload.json")" == 1 ]]
+[[ "$(jq -r .outcome_count "$fixture_root/reload.json")" == 1 ]]
+[[ "$(jq -r '.polish_statuses | index("accepted") != null' "$fixture_root/reload.json")" == true ]]
+reload_health="$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/health")"
+[[ "$(jq -r .process_id <<<"$reload_health")" == "$daemon_pid" ]]
+kill -0 "$basert_pid"
 
 protected_8080_after="$(lsof -nP -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)"
 protected_8082_after="$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)"
 [[ "$protected_8080_before" == "$protected_8080_after" ]]
 [[ "$protected_8082_before" == "$protected_8082_after" ]]
 
-# Explicit deterministic runtime proof for idle retirement and later reload.
-cargo test -p bagentd --test model_runtime idle_retirement -- --exact >/dev/null
-
-echo "A59 final observational live smoke: PASS (macOS $os_version; signed candidate; disposable real daemon/BaseRT stable; preload, foreground chat, two canonical automation Works and sessions, activity/tool presentation, result open, continuation, scoped /clear, permission reread, UI-only relaunch, idle-retirement regression, later reload, and port isolation verified; no TCC mutation)"
+echo "A59 live foreground chats: 2"
+echo "A59 canonical automation Works: $canonical_automation_work_count"
+echo "A59 canonical automation links: $canonical_automation_link_count"
+echo "A59 canonical automation sessions: $canonical_automation_session_count"
+echo "A59 live idle retirements: 1"
+echo "A59 live reloads: 1"
+echo "A59 final observational live smoke: PASS (macOS $os_version; signed candidate; disposable real daemon/BaseRT stable; preload, foreground chat, two canonical automation Works and sessions, activity/tool presentation, result open, continuation, scoped /clear, permission reread, UI-only relaunch, live idle retirement, live reload, and port isolation verified; no TCC mutation)"

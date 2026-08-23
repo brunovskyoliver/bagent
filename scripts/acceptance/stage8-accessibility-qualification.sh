@@ -33,11 +33,9 @@ for field in active_element_count approval_element_count assertion_count; do
     count="$(jq -r ".$field" "$notch_evidence")"
     [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "A57 $field is zero" >&2; exit 1; }
 done
-for field in keyboard_only_navigation focus_order voiceover_names_readouts contrast enlarged_text; do
-    [[ "$(jq -r ".$field" "$notch_evidence")" == true ]] || {
-        echo "A57 signed AX evidence is incomplete: $field" >&2
-        exit 1
-    }
+for field in ax_press_actions_executed keyboard_events_sent focus_destination_changes_observed ax_names_values_observed contrast_checks enlarged_layout_frames_observed; do
+    count="$(jq -r ".$field" "$notch_evidence")"
+    [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "A57 signed AX evidence is zero: $field" >&2; exit 1; }
 done
 announcements_posted="$(jq -r .announcements_posted "$notch_evidence")"
 [[ "$announcements_posted" =~ ^[2-9][0-9]*$ ]]

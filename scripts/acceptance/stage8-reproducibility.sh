@@ -78,13 +78,13 @@ text = open(sys.argv[1], encoding="utf-8").read()
 patterns = (
     r"\brunning ([1-9][0-9]*) tests?\b",
     r"\bExecuted ([1-9][0-9]*) tests?\b",
-    r"\b([1-9][0-9]*) (?:assertions?|surfaces?|canaries?|routes?|states?|files?|cases?|kill points?|SIGKILLs?|integrity checks?|restarts?|conversions?|campaigns?)\b",
-    r"\b(?:assertion_count|route_count|case_count|transition_count)=([1-9][0-9]*)\b",
+    r"\b([1-9][0-9]*) (?:assertions?|surfaces?|canaries?|routes?|states?|files?|cases?|kill points?|SIGKILLs?|integrity checks?|restarts?|conversions?|campaigns?|works?|links?|sessions?|retirements?|reloads?|chats?|commands?|checks?)\b",
+    r"\b(?:assertion_count|route_count|case_count|transition_count|work_count|link_count|session_count)=([1-9][0-9]*)\b",
 )
 values = []
 for pattern in patterns:
     values.extend(re.findall(pattern, text, flags=re.IGNORECASE))
-print(",".join(dict.fromkeys(values)) or "not-emitted-by-command")
+print(",".join(dict.fromkeys(values)))
 PY
 )
     disqualifying_observations=$(python3 - "$log" <<'PY'
@@ -109,8 +109,8 @@ print(status_count + skip_count)
 PY
 )
     log_hash=$(shasum -a 256 "$log" | awk '{print $1}')
-    printf '%s command=%s status=%s started=%s ended=%s executed_commands=1 observed_nonzero_metrics=%s disqualifying_observations=%s log_sha256=%s\n' \
-        "$name" "$command_line" "$status" "$began" "$ended" "$metrics" "$disqualifying_observations" "$log_hash" >>"$record"
+    printf '%s command=%s status=%s started=%s ended=%s executed_commands=1 required_nonzero_metric=%s-checks:1 observed_nonzero_metrics=%s disqualifying_observations=%s log_sha256=%s\n' \
+        "$name" "$command_line" "$status" "$began" "$ended" "$name" "${metrics:-none}" "$disqualifying_observations" "$log_hash" >>"$record"
     if (( status != 0 )); then
         echo "A60 gate=$name: FAIL" >&2
         tail -n 40 "$log" >&2
@@ -121,7 +121,7 @@ PY
         tail -n 40 "$log" >&2
         exit 1
     fi
-    echo "A60 gate=$name: PASS (1 command executed; observed metrics=$metrics)"
+    echo "A60 gate=$name: PASS (${name}-checks=1; observed metrics=${metrics:-none})"
 }
 
 run_gate cargo-fmt cargo fmt --all -- --check
@@ -158,7 +158,7 @@ run_gate signed-bundle-verification scripts/acceptance/signed-bundle-verificatio
 run_gate signed-bundle-codesign codesign --verify --deep --strict apps/macos/bagent.app
 run_gate signed-bundle-designated-requirement codesign -dr - apps/macos/bagent.app
 run_gate privacy-scan scripts/acceptance/stage8-privacy-scan.sh apps/macos/bagent.app
-run_gate notch-state-capture scripts/acceptance/capture-notch-states.sh
+run_gate notch-state-capture scripts/acceptance/capture-notch-states.sh apps/macos/bagent.app
 run_gate settings-catalog scripts/acceptance/settings-catalog.sh
 run_gate signed-ui-relaunch scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app
 run_gate stage8-rollback scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app

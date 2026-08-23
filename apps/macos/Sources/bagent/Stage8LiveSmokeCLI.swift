@@ -1,5 +1,6 @@
 import Foundation
 
+#if BAGENT_ACCEPTANCE
 /// Signed-candidate observation and mutation boundary for the A59 disposable
 /// live smoke. It uses the production client and projection, while writing
 /// only counts, enum values, and identities' structural relationships.
@@ -152,3 +153,4 @@ enum Stage8LiveSmokeCLI {
         try data.write(to: url, options: .atomic)
     }
 }
+#endif

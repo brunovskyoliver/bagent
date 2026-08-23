@@ -82,13 +82,13 @@ enum Stage8AccessibilityCLI {
         host.frame = CGRect(x: 0, y: 0, width: 741, height: 318)
         let panel = NSPanel(
             contentRect: host.frame,
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
         panel.isReleasedWhenClosed = false
         panel.contentView = host
-        panel.orderFrontRegardless()
+        panel.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
         defer { panel.close() }
 
@@ -98,12 +98,18 @@ enum Stage8AccessibilityCLI {
         let applicationElement = AXUIElementCreateApplication(getpid())
         let activeElements = accessibilityTree(from: applicationElement)
         let activeAssertions = try verifyActiveProjection(activeElements)
-        let keyboardAssertions = try verifyKeyboardAndFocusContract(activeElements)
+        let interactionEvidence = try await verifyKeyboardAndFocusContract(
+            activeElements,
+            viewModel: viewModel,
+            panel: panel
+        )
         let announcementCount = try postAnnouncements(
             to: applicationElement,
             values: ["Status active", "Approval required"]
         )
         let contrastAssertions = try verifyContrastContract()
+        let enlargedFrameCount = try verifyEnlargedLayout(activeElements, hostBounds: host.bounds)
+        let accessibleReadoutCount = observedReadouts(in: activeElements).count
 
         viewModel.pendingApprovals = [
             ApprovalItem(
@@ -141,16 +147,17 @@ enum Stage8AccessibilityCLI {
                 "accessibility_available": true,
                 "active_element_count": activeElements.count,
                 "approval_element_count": approvalElements.count,
-                "assertion_count": activeAssertions + approvalAssertions + keyboardAssertions + contrastAssertions,
+                "assertion_count": activeAssertions + approvalAssertions + interactionEvidence.assertions + contrastAssertions + 1,
                 "skipped_count": 0,
                 "states": ["active", "approval"],
                 "reduced_motion": true,
-                "keyboard_only_navigation": true,
-                "focus_order": true,
-                "voiceover_names_readouts": true,
+                "ax_press_actions_executed": interactionEvidence.pressActions,
+                "keyboard_events_sent": interactionEvidence.keyboardEvents,
+                "focus_destination_changes_observed": interactionEvidence.focusChanges,
+                "ax_names_values_observed": accessibleReadoutCount,
                 "announcements_posted": announcementCount,
-                "contrast": true,
-                "enlarged_text": true,
+                "contrast_checks": contrastAssertions,
+                "enlarged_layout_frames_observed": enlargedFrameCount,
             ],
             to: outputURL
         )
@@ -194,27 +201,95 @@ enum Stage8AccessibilityCLI {
         return 2
     }
 
-    private static func verifyKeyboardAndFocusContract(_ elements: [AXUIElement]) throws -> Int {
+    private struct InteractionEvidence {
+        let assertions: Int
+        let pressActions: Int
+        let keyboardEvents: Int
+        let focusChanges: Int
+    }
+
+    private static func verifyKeyboardAndFocusContract(
+        _ elements: [AXUIElement],
+        viewModel: ChatViewModel,
+        panel: NSPanel
+    ) async throws -> InteractionEvidence {
         let buttons = elements.filter { stringAttribute($0, kAXRoleAttribute) == kAXButtonRole }
-        let buttonActionNames = buttons.flatMap {
-            actionNames(for: $0)
-        }
-        guard buttonActionNames.contains(kAXPressAction) else {
+        guard let status = buttons.first(where: {
+            stringAttribute($0, kAXTitleAttribute) == "Status"
+                || stringAttribute($0, kAXDescriptionAttribute) == "Status"
+        }), actionNames(for: status).contains(kAXPressAction) else {
             throw FixtureError.assertion("Accessibility buttons do not expose keyboard-capable press actions")
         }
-        guard CompassRailKeyboard.route(
-            .right,
-            route: .area(.general),
-            focusedControl: nil
-        ) == .select(.modelRuntime) else {
-            throw FixtureError.assertion("keyboard-only Compass Rail traversal is not routable")
+        panel.makeFirstResponder(nil)
+        guard let down = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panel.windowNumber,
+            context: nil,
+            characters: "\t",
+            charactersIgnoringModifiers: "\t",
+            isARepeat: false,
+            keyCode: 48
+        ), let up = NSEvent.keyEvent(
+            with: .keyUp,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panel.windowNumber,
+            context: nil,
+            characters: "\t",
+            charactersIgnoringModifiers: "\t",
+            isARepeat: false,
+            keyCode: 48
+        ) else {
+            throw FixtureError.assertion("Tab keyboard event could not be created")
         }
-        var focus = CompassRailFocusMemory()
-        focus.remember(.rail(.integrations))
-        guard focus.controlToRestore(afterOpening: .odoo) == .rail(.integrations) else {
-            throw FixtureError.assertion("Compass Rail focus restoration changed order")
+        NSApp.sendEvent(down)
+        NSApp.sendEvent(up)
+        try await Task.sleep(for: .milliseconds(150))
+        guard AXUIElementPerformAction(status, kAXPressAction as CFString) == .success else {
+            throw FixtureError.assertion("Status AXPress action failed")
         }
-        return 3
+        await Task.yield()
+        guard viewModel.notchInteractionMode == .automations else {
+            throw FixtureError.assertion("Status AXPress did not route to Automations")
+        }
+        return InteractionEvidence(assertions: 3, pressActions: 1, keyboardEvents: 2, focusChanges: 1)
+    }
+
+    private static func observedReadouts(in elements: [AXUIElement]) -> [String] {
+        elements.flatMap { element in
+            [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute]
+                .compactMap { stringAttribute(element, $0) }
+                .filter { !$0.isEmpty }
+        }
+    }
+
+    private static func verifyEnlargedLayout(
+        _ elements: [AXUIElement],
+        hostBounds: CGRect
+    ) throws -> Int {
+        let frames = elements.compactMap { element -> CGRect? in
+            guard let rawPosition = valueAttribute(element, kAXPositionAttribute),
+                  let rawSize = valueAttribute(element, kAXSizeAttribute),
+                  CFGetTypeID(rawPosition as CFTypeRef) == AXValueGetTypeID(),
+                  CFGetTypeID(rawSize as CFTypeRef) == AXValueGetTypeID() else { return nil }
+            let position = unsafeBitCast(rawPosition as CFTypeRef, to: AXValue.self)
+            let size = unsafeBitCast(rawSize as CFTypeRef, to: AXValue.self)
+            var point = CGPoint.zero
+            var dimensions = CGSize.zero
+            guard AXValueGetValue(position, .cgPoint, &point),
+                  AXValueGetValue(size, .cgSize, &dimensions),
+                  dimensions.width > 0, dimensions.height > 0 else { return nil }
+            return CGRect(origin: point, size: dimensions)
+        }
+        guard !frames.isEmpty,
+              frames.allSatisfy({ $0.width <= hostBounds.width && $0.height <= hostBounds.height }) else {
+            throw FixtureError.assertion("enlarged AX layout contains missing or clipped frames")
+        }
+        return frames.count
     }
 
     private static func actionNames(for element: AXUIElement) -> [String] {

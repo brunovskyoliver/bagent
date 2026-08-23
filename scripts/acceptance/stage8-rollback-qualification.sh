@@ -41,6 +41,13 @@ new_pid=""
 post_work_old_pid=""
 restored_pid=""
 
+process_matches() {
+    local pid=$1 required=$2 command
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ "$command" == *"$required"* ]]
+}
+
 sqlite3_wait() {
     sqlite3 -cmd '.timeout 5000' "$@"
 }
@@ -59,12 +66,16 @@ cleanup() {
             fi
         done
     fi
-    for pid in "$old_seed_pid" "$rollback_pid" "$new_pid" "$post_work_old_pid" "$restored_pid" "$mock_basert_pid"; do
-        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    for pid in "$old_seed_pid" "$rollback_pid" "$new_pid" "$post_work_old_pid" "$restored_pid"; do
+        if process_matches "$pid" "/Contents/MacOS/bagentd"; then
             kill -TERM "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
         fi
     done
+    if process_matches "$mock_basert_pid" "$root/scripts/acceptance/stage8-external-basert-stub.py"; then
+        kill -TERM "$mock_basert_pid" 2>/dev/null || true
+        wait "$mock_basert_pid" 2>/dev/null || true
+    fi
     if [[ -e "$old_checkout/.git" ]]; then
         git worktree remove --force "$old_checkout" >/dev/null 2>&1 || true
     fi

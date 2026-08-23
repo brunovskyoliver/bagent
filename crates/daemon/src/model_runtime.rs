@@ -24,6 +24,41 @@ impl Default for ModelRuntimePolicy {
     }
 }
 
+fn production_policy() -> ModelRuntimePolicy {
+    let policy = ModelRuntimePolicy::default();
+    #[cfg(feature = "stage8-acceptance")]
+    {
+        return acceptance_policy_override(
+            policy,
+            std::env::var("BAGENT_STAGE8_ACCEPTANCE_FIXTURES").as_deref() == Ok("1"),
+            std::env::var("BAGENT_STAGE8_IDLE_TIMEOUT_SECONDS")
+                .ok()
+                .as_deref(),
+        );
+    }
+    #[allow(unreachable_code)]
+    policy
+}
+
+#[cfg(feature = "stage8-acceptance")]
+fn acceptance_policy_override(
+    policy: ModelRuntimePolicy,
+    fixtures_enabled: bool,
+    timeout: Option<&str>,
+) -> ModelRuntimePolicy {
+    let Some(seconds) = fixtures_enabled
+        .then(|| timeout?.parse::<u64>().ok())
+        .flatten()
+        .filter(|seconds| (1..=60).contains(seconds))
+    else {
+        return policy;
+    };
+    ModelRuntimePolicy {
+        shared_idle_timeout_seconds: seconds,
+        ..policy
+    }
+}
+
 pub use crate::work_coordinator::WorkIdentity;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -1030,7 +1065,7 @@ impl ModelRuntime {
             transition: AsyncMutex::new(()),
             changed: tokio::sync::Notify::new(),
             simulated: false,
-            policy: ModelRuntimePolicy::default(),
+            policy: production_policy(),
         })
     }
 
@@ -1681,6 +1716,28 @@ mod tests {
     use super::{registered_model_directory, ProductionBaseRtAdapter};
     use std::path::{Path, PathBuf};
     use std::{sync::Arc, time::Duration};
+
+    #[cfg(feature = "stage8-acceptance")]
+    #[test]
+    fn stage8_idle_timeout_override_is_bounded_and_fixture_gated() {
+        let default = super::ModelRuntimePolicy::default();
+        assert_eq!(
+            super::acceptance_policy_override(default, true, Some("1")).shared_idle_timeout_seconds,
+            1
+        );
+        assert_eq!(
+            super::acceptance_policy_override(default, false, Some("1")),
+            default
+        );
+        assert_eq!(
+            super::acceptance_policy_override(default, true, Some("0")),
+            default
+        );
+        assert_eq!(
+            super::acceptance_policy_override(default, true, Some("61")),
+            default
+        );
+    }
 
     #[test]
     fn custom_model_sources_map_beneath_the_managed_registry() {

@@ -1,7 +1,43 @@
 import AppKit
 
 let arguments = CommandLine.arguments
-if (arguments.count == 3 || arguments.count == 4),
+#if BAGENT_ACCEPTANCE
+func runStage8LiveAcceptanceCommand(_ arguments: [String]) -> Bool {
+    if arguments.count == 6, arguments[1] == "--stage8-live-session" {
+        let runIdentity = arguments[2]
+        let workIdentity = arguments[3]
+        guard let workRevision = UInt64(arguments[4]) else { exit(64) }
+        let outputURL = URL(fileURLWithPath: arguments[5])
+        Task { @MainActor in
+            exit(await Stage8LiveSmokeCLI.run(
+                runIdentity: runIdentity,
+                workIdentity: workIdentity,
+                workRevision: workRevision,
+                outputURL: outputURL
+            ))
+        }
+        RunLoop.main.run()
+        return true
+    }
+    if arguments.count == 3, arguments[1] == "--stage8-live-projection" {
+        let outputURL = URL(fileURLWithPath: arguments[2])
+        Task { @MainActor in
+            exit(await Stage8LiveSmokeCLI.runProjection(outputURL: outputURL))
+        }
+        RunLoop.main.run()
+        return true
+    }
+    return false
+}
+
+let handledStage8LiveAcceptance = runStage8LiveAcceptanceCommand(arguments)
+#else
+let handledStage8LiveAcceptance = false
+#endif
+
+if handledStage8LiveAcceptance {
+    // The acceptance handler owns the main run loop.
+} else if (arguments.count == 3 || arguments.count == 4),
    arguments[1] == "--stage7a-relaunch-fixture" {
     let outputURL = URL(fileURLWithPath: arguments[2])
     let sentinelURL = arguments.count == 4 ? URL(fileURLWithPath: arguments[3]) : nil
@@ -22,26 +58,6 @@ if (arguments.count == 3 || arguments.count == 4),
             outputURL: outputURL
         )
         exit(status)
-    }
-    RunLoop.main.run()
-} else if arguments.count == 6, arguments[1] == "--stage8-live-session" {
-    let runIdentity = arguments[2]
-    let workIdentity = arguments[3]
-    guard let workRevision = UInt64(arguments[4]) else { exit(64) }
-    let outputURL = URL(fileURLWithPath: arguments[5])
-    Task { @MainActor in
-        exit(await Stage8LiveSmokeCLI.run(
-            runIdentity: runIdentity,
-            workIdentity: workIdentity,
-            workRevision: workRevision,
-            outputURL: outputURL
-        ))
-    }
-    RunLoop.main.run()
-} else if arguments.count == 3, arguments[1] == "--stage8-live-projection" {
-    let outputURL = URL(fileURLWithPath: arguments[2])
-    Task { @MainActor in
-        exit(await Stage8LiveSmokeCLI.runProjection(outputURL: outputURL))
     }
     RunLoop.main.run()
 } else if (3...4).contains(arguments.count),
@@ -67,6 +83,15 @@ if (arguments.count == 3 || arguments.count == 4),
     let outputURL = URL(fileURLWithPath: arguments[2])
     Task { @MainActor in
         exit(await Stage8AccessibilityCLI.run(outputURL: outputURL))
+    }
+    RunLoop.main.run()
+} else if arguments.count == 4,
+          arguments[1] == "--stage8-visual-capture",
+          ProcessInfo.processInfo.environment[Stage8VisualCaptureCLI.environmentKey] == "1" {
+    let outputDirectory = URL(fileURLWithPath: arguments[2], isDirectory: true)
+    let evidenceURL = URL(fileURLWithPath: arguments[3])
+    Task { @MainActor in
+        exit(Stage8VisualCaptureCLI.run(outputDirectory: outputDirectory, evidenceURL: evidenceURL))
     }
     RunLoop.main.run()
 } else if arguments.count == 3, arguments[1] == "--stage7c-drag-validation" {

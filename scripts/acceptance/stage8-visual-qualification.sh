@@ -25,7 +25,6 @@ for filter in "${test_filters[@]}"; do
     swift test --package-path "$root/apps/macos" --filter "$filter"
 done
 
-"$root/scripts/acceptance/capture-notch-states.sh"
 "$root/scripts/acceptance/settings-catalog.sh"
 
 fixture="$(mktemp -d "${TMPDIR:-/tmp}/bagent-stage8-visual.XXXXXX")"
@@ -36,8 +35,9 @@ esac
 trap 'rm -rf -- "$fixture"' EXIT INT TERM
 
 transition_evidence="$fixture/notch-transition.json"
+BAGENT_NOTCH_CAPTURE_DIR="$fixture/notch-state-catalog" \
 BAGENT_NOTCH_TRANSITION_EVIDENCE="$transition_evidence" \
-    swift test --package-path "$root/apps/macos" --filter NotchTransitionTests
+    "$root/scripts/acceptance/capture-notch-states.sh" "$candidate"
 [[ "$(jq -r .status "$transition_evidence")" == pass ]]
 [[ "$(jq -r .transition_count "$transition_evidence")" =~ ^[2-9][0-9]*$ ]]
 for field in interruption_reconciled status_pill_anchor_invariant normal_motion_recorded reduced_motion_recorded; do
@@ -63,6 +63,6 @@ done
 rg -q 'InvariantNotchStatusPill' "$root/apps/macos/Tests/bagentTests/NotchStateCatalogTests.swift"
 rg -q 'NotchPillLayout\.origin' "$root/apps/macos/Tests/bagentTests/NotchStateCatalogTests.swift"
 rg -q 'acceptanceReduceMotionOverride' "$root/apps/macos/Sources/bagent/ChatView.swift"
-test "$(find "$root/apps/macos/.build/notch-state-catalog" -maxdepth 1 -name '*.png' ! -name 'contact-sheet.png' | wc -l | tr -d ' ')" = 11
+test "$(find "$fixture/notch-state-catalog" -maxdepth 1 -name '*.png' ! -name 'contact-sheet.png' | wc -l | tr -d ' ')" = 11
 
 echo "A56 visual qualification: PASS (macOS $product_version; signed candidate; 11 notch states; transition interruption reconciled in normal and reduced motion; 57 settings fixtures x 2 widths x light/dark/high-contrast/large-text/reduced-motion; signed identity and status-pill anchor verified)"

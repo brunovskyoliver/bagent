@@ -2,12 +2,15 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
-catalog="$root/apps/macos/.build/notch-state-catalog"
+candidate="${1:-$root/apps/macos/bagent.app}"
+catalog="${BAGENT_NOTCH_CAPTURE_DIR:-$root/apps/macos/.build/notch-state-catalog}"
+evidence="${BAGENT_NOTCH_TRANSITION_EVIDENCE:-$catalog/evidence.json}"
 sources="$root/apps/macos/Sources/bagent"
 
 mkdir -p "$catalog"
-BAGENT_NOTCH_CAPTURE_DIR="$catalog" \
-    swift test --package-path "$root/apps/macos" --filter NotchStateCatalogTests
+codesign --verify --deep --strict "$candidate"
+BAGENT_STAGE8_VISUAL_FIXTURE=1 \
+    "$candidate/Contents/MacOS/bagent" --stage8-visual-capture "$catalog" "$evidence"
 
 expected=(idle queued loading thinking tool approval streaming completion failure cancellation interruption)
 for state in "${expected[@]}"; do
@@ -15,6 +18,9 @@ for state in "${expected[@]}"; do
 done
 
 test "$(find "$catalog" -maxdepth 1 -name '*.png' ! -name 'contact-sheet.png' | wc -l | tr -d ' ')" = 11
+[[ "$(jq -r .status "$evidence")" == pass ]]
+[[ "$(jq -r .rendered_notch_state_count "$evidence")" == 11 ]]
+[[ "$(jq -r .transition_count "$evidence")" == 22 ]]
 rg -q 'surfaceDuration: 0\.58' "$sources/NotchProjection.swift"
 rg -q 'contentRevealDelay: 0\.36' "$sources/NotchProjection.swift"
 rg -q 'duration: 0\.38' "$sources/StageRailView.swift"
@@ -28,4 +34,4 @@ if rg -n '\.(blur|shadow)\(|Material|material\)' \
     exit 1
 fi
 
-echo "PASS: rendered 11 deterministic notch-state PNGs in $catalog and verified accepted motion constants"
+echo "PASS: signed candidate rendered 11 deterministic notch-state PNGs and executed 22 normal/reduced-motion transitions in $catalog"

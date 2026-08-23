@@ -12,13 +12,20 @@ seed_db="$seed_data/bagent.db"
 stub_pid=""
 daemon_pid=""
 
+process_matches() {
+    local pid=$1 required=$2 command
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ "$command" == *"$required"* ]]
+}
+
 cleanup() {
     local exit_code=$?
-    if [[ "$daemon_pid" =~ ^[0-9]+$ ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+    if process_matches "$daemon_pid" "$daemon"; then
         kill -KILL "$daemon_pid" 2>/dev/null || true
         wait "$daemon_pid" 2>/dev/null || true
     fi
-    if [[ "$stub_pid" =~ ^[0-9]+$ ]] && kill -0 "$stub_pid" 2>/dev/null; then
+    if process_matches "$stub_pid" "$root/scripts/acceptance/stage8-external-basert-stub.py"; then
         kill -TERM "$stub_pid" 2>/dev/null || true
         wait "$stub_pid" 2>/dev/null || true
     fi
@@ -67,7 +74,7 @@ start_daemon() {
 }
 
 stop_daemon() {
-    if [[ "$daemon_pid" =~ ^[0-9]+$ ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+    if process_matches "$daemon_pid" "$daemon"; then
         kill -TERM "$daemon_pid" 2>/dev/null || true
         wait "$daemon_pid" 2>/dev/null || true
     fi
@@ -142,6 +149,7 @@ for killpoint in before-migration during-copy after-commit before-route-admissio
         echo "A53 FAIL: $killpoint admitted routes before the external kill" >&2
         exit 1
     }
+    process_matches "$daemon_pid" "$daemon"
     kill -KILL "$daemon_pid"
     wait "$daemon_pid" 2>/dev/null || true
     daemon_pid=""

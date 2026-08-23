@@ -54,6 +54,7 @@ build:
 
 # Bundle: Swift + daemon release binary
 bundle: build daemon
+	@! strings "$(BUILD_DIR)/$(APP_NAME)" | grep -Eq -- '--stage8-live-(session|projection)' || { echo "release executable contains Stage 8 live acceptance commands" >&2; exit 1; }
 	$(MAKE) require-signing
 	$(MAKE) assemble-bundle
 	@echo "✓  $(BUNDLE) ready — open $(BUNDLE) or drag to Applications"
