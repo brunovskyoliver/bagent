@@ -11,12 +11,16 @@ seed_data="$fixture/seed-data"
 seed_db="$seed_data/bagent.db"
 stub_pid=""
 daemon_pid=""
+python_binary="$(command -v python3)"
 
 process_matches() {
-    local pid=$1 required=$2 command
+    local pid=$1 expected_executable=$2 required_argument=${3:-} command executable
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    executable="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    [[ "$executable" == "$expected_executable" ]] || return 1
+    [[ -z "$required_argument" ]] && return 0
     command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    [[ "$command" == *"$required"* ]]
+    [[ " $command " == *" $required_argument "* ]]
 }
 
 cleanup() {
@@ -25,7 +29,7 @@ cleanup() {
         kill -KILL "$daemon_pid" 2>/dev/null || true
         wait "$daemon_pid" 2>/dev/null || true
     fi
-    if process_matches "$stub_pid" "$root/scripts/acceptance/stage8-external-basert-stub.py"; then
+    if process_matches "$stub_pid" "$python_binary" "$root/scripts/acceptance/stage8-external-basert-stub.py"; then
         kill -TERM "$stub_pid" 2>/dev/null || true
         wait "$stub_pid" 2>/dev/null || true
     fi

@@ -79,7 +79,7 @@ text = open(sys.argv[1], encoding="utf-8").read()
 patterns = (
     r"\brunning ([1-9][0-9]*) tests?\b",
     r"\bExecuted ([1-9][0-9]*) tests?\b",
-    r"\b([1-9][0-9]*) (?:repository-relative )?(?:assertions?|surfaces?|canaries?|routes?|states?|files?|cases?|keys?|kill points?|SIGKILLs?|integrity checks?|restarts?|conversions?|campaigns?|works?|links?(?: checked)?|sessions?|retirements?|reloads?|chats?|commands?|checks?)\b",
+    r"\b([1-9][0-9]*) (?:repository-relative )?(?:assertions?|surfaces?|canaries?|routes?|states?|files?|cases?|keys?|categories|matches|kill points?|SIGKILLs?|integrity checks?|restarts?|conversions?|campaigns?|works?|links?(?: checked)?|sessions?|retirements?|reloads?|chats?|commands?|checks?)\b",
     r"\b(?:assertion_count|route_count|case_count|transition_count|work_count|link_count|session_count)=([1-9][0-9]*)\b",
 )
 values = []

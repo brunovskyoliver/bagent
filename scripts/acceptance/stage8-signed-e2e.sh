@@ -19,11 +19,14 @@ esac
 
 basert_pid=""
 daemon_pid=""
+basert_binary=""
 cleanup() {
-    if [[ "$daemon_pid" =~ ^[0-9]+$ ]] && ps -p "$daemon_pid" -o comm= 2>/dev/null | awk -F/ '{print $NF}' | rg -qx 'bagentd'; then
+    if [[ "$daemon_pid" =~ ^[0-9]+$ ]] &&
+       [[ "$(ps -p "$daemon_pid" -o comm= 2>/dev/null || true)" == "$root/target/debug/bagentd" ]]; then
         kill -TERM "$daemon_pid" 2>/dev/null || true
     fi
-    if [[ "$basert_pid" =~ ^[0-9]+$ ]] && ps -p "$basert_pid" -o comm= 2>/dev/null | awk -F/ '{print $NF}' | rg -qx 'basert-serve'; then
+    if [[ "$basert_pid" =~ ^[0-9]+$ ]] &&
+       [[ "$(ps -p "$basert_pid" -o comm= 2>/dev/null || true)" == "$basert_binary" ]]; then
         kill -TERM "$basert_pid" 2>/dev/null || true
     fi
     for pid in "$daemon_pid" "$basert_pid"; do
