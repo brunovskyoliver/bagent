@@ -204,6 +204,11 @@ or pull request is part of this stage.
 - A53 process recovery: the external restart script failed red because no
   process-kill marker existed, then passed all four `SIGKILL` cases after the
   acceptance-only startup seams were added.
+- A60 skip accounting: the first frozen-candidate run stopped on the hosted
+  Accessibility test's skipped result. The deterministic audit no longer runs
+  that environment-dependent test; signed live AX remains in A57, and A60's
+  classifier now catches uppercase gate states, positive skip counts, and
+  XCTest's `Test skipped` output.
 - Earlier review passes identified and were followed by fixes for the counted
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,

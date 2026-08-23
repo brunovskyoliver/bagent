@@ -97,7 +97,8 @@ status_patterns = (
 )
 skip_patterns = (
     r"\bskip:",
-    r"\b[1-9][0-9]*\s+skipped\b",
+    r"\b[1-9][0-9]*(?:\s+tests?)?\s+skipped\b",
+    r"\bTest skipped\b",
     r"\bskipped(?:_count|\s+signed assertions)?\s*[=:]\s*[1-9][0-9]*\b",
 )
 status_count = sum(len(re.findall(pattern, text)) for pattern in status_patterns)
