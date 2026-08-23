@@ -41,6 +41,7 @@ const CANONICAL_TABLES: &[&str] = &[
     "automation_continuation_provenance",
     "automation_definitions",
     "automation_retention_audit",
+    "automations",
     "current_chats",
     "current_chat_authority",
     "current_chat_turns",
@@ -55,6 +56,25 @@ const CANONICAL_TABLES: &[&str] = &[
     "work_approval_requests",
     "stage8_cleanup_state",
 ];
+
+const AUTOMATION_DEFINITION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS automations (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    prompt              TEXT NOT NULL,
+    enabled             INTEGER NOT NULL DEFAULT 1,
+    timezone            TEXT NOT NULL,
+    schedule_json       TEXT NOT NULL,
+    next_run_at         TEXT,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    last_run_at         TEXT,
+    last_run_status     TEXT,
+    last_result_summary TEXT,
+    definition_revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_automations_due ON automations (enabled, next_run_at);
+"#;
 
 fn canonical_schema_checksum(connection: &Connection) -> String {
     let mut statement = connection
@@ -164,6 +184,11 @@ fn assert_no_private_projection_values(connection: &Connection) {
 }
 
 fn canonicalize(path: &std::path::Path, backup_hash: &str) -> Connection {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(AUTOMATION_DEFINITION_SCHEMA)
+        .unwrap();
+    drop(connection);
     migrate_v14_copy(path, backup_hash, true).unwrap();
     finalize_stage8_cleanup(path).unwrap();
     let connection = Connection::open(path).unwrap();
@@ -171,6 +196,116 @@ fn canonicalize(path: &std::path::Path, backup_hash: &str) -> Connection {
     let snapshot = bagentd::current_chat::open_or_create_current_chat(&connection).unwrap();
     assert!(snapshot.identity.len() > 8);
     connection
+}
+
+fn automation_definition_contract(path: &std::path::Path) -> String {
+    let connection = Connection::open(path).unwrap();
+    let columns = connection
+        .prepare("PRAGMA table_info(automations)")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            ("id".to_owned(), "TEXT".to_owned(), 0, None),
+            ("name".to_owned(), "TEXT".to_owned(), 1, None),
+            ("prompt".to_owned(), "TEXT".to_owned(), 1, None),
+            (
+                "enabled".to_owned(),
+                "INTEGER".to_owned(),
+                1,
+                Some("1".to_owned())
+            ),
+            ("timezone".to_owned(), "TEXT".to_owned(), 1, None),
+            ("schedule_json".to_owned(), "TEXT".to_owned(), 1, None),
+            ("next_run_at".to_owned(), "TEXT".to_owned(), 0, None),
+            ("created_at".to_owned(), "TEXT".to_owned(), 1, None),
+            ("updated_at".to_owned(), "TEXT".to_owned(), 1, None),
+            ("last_run_at".to_owned(), "TEXT".to_owned(), 0, None),
+            ("last_run_status".to_owned(), "TEXT".to_owned(), 0, None),
+            ("last_result_summary".to_owned(), "TEXT".to_owned(), 0, None),
+            (
+                "definition_revision".to_owned(),
+                "INTEGER".to_owned(),
+                1,
+                Some("1".to_owned())
+            ),
+        ]
+    );
+    let due_index: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_automations_due'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(due_index, 1, "scheduler due-time index is canonical");
+
+    let id = "00000000-0000-0000-0000-0000000000a2";
+    connection
+        .execute(
+            "INSERT INTO automations
+             (id,name,prompt,enabled,timezone,schedule_json,next_run_at,created_at,updated_at,definition_revision)
+             VALUES (?1,'A52 contract','safe prompt',1,'UTC','{\"kind\":\"once\"}',
+                     '2099-01-01T00:00:00Z','2026-08-18T20:00:00Z','2026-08-18T20:00:00Z',1)",
+            [id],
+        )
+        .unwrap();
+    let enabled_due: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM automations WHERE enabled=1 AND next_run_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        enabled_due >= 1,
+        "enabled scheduled definition is discoverable"
+    );
+    connection
+        .execute(
+            "UPDATE automations SET name='A52 updated', enabled=0, updated_at='2026-08-18T20:01:00Z' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+    let updated: (String, i64, i64) = connection
+        .query_row(
+            "SELECT name, enabled, definition_revision FROM automations WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(updated, ("A52 updated".to_owned(), 0, 1));
+    let disabled_due: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM automations WHERE enabled=1 AND next_run_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(disabled_due, enabled_due - 1);
+    connection
+        .execute("DELETE FROM automations WHERE id=?1", [id])
+        .unwrap();
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM automations WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+    format!("columns={columns:?};index={due_index};enabled_due={enabled_due};disabled_due={disabled_due};updated={updated:?}")
 }
 
 fn exercise_canonical_work_session(path: &std::path::Path) {
@@ -265,9 +400,11 @@ fn v14_fixture() -> (TempDir, std::path::PathBuf) {
     let path = dir.path().join("v14.sqlite");
     let connection = Connection::open(&path).unwrap();
     connection
-        .execute_batch(
-            "PRAGMA journal_mode=DELETE;
-         CREATE TABLE automations (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+        .execute_batch("PRAGMA journal_mode=DELETE;")
+        .unwrap();
+    connection
+        .execute_batch(&format!(
+            "{AUTOMATION_DEFINITION_SCHEMA}
          CREATE TABLE automation_runs (
            id TEXT PRIMARY KEY, automation_id TEXT NOT NULL, scheduled_for TEXT NOT NULL,
            started_at TEXT, finished_at TEXT, status TEXT NOT NULL, result_summary TEXT,
@@ -279,10 +416,16 @@ fn v14_fixture() -> (TempDir, std::path::PathBuf) {
            expires_at TEXT NOT NULL, created_at TEXT NOT NULL, decision TEXT, decided_at TEXT,
            origin_json TEXT
          );",
-        )
+        ))
         .unwrap();
     connection
-        .execute("INSERT INTO automations VALUES ('a','A')", [])
+        .execute(
+            "INSERT INTO automations
+             (id,name,prompt,enabled,timezone,schedule_json,created_at,updated_at,definition_revision)
+             VALUES ('a','A','safe migration automation',1,'UTC','{\"kind\":\"once\"}',
+                     '2026-08-18T18:00:00Z','2026-08-18T18:00:00Z',1)",
+            [],
+        )
         .unwrap();
     for index in 0..55 {
         connection
@@ -331,6 +474,11 @@ fn clean_and_v14() {
         canonical_schema_checksum(&clean),
         canonical_schema_checksum(&v14),
         "clean install and V14 upgrade must have one canonical schema checksum"
+    );
+    assert_eq!(
+        automation_definition_contract(&clean_path),
+        automation_definition_contract(&v14_path),
+        "clean install and V14 upgrade must expose identical automation definition behavior"
     );
     for connection in [&clean, &v14] {
         let integrity: String = connection

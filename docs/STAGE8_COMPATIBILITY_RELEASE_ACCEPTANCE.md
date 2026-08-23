@@ -50,11 +50,11 @@ conditional, blocked, or inferred result is called PASS.
 | --- | --- | --- |
 | A51 | `scripts/acceptance/final-authority-inventory.sh`; canonical authority subgates and production inventory | PASS: capability detector found 13 seeded forbidden matches, including the retired prompt/debug result path and obsolete automation event shim; four authority subgates passed; production inventory found 0 findings and 8 canonical assertions |
 | A52 | `cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact` | PASS: 1 executed, 1 passed, 0 failed; disposable empty and V14 databases converged to the canonical schema and invariants, with kind-only approval provenance and no private automation identity |
-| A53 | `cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact`; `cargo test -p bagentd --test work_concurrency crash_recovery -- --exact` | PASS: 2 executed, 2 passed, 0 failed; before-transaction, during-copy, after-commit, before-admission, retry, canonical recovery, and crash-recovery checks ran |
-| A54 | `scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app` | PASS: disposable old/new signed candidates and databases; fixed-base refusal, pre-Work verified backup, post-Work archive-and-restore, hashes, and cleanup recorded; integration backup `39b40193d8583f0abe188a38dad1f9f8aa3ed011277b55cef182d7a43ac5e9f2`, pre-Work `623c1252a32eeac496129f0e4b45ae46da8bd1d5793ae3276e86289ca1f588f1`, archive `61d44bf0e6717743e97f832efea9144c65bb1d9c1e5a582e32ac5ecda766b7d0` |
+| A53 | `scripts/acceptance/stage8-migration-restart.sh`; `cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact`; `cargo test -p bagentd --test work_concurrency crash_recovery -- --exact` | PASS: 4 external `SIGKILL` cases and 2 exact tests executed; before-migration, during-copy, after-commit, and before-route-admission recovery preserved integrity, changed the daemon PID, admitted routes only after restart, converted 8 records without duplicates, and left protected ports unchanged |
+| A54 | `scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app` | PASS: disposable old/new signed candidates and databases; pre-Work verified backup and old reader, signed migration and first post-cutover Work, old-binary refusal of the post-Work database, archive-and-restore, hashes, protected-port checks, and cleanup all executed |
 | A55 | `scripts/acceptance/stage8-privacy-scan.sh`; `cargo test -p bagentd --test privacy_contract -- --nocapture`; `swift test --package-path apps/macos --filter ProjectionPrivacyTests`; `swift test --package-path apps/macos --filter UIRelaunchHandoffTests` | PASS: 9 surfaces, 9 synthetic canaries, 9 scanner detections, 0 sanitized projection matches; disposable captures securely deleted; Rust privacy contract 1 executed and passed, Swift privacy projection 4 executed and passed, UI relaunch handoff privacy 5 executed and passed |
 | A56 | `scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app` | PASS: signed macOS 26 candidate; 11 notch states; 57 settings fixtures × 2 widths across light/dark/high-contrast/large-text/reduced-motion; status-pill anchor and identity verified |
-| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS: signed macOS 26 live AX fixture; 2 notch states, 10 notch assertions, 57 settings routes, 634 settings assertions, 0 skipped signed assertions; hosted XCTest AX check is recorded as SKIPPED, not PASS |
+| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS: signed macOS 26 live AX fixture; 2 notch states, 10 notch assertions, 57 settings routes, 634 settings assertions, and 0 skipped signed assertions; the environment-dependent hosted XCTest probe is not a qualification input |
 | A58 | `scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app`; `scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app` | PASS: A18–A21, poison/8080 isolation, and signed A49 UI-only relaunch all executed nonzero; daemon/BaseRT stability, Work/model convergence, protected port sentinel, and historical A50 scanner verified |
 | A59 | `scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app` | PASS: signed macOS 26 candidate with real disposable daemon/BaseRT; preload, foreground chat, two canonical automation Works and sessions, safe activity/tool presentation, result open, continuation, scoped `/clear`, permission reread, UI-only relaunch, idle retirement, later reload, and port isolation verified; safe external source ended in `verification_shortfall` (`acquired=0`, `requested=2`, `source_count=0`, 489 token bytes, capture SHA-256 `32d06c60779de22c4f74d3ae96d2433edc339c99e88430d8a872ba8fdeb84bf5`); no TCC mutation |
 | A60 | `scripts/acceptance/stage8-reproducibility.sh <frozen-final-commit>` | The final clean-checkout record, including every gate status, nonzero execution count, log hash, signed bundle hash, timestamps, protected-port baseline, cleanup, and final runtime state, is attached to the Stage 8 ticket resolution comment. This row is not a substitute for that emitted record. |
@@ -73,13 +73,14 @@ behavior remain covered by deterministic tests.
 
 Migration fixtures are disposable and never use the user's production
 database. Empty and V14 inputs converge through the same canonical schema
-checksum and invariant checks, including Legacy Run Records, Current Chat,
-Work/session conversion, authority ownership, and privacy. Failpoints cover
-pre-commit retry and post-commit recovery. Rollback is before first post-cutover
-Work only; after cutover it uses archive-and-restore and the old binary never
-reads the new database. Privacy canaries cover event, UI, logs, diagnostics,
-export, migration, rollback, crash, and failure surfaces without retaining
-disposable captures.
+checksum and invariant checks, including the Automation Definition schema,
+Legacy Run Records, Current Chat, Work/session conversion, authority ownership,
+and privacy. Unit failpoints and external process kills cover pre-commit retry,
+post-commit recovery, and route admission. Rollback is before first
+post-cutover Work only; after cutover it uses archive-and-restore and the old
+binary never reads the new database. Privacy canaries cover event, UI, logs,
+diagnostics, export, migration, rollback, crash, and failure surfaces without
+retaining disposable captures.
 
 ### A56–A58 signed visual, accessibility, and active-load evidence
 
@@ -173,11 +174,14 @@ production_database=not used; production application and port-8080 owner untouch
 
 The superseded record has SHA-256
 `02b3ce188e9d2b57e5fa3622d0a2a256e0154b48587571e02af66bc4863307c2`.
-Its zero statuses and nonzero execution metrics are retained for traceability,
-not as current release evidence. The final A60 record is the one emitted by
-the frozen-candidate command and attached to ticket #38; the hosted XCTest
-Accessibility check remains explicitly SKIPPED because granting Accessibility
-to the production bagent app is outside this campaign.
+Its zero statuses are retained for traceability, but several silent commands
+reported no metric and the old runner allowed skip observations alongside a
+PASS verdict. Those are known defects in the superseded evidence. The final
+A60 record requires one executed-command count for every gate, rejects any
+skipped, blocked, or conditional observation, and records additional nonzero
+metrics when a command emits them. The environment-dependent hosted XCTest
+Accessibility probe is not a qualification input; the signed candidate AX
+checks are the executed evidence.
 
 ## Review and closeout
 
@@ -197,6 +201,9 @@ or pull request is part of this stage.
 - A52 privacy boundary: both migration and live approval-origin tests failed
   red when a private automation name was retained, then passed after the
   canonical origin became kind-only.
+- A53 process recovery: the external restart script failed red because no
+  process-kill marker existed, then passed all four `SIGKILL` cases after the
+  acceptance-only startup seams were added.
 - Earlier review passes identified and were followed by fixes for the counted
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,

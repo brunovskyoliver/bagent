@@ -350,6 +350,9 @@ async fn main() -> Result<()> {
     std::fs::write(data_dir.join("daemon.pid"), std::process::id().to_string())?;
 
     let db_path = data_dir.join("bagent.db");
+    #[cfg(feature = "stage8-acceptance")]
+    bagentd::cutover::stage8_migration_killpoint("before-migration")
+        .map_err(|error| anyhow::anyhow!("pause before Stage 8 migration: {error}"))?;
     let pre_cutover_backup_hash = bagentd::cutover::prepare_pre_cutover_backup(
         &db_path,
         &data_dir.join("bagent.pre-stage4.sqlite"),
@@ -901,6 +904,9 @@ async fn main() -> Result<()> {
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
+    #[cfg(feature = "stage8-acceptance")]
+    bagentd::cutover::stage8_migration_killpoint("before-route-admission")
+        .map_err(|error| anyhow::anyhow!("pause before Stage 8 route admission: {error}"))?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     std::fs::write(data_dir.join("daemon.port"), port.to_string())?;

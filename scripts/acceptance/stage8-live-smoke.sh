@@ -349,10 +349,19 @@ else
 fi
 [[ "$terminal_work" != "null" && "$terminal_work" != "" ]]
 [[ "$terminal_revision" =~ ^[0-9]+$ ]]
+set +e
 BAGENT_STAGE8_ACCEPTANCE_FIXTURES=1 BAGENT_DATA_DIR="$fixture_root/data" \
     "$candidate/Contents/MacOS/bagent" --stage8-live-session \
     "$inspect_run_id" "$terminal_work" "$terminal_revision" "$fixture_root/session-ui.json" \
     >"$fixture_root/session-ui.log" 2>&1
+session_ui_status=$?
+set -e
+if [[ "$session_ui_status" != "0" ]]; then
+    echo "Stage 8 signed live session failed with status $session_ui_status"
+    [[ -f "$fixture_root/session-ui.log" ]] && sed -n '1,120p' "$fixture_root/session-ui.log"
+    [[ -f "$fixture_root/session-ui.json" ]] && sed -n '1,160p' "$fixture_root/session-ui.json"
+    exit 1
+fi
 [[ "$(jq -r .status "$fixture_root/session-ui.json")" == pass ]]
 [[ "$(jq -r .result_opened "$fixture_root/session-ui.json")" == true ]]
 [[ "$(jq -r .continuation_target_changed "$fixture_root/session-ui.json")" == true ]]

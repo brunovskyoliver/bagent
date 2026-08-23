@@ -7,6 +7,8 @@
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, path::Path};
+#[cfg(feature = "stage8-acceptance")]
+use std::{path::PathBuf, thread, time::Duration};
 
 const WORK_SCHEMA: &str = include_str!("../migrations/V15__work_coordinator_foundations.sql");
 const CUTOVER_SCHEMA: &str = include_str!("../migrations/V16__unified_work_cutover.sql");
@@ -26,6 +28,28 @@ pub enum Stage8MigrationFailpoint {
 pub enum RollbackBoundary {
     PreFirstWork,
     ForwardOnly,
+}
+
+/// Pauses an acceptance-only daemon at a named external process-kill seam.
+/// Ordinary builds do not compile this hook, so environment variables cannot
+/// reactivate it in production.
+#[cfg(feature = "stage8-acceptance")]
+pub fn stage8_migration_killpoint(name: &str) -> Result<(), String> {
+    if std::env::var("BAGENT_STAGE8_MIGRATION_KILLPOINT").as_deref() != Ok(name) {
+        return Ok(());
+    }
+    let marker_dir = std::env::var_os("BAGENT_STAGE8_MIGRATION_KILLPOINT_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| "Stage 8 migration killpoint marker directory is missing".to_owned())?;
+    fs::create_dir_all(&marker_dir).map_err(storage)?;
+    fs::write(
+        marker_dir.join(format!("{name}.ready")),
+        std::process::id().to_string(),
+    )
+    .map_err(storage)?;
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
 }
 
 fn storage(error: impl std::fmt::Display) -> String {
@@ -407,6 +431,9 @@ fn finalize_stage8_cleanup_with_optional_failpoint(
         }
     }
 
+    #[cfg(feature = "stage8-acceptance")]
+    stage8_migration_killpoint("during-copy")?;
+
     if failpoint == Some(Stage8MigrationFailpoint::DuringCopy) {
         return Err("Stage 8 failpoint during copy".to_owned());
     }
@@ -487,6 +514,9 @@ fn finalize_stage8_cleanup_with_optional_failpoint(
         )
         .map_err(storage)?;
     transaction.commit().map_err(storage)?;
+
+    #[cfg(feature = "stage8-acceptance")]
+    stage8_migration_killpoint("after-commit")?;
 
     if failpoint == Some(Stage8MigrationFailpoint::AfterCommit) {
         return Err("Stage 8 failpoint after commit".to_owned());

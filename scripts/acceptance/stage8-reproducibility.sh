@@ -57,7 +57,7 @@ run_gate() {
     local name=$1
     shift
     local log="$temp_root/$name.log"
-    local began ended status command_line metrics skipped_observations log_hash
+    local began ended status command_line metrics disqualifying_observations log_hash
     began=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     printf -v command_line '%q ' "$@"
     command_line=${command_line% }
@@ -78,29 +78,49 @@ text = open(sys.argv[1], encoding="utf-8").read()
 patterns = (
     r"\brunning ([1-9][0-9]*) tests?\b",
     r"\bExecuted ([1-9][0-9]*) tests?\b",
-    r"\b([1-9][0-9]*) (?:assertions?|surfaces?|canaries?|routes?|states?|files?|cases?)\b",
+    r"\b([1-9][0-9]*) (?:assertions?|surfaces?|canaries?|routes?|states?|files?|cases?|kill points?|SIGKILLs?|integrity checks?|restarts?|conversions?|campaigns?)\b",
+    r"\b(?:assertion_count|route_count|case_count|transition_count)=([1-9][0-9]*)\b",
 )
 values = []
 for pattern in patterns:
     values.extend(re.findall(pattern, text, flags=re.IGNORECASE))
-print(",".join(dict.fromkeys(values)) or "none-reported")
+print(",".join(dict.fromkeys(values)) or "not-emitted-by-command")
 PY
 )
-    skipped_observations=$(rg -i -c 'skipped|skip:' "$log" 2>/dev/null || true)
-    skipped_observations=${skipped_observations:-0}
+    disqualifying_observations=$(python3 - "$log" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+status_patterns = (
+    r"\b(?:SKIPPED|BLOCKED|CONDITIONAL)\b",
+)
+skip_patterns = (
+    r"\bskip:",
+    r"\b[1-9][0-9]*\s+skipped\b",
+    r"\bskipped(?:_count|\s+signed assertions)?\s*[=:]\s*[1-9][0-9]*\b",
+)
+status_count = sum(len(re.findall(pattern, text)) for pattern in status_patterns)
+skip_count = sum(
+    len(re.findall(pattern, text, flags=re.IGNORECASE)) for pattern in skip_patterns
+)
+print(status_count + skip_count)
+PY
+)
     log_hash=$(shasum -a 256 "$log" | awk '{print $1}')
-    printf '%s command=%s status=%s started=%s ended=%s nonzero_metrics=%s skipped_observations=%s log_sha256=%s\n' \
-        "$name" "$command_line" "$status" "$began" "$ended" "$metrics" "$skipped_observations" "$log_hash" >>"$record"
+    printf '%s command=%s status=%s started=%s ended=%s executed_commands=1 observed_nonzero_metrics=%s disqualifying_observations=%s log_sha256=%s\n' \
+        "$name" "$command_line" "$status" "$began" "$ended" "$metrics" "$disqualifying_observations" "$log_hash" >>"$record"
     if (( status != 0 )); then
         echo "A60 gate=$name: FAIL" >&2
         tail -n 40 "$log" >&2
         exit "$status"
     fi
-    if (( skipped_observations > 0 )); then
-        echo "A60 gate=$name: PASS (executed checks passed; $skipped_observations skipped observation(s) recorded separately and not called PASS)"
-    else
-        echo "A60 gate=$name: PASS"
+    if (( disqualifying_observations > 0 )); then
+        echo "A60 gate=$name: FAIL ($disqualifying_observations skipped, blocked, or conditional observation(s))" >&2
+        tail -n 40 "$log" >&2
+        exit 1
     fi
+    echo "A60 gate=$name: PASS (1 command executed; observed metrics=$metrics)"
 }
 
 run_gate cargo-fmt cargo fmt --all -- --check
@@ -129,6 +149,7 @@ run_gate model-runtime-regression cargo test -p bagentd --test model_runtime --n
 run_gate migration-clean-v14 cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact
 run_gate migration-interruption cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact
 run_gate work-crash-recovery cargo test -p bagentd --test work_concurrency crash_recovery -- --exact
+run_gate migration-process-restart scripts/acceptance/stage8-migration-restart.sh
 run_gate work-fairness cargo test -p bagentd --test work_concurrency fairness_foreground -- --exact
 run_gate model-poison cargo test -p bagentd --test model_runtime poison_changed_pid -- --exact
 run_gate signed-bundle-make make -C apps/macos bundle
