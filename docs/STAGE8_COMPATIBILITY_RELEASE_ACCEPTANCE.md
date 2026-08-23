@@ -232,6 +232,11 @@ or pull request is part of this stage.
   regression failed before the fix and passed after maintenance adopted the
   existing clean changed-PID recovery path; the original signed live smoke then
   passed with one observed idle retirement and one live reload.
+- A60 signed AX readiness: the next frozen run received only the application
+  root while waiting for the approval projection. Twenty immediate signed
+  reruns exposed all 11 expected approval elements, confirming a low-rate panel
+  exposure race. The disposable fixture now re-presents a missing panel within
+  a bounded ten-second poll while retaining the same content assertions.
 - Earlier review passes identified and were followed by fixes for the counted
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,

@@ -96,7 +96,8 @@ enum Stage8AccessibilityCLI {
         let applicationElement = AXUIElementCreateApplication(getpid())
         let activeElements = try await waitForAccessibilityTree(
             from: applicationElement,
-            host: host
+            host: host,
+            panel: panel
         ) { elements in
             (try? verifyActiveProjection(elements)) != nil
         }
@@ -141,7 +142,8 @@ enum Stage8AccessibilityCLI {
         )
         let approvalElements = try await waitForAccessibilityTree(
             from: applicationElement,
-            host: host
+            host: host,
+            panel: panel
         ) { elements in
             (try? verifyApprovalProjection(elements)) != nil
         }
@@ -385,16 +387,20 @@ enum Stage8AccessibilityCLI {
     private static func waitForAccessibilityTree(
         from applicationElement: AXUIElement,
         host: NSHostingView<some View>,
+        panel: NSPanel,
         ready: ([AXUIElement]) -> Bool
     ) async throws -> [AXUIElement] {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(3))
+        let deadline = clock.now.advanced(by: .seconds(10))
         var elements: [AXUIElement] = []
         repeat {
             host.layoutSubtreeIfNeeded()
             elements = accessibilityTree(from: applicationElement)
             if ready(elements) {
                 return elements
+            }
+            if elements.count <= 1 {
+                panel.makeKeyAndOrderFront(nil)
             }
             try await Task.sleep(for: .milliseconds(50))
         } while clock.now < deadline
