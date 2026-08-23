@@ -27,9 +27,9 @@ use bagentd::current_chat::{
     read_current_chat, recover_after_daemon_restart, save_draft, upsert_connector_reference,
     ClearCurrentChatCommand, SubmittedAttachmentMetadata, ValidatedSourceMetadata,
 };
-use bagentd::model_runtime::{
-    ModelClass, ModelDemand, ModelRuntime, ProductionModelConfig, RuntimePhase,
-};
+#[cfg(feature = "stage8-acceptance")]
+use bagentd::model_runtime::{ModelClass, ModelDemand};
+use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig, RuntimePhase};
 use bagentd::permission_probe::DaemonFullDiskAccessProbe;
 use bagentd::ui_relaunch::{
     TransferStatus, UiConsumerAuthority, UiConsumerTransferError, TRANSFER_TIMEOUT,
@@ -888,6 +888,10 @@ async fn main() -> Result<()> {
             .route(
                 "/acceptance/stage8/model-reload",
                 post(stage8_acceptance_model_reload_handler),
+            )
+            .route(
+                "/acceptance/stage8/privacy-diagnostic",
+                post(stage8_acceptance_privacy_diagnostic_handler),
             );
     } else {
         app = app.route(
@@ -4765,6 +4769,13 @@ struct Stage8AcceptanceApprovalRequest {
     work_identity: String,
 }
 
+#[cfg(feature = "stage8-acceptance")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Stage8AcceptancePrivacyDiagnosticRequest {
+    canaries: Vec<String>,
+}
+
 /// Acceptance-only authenticated control. Both the compile-time feature and
 /// exact runtime environment flag are required before the route is registered.
 #[cfg(feature = "stage8-acceptance")]
@@ -4858,6 +4869,38 @@ async fn stage8_acceptance_model_reload_handler(
             Json(serde_json::json!({ "ok": false, "error": error.to_string() })),
         ),
     }
+}
+
+/// Sends forbidden fixture values through the production diagnostic sanitizer.
+/// Only the structural allowlist may reach the persisted trace and export.
+#[cfg(feature = "stage8-acceptance")]
+async fn stage8_acceptance_privacy_diagnostic_handler(
+    State(state): State<AppState>,
+    Json(body): Json<Stage8AcceptancePrivacyDiagnosticRequest>,
+) -> impl IntoResponse {
+    if state.acceptance.is_none() || body.canaries.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false })),
+        );
+    }
+    let turn_id = format!("stage8-privacy:{}", Uuid::new_v4());
+    let forbidden = body.canaries.join(":");
+    state.evidence_diagnostics.record(&serde_json::json!({
+        "type": "evidence_acquisition_diagnostic",
+        "turn_id": turn_id,
+        "normalized_operation": "privacy.acceptance",
+        "status": "completed",
+        "hidden_reasoning": forbidden,
+        "raw_arguments": body.canaries,
+        "credential": forbidden,
+        "evidence_content": forbidden,
+        "unknown_field": forbidden,
+    }));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "turnId": turn_id })),
+    )
 }
 
 /// Receives the Tavily credential from the signed app's Keychain and keeps it

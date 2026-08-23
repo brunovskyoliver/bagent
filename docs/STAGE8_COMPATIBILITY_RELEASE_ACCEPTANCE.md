@@ -52,9 +52,9 @@ conditional, blocked, or inferred result is called PASS.
 | A52 | `cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact` | PASS: 1 executed, 1 passed, 0 failed; disposable empty and V14 databases converged to the canonical schema and invariants, with kind-only approval provenance and no private automation identity |
 | A53 | `scripts/acceptance/stage8-migration-restart.sh`; `cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact`; `cargo test -p bagentd --test work_concurrency crash_recovery -- --exact` | PASS: 4 external `SIGKILL` cases and 2 exact tests executed; before-migration, during-copy, after-commit, and before-route-admission recovery preserved integrity, changed the daemon PID, admitted routes only after restart, converted 8 records without duplicates, and left protected ports unchanged |
 | A54 | `scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app` | PASS: disposable old/new signed candidates and databases; pre-Work verified backup and old reader, signed migration and first post-cutover Work, old-binary refusal of the post-Work database, archive-and-restore, hashes, protected-port checks, and cleanup all executed |
-| A55 | `scripts/acceptance/stage8-privacy-scan.sh`; privacy contract and Swift privacy suites | PASS: 9 canaries entered the signed disposable workload, the shared scanner detected all 9 raw seeds, and the 9 actual production capture files contained 0 canary matches; disposable captures were securely deleted; Rust 1, Swift projection 4, and handoff privacy 5 tests passed |
-| A56 | `scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app` | PASS: signed candidate rendered 11 notch-state PNGs and executed 22 normal/reduced-motion transitions; 57 settings fixtures × 2 widths across the accepted variants; status-pill anchor and identity verified |
-| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS: signed live AX fixture exercised active and approval states, 1 AX press action, 2 keyboard events, 1 destination change, observed AX names/values and enlarged-layout frames, 2 contrast checks, 2 posted announcements, and 0 skips |
+| A55 | `scripts/acceptance/stage8-privacy-scan.sh`; privacy contract and Swift privacy suites | PASS: 9 canaries entered the signed disposable workload; the scanner detected all 9 raw seeds; 9 actual event, UI, log, diagnostic, export, migration, rollback, crash, and failure artifacts contained 0 canary matches; disposable captures were securely deleted; Rust 1, Swift projection 4, and handoff privacy 5 tests passed |
+| A56 | `scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app` | PASS: signed candidate rendered 11 notch-state PNGs and recorded 72 hosted transition PNG frames with 35 distinct renders across 22 normal/reduced-motion transitions; 2 mid-transition failures reconciled; 57 settings fixtures × 2 widths across the accepted variants; status-pill anchor and identity verified |
+| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | BLOCKED: signed AX and keyboard checks pass, and a temporary VoiceOver session received navigation commands, but macOS exposed no Caption Panel text through the VoiceOver AX tree or Computer Use capture. No VoiceOver rotor/readout result is called PASS. VoiceOver was restored to its prior off state. |
 | A58 | `scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app`; `scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app` | PASS: signed UI-only relaunch preserved 1 foreground Work, 2 real run-now automation Works, and 1 canonical pending approval while daemon/BaseRT PIDs, Work revisions, protected ports, and the active UI consumer converged |
 | A59 | `scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app` | PASS: signed candidate and real disposable daemon/BaseRT; 2 foreground chats, 2 canonical automation Works, 2 links, 2 sessions, 1 live idle retirement, and 1 live reload through bounded production inference; result open, continuation, scoped `/clear`, permission reread, UI-only relaunch, unchanged process identities, and port isolation verified; external source ended in a safe `verification_shortfall` with privacy-safe capture SHA-256 `47181899a308741f2a05ecbf38106907edd75af016d2d245633a67d95ebc4884` |
 | A60 | `scripts/acceptance/stage8-reproducibility.sh <frozen-final-commit>` | The final clean-checkout record, including every gate status, nonzero execution count, log hash, signed bundle hash, timestamps, protected-port baseline, cleanup, and final runtime state, is attached to the Stage 8 ticket resolution comment. This row is not a substitute for that emitted record. |
@@ -79,20 +79,25 @@ and privacy. Unit failpoints and external process kills cover pre-commit retry,
 post-commit recovery, and route admission. Rollback is before first
 post-cutover Work only; after cutover it uses archive-and-restore and the old
 binary never reads the new database. Privacy canaries enter the signed
-disposable relaunch workload. The gate scans the nine resulting production
-capture files and securely removes them; it does not manufacture separate
-sanitized placeholder files.
+disposable relaunch workload and production diagnostic sanitizer. The gate
+scans the actual Work event response, signed UI evidence, daemon log, persisted
+diagnostic, diagnostic export, migration-version result, timeout rollback
+response, fenced-UI evidence, and stale-fence failure response. It securely
+removes those artifacts and does not manufacture sanitized placeholder files.
 
 ### A56–A58 signed visual, accessibility, and active-load evidence
 
 Signed/live visual and accessibility qualification is macOS 26 only and follows
 `docs/UI_DESIGN.md`. The invariant status pill remains top-right. The signed
-fixture records AX names/values, an AX action and destination change, delivered
-keyboard events, posted announcements, contrast, enlarged-layout frames, and
-reduced motion. It does not claim to observe VoiceOver speech. No TCC state is
-changed. Active-load relaunch changes only the UI consumer PID and preserves
-one foreground Work, two automation Works, and one pending approval; the
-port-8080 owner is never touched.
+visual fixture records hosted normal/reduced-motion frame sequences and injects
+a failure before the normal transition settles. The signed accessibility
+fixture records AX names/values, AX action routing, a Return-key destination
+change, posted announcements, contrast, and enlarged-layout frames. A temporary
+VoiceOver session was started and restored, but its Caption Panel was not
+observable through the available automation channels, so A57 remains blocked.
+No TCC state was changed. Active-load relaunch changes only the UI consumer PID
+and preserves one foreground Work, two automation Works, and one pending
+approval; the port-8080 owner is never touched.
 
 ### A59 observational live smoke
 
@@ -220,8 +225,10 @@ or pull request is part of this stage.
   retirement, shipped Stage 8 mutation controls, weak PID cleanup, and missing
   A60 metrics. The corrected candidate uses live signed captures, measured AX
   evidence, a combined relaunch load, compile-time Swift acceptance isolation,
-  executable-bound cleanup, live retirement/reload, and named nonzero gate
-  checks. A fresh two-axis review is still required after the final A60 run.
+  executable-bound cleanup, live retirement/reload, and policy-specific
+  nonzero gate checks. A57 remains blocked on observable VoiceOver readout
+  evidence; A60 and the fresh two-axis final review cannot be completed until
+  that evidence exists.
 - The two final independent review reports and their zero-finding results are
   attached to the Stage 8 ticket resolution comment after the final candidate
   is frozen.

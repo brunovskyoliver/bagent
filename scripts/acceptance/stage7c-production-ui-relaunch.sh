@@ -24,6 +24,7 @@ basert_port=""
 daemon_port=""
 auth_header=""
 capture_dir="${BAGENT_STAGE7C_CAPTURE_DIR:-}"
+stage8_actual_capture_dir="${BAGENT_STAGE8_ACTUAL_CAPTURE_DIR:-}"
 tmp_root="${TMPDIR:-/tmp}"
 tmp_root="${tmp_root%/}"
 privacy_canary_bundle="${BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE:-}"
@@ -39,11 +40,28 @@ if [[ -n "$capture_dir" ]]; then
     mkdir -p "$capture_dir"
 fi
 
+if [[ -n "$stage8_actual_capture_dir" ]]; then
+    stage8_actual_capture_dir="${stage8_actual_capture_dir//\/\//\/}"
+    case "$stage8_actual_capture_dir" in
+        "$tmp_root"/bagent-stage8-actual-captures.*) ;;
+        *) echo "refusing unexpected Stage 8 actual capture path: $stage8_actual_capture_dir"; exit 1 ;;
+    esac
+    mkdir -p "$stage8_actual_capture_dir"
+fi
+
 write_capture() {
     local name="$1"
     local contents="$2"
     [[ -n "$capture_dir" ]] || return 0
     printf '%s\n' "$contents" > "$capture_dir/$name"
+}
+
+copy_stage8_actual() {
+    local source="$1"
+    local name="$2"
+    [[ -n "$stage8_actual_capture_dir" ]] || return 0
+    [[ -s "$source" ]] || { echo "missing actual Stage 8 artifact: $source"; exit 1; }
+    cp "$source" "$stage8_actual_capture_dir/$name"
 }
 
 process_matches() {
@@ -65,6 +83,16 @@ safe_signal() {
 }
 
 cleanup() {
+    local exit_code=$?
+    if (( exit_code != 0 )); then
+        for log in "$fixture_root/old-ui.log" "$fixture_root/replacement-ui.log" "$fixture_root/daemon.log"; do
+            if [[ -s "$log" ]]; then
+                echo "Stage 7C diagnostic log: $log" >&2
+                tail -n 80 "$log" >&2 || true
+            fi
+        done
+        find "$fixture_root/evidence" -maxdepth 1 -type f -print >&2 2>/dev/null || true
+    fi
     safe_signal "$basert_pid" basert-serve -CONT
     safe_signal "$old_ui_pid" bagent -CONT
     safe_signal "$replacement_ui_pid" bagent -CONT
@@ -80,6 +108,7 @@ cleanup() {
     done
     find "$fixture_root" -depth \( -type f -o -type l \) -delete
     find "$fixture_root" -depth -type d -empty -delete
+    return "$exit_code"
 }
 trap cleanup EXIT INT TERM
 trap 'echo "Stage 7C production UI assertion failed at line $LINENO"' ERR
@@ -130,6 +159,7 @@ BAGENT_BASERT_BASE_URL="http://127.0.0.1:$basert_port/v1" \
 BAGENT_BASERT_API_KEY=stage7c-fixture \
 BAGENT_DEFAULT_MODEL=basecompute/Qwen3-4B-Instruct-2507 \
 BAGENT_CLASSIFIER_MODEL=basecompute/Qwen3-4B-Instruct-2507 \
+RUST_LOG=info \
     "$repo_root/target/debug/bagentd" >"$fixture_root/daemon.log" 2>&1 &
 daemon_pid=$!
 for _ in {1..120}; do
@@ -231,8 +261,8 @@ replacement_fence="$(jq -r .consumer_fence "$fixture_root/evidence/replacement.j
 replacement_ui_pid="$(jq -r .ui_pid "$fixture_root/evidence/replacement.json")"
 [[ "$(jq -r .compass_rail_route "$fixture_root/evidence/replacement.json")" == "child-full_disk_access" ]]
 [[ "$(jq -r .presentation_active "$fixture_root/evidence/replacement.json")" == "true" ]]
-[[ "$(jq -r .current_chat_identity "$fixture_root/evidence/replacement.json")" == "$(jq -r .identity <<<"$current_before")" ]]
-[[ "$(jq -r .current_chat_revision "$fixture_root/evidence/replacement.json")" == "$(jq -r .revision <<<"$current_before")" ]]
+[[ "$(jq -r .current_chat_identity "$fixture_root/evidence/replacement.json")" == "$(jq -r .current_chat_identity "$fixture_root/evidence/old.json")" ]]
+[[ "$(jq -r .current_chat_revision "$fixture_root/evidence/replacement.json")" == "$(jq -r .current_chat_revision "$fixture_root/evidence/old.json")" ]]
 replacement_acknowledged=false
 [[ -f "$fixture_root/evidence/replacement-acknowledged.marker" ]] && replacement_acknowledged=true
 for _ in {1..300}; do
@@ -256,7 +286,7 @@ write_capture "ui-daemon-logging.json" "$(jq -nc \
     --argjson daemon_log_observed "$daemon_log_observed" \
     '{captured:true,surface:"logging",surface_canary:$surface_canary,ui_events_observed:true,daemon_events_observed:$daemon_log_observed,content_redacted:true}')"
 curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/work/snapshot?consumer_fence=$replacement_fence" >/dev/null
-stale_old_code="$(curl -sS -o /dev/null -w '%{http_code}' -H "$auth_header" \
+stale_old_code="$(curl -sS -o "$fixture_root/stale-old.json" -w '%{http_code}' -H "$auth_header" \
     "http://127.0.0.1:$daemon_port/work/snapshot?consumer_fence=$old_fence")"
 if [[ "$stale_old_code" != "409" ]]; then
     echo "stale old UI consumer remained authoritative"
@@ -310,13 +340,46 @@ curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
 sleep 11
 timeout_status="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg i "$timeout_identity" '{transferIdentity:$i}')" \
-    "http://127.0.0.1:$daemon_port/work/ui-relaunch/status")"
+    "http://127.0.0.1:$daemon_port/work/ui-relaunch/status" | tee "$fixture_root/timeout-status.json")"
 [[ "$(jq -r .status <<<"$timeout_status")" == "expired" ]]
 write_capture "timeout-path.json" "$(jq -nc \
     --arg surface_canary stage7c-timeout-observed \
     --arg status "$(jq -r .status <<<"$timeout_status")" \
     '{captured:true,surface:"timeout",surface_canary:$surface_canary,timeout_status_observed:($status == "expired"),rollback_observed:($status == "expired")}')"
 curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/work/snapshot?consumer_fence=$replacement_fence" >/dev/null
+
+if [[ -n "$stage8_actual_capture_dir" ]]; then
+    event_cursor="$(jq -r .cursor <<<"$combined_after")"
+    event_generation="$(jq -r .daemonGeneration <<<"$combined_after")"
+    event_after=$((event_cursor > 0 ? event_cursor - 1 : 0))
+    curl -fsS -G -H "$auth_header" \
+        --data-urlencode "after=$event_after" \
+        --data-urlencode "daemon_generation=$event_generation" \
+        --data-urlencode "consumer_fence=$replacement_fence" \
+        "http://127.0.0.1:$daemon_port/work/events" >"$fixture_root/work-events.json"
+    privacy_diagnostic="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
+        -d "$(jq -nc --arg bundle "$privacy_canary_bundle" \
+            '{canaries:($bundle | split(":"))}')" \
+        "http://127.0.0.1:$daemon_port/acceptance/stage8/privacy-diagnostic")"
+    privacy_turn_id="$(jq -r .turnId <<<"$privacy_diagnostic")"
+    [[ -n "$privacy_turn_id" && "$privacy_turn_id" != null ]]
+    diagnostic_hash="$(printf '%s' "$privacy_turn_id" | shasum -a 256 | awk '{print $1}')"
+    diagnostic_file="$fixture_root/data/evidence-diagnostics/$diagnostic_hash.json"
+    [[ -s "$diagnostic_file" ]]
+    curl -fsS -H "$auth_header" \
+        "http://127.0.0.1:$daemon_port/diagnostics/evidence/$privacy_turn_id/export" \
+        >"$fixture_root/diagnostic-export.json"
+    sqlite3 "$fixture_root/data/bagent.db" 'PRAGMA user_version;' >"$fixture_root/migration-version.txt"
+    copy_stage8_actual "$fixture_root/work-events.json" event.json
+    copy_stage8_actual "$fixture_root/evidence/replacement.json" ui.json
+    copy_stage8_actual "$fixture_root/daemon.log" daemon.log
+    copy_stage8_actual "$diagnostic_file" diagnostics.json
+    copy_stage8_actual "$fixture_root/diagnostic-export.json" export.json
+    copy_stage8_actual "$fixture_root/migration-version.txt" migration.txt
+    copy_stage8_actual "$fixture_root/timeout-status.json" rollback.json
+    copy_stage8_actual "$fixture_root/evidence/old-fenced.json" crash.json
+    copy_stage8_actual "$fixture_root/stale-old.json" failure.json
+fi
 
 protected_8080_after="$(lsof -nP -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)"
 protected_8082_after="$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)"

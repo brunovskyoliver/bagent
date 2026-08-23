@@ -33,7 +33,7 @@ for field in active_element_count approval_element_count assertion_count; do
     count="$(jq -r ".$field" "$notch_evidence")"
     [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "A57 $field is zero" >&2; exit 1; }
 done
-for field in ax_press_actions_executed keyboard_events_sent focus_destination_changes_observed ax_names_values_observed contrast_checks enlarged_layout_frames_observed; do
+for field in ax_press_actions_executed keyboard_events_sent keyboard_focus_changes_observed ax_names_values_observed contrast_checks enlarged_layout_frames_observed; do
     count="$(jq -r ".$field" "$notch_evidence")"
     [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "A57 signed AX evidence is zero: $field" >&2; exit 1; }
 done
@@ -70,4 +70,5 @@ for field in route_count element_count assertion_count; do
 done
 
 echo "A57 hosted XCTest AX runner probe: not a qualification input (runner Accessibility entitlement is environment-dependent; signed candidate AX evidence below is the executed check)"
-echo "A57 accessibility qualification: PASS (macOS $product_version; signed live notch AX states=2, notch assertions=$(jq -r .assertion_count "$notch_evidence"), keyboard-only/focus/AX names-readouts/announcement/contrast/enlarged-text evidence executed, settings routes=$(plutil -extract route_count raw -o - "$settings_evidence"), settings assertions=$(plutil -extract assertion_count raw -o - "$settings_evidence"), skipped signed assertions=0; no TCC mutation)"
+echo "A57 BLOCKED: signed AX, Return-key focus cycling, AX action, names/values, posted announcements, contrast, enlarged-text, and settings checks passed, but no observable VoiceOver rotor/readout evidence channel is available" >&2
+exit 1

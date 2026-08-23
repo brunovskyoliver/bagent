@@ -48,6 +48,13 @@ process_matches() {
     [[ "$command" == *"$required"* ]]
 }
 
+process_matches_exact_executable() {
+    local pid=$1 expected=$2 executable
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    executable="$(ps -p "$pid" -o command= 2>/dev/null | awk '{print $1}' || true)"
+    [[ "$executable" == "$expected" ]]
+}
+
 sqlite3_wait() {
     sqlite3 -cmd '.timeout 5000' "$@"
 }
@@ -66,8 +73,16 @@ cleanup() {
             fi
         done
     fi
-    for pid in "$old_seed_pid" "$rollback_pid" "$new_pid" "$post_work_old_pid" "$restored_pid"; do
-        if process_matches "$pid" "/Contents/MacOS/bagentd"; then
+    local pid expected
+    for entry in \
+        "$old_seed_pid|$old_app/Contents/MacOS/bagentd" \
+        "$rollback_pid|$old_app/Contents/MacOS/bagentd" \
+        "$new_pid|$new_app/Contents/MacOS/bagentd" \
+        "$post_work_old_pid|$old_app/Contents/MacOS/bagentd" \
+        "$restored_pid|$old_app/Contents/MacOS/bagentd"; do
+        pid=${entry%%|*}
+        expected=${entry#*|}
+        if process_matches_exact_executable "$pid" "$expected"; then
             kill -TERM "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
         fi

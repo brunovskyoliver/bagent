@@ -91,7 +91,7 @@ if handledStage8LiveAcceptance {
     let outputDirectory = URL(fileURLWithPath: arguments[2], isDirectory: true)
     let evidenceURL = URL(fileURLWithPath: arguments[3])
     Task { @MainActor in
-        exit(Stage8VisualCaptureCLI.run(outputDirectory: outputDirectory, evidenceURL: evidenceURL))
+        exit(await Stage8VisualCaptureCLI.run(outputDirectory: outputDirectory, evidenceURL: evidenceURL))
     }
     RunLoop.main.run()
 } else if arguments.count == 3, arguments[1] == "--stage7c-drag-validation" {

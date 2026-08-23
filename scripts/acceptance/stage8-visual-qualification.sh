@@ -40,12 +40,17 @@ BAGENT_NOTCH_TRANSITION_EVIDENCE="$transition_evidence" \
     "$root/scripts/acceptance/capture-notch-states.sh" "$candidate"
 [[ "$(jq -r .status "$transition_evidence")" == pass ]]
 [[ "$(jq -r .transition_count "$transition_evidence")" =~ ^[2-9][0-9]*$ ]]
-for field in interruption_reconciled status_pill_anchor_invariant normal_motion_recorded reduced_motion_recorded; do
-    [[ "$(jq -r ".$field" "$transition_evidence")" == true ]] || {
-        echo "A56 transition evidence is incomplete: $field" >&2
+for field in recorded_transition_frame_count distinct_transition_frame_count normal_motion_frame_count reduced_motion_frame_count interruptions_injected interruptions_reconciled; do
+    count="$(jq -r ".$field" "$transition_evidence")"
+    [[ "$count" =~ ^[1-9][0-9]*$ ]] || {
+        echo "A56 transition evidence is zero: $field" >&2
         exit 1
     }
 done
+[[ "$(jq -r .interruptions_injected "$transition_evidence")" == "$(jq -r .interruptions_reconciled "$transition_evidence")" ]]
+[[ "$(jq -r .status_pill_anchor_invariant "$transition_evidence")" == true ]]
+recorded_files="$(find "$fixture/notch-state-catalog/transition-frames" -type f -name '*.png' | wc -l | tr -d ' ')"
+[[ "$recorded_files" == "$(jq -r .recorded_transition_frame_count "$transition_evidence")" ]]
 
 for variant in light dark; do
     BAGENT_STAGE7B_SETTINGS_FIXTURE=1 \
@@ -65,4 +70,4 @@ rg -q 'NotchPillLayout\.origin' "$root/apps/macos/Tests/bagentTests/NotchStateCa
 rg -q 'acceptanceReduceMotionOverride' "$root/apps/macos/Sources/bagent/ChatView.swift"
 test "$(find "$fixture/notch-state-catalog" -maxdepth 1 -name '*.png' ! -name 'contact-sheet.png' | wc -l | tr -d ' ')" = 11
 
-echo "A56 visual qualification: PASS (macOS $product_version; signed candidate; 11 notch states; transition interruption reconciled in normal and reduced motion; 57 settings fixtures x 2 widths x light/dark/high-contrast/large-text/reduced-motion; signed identity and status-pill anchor verified)"
+echo "A56 visual qualification: PASS (macOS $product_version; signed candidate; 11 notch states; $(jq -r .recorded_transition_frame_count "$transition_evidence") hosted transition PNG frames with $(jq -r .distinct_transition_frame_count "$transition_evidence") distinct renders; $(jq -r .interruptions_reconciled "$transition_evidence") mid-transition interruptions reconciled across normal and reduced motion; 57 settings fixtures x 2 widths x light/dark/high-contrast/large-text/reduced-motion; signed identity and status-pill anchor verified)"

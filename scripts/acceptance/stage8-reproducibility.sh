@@ -55,9 +55,10 @@ actual=$(git -C "$clean_checkout" rev-parse HEAD)
 
 run_gate() {
     local name=$1
-    shift
+    local metric_policy=$2
+    shift 2
     local log="$temp_root/$name.log"
-    local began ended status command_line metrics disqualifying_observations log_hash
+    local began ended status command_line metrics observed_metrics required_metric metric_failure disqualifying_observations log_hash
     began=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     printf -v command_line '%q ' "$@"
     command_line=${command_line% }
@@ -87,6 +88,36 @@ for pattern in patterns:
 print(",".join(dict.fromkeys(values)))
 PY
 )
+    metric_failure=""
+    case "$metric_policy" in
+        command)
+            required_metric="executed_commands:1"
+            ;;
+        tests)
+            if [[ -n "$metrics" ]]; then
+                required_metric="executed_tests:${metrics%%,*}"
+            else
+                required_metric="executed_tests:missing"
+                metric_failure="test command executed zero tests"
+            fi
+            ;;
+        evidence)
+            if [[ -n "$metrics" ]]; then
+                required_metric="emitted_evidence:${metrics%%,*}"
+            else
+                required_metric="emitted_evidence:missing"
+                metric_failure="no nonzero evidence metric was emitted"
+            fi
+            ;;
+        *)
+            echo "A60 gate=$name: FAIL (unknown metric policy: $metric_policy)" >&2
+            exit 2
+            ;;
+    esac
+    observed_metrics="executed_commands:1"
+    if [[ -n "$metrics" ]]; then
+        observed_metrics="$observed_metrics,emitted_counts:$metrics"
+    fi
     disqualifying_observations=$(python3 - "$log" <<'PY'
 import re
 import sys
@@ -109,64 +140,69 @@ print(status_count + skip_count)
 PY
 )
     log_hash=$(shasum -a 256 "$log" | awk '{print $1}')
-    printf '%s command=%s status=%s started=%s ended=%s executed_commands=1 required_nonzero_metric=%s-checks:1 observed_nonzero_metrics=%s disqualifying_observations=%s log_sha256=%s\n' \
-        "$name" "$command_line" "$status" "$began" "$ended" "$name" "${metrics:-none}" "$disqualifying_observations" "$log_hash" >>"$record"
+    printf '%s command=%s status=%s started=%s ended=%s executed_commands=1 metric_policy=%s required_nonzero_metric=%s observed_nonzero_metrics=%s disqualifying_observations=%s log_sha256=%s\n' \
+        "$name" "$command_line" "$status" "$began" "$ended" "$metric_policy" "$required_metric" "$observed_metrics" "$disqualifying_observations" "$log_hash" >>"$record"
     if (( status != 0 )); then
         echo "A60 gate=$name: FAIL" >&2
         tail -n 40 "$log" >&2
         exit "$status"
+    fi
+    if [[ -n "$metric_failure" ]]; then
+        echo "A60 gate=$name: FAIL ($metric_failure)" >&2
+        tail -n 40 "$log" >&2
+        exit 1
     fi
     if (( disqualifying_observations > 0 )); then
         echo "A60 gate=$name: FAIL ($disqualifying_observations skipped, blocked, or conditional observation(s))" >&2
         tail -n 40 "$log" >&2
         exit 1
     fi
-    echo "A60 gate=$name: PASS (${name}-checks=1; observed metrics=${metrics:-none})"
+    echo "A60 gate=$name: PASS ($required_metric; $observed_metrics)"
 }
 
-run_gate cargo-fmt cargo fmt --all -- --check
-run_gate cargo-clippy cargo clippy --workspace --all-targets -- -D warnings
-run_gate daemon-acceptance-clippy cargo clippy -p bagentd --features stage7a-acceptance,stage8-acceptance --all-targets -- -D warnings
-run_gate cargo-test cargo test --workspace --no-fail-fast
-run_gate daemon-acceptance-tests cargo test -p bagentd --features stage7a-acceptance,stage8-acceptance --bin bagentd --no-fail-fast
-run_gate swift-build swift build --package-path apps/macos
-run_gate swift-test swift test --package-path apps/macos
-run_gate git-diff-check git -C "$clean_checkout" diff --check
-run_gate documentation-links scripts/acceptance/documentation-links.sh
-run_gate authority-inventory scripts/acceptance/final-authority-inventory.sh
-run_gate work-authority scripts/acceptance/work-authority.sh
-run_gate model-runtime-authority scripts/acceptance/model-runtime-authority.sh
-run_gate current-chat-authority scripts/acceptance/current-chat-authority.sh
-run_gate settings-authority scripts/acceptance/settings-authority.sh
-run_gate notch-mode-authority scripts/acceptance/notch-mode-authority.sh
-run_gate work-cutover-rollback scripts/acceptance/work-cutover-rollback.sh
-run_gate accessibility-audit scripts/acceptance/accessibility-audit.sh
-run_gate settings-localization scripts/acceptance/settings-localization.sh
-run_gate automation-sessions-regression cargo test -p bagentd --test automation_sessions --no-fail-fast
-run_gate current-chat-regression cargo test -p bagentd --test current_chat --no-fail-fast
-run_gate work-coordinator-regression cargo test -p bagentd --test work_coordinator --no-fail-fast
-run_gate work-failure-regression cargo test -p bagentd --test work_failure_injection --no-fail-fast
-run_gate model-runtime-regression cargo test -p bagentd --test model_runtime --no-fail-fast
-run_gate migration-clean-v14 cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact
-run_gate migration-interruption cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact
-run_gate work-crash-recovery cargo test -p bagentd --test work_concurrency crash_recovery -- --exact
-run_gate migration-process-restart scripts/acceptance/stage8-migration-restart.sh
-run_gate work-fairness cargo test -p bagentd --test work_concurrency fairness_foreground -- --exact
-run_gate model-poison cargo test -p bagentd --test model_runtime poison_changed_pid -- --exact
-run_gate signed-bundle-make make -C apps/macos bundle
-run_gate signed-bundle-verification scripts/acceptance/signed-bundle-verification.sh apps/macos/bagent.app
-run_gate signed-bundle-codesign codesign --verify --deep --strict apps/macos/bagent.app
-run_gate signed-bundle-designated-requirement codesign -dr - apps/macos/bagent.app
-run_gate privacy-scan scripts/acceptance/stage8-privacy-scan.sh apps/macos/bagent.app
-run_gate notch-state-capture scripts/acceptance/capture-notch-states.sh apps/macos/bagent.app
-run_gate settings-catalog scripts/acceptance/settings-catalog.sh
-run_gate signed-ui-relaunch scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app
-run_gate stage8-rollback scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app
-run_gate stage8-visual scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app
-run_gate stage8-accessibility scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app
-run_gate stage8-active-load-relaunch scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app
-run_gate signed-stage8-e2e scripts/acceptance/stage8-signed-e2e.sh apps/macos/bagent.app
-run_gate stage8-live-smoke scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app
+run_gate cargo-fmt command cargo fmt --all -- --check
+run_gate cargo-clippy command cargo clippy --workspace --all-targets -- -D warnings
+run_gate daemon-acceptance-clippy command cargo clippy -p bagentd --features stage7a-acceptance,stage8-acceptance --all-targets -- -D warnings
+run_gate cargo-test tests cargo test --workspace --no-fail-fast
+run_gate daemon-acceptance-tests tests cargo test -p bagentd --features stage7a-acceptance,stage8-acceptance --bin bagentd --no-fail-fast
+run_gate swift-build command swift build --package-path apps/macos
+run_gate swift-test tests swift test --package-path apps/macos
+run_gate git-diff-check command git -C "$clean_checkout" diff --check
+run_gate documentation-links evidence scripts/acceptance/documentation-links.sh
+run_gate authority-inventory evidence scripts/acceptance/final-authority-inventory.sh
+run_gate work-authority evidence scripts/acceptance/work-authority.sh
+run_gate model-runtime-authority evidence scripts/acceptance/model-runtime-authority.sh
+run_gate current-chat-authority evidence scripts/acceptance/current-chat-authority.sh
+run_gate settings-authority evidence scripts/acceptance/settings-authority.sh
+run_gate notch-mode-authority command scripts/acceptance/notch-mode-authority.sh
+run_gate work-cutover-rollback command scripts/acceptance/work-cutover-rollback.sh
+run_gate accessibility-audit command scripts/acceptance/accessibility-audit.sh
+run_gate settings-localization evidence scripts/acceptance/settings-localization.sh
+run_gate automation-sessions-regression tests cargo test -p bagentd --test automation_sessions --no-fail-fast
+run_gate current-chat-regression tests cargo test -p bagentd --test current_chat --no-fail-fast
+run_gate work-coordinator-regression tests cargo test -p bagentd --test work_coordinator --no-fail-fast
+run_gate work-failure-regression tests cargo test -p bagentd --test work_failure_injection --no-fail-fast
+run_gate model-runtime-regression tests cargo test -p bagentd --test model_runtime --no-fail-fast
+run_gate migration-clean-v14 tests cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact
+run_gate migration-interruption tests cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact
+run_gate work-crash-recovery tests cargo test -p bagentd --test work_concurrency crash_recovery -- --exact
+run_gate migration-process-restart evidence scripts/acceptance/stage8-migration-restart.sh
+run_gate work-fairness tests cargo test -p bagentd --test work_concurrency fairness_foreground -- --exact
+run_gate model-poison tests cargo test -p bagentd --test model_runtime poison_changed_pid -- --exact
+run_gate signed-bundle-make command make -C apps/macos bundle
+run_gate signed-bundle-verification command scripts/acceptance/signed-bundle-verification.sh apps/macos/bagent.app
+run_gate signed-bundle-codesign command codesign --verify --deep --strict apps/macos/bagent.app
+run_gate signed-bundle-designated-requirement command codesign -dr - apps/macos/bagent.app
+run_gate privacy-scan evidence scripts/acceptance/stage8-privacy-scan.sh apps/macos/bagent.app
+run_gate notch-state-capture evidence scripts/acceptance/capture-notch-states.sh apps/macos/bagent.app
+run_gate settings-catalog evidence scripts/acceptance/settings-catalog.sh
+run_gate signed-ui-relaunch evidence scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app
+run_gate stage8-rollback evidence scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app
+run_gate stage8-visual evidence scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app
+run_gate stage8-accessibility evidence scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app
+run_gate stage8-active-load-relaunch evidence scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app
+run_gate signed-stage8-e2e evidence scripts/acceptance/stage8-signed-e2e.sh apps/macos/bagent.app
+run_gate stage8-live-smoke evidence scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app
 
 protected_8080_after=$(lsof -nP -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)
 protected_8082_after=$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)

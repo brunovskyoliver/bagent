@@ -93,7 +93,7 @@ enum Stage8AccessibilityCLI {
         defer { panel.close() }
 
         host.layoutSubtreeIfNeeded()
-        try await Task.sleep(for: .milliseconds(500))
+        try await Task.sleep(for: .milliseconds(1_000))
         host.layoutSubtreeIfNeeded()
         let applicationElement = AXUIElementCreateApplication(getpid())
         let activeElements = accessibilityTree(from: applicationElement)
@@ -153,7 +153,7 @@ enum Stage8AccessibilityCLI {
                 "reduced_motion": true,
                 "ax_press_actions_executed": interactionEvidence.pressActions,
                 "keyboard_events_sent": interactionEvidence.keyboardEvents,
-                "focus_destination_changes_observed": interactionEvidence.focusChanges,
+                "keyboard_focus_changes_observed": interactionEvidence.focusChanges,
                 "ax_names_values_observed": accessibleReadoutCount,
                 "announcements_posted": announcementCount,
                 "contrast_checks": contrastAssertions,
@@ -220,6 +220,10 @@ enum Stage8AccessibilityCLI {
         }), actionNames(for: status).contains(kAXPressAction) else {
             throw FixtureError.assertion("Accessibility buttons do not expose keyboard-capable press actions")
         }
+        let initialDestination = viewModel.notchPresentation.focusedDestination
+        guard initialDestination != nil else {
+            throw FixtureError.assertion("Activity has no initial focused destination")
+        }
         panel.makeFirstResponder(nil)
         guard let down = NSEvent.keyEvent(
             with: .keyDown,
@@ -228,10 +232,10 @@ enum Stage8AccessibilityCLI {
             timestamp: ProcessInfo.processInfo.systemUptime,
             windowNumber: panel.windowNumber,
             context: nil,
-            characters: "\t",
-            charactersIgnoringModifiers: "\t",
+            characters: "\r",
+            charactersIgnoringModifiers: "\r",
             isARepeat: false,
-            keyCode: 48
+            keyCode: 36
         ), let up = NSEvent.keyEvent(
             with: .keyUp,
             location: .zero,
@@ -239,16 +243,21 @@ enum Stage8AccessibilityCLI {
             timestamp: ProcessInfo.processInfo.systemUptime,
             windowNumber: panel.windowNumber,
             context: nil,
-            characters: "\t",
-            charactersIgnoringModifiers: "\t",
+            characters: "\r",
+            charactersIgnoringModifiers: "\r",
             isARepeat: false,
-            keyCode: 48
+            keyCode: 36
         ) else {
-            throw FixtureError.assertion("Tab keyboard event could not be created")
+            throw FixtureError.assertion("Return keyboard event could not be created")
         }
-        NSApp.sendEvent(down)
-        NSApp.sendEvent(up)
+        guard panel.performKeyEquivalent(with: down) else {
+            throw FixtureError.assertion("Return key equivalent was not handled by the hosted signed UI")
+        }
+        panel.sendEvent(up)
         try await Task.sleep(for: .milliseconds(150))
+        guard viewModel.notchPresentation.focusedDestination != initialDestination else {
+            throw FixtureError.assertion("Return did not cycle the focused Activity destination")
+        }
         guard AXUIElementPerformAction(status, kAXPressAction as CFString) == .success else {
             throw FixtureError.assertion("Status AXPress action failed")
         }
@@ -256,7 +265,7 @@ enum Stage8AccessibilityCLI {
         guard viewModel.notchInteractionMode == .automations else {
             throw FixtureError.assertion("Status AXPress did not route to Automations")
         }
-        return InteractionEvidence(assertions: 3, pressActions: 1, keyboardEvents: 2, focusChanges: 1)
+        return InteractionEvidence(assertions: 4, pressActions: 1, keyboardEvents: 2, focusChanges: 1)
     }
 
     private static func observedReadouts(in elements: [AXUIElement]) -> [String] {
