@@ -27,6 +27,13 @@ enum Stage8VisualCaptureCLI {
                 .filter { $0.pathExtension == "png" }
             guard captures.count == fixtures.count else { throw CaptureError.count }
 
+            let automationSplitCaptureCount = try await captureAutomationSplitViews(
+                outputDirectory: outputDirectory.appendingPathComponent(
+                    "automation-split-view",
+                    isDirectory: true
+                )
+            )
+
             let transitionEvidence = try await recordTransitions(
                 fixtures: fixtures,
                 outputDirectory: outputDirectory.appendingPathComponent("transition-frames", isDirectory: true)
@@ -35,6 +42,7 @@ enum Stage8VisualCaptureCLI {
                 "status": "pass",
                 "signed_process_id": ProcessInfo.processInfo.processIdentifier,
                 "rendered_notch_state_count": captures.count,
+                "automation_split_view_capture_count": automationSplitCaptureCount,
                 "transition_count": transitionEvidence.transitionCount,
                 "recorded_transition_frame_count": transitionEvidence.frameCount,
                 "distinct_transition_frame_count": transitionEvidence.distinctFrameCount,
@@ -55,6 +63,11 @@ enum Stage8VisualCaptureCLI {
 
     private enum CaptureError: Error { case render(String), count, transition }
 
+    private struct VisualStateFixture {
+        let name: String
+        let presentation: NotchPresentation
+    }
+
     private struct TransitionEvidence {
         let transitionCount: Int
         let frameCount: Int
@@ -66,7 +79,7 @@ enum Stage8VisualCaptureCLI {
     }
 
     private static func recordTransitions(
-        fixtures: [(name: String, presentation: NotchPresentation)],
+        fixtures: [VisualStateFixture],
         outputDirectory: URL
     ) async throws -> TransitionEvidence {
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
@@ -188,6 +201,48 @@ enum Stage8VisualCaptureCLI {
         )
     }
 
+    private static func captureAutomationSplitViews(outputDirectory: URL) async throws -> Int {
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        let snapshots = [
+            NotchWorkSnapshot(
+                schemaVersion: 1,
+                cursor: 101,
+                daemonGeneration: "signed-automation-split",
+                works: [work("automation-active", state: .running, activity: .web)],
+                pendingApprovals: [],
+                model: .ready
+            ),
+            NotchWorkSnapshot(
+                schemaVersion: 1,
+                cursor: 102,
+                daemonGeneration: "signed-automation-split",
+                works: [work("automation-terminal", state: .completed, attention: .unread)],
+                pendingApprovals: [],
+                model: .ready
+            ),
+        ]
+        let names = ["active", "terminal-preview"]
+        for (name, snapshot) in zip(names, snapshots) {
+            let viewModel = ChatViewModel(startMonitoring: false)
+            try viewModel.applyAuthoritativeSnapshot(snapshot)
+            viewModel.refreshAutomationSessionProjection()
+            let host = NSHostingView(
+                rootView: AutomationSessionSplitView(viewModel: viewModel)
+            )
+            host.frame = CGRect(x: 0, y: 0, width: 741, height: 280)
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(80))
+            let data = try capturePNG(host, name: "automation-split-\(name)")
+            try data.write(to: outputDirectory.appendingPathComponent("\(name).png"))
+        }
+        let captures = try FileManager.default.contentsOfDirectory(
+            at: outputDirectory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "png" }
+        guard captures.count == names.count else { throw CaptureError.count }
+        return captures.count
+    }
+
     private static func capturePNG(_ view: NSView, name: String) throws -> Data {
         view.layoutSubtreeIfNeeded()
         guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
@@ -265,8 +320,8 @@ enum Stage8VisualCaptureCLI {
         }.frame(width: 741, height: 312)
     }
 
-    private static func stateFixtures() throws -> [(name: String, presentation: NotchPresentation)] {
-        let states: [(String, [NotchWork], [NotchApproval], NotchModelPhase)] = [
+    private static func stateFixtures() throws -> [VisualStateFixture] {
+        let states: [(name: String, works: [NotchWork], approvals: [NotchApproval], model: NotchModelPhase)] = [
             ("idle", [], [], .unloaded),
             ("queued", [work("queued", state: .queued)], [], .ready),
             ("loading", [work("loading", state: .waitingForModel)], [], .loading),
@@ -284,11 +339,18 @@ enum Stage8VisualCaptureCLI {
                 schemaVersion: 1,
                 cursor: UInt64(index + 1),
                 daemonGeneration: "signed-state-catalog",
-                works: state.1,
-                pendingApprovals: state.2,
-                model: state.3
+                works: state.works,
+                pendingApprovals: state.approvals,
+                model: state.model
             )
-            return (state.0, try NotchProjection.reduce(previous: .idle, input: .snapshot(snapshot), reduceMotion: true))
+            return VisualStateFixture(
+                name: state.name,
+                presentation: try NotchProjection.reduce(
+                    previous: .idle,
+                    input: .snapshot(snapshot),
+                    reduceMotion: true
+                )
+            )
         }
     }
 
@@ -307,7 +369,10 @@ enum Stage8VisualCaptureCLI {
             activity: activity.map(NotchActivity.init(category:)),
             queuePosition: state == .queued ? 1 : nil,
             automationDisplayName: origin == .automation ? "Saved Automation" : nil,
+            automationDefinitionIdentity: origin == .automation ? "definition-\(identity)" : nil,
+            automationSessionIdentity: origin == .automation ? "automation-session:\(identity)" : nil,
             terminalAttention: attention,
+            terminalFinishedAt: state.isTerminal ? "2026-08-23T18:00:00Z" : nil,
             claimedOrder: 1
         )
     }

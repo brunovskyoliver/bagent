@@ -37,11 +37,10 @@ cargo test -p bagentd --test privacy_contract -- --nocapture
 swift test --package-path "$repo_root/apps/macos" --filter ProjectionPrivacyTests
 swift test --package-path "$repo_root/apps/macos" --filter UIRelaunchHandoffTests
 
-# Exercise the real disposable signed UI/daemon/BaseRT capture path for event,
-# UI, logging, diagnostics, export, timeout, and failure surfaces. The capture
-# directory is deliberately outside the production data directory and is
-# securely removed by this script after the scanner has retained only counts
-# and hashes in its output.
+# Exercise the real disposable signed UI/daemon/BaseRT capture path and the
+# real migration, rollback, crash-recovery, and failure-injection authorities.
+# The capture directory is deliberately outside the production data directory
+# and is securely removed after only counts and hashes are retained.
 capture_dir="$(mktemp -d "${TMPDIR:-/tmp}/bagent-stage8-actual-captures.XXXXXX")"
 case "$capture_dir" in
     "${TMPDIR:-/tmp}"/bagent-stage8-actual-captures.*) ;;
@@ -70,7 +69,7 @@ canary_terms=(
     "diagnostic export"
     "failure payload"
 )
-surfaces=(event ui log diagnostics export)
+surfaces=(event ui log diagnostics export migration rollback crash failure)
 
 printf '%s\n' "${canaries[@]}" > "$fixture/canary-seed.txt"
 canary_json="$(printf '%s\n' "${canaries[@]}" | jq -R -s 'split("\n") | map(select(length > 0))')"
@@ -92,6 +91,20 @@ BAGENT_STAGE8_ACTUAL_CAPTURE_DIR="$capture_dir" \
 BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE="$(IFS=:; echo "${canaries[*]}")" \
     "$repo_root/scripts/acceptance/stage7c-production-ui-relaunch.sh" "$candidate"
 
+privacy_canary_bundle="$(IFS=:; echo "${canaries[*]}")"
+BAGENT_STAGE8_PRIVACY_CAPTURE_DIR="$capture_dir" \
+BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE="$privacy_canary_bundle" \
+    cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact
+BAGENT_STAGE8_PRIVACY_CAPTURE_DIR="$capture_dir" \
+BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE="$privacy_canary_bundle" \
+    cargo test -p bagentd --test persistence_migration cutover_boundary -- --exact
+BAGENT_STAGE8_PRIVACY_CAPTURE_DIR="$capture_dir" \
+BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE="$privacy_canary_bundle" \
+    cargo test -p bagentd --test work_concurrency crash_recovery -- --exact
+BAGENT_STAGE8_PRIVACY_CAPTURE_DIR="$capture_dir" \
+BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE="$privacy_canary_bundle" \
+    cargo test -p bagentd --test work_failure_injection every_required_boundary_fails_closed -- --exact
+
 detected=0
 for file in "$scanner_canary_dir"/*.json; do
     if rg -q -i '(hidden reasoning|raw arguments|credential|evidence content|private identity|unknown field|handoff data|diagnostic export|failure payload)' "$file"; then
@@ -107,7 +120,7 @@ for file in "$capture_dir"/*; do
 done
 [[ "$sanitized_matches" -eq 0 ]]
 [[ "$(find "$capture_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "${#surfaces[@]}" ]]
-expected_files=(event.json ui.json daemon.log diagnostics.json export.json)
+expected_files=(event.json ui.json daemon.log diagnostics.json export.json migration.json rollback.json crash.json failure.json)
 for file in "${expected_files[@]}"; do [[ -s "$capture_dir/$file" ]]; done
 
 capture_bytes="$(find "$capture_dir" -maxdepth 1 -type f -exec stat -f '%z' {} + | awk '{sum += $1} END {print sum + 0}')"

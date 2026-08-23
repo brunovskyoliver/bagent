@@ -1,4 +1,5 @@
-import Foundation
+import AppKit
+import SwiftUI
 
 #if BAGENT_ACCEPTANCE
 /// Signed-candidate observation and mutation boundary for the A59 disposable
@@ -11,13 +12,49 @@ enum Stage8LiveSmokeCLI {
     static func runProjection(outputURL: URL) async -> Int32 {
         guard ProcessInfo.processInfo.environment[environmentKey] == "1" else { return 64 }
         do {
-            let snapshot = try await DaemonClient().fetchAuthoritativeSnapshot()
+            let client = DaemonClient()
             let viewModel = ChatViewModel(startMonitoring: false)
-            try viewModel.applyAuthoritativeSnapshot(snapshot)
+            var observedStages = Set<StageRailStage>()
+            var renderedBytes = 0
+            var renderCount = 0
+            var lastSnapshot: NotchWorkSnapshot?
+            let deadline = ContinuousClock.now.advanced(by: .seconds(12))
+            while ContinuousClock.now < deadline,
+                  !observedStages.isSuperset(of: [.think, .tool]) {
+                let snapshot = try await client.fetchAuthoritativeSnapshot()
+                lastSnapshot = snapshot
+                try viewModel.applyAuthoritativeSnapshot(snapshot)
+                let presentation = viewModel.notchPresentation
+                if let stage = presentation.rail.selectedStage,
+                   [.think, .tool].contains(stage),
+                   !observedStages.contains(stage) {
+                    guard presentation.interactionMode == .collapsed else {
+                        throw LiveSmokeError.assertion(
+                            "signed activity rail was not in collapsed presentation"
+                        )
+                    }
+                    let png = try renderCollapsedRail(presentation)
+                    try png.write(
+                        to: outputURL.deletingLastPathComponent()
+                            .appendingPathComponent("collapsed-\(stage.rawValue).png"),
+                        options: .atomic
+                    )
+                    renderedBytes += png.count
+                    renderCount += 1
+                    observedStages.insert(stage)
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            guard let snapshot = lastSnapshot else {
+                throw LiveSmokeError.assertion("signed UI did not fetch an authoritative snapshot")
+            }
             let presentation = viewModel.notchPresentation
-            guard presentation.activeAutomationCount > 0,
-                  presentation.rail.selectedStage != nil else {
-                throw LiveSmokeError.assertion("signed UI did not observe active automation projection")
+            guard observedStages.isSuperset(of: [.think, .tool]),
+                  renderCount == 2,
+                  renderedBytes > 2_000 else {
+                throw LiveSmokeError.assertion(
+                    "signed UI did not render both collapsed Think and Tool presentations"
+                )
             }
             try writeEvidence([
                 "status": "pass",
@@ -27,6 +64,11 @@ enum Stage8LiveSmokeCLI {
                 "status_pill": presentation.statusPill.label ?? "hidden",
                 "active_automation_count": presentation.activeAutomationCount,
                 "foreground_work": presentation.hasActiveForegroundWork,
+                "collapsed_presentation_observed": true,
+                "collapsed_render_count": renderCount,
+                "collapsed_render_bytes": renderedBytes,
+                "thinking_stage_observed": observedStages.contains(.think),
+                "tool_stage_observed": observedStages.contains(.tool),
                 "status_pill_anchor_invariant": NotchPillLayout.origin(maxPanelWidth: 741)
                     == CGPoint(x: 643, y: 9),
             ], to: outputURL)
@@ -146,6 +188,28 @@ enum Stage8LiveSmokeCLI {
             case .assertion(let message): message
             }
         }
+    }
+
+    private static func renderCollapsedRail(_ presentation: NotchPresentation) throws -> Data {
+        let host = NSHostingView(
+            rootView: ZStack {
+                Color.black
+                ActivityPeekStageRailView(presentation: presentation, action: {})
+                    .padding(16)
+            }
+            .frame(width: 460, height: 108)
+        )
+        host.frame = CGRect(x: 0, y: 0, width: 460, height: 108)
+        host.layoutSubtreeIfNeeded()
+        guard !presentation.rail.accessibilityValue.isEmpty,
+              let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
+            throw LiveSmokeError.assertion("collapsed activity rail was not inspectable")
+        }
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        guard let png = bitmap.representation(using: .png, properties: [:]), png.count > 1_000 else {
+            throw LiveSmokeError.assertion("collapsed activity rail render was empty")
+        }
+        return png
     }
 
     private static func writeEvidence(_ object: [String: Any], to url: URL) throws {

@@ -1,0 +1,13 @@
+{
+  "macos_major": 26,
+  "notch_states": "e3a883abdd53bcd0c2c68a083bab0c89db6c36c283a82f68bbe70444ed8a0838",
+  "automation_split_view": "c92a5bec204cf4ced5f18b8078e96b493c642f3d35d71f9c2aeffe91c9299503",
+  "settings": {
+    "default": "85d65666d46966cb782104bf2f1e3b8a8587ba56ee80bb94297144dd3d80a195",
+    "light": "b6101ebbf1e490d46c294eb6ec8157c7910ce3f71ea0c314d4c4c58ed22602f4",
+    "dark": "85d65666d46966cb782104bf2f1e3b8a8587ba56ee80bb94297144dd3d80a195",
+    "large-text": "d060d24a778d1f9460fe0afb29bcb57eca7b0e297850cf79254fa75bbf6ce227",
+    "high-contrast": "274e73e18a826a4aeb3c50d0d1e239a9e8955e5ec20b502f5e7a09f57bd76952",
+    "reduce-motion": "85d65666d46966cb782104bf2f1e3b8a8587ba56ee80bb94297144dd3d80a195"
+  }
+}

@@ -281,7 +281,7 @@ curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
 # BaseRT, session, and canonical run-record paths.
 automation_schedule="$(python3 -c 'from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)+timedelta(seconds=120)).isoformat().replace("+00:00","Z"))')"
 automation_payload="$(jq -nc --arg at "$automation_schedule" \
-    '{name:"Stage 8 disposable automation",prompt:"What is the current population of Bratislava online?",timezone:"UTC",schedule:{kind:"once",at:$at},enabled:true}')"
+    '{name:"Stage 8 disposable automation",prompt:"Use the web search tool to find the current population of Bratislava, then report the result.",timezone:"UTC",schedule:{kind:"once",at:$at},enabled:true}')"
 automation_a="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' -d "$automation_payload" "http://127.0.0.1:$daemon_port/automations")"
 automation_b="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
     -d "$(jq --arg name 'Stage 8 disposable automation B' '.name=$name' <<<"$automation_payload")" \
@@ -311,6 +311,11 @@ done
 [[ "$active_ui_observed" == true ]]
 [[ "$(jq -r .active_automation_count "$fixture_root/active-ui.json")" =~ ^[1-9][0-9]*$ ]]
 [[ "$(jq -r .status_pill_anchor_invariant "$fixture_root/active-ui.json")" == true ]]
+[[ "$(jq -r .collapsed_presentation_observed "$fixture_root/active-ui.json")" == true ]]
+[[ "$(jq -r .thinking_stage_observed "$fixture_root/active-ui.json")" == true ]]
+[[ "$(jq -r .tool_stage_observed "$fixture_root/active-ui.json")" == true ]]
+[[ "$(jq -r .collapsed_render_count "$fixture_root/active-ui.json")" == 2 ]]
+[[ "$(jq -r .collapsed_render_bytes "$fixture_root/active-ui.json")" =~ ^[1-9][0-9]{3,}$ ]]
 
 # Admit the second controlled automation only after the signed UI has
 # observed the first active Work projection.
@@ -462,6 +467,7 @@ echo "A59 live foreground chats: 2"
 echo "A59 canonical automation Works: $canonical_automation_work_count"
 echo "A59 canonical automation links: $canonical_automation_link_count"
 echo "A59 canonical automation sessions: $canonical_automation_session_count"
+echo "A59 collapsed activity renders: $(jq -r .collapsed_render_count "$fixture_root/active-ui.json") ($(jq -r .collapsed_render_bytes "$fixture_root/active-ui.json") bytes; Think and Tool observed)"
 echo "A59 live idle retirements: 1"
 echo "A59 live reloads: 1"
 echo "A59 evidence metrics: case_count=2 work_count=$canonical_automation_work_count link_count=$canonical_automation_link_count session_count=$canonical_automation_session_count transition_count=2"

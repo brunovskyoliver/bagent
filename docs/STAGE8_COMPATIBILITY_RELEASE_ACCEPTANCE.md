@@ -52,11 +52,11 @@ conditional, blocked, or inferred result is called PASS.
 | A52 | `cargo test -p bagentd --test persistence_migration clean_and_v14 -- --exact` | PASS: 1 executed, 1 passed, 0 failed; disposable empty and V14 databases converged to the canonical schema and invariants, with kind-only approval provenance and no private automation identity |
 | A53 | `scripts/acceptance/stage8-migration-restart.sh`; `cargo test -p bagentd --test persistence_migration interrupted_migration -- --exact`; `cargo test -p bagentd --test work_concurrency crash_recovery -- --exact` | PASS: 4 external `SIGKILL` cases and 2 exact tests executed; before-migration, during-copy, after-commit, and before-route-admission recovery preserved integrity, changed the daemon PID, admitted routes only after restart, converted 8 records without duplicates, and left protected ports unchanged |
 | A54 | `scripts/acceptance/stage8-rollback-qualification.sh apps/macos/bagent.app` | PASS: disposable old/new signed candidates and databases; pre-Work verified backup and old reader, signed migration and first post-cutover Work, old-binary refusal of the post-Work database, archive-and-restore, hashes, protected-port checks, and cleanup all executed |
-| A55 | `scripts/acceptance/stage8-privacy-scan.sh`; privacy contract and Swift privacy suites | PASS: 9 canaries entered the signed disposable workload; the scanner detected all 9 raw seeds; 5 actual event, UI, log, diagnostic, and export artifacts contained 0 canary matches; disposable captures were securely deleted; Rust 1, Swift projection 4, and handoff privacy 5 tests passed |
-| A56 | `scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app` | PASS: signed candidate rendered 11 notch-state PNGs and recorded hosted transition frame sequences across 22 normal/reduced-motion transitions; 2 mid-transition failures reconciled to independently rendered failed-state frames; 57 settings fixtures × 2 widths across the accepted variants; status-pill anchor and identity verified |
-| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS: 11 Compass Rail tests, 1 Compass Rail accessibility test, and 8 notch/Stage Rail tests passed; signed live evidence recorded 5 active and 11 approval AX elements, 12 assertions, 1 AX press action, 2 keyboard events, 1 focus change, 1 names/values readout, 2 posted announcements, 2 contrast checks, and 2 enlarged-layout frames; signed settings AX and source assertions passed |
+| A55 | `scripts/acceptance/stage8-privacy-scan.sh`; privacy contract and Swift privacy suites | PASS: 9 canaries entered the signed disposable workload; the scanner detected all 9 raw seeds; 9 actual event, UI, log, diagnostic, export, migration, rollback, crash, and failure artifacts contained 0 canary matches; disposable captures were securely deleted; Rust and Swift privacy suites passed |
+| A56 | `scripts/acceptance/stage8-visual-qualification.sh apps/macos/bagent.app` | PASS: signed candidate matched checked-in approved aggregate hashes for 11 notch states, 2 Automation Split View states, and 57 settings/Compass Rail fixtures × 2 widths × 6 variants; 74 hosted transition frames covered 22 normal/reduced-motion transitions and 2 reconciled interruptions; status-pill anchor and identity verified |
+| A57 | `scripts/acceptance/stage8-accessibility-qualification.sh apps/macos/bagent.app` | PASS twice: signed live evidence recorded 5 active and 11 approval AX elements, 18 assertions, 1 AX press action, 8 keyboard events, 2 focus changes, 2 approval actions, 1 approval focus-order transition, 1 names/values readout, 2 posted announcements, 2 contrast checks, and 2 enlarged-layout frames; Tab moved deny-to-approve, Return approved, Escape denied, and signed settings AX passed |
 | A58 | `scripts/acceptance/stage8-active-load-relaunch.sh apps/macos/bagent.app`; `scripts/acceptance/ui-relaunch-handoff.sh apps/macos/bagent.app` | PASS: signed UI-only relaunch preserved 1 foreground Work, 2 real run-now automation Works, and 1 canonical pending approval while daemon/BaseRT PIDs, Work revisions, protected ports, and the active UI consumer converged |
-| A59 | `scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app` | PASS: signed candidate and real disposable daemon/BaseRT; 2 foreground chats, 2 canonical automation Works, 2 links, 2 sessions, 1 live idle retirement, and 1 live reload through bounded production inference; result open, continuation, scoped `/clear`, permission reread, UI-only relaunch, unchanged process identities, and port isolation verified; external source ended in a safe `verification_shortfall` with privacy-safe capture SHA-256 `47181899a308741f2a05ecbf38106907edd75af016d2d245633a67d95ebc4884` |
+| A59 | `scripts/acceptance/stage8-live-smoke.sh apps/macos/bagent.app` | PASS: signed candidate and real disposable daemon/BaseRT; 2 foreground chats, 2 canonical automation Works, 2 links, 2 sessions, 2 nonempty collapsed Stage Rail renders that observed Think and a real web Tool call, 1 live idle retirement, and 1 live reload; result open, continuation, scoped `/clear`, permission reread, UI-only relaunch, unchanged process identities, safe external-source outcome, and port isolation verified |
 | A60 | `scripts/acceptance/stage8-reproducibility.sh <frozen-final-commit>` | The final clean-checkout record, including every gate status, nonzero execution count, log hash, signed bundle hash, timestamps, protected-port baseline, cleanup, and final runtime state, is attached to the Stage 8 ticket resolution comment. This row is not a substitute for that emitted record. |
 
 ### A51 final authority cleanup
@@ -80,21 +80,23 @@ post-commit recovery, and route admission. Rollback is before first
 post-cutover Work only; after cutover it uses archive-and-restore and the old
 binary never reads the new database. Privacy canaries enter the signed
 disposable relaunch workload and production diagnostic sanitizer. The gate
-scans the five surfaces named by A55: the actual Work event response, signed UI
-evidence, daemon log, persisted diagnostic, and diagnostic export. A53 and A54
-own migration crash recovery and rollback qualification. A55 securely removes
-its artifacts and does not manufacture sanitized placeholder files.
+scans actual Work event, signed UI, daemon log, persisted diagnostic,
+diagnostic export, migration, rollback, crash-recovery, and injected-failure
+artifacts. The last four are emitted by the exact A52/A53 and fail-closed
+tests, not placeholder JSON. A55 securely removes every capture.
 
 ### A56–A58 signed visual, accessibility, and active-load evidence
 
 Signed/live visual and accessibility qualification is macOS 26 only and follows
 `docs/UI_DESIGN.md`. The invariant status pill remains top-right. The signed
-visual fixture records hosted normal/reduced-motion frame sequences and injects
-a failure before the normal transition settles. The signed accessibility
-fixture records AX names/values, AX action routing, a Return-key destination
-change, posted announcements, contrast, and enlarged-layout frames. The A57
-contract uses the signed Accessibility API and keyboard path. No TCC state was
-changed.
+visual fixture records hosted normal/reduced-motion frame sequences, injects a
+failure before the normal transition settles, and compares the notch, Compass
+Rail/settings, and Automation Split View PNG catalogs with checked-in approved
+hashes. The signed accessibility fixture records AX names/values, AX action
+routing, Tab focus order, Return approval, Escape denial, posted announcements,
+contrast, and enlarged-layout frames. The A57 contract uses the signed
+Accessibility API and keyboard path. No screen reader was used and no TCC state
+was changed.
 Active-load relaunch changes only the UI consumer PID and preserves one
 foreground Work, two automation Works, and one pending approval; the port-8080
 owner is never touched.
@@ -105,7 +107,8 @@ The run recorded the initial disposable process/runtime baseline and restored
 application, daemon, BaseRT, automation, lease, session, port, and preference
 state. The safe external-source limitation is handled under
 `docs/ADR-0002-REPRODUCIBLE-STAGE8-RELEASE-GATE.md`; no unsupported answer was
-accepted.
+accepted. The signed UI also rendered and inspected the collapsed Stage Rail
+while a real automation moved through Think and web Tool activity.
 
 ## A60 reproducibility record
 
@@ -241,6 +244,14 @@ or pull request is part of this stage.
   chats, two Works/links/sessions, one retirement, and one reload, but those
   human-readable nouns did not match A60's metric parser. A59 now emits explicit
   nonzero case, work, link, session, and lifecycle-transition counts.
+- The next independent specification review found four remaining evidence
+  defects: A55 manufactured four sanitized placeholder files, A56 lacked
+  Automation Split View/Compass Rail baselines, A57 did not execute approval
+  focus order and actions, and A59 did not inspect collapsed Think/Tool UI.
+  The corrected gates now capture four real test artifacts, compare all signed
+  visual catalogs with stable approved hashes, execute Tab/Return/Escape on the
+  approval panel, and render real collapsed Think and Tool states. The paired
+  standards review also replaced opaque tuple indexes with a named fixture.
 - Earlier review passes identified and were followed by fixes for the counted
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,

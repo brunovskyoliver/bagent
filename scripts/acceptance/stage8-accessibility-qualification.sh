@@ -33,13 +33,13 @@ for field in active_element_count approval_element_count assertion_count; do
     count="$(jq -r ".$field" "$notch_evidence")"
     [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "A57 $field is zero" >&2; exit 1; }
 done
-for field in ax_press_actions_executed keyboard_events_sent keyboard_focus_changes_observed ax_names_values_observed contrast_checks enlarged_layout_frames_observed; do
+for field in ax_press_actions_executed keyboard_events_sent keyboard_focus_changes_observed approval_keyboard_actions_executed approval_focus_order_transitions ax_names_values_observed contrast_checks enlarged_layout_frames_observed; do
     count="$(jq -r ".$field" "$notch_evidence")"
     [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo "A57 signed AX evidence is zero: $field" >&2; exit 1; }
 done
 announcements_posted="$(jq -r .announcements_posted "$notch_evidence")"
 [[ "$announcements_posted" =~ ^[2-9][0-9]*$ ]]
-jq -r '"A57 signed notch evidence: \(.active_element_count) active elements, \(.approval_element_count) approval elements, \(.assertion_count) assertions, \(.ax_press_actions_executed) AX press actions, \(.keyboard_events_sent) keyboard events, \(.keyboard_focus_changes_observed) focus changes, \(.ax_names_values_observed) AX names/values, \(.announcements_posted) announcements, \(.contrast_checks) contrast checks, \(.enlarged_layout_frames_observed) enlarged-layout frames"' "$notch_evidence"
+jq -r '"A57 signed notch evidence: \(.active_element_count) active elements, \(.approval_element_count) approval elements, \(.assertion_count) assertions, \(.ax_press_actions_executed) AX press actions, \(.keyboard_events_sent) keyboard events, \(.keyboard_focus_changes_observed) focus changes, \(.approval_keyboard_actions_executed) approval actions, \(.approval_focus_order_transitions) approval focus transitions, \(.ax_names_values_observed) AX names/values, \(.announcements_posted) announcements, \(.contrast_checks) contrast checks, \(.enlarged_layout_frames_observed) enlarged-layout frames"' "$notch_evidence"
 
 settings_dir="$fixture/settings"
 set +e
@@ -71,4 +71,4 @@ for field in route_count element_count assertion_count; do
 done
 
 echo "A57 hosted XCTest AX runner probe: not a qualification input (runner Accessibility entitlement is environment-dependent; signed candidate AX evidence below is the executed check)"
-echo "PASS: A57 signed Accessibility API, Return-key focus cycling, AX action, names/values, posted announcements, contrast, enlarged-text, and settings checks passed"
+echo "PASS: A57 signed Accessibility API, Tab focus order, Return approval, Escape denial, AX action, names/values, posted announcements, contrast, enlarged-text, and settings checks passed"

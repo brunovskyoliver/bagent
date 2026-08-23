@@ -334,7 +334,11 @@ struct NotchSettingsContent: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
-        .onAppear { permissions.beginAssist(for: kind) }
+        .onAppear {
+            if acceptanceState == nil {
+                permissions.beginAssist(for: kind)
+            }
+        }
     }
 
     private func permissionHint(for kind: PermissionGrantKind) -> String {

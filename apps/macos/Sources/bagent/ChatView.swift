@@ -2727,9 +2727,15 @@ struct ThinkingIndicator: View {
 /// The only approval surface — the daemon auto-denies after 60 s, so this must
 /// stay reachable whenever `pendingApprovals` is non-empty.
 struct ApprovalModalOverlay: View {
+    private enum FocusedAction: Hashable {
+        case deny
+        case allow
+    }
+
     let approval: ApprovalItem
     @ObservedObject var viewModel: ChatViewModel
     @State private var secondsLeft: Int = 60
+    @FocusState private var focusedAction: FocusedAction?
 
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -2791,6 +2797,8 @@ struct ApprovalModalOverlay: View {
                         .contentShape(RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
+                .focusable()
+                .focused($focusedAction, equals: .deny)
                 .keyboardShortcut(.escape, modifiers: [])
                 Button { viewModel.decideApproval(approval, allow: true) } label: {
                     Text("Schváliť")
@@ -2802,9 +2810,16 @@ struct ApprovalModalOverlay: View {
                         .contentShape(RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
+                .focusable()
+                .focused($focusedAction, equals: .allow)
                 .keyboardShortcut(.return, modifiers: [])
             }
+            .onKeyPress(.tab) {
+                focusedAction = focusedAction == .deny ? .allow : .deny
+                return .handled
+            }
         }
+        .onAppear { focusedAction = .deny }
         .onReceive(timer) { _ in
             if secondsLeft > 0 {
                 secondsLeft -= 1

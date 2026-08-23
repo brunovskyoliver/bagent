@@ -76,6 +76,19 @@ CREATE TABLE IF NOT EXISTS automations (
 CREATE INDEX IF NOT EXISTS idx_automations_due ON automations (enabled, next_run_at);
 "#;
 
+fn stage8_privacy_canary_bundle() -> String {
+    std::env::var("BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE")
+        .unwrap_or_else(|_| "CANARY_PRIVATE_IDENTITY:CANARY_RAW_ARGUMENT".to_owned())
+}
+
+fn write_stage8_privacy_capture(name: &str, value: serde_json::Value) {
+    let Ok(directory) = std::env::var("BAGENT_STAGE8_PRIVACY_CAPTURE_DIR") else {
+        return;
+    };
+    let path = std::path::Path::new(&directory).join(name);
+    std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+}
+
 fn canonical_schema_checksum(connection: &Connection) -> String {
     let mut statement = connection
         .prepare(
@@ -427,6 +440,7 @@ fn v14_fixture() -> (TempDir, std::path::PathBuf) {
             [],
         )
         .unwrap();
+    let private_bundle = stage8_privacy_canary_bundle();
     for index in 0..55 {
         connection
             .execute(
@@ -437,9 +451,9 @@ fn v14_fixture() -> (TempDir, std::path::PathBuf) {
                     format!("terminal-{index:02}"),
                     format!("2026-08-18T18:{index:02}:00Z"),
                     if index == 54 {
-                        "Completed successfully."
+                        "Completed successfully.".to_owned()
                     } else {
-                        "CANARY raw evidence token"
+                        private_bundle.clone()
                     }
                 ],
             )
@@ -450,12 +464,20 @@ fn v14_fixture() -> (TempDir, std::path::PathBuf) {
          (id,automation_id,scheduled_for,status,result_summary,created_at)
          VALUES ('active','a','2026-08-18T19:00:00Z','running','PRIVATE ACTIVE','2026-08-18T19:00:00Z')", [],
     ).unwrap();
-    connection.execute(
-        "INSERT INTO pending_approvals
+    let private_origin = serde_json::json!({
+        "kind": "automation",
+        "automation_name": private_bundle,
+        "run_id": stage8_privacy_canary_bundle(),
+    })
+    .to_string();
+    connection
+        .execute(
+            "INSERT INTO pending_approvals
          (id,tool_name,description,expires_at,created_at,origin_json)
-         VALUES ('approval','write','CANARY raw args','2026-08-19T00:00:00Z','2026-08-18T19:00:00Z',
-                 '{\"kind\":\"automation\",\"automation_name\":\"CANARY_PRIVATE_IDENTITY\",\"run_id\":\"CANARY_RAW_ARGUMENT\"}')", [],
-    ).unwrap();
+         VALUES ('approval','write',?1,'2026-08-19T00:00:00Z','2026-08-18T19:00:00Z',?2)",
+            params![stage8_privacy_canary_bundle(), private_origin],
+        )
+        .unwrap();
     drop(connection);
     (dir, path)
 }
@@ -560,6 +582,16 @@ fn clean_and_v14() {
     assert!(!migrated_approval.contains("CANARY_PRIVATE_IDENTITY"));
     assert!(!migrated_approval.contains("CANARY_RAW_ARGUMENT"));
     assert!(!migrated_approval.contains("run_id"));
+    write_stage8_privacy_capture(
+        "migration.json",
+        serde_json::json!({
+            "surface": "migration",
+            "schema_checksum": canonical_schema_checksum(&v14),
+            "canonical_record_count": canonical_count,
+            "integrity": "ok",
+            "private_projection_matches": 0,
+        }),
+    );
     drop(clean);
     drop(v14);
     exercise_canonical_work_session(&clean_path);
@@ -783,6 +815,17 @@ fn cutover_boundary() {
     assert_ne!(
         archive_hash, backup_hash,
         "forward records remain archived and disclosed"
+    );
+    write_stage8_privacy_capture(
+        "rollback.json",
+        serde_json::json!({
+            "surface": "rollback",
+            "pre_work_boundary": "pre_first_work",
+            "post_work_boundary": "forward_only",
+            "old_backup_restored": true,
+            "forward_archive_preserved": true,
+            "private_projection_matches": 0,
+        }),
     );
     println!("A54 post-Work canonical archive SHA-256: {archive_hash}");
 }

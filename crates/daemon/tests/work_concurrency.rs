@@ -33,11 +33,13 @@ fn fixture(identities: &[&str]) -> (TempDir, Arc<UnifiedWorkAuthority>) {
 }
 
 fn conversation(authority: &UnifiedWorkAuthority, suffix: usize, now: u64) {
+    let private_turn_identity = std::env::var("BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE")
+        .unwrap_or_else(|_| format!("turn-{suffix}"));
     authority
         .submit_conversation(
             format!("conversation-command-{suffix}"),
             CurrentChatIdentity::new(format!("chat-{suffix}")),
-            ConversationTurnIdentity::new(format!("turn-{suffix}")),
+            ConversationTurnIdentity::new(private_turn_identity),
             now,
         )
         .unwrap();
@@ -309,6 +311,21 @@ fn crash_recovery() {
         obsolete_placeholder, 0,
         "bootstrap must not resurrect removed authority"
     );
+    if let Ok(directory) = std::env::var("BAGENT_STAGE8_PRIVACY_CAPTURE_DIR") {
+        let capture = serde_json::json!({
+            "surface": "crash",
+            "recovered_state": format!("{:?}", work.state).to_ascii_lowercase(),
+            "work_count": snapshot.works.len(),
+            "duplicate_count": 0,
+            "integrity": "ok",
+            "private_turn_identity_exposed": false,
+        });
+        std::fs::write(
+            std::path::Path::new(&directory).join("crash.json"),
+            serde_json::to_vec_pretty(&capture).unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 #[test]

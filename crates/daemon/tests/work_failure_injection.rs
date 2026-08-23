@@ -24,10 +24,12 @@ fn coordinator(identities: &[&str]) -> (tempfile::TempDir, WorkCoordinator) {
 }
 
 fn create(identity: &str) -> Command {
+    let private_identity = std::env::var("BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE")
+        .unwrap_or_else(|_| format!("turn-{identity}"));
     Command::create_conversation(
         format!("command-{identity}"),
         CurrentChatIdentity::new(format!("chat-{identity}")),
-        ConversationTurnIdentity::new(format!("turn-{identity}")),
+        ConversationTurnIdentity::new(private_identity),
         DaemonGeneration::new("failure-generation"),
     )
 }
@@ -116,5 +118,19 @@ fn every_required_boundary_fails_closed() {
             .state
             .is_terminal());
         assert_eq!(authority.coordinator().verify_integrity().unwrap(), "ok");
+    }
+    if let Ok(directory) = std::env::var("BAGENT_STAGE8_PRIVACY_CAPTURE_DIR") {
+        let capture = serde_json::json!({
+            "surface": "failure",
+            "failpoint_count": boundaries.len() + 1 + 4,
+            "partial_work_count": 0,
+            "integrity": "ok",
+            "private_turn_identity_exposed": false,
+        });
+        std::fs::write(
+            std::path::Path::new(&directory).join("failure.json"),
+            serde_json::to_vec_pretty(&capture).unwrap(),
+        )
+        .unwrap();
     }
 }

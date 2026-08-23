@@ -115,16 +115,7 @@ enum Stage8AccessibilityCLI {
         let enlargedFrameCount = try verifyEnlargedLayout(activeElements, hostBounds: host.bounds)
         let accessibleReadoutCount = observedReadouts(in: activeElements).count
 
-        viewModel.pendingApprovals = [
-            ApprovalItem(
-                id: "approval-stage8",
-                toolName: "filesystem_write",
-                description: "Approval required for filesystem_write",
-                expiresAt: "",
-                createdAt: "",
-                origin: nil
-            )
-        ]
+        viewModel.pendingApprovals = [approvalFixtureItem()]
         try viewModel.applyAuthoritativeSnapshot(
             .init(
                 schemaVersion: 1,
@@ -148,6 +139,13 @@ enum Stage8AccessibilityCLI {
             (try? verifyApprovalProjection(elements)) != nil
         }
         let approvalAssertions = try verifyApprovalProjection(approvalElements)
+        let approvalInteraction = try await verifyApprovalKeyboardContract(
+            approvalElements,
+            applicationElement: applicationElement,
+            viewModel: viewModel,
+            panel: panel,
+            host: host
+        )
 
         try writeEvidence(
             [
@@ -155,13 +153,15 @@ enum Stage8AccessibilityCLI {
                 "accessibility_available": true,
                 "active_element_count": activeElements.count,
                 "approval_element_count": approvalElements.count,
-                "assertion_count": activeAssertions + approvalAssertions + interactionEvidence.assertions + contrastAssertions + 1,
+                "assertion_count": activeAssertions + approvalAssertions + interactionEvidence.assertions + approvalInteraction.assertions + contrastAssertions + 1,
                 "skipped_count": 0,
                 "states": ["active", "approval"],
                 "reduced_motion": true,
                 "ax_press_actions_executed": interactionEvidence.pressActions,
-                "keyboard_events_sent": interactionEvidence.keyboardEvents,
-                "keyboard_focus_changes_observed": interactionEvidence.focusChanges,
+                "keyboard_events_sent": interactionEvidence.keyboardEvents + approvalInteraction.keyboardEvents,
+                "keyboard_focus_changes_observed": interactionEvidence.focusChanges + approvalInteraction.focusChanges,
+                "approval_keyboard_actions_executed": approvalInteraction.actionsExecuted,
+                "approval_focus_order_transitions": approvalInteraction.focusChanges,
                 "ax_names_values_observed": accessibleReadoutCount,
                 "announcements_posted": announcementCount,
                 "contrast_checks": contrastAssertions,
@@ -214,6 +214,119 @@ enum Stage8AccessibilityCLI {
         let pressActions: Int
         let keyboardEvents: Int
         let focusChanges: Int
+    }
+
+    private struct ApprovalInteractionEvidence {
+        let assertions: Int
+        let actionsExecuted: Int
+        let keyboardEvents: Int
+        let focusChanges: Int
+    }
+
+    private static func verifyApprovalKeyboardContract(
+        _ elements: [AXUIElement],
+        applicationElement: AXUIElement,
+        viewModel: ChatViewModel,
+        panel: NSPanel,
+        host: NSHostingView<some View>
+    ) async throws -> ApprovalInteractionEvidence {
+        guard let deny = button(named: "Zamietnuť", in: elements),
+              let allow = button(named: "Schváliť", in: elements),
+              actionNames(for: deny).contains(kAXPressAction),
+              actionNames(for: allow).contains(kAXPressAction) else {
+            throw FixtureError.assertion("approval actions do not expose named AX press actions")
+        }
+
+        guard AXUIElementSetAttributeValue(
+            deny,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+        ) == .success else {
+            throw FixtureError.assertion("approval deny control could not receive AX focus")
+        }
+        let initialFocusReady = await waitForCondition {
+            focusedElement(from: applicationElement).map { sameElement($0, deny) } == true
+                || boolAttribute(deny, kAXFocusedAttribute)
+        }
+        guard initialFocusReady else {
+            throw FixtureError.assertion("approval deny focus was not observable")
+        }
+
+        let tabEvents = try keyEvents(keyCode: 48, characters: "\t", panel: panel)
+        panel.sendEvent(tabEvents.down)
+        panel.sendEvent(tabEvents.up)
+        let tabFocusReady = await waitForCondition {
+            focusedElement(from: applicationElement).map { sameElement($0, allow) } == true
+                || boolAttribute(allow, kAXFocusedAttribute)
+        }
+        guard tabFocusReady else {
+            throw FixtureError.assertion("Tab did not move approval focus from deny to approve")
+        }
+
+        let returnEvents = try keyEvents(keyCode: 36, characters: "\r", panel: panel)
+        guard panel.performKeyEquivalent(with: returnEvents.down) else {
+            throw FixtureError.assertion("Return did not execute approval")
+        }
+        panel.sendEvent(returnEvents.up)
+        guard await waitForCondition({ viewModel.pendingApprovals.isEmpty }) else {
+            throw FixtureError.assertion("Return did not clear the approved item")
+        }
+
+        try viewModel.applyAuthoritativeSnapshot(
+            .init(
+                schemaVersion: 1,
+                cursor: 3,
+                daemonGeneration: "stage8-accessibility",
+                works: [
+                    automation("automation-a", order: 1, category: .web),
+                    automation("automation-b", order: 2, category: .mail),
+                ],
+                pendingApprovals: [],
+                model: .ready
+            )
+        )
+        try await Task.sleep(for: .milliseconds(100))
+        viewModel.pendingApprovals = [approvalFixtureItem()]
+        try viewModel.applyAuthoritativeSnapshot(
+            .init(
+                schemaVersion: 1,
+                cursor: 4,
+                daemonGeneration: "stage8-accessibility",
+                works: [
+                    automation("automation-a", order: 1, category: .web, state: .waitingForApproval),
+                    automation("automation-b", order: 2, category: .mail),
+                ],
+                pendingApprovals: [
+                    NotchApproval(identity: "approval-stage8", workIdentity: "automation-a")
+                ],
+                model: .ready
+            )
+        )
+        let restored = try await waitForAccessibilityTree(
+            from: applicationElement,
+            host: host,
+            panel: panel
+        ) { tree in
+            (try? verifyApprovalProjection(tree)) != nil
+        }
+        guard button(named: "Zamietnuť", in: restored) != nil else {
+            throw FixtureError.assertion("approval fixture did not restore for denial")
+        }
+        let escapeEvents = try keyEvents(keyCode: 53, characters: "\u{1b}", panel: panel)
+        guard panel.performKeyEquivalent(with: escapeEvents.down) else {
+            throw FixtureError.assertion("Escape did not execute denial")
+        }
+        panel.sendEvent(escapeEvents.up)
+        guard await waitForCondition({ viewModel.pendingApprovals.isEmpty }) else {
+            throw FixtureError.assertion("Escape did not clear the denied item")
+        }
+
+        return ApprovalInteractionEvidence(
+            assertions: 6,
+            actionsExecuted: 2,
+            keyboardEvents: 6,
+            focusChanges: 1
+        )
     }
 
     private static func verifyKeyboardAndFocusContract(
@@ -369,6 +482,77 @@ enum Stage8AccessibilityCLI {
         )
     }
 
+    private static func approvalFixtureItem() -> ApprovalItem {
+        ApprovalItem(
+            id: "approval-stage8",
+            toolName: "filesystem_write",
+            description: "Approval required for filesystem_write",
+            expiresAt: "",
+            createdAt: "",
+            origin: nil
+        )
+    }
+
+    private static func button(named name: String, in elements: [AXUIElement]) -> AXUIElement? {
+        elements.first {
+            stringAttribute($0, kAXRoleAttribute) == kAXButtonRole
+                && (stringAttribute($0, kAXDescriptionAttribute) == name
+                    || stringAttribute($0, kAXTitleAttribute) == name)
+        }
+    }
+
+    private static func focusedElement(from application: AXUIElement) -> AXUIElement? {
+        guard let value = valueAttribute(application, kAXFocusedUIElementAttribute) else { return nil }
+        return unsafeBitCast(value as AnyObject, to: AXUIElement.self)
+    }
+
+    private static func sameElement(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool {
+        CFEqual(lhs, rhs)
+    }
+
+    private static func waitForCondition(_ condition: () -> Bool) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(3))
+        repeat {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        } while clock.now < deadline
+        return condition()
+    }
+
+    private static func keyEvents(
+        keyCode: UInt16,
+        characters: String,
+        panel: NSPanel
+    ) throws -> (down: NSEvent, up: NSEvent) {
+        guard let down = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panel.windowNumber,
+            context: nil,
+            characters: characters,
+            charactersIgnoringModifiers: characters,
+            isARepeat: false,
+            keyCode: keyCode
+        ), let up = NSEvent.keyEvent(
+            with: .keyUp,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panel.windowNumber,
+            context: nil,
+            characters: characters,
+            charactersIgnoringModifiers: characters,
+            isARepeat: false,
+            keyCode: keyCode
+        ) else {
+            throw FixtureError.assertion("keyboard event could not be created")
+        }
+        return (down, up)
+    }
+
     private static func accessibilityTree(from root: AXUIElement) -> [AXUIElement] {
         var result: [AXUIElement] = []
         var pending = [root]
@@ -415,6 +599,10 @@ enum Stage8AccessibilityCLI {
 
     private static func stringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
         valueAttribute(element, attribute) as? String
+    }
+
+    private static func boolAttribute(_ element: AXUIElement, _ attribute: String) -> Bool {
+        (valueAttribute(element, attribute) as? NSNumber)?.boolValue == true
     }
 
     private static func displayedValue(_ element: AXUIElement) -> String? {

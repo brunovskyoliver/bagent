@@ -66,22 +66,23 @@ enum Stage7BSettingsAcceptanceCLI {
         viewModel.openNotchSettings()
         var renderedRoutes: [String] = []
         for panelWidth in CompassRailStateCatalog.syntheticPanelWidths {
-            let notchWidth = CGFloat(panelWidth) - 2 * NotchWrapMetrics.maxWingWidth
             for route in CompassRailStateCatalog.routes {
                 viewModel.selectCompassRailArea(route.area)
                 if let child = route.child {
                     viewModel.openCompassRailChild(child)
                 }
                 for state in states(for: route) {
-                    let root = NotchWrapView(
-                        notchWidth: notchWidth,
-                        notchHeight: 38,
-                        viewModel: viewModel,
-                        onTap: {},
-                        onHoverChanged: { _ in },
-                        acceptanceReduceMotionOverride: variant == "reduce-motion",
-                        acceptanceSettingsState: state
-                    )
+                    let root = ZStack {
+                        Color.black
+                        NotchSettingsContent(
+                            viewModel: viewModel,
+                            acceptanceState: state,
+                            reduceMotionOverride: variant == "reduce-motion"
+                        )
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 12)
+                    }
+                    .frame(width: CGFloat(panelWidth), height: 318)
                     .environment(\.dynamicTypeSize, variant == "large-text" ? DynamicTypeSize.accessibility2 : DynamicTypeSize.large)
                     // macOS SwiftUI exposes colorSchemeContrast as read-only. The
                     // disposable fixture injects the equivalent contrast state
