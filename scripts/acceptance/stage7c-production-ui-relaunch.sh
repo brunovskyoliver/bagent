@@ -26,6 +26,9 @@ auth_header=""
 capture_dir="${BAGENT_STAGE7C_CAPTURE_DIR:-}"
 tmp_root="${TMPDIR:-/tmp}"
 tmp_root="${tmp_root%/}"
+privacy_canary_bundle="${BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE:-}"
+controlled_draft="${privacy_canary_bundle:-stage7c controlled relaunch draft}"
+controlled_prompt="${privacy_canary_bundle:-Create a short deterministic acceptance lease.}"
 
 if [[ -n "$capture_dir" ]]; then
     capture_dir="${capture_dir//\/\//\/}"
@@ -143,13 +146,14 @@ chat_identity="$(jq -r .identity <<<"$current_before")"
 chat_revision="$(jq -r .revision <<<"$current_before")"
 curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg identity "$chat_identity" --argjson revision "$chat_revision" \
-        --arg text 'stage7c controlled relaunch draft' \
+        --arg text "$controlled_draft" \
         '{current_chat_identity:$identity,expected_revision:$revision,text:$text,pending_attachment_references:[]}')" \
     "http://127.0.0.1:$daemon_port/current-chat/draft" >/dev/null
 
 curl -fsS --no-buffer --max-time 120 -H "$auth_header" -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg identity "$chat_identity" --argjson revision "$(curl -fsS -H "$auth_header" "http://127.0.0.1:$daemon_port/current-chat" | jq -r .revision)" \
-        '{message:"Create a short deterministic acceptance lease.",current_chat_identity:$identity,expected_revision:$revision,model:"basecompute/Qwen3-4B-Instruct-2507",attachment_ids:[]}')" \
+        --arg message "$controlled_prompt" \
+        '{message:$message,current_chat_identity:$identity,expected_revision:$revision,model:"basecompute/Qwen3-4B-Instruct-2507",attachment_ids:[]}')" \
     "http://127.0.0.1:$daemon_port/chat" >"$fixture_root/chat.sse" 2>"$fixture_root/chat.log" &
 chat_pid=$!
 
@@ -167,7 +171,8 @@ kill -STOP "$basert_pid"
 # in BaseRT, then move one of those canonical Works to an approval boundary.
 automation_at="$(python3 -c 'from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)+timedelta(seconds=120)).isoformat().replace("+00:00","Z"))')"
 automation_payload="$(jq -nc --arg at "$automation_at" \
-    '{name:"Stage 8 relaunch automation A",prompt:"Controlled relaunch work",timezone:"UTC",schedule:{kind:"once",at:$at},enabled:true}')"
+    --arg prompt "$controlled_prompt" \
+    '{name:"Stage 8 relaunch automation A",prompt:$prompt,timezone:"UTC",schedule:{kind:"once",at:$at},enabled:true}')"
 automation_a="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' -d "$automation_payload" "http://127.0.0.1:$daemon_port/automations")"
 automation_b="$(curl -fsS -H "$auth_header" -H 'Content-Type: application/json' \
     -d "$(jq '.name="Stage 8 relaunch automation B"' <<<"$automation_payload")" \

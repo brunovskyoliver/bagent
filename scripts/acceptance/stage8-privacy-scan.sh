@@ -70,7 +70,7 @@ canary_terms=(
     "diagnostic export"
     "failure payload"
 )
-surfaces=(event ui log diagnostics export migration rollback crash failure)
+surfaces=(handoff process pasteboard accessibility logging diagnostic export timeout failure)
 
 printf '%s\n' "${canaries[@]}" > "$fixture/canary-seed.txt"
 canary_json="$(printf '%s\n' "${canaries[@]}" | jq -R -s 'split("\n") | map(select(length > 0))')"
@@ -89,6 +89,7 @@ for ((index = 0; index < ${#canaries[@]}; index++)); do
 done
 
 BAGENT_STAGE7C_CAPTURE_DIR="$capture_dir" \
+BAGENT_STAGE8_PRIVACY_CANARY_BUNDLE="$(IFS=:; echo "${canaries[*]}")" \
     "$repo_root/scripts/acceptance/stage7c-production-ui-relaunch.sh" "$candidate"
 BAGENT_STAGE7C_CANARY_SCAN_DIR="$scanner_canary_dir" \
 BAGENT_STAGE7C_CANARY_RESULT_FILE="$fixture/scanner-canary-result.json" \
@@ -101,23 +102,20 @@ expected="$(jq -r .expected "$fixture/scanner-canary-result.json")"
 [[ "$detected" == "$expected" ]]
 [[ "$detected" -eq "${#canaries[@]}" ]]
 
-for surface in "${surfaces[@]}"; do
-    jq -n --arg surface "$surface" \
-        '{captured:true,surface:$surface,schema_version:1,status:"redacted",values_omitted:true}' \
-        > "$fixture/sanitized-$surface.json"
-done
-
 sanitized_matches=0
-for file in "$fixture"/sanitized-*.json; do
+for file in "$capture_dir"/*.json; do
     matches=$( (rg -n -F -f "$fixture/canary-seed.txt" "$file" 2>/dev/null || true) | wc -l | tr -d ' ' )
     sanitized_matches=$((sanitized_matches + matches))
 done
 [[ "$sanitized_matches" -eq 0 ]]
-[[ "$(find "$fixture" -type f | wc -l | tr -d ' ')" -ge 11 ]]
+[[ "$(find "$capture_dir" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "${#surfaces[@]}" ]]
+for surface in "${surfaces[@]}"; do
+    [[ "$(jq -r .surface "$capture_dir"/*.json | rg -x "$surface" | wc -l | tr -d ' ')" == 1 ]]
+done
 
-echo "A55 surfaces exercised: ${#surfaces[@]} (signed production capture plus sanitized projections)"
+echo "A55 surfaces exercised: ${#surfaces[@]} (signed production capture files)"
 echo "A55 synthetic canaries: ${#canaries[@]}"
 echo "A55 scanner detections: $detected (shared production privacy scanner)"
-echo "A55 sanitized projection matches: $sanitized_matches"
+echo "A55 injected-canary matches in production captures: $sanitized_matches"
 echo "A55 disposable capture cleanup: secure-delete requested"
 echo "A55 privacy: PASS"
