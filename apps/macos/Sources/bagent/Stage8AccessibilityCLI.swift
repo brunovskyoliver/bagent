@@ -93,10 +93,13 @@ enum Stage8AccessibilityCLI {
         defer { panel.close() }
 
         host.layoutSubtreeIfNeeded()
-        try await Task.sleep(for: .milliseconds(1_000))
-        host.layoutSubtreeIfNeeded()
         let applicationElement = AXUIElementCreateApplication(getpid())
-        let activeElements = accessibilityTree(from: applicationElement)
+        let activeElements = try await waitForAccessibilityTree(
+            from: applicationElement,
+            host: host
+        ) { elements in
+            (try? verifyActiveProjection(elements)) != nil
+        }
         let activeAssertions = try verifyActiveProjection(activeElements)
         let interactionEvidence = try await verifyKeyboardAndFocusContract(
             activeElements,
@@ -136,9 +139,12 @@ enum Stage8AccessibilityCLI {
                 model: .ready
             )
         )
-        try await Task.sleep(for: .milliseconds(300))
-        host.layoutSubtreeIfNeeded()
-        let approvalElements = accessibilityTree(from: applicationElement)
+        let approvalElements = try await waitForAccessibilityTree(
+            from: applicationElement,
+            host: host
+        ) { elements in
+            (try? verifyApprovalProjection(elements)) != nil
+        }
         let approvalAssertions = try verifyApprovalProjection(approvalElements)
 
         try writeEvidence(
@@ -374,6 +380,25 @@ enum Stage8AccessibilityCLI {
             }
         }
         return result
+    }
+
+    private static func waitForAccessibilityTree(
+        from applicationElement: AXUIElement,
+        host: NSHostingView<some View>,
+        ready: ([AXUIElement]) -> Bool
+    ) async throws -> [AXUIElement] {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(3))
+        var elements: [AXUIElement] = []
+        repeat {
+            host.layoutSubtreeIfNeeded()
+            elements = accessibilityTree(from: applicationElement)
+            if ready(elements) {
+                return elements
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        } while clock.now < deadline
+        return elements
     }
 
     private static func valueAttribute(_ element: AXUIElement, _ attribute: String) -> Any? {
