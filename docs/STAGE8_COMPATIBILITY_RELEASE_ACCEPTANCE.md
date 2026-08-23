@@ -216,6 +216,9 @@ or pull request is part of this stage.
   was removed from the deterministic XCTest suite; signed live AX remains in
   A57, and A60's classifier now catches uppercase gate states, positive skip
   counts, and XCTest's `Test skipped` output.
+- A60 A51 metric accounting: the first amended-candidate run stopped after all
+  authority checks passed because A51 emitted no parser-recognized count. A51
+  now emits explicit nonzero `case_count` and `assertion_count` fields.
 - Earlier review passes identified and were followed by fixes for the counted
   A51 migration allowlist, shared A55 canary scanner, signed A56 transition
   evidence, signed A57 accessibility evidence, signed A59 observation order,

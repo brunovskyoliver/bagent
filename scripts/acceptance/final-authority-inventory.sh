@@ -245,4 +245,5 @@ for label, command, args in checks:
     print(f"A51 authority subgate: PASS ({label})")
 
 print(f"A51 production inventory: PASS (0 findings; {len(required)} canonical assertions)")
+print(f"A51 evidence metrics: case_count={len(seed_hits)} assertion_count={len(required)}")
 PY
