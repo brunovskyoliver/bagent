@@ -7,7 +7,7 @@ projection="$root/apps/macos/Sources/bagent/NotchProjection.swift"
 notch="$root/apps/macos/Sources/bagent/ChatView.swift"
 fixture="$root/apps/macos/Sources/bagent/Stage5AcceptanceFixture.swift"
 
-swift test --package-path "$root/apps/macos" --filter 'StageRailTests|NotchStateCatalogTests'
+swift test --package-path "$root/apps/macos" --filter 'StageRailTests|StageRailAccessibilityTests|NotchStateCatalogTests'
 make -C "$root/apps/macos" bundle
 codesign --verify --strict "$root/apps/macos/bagent.app"
 
