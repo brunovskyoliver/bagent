@@ -12,19 +12,23 @@ REFERENCE_ACCEPTANCE_TARGET_DIR = $(REFERENCE_BUILD_ROOT)/acceptance-build/cargo
 # Stable signing identity: ad-hoc ("-") signatures use a per-build cdhash as the
 # designated requirement, so every rebuild invalidates TCC grants (Accessibility,
 # Screen Recording). A real identity keys the grant to identifier+team instead.
-# Falls back to ad-hoc when no identity is available.
+# Falls back to ad-hoc for the developer-only `make run` path and for the
+# compile-only reference goals. The `bundle` targets additionally go through
+# `require-signing`, which refuses to produce an ad-hoc release bundle.
+EXPECTED_SIGN_ID := Apple Development: obrunovsky7@gmail.com (D63PW2838J)
 REFERENCE_ONLY_GOALS = reference-daemon-ordinary reference-daemon-acceptance reference-verification-controls
 REFERENCE_ONLY_REQUEST = $(if $(strip $(MAKECMDGOALS)),$(if $(filter-out $(REFERENCE_ONLY_GOALS),$(MAKECMDGOALS)),,1),)
 ifeq ($(REFERENCE_ONLY_REQUEST),1)
 SIGN_ID   := -
 else
-SIGN_ID   := $(shell security find-identity -v -p codesigning 2>/dev/null | grep -o '"Apple Development: [^"]*"' | head -1)
+SIGN_ID   := $(shell security find-identity -v -p codesigning 2>/dev/null | grep -F '"$(EXPECTED_SIGN_ID)"' | head -1 | sed -n 's/^[^\"]*"\([^\"]*\)".*$$/\1/p')
 ifeq ($(SIGN_ID),)
 SIGN_ID   := -
 endif
 endif
+ICON_OUTPUT := .build/generated-icon
 
-.PHONY: run build browser-mcp daemon daemon-acceptance bundle bundle-acceptance assemble-bundle clean whatsapp-bridge-install reference-daemon-ordinary reference-daemon-acceptance reference-verification-controls
+.PHONY: run build browser-mcp daemon daemon-acceptance bundle bundle-acceptance assemble-bundle prepare-icon require-signing clean whatsapp-bridge-install reference-daemon-ordinary reference-daemon-acceptance reference-verification-controls
 
 # Dev run: builds daemon first, then the Swift app. The Info.plist is embedded in
 # the binary (see Package.swift) so screen-capture TCC works without bundling. Ad-hoc
@@ -77,39 +81,53 @@ browser-mcp:
 
 # Bundle: Swift + daemon release binary
 bundle: build daemon browser-mcp
+	@! strings "$(BUILD_DIR)/$(APP_NAME)" | grep -Eq -- '--stage8-live-(session|projection)' || { echo "release executable contains Stage 8 live acceptance commands" >&2; exit 1; }
+	$(MAKE) require-signing
 	$(MAKE) assemble-bundle
 	@echo "✓  $(BUNDLE) ready — open $(BUNDLE) or drag to Applications"
 
 # Signed-app acceptance bundle. This is never used by the ordinary bundle
 # target, so production/default builds contain no fixture controls.
 bundle-acceptance: build daemon-acceptance browser-mcp
+	$(MAKE) require-signing
 	$(MAKE) assemble-bundle
 	@echo "✓  $(BUNDLE) Stage 8 acceptance build ready"
 
 assemble-bundle:
 	rm -rf $(BUNDLE)
-	mkdir -p "$(BUNDLE)/Contents/MacOS"
+	mkdir -p "$(BUNDLE)/Contents/MacOS" "$(BUNDLE)/Contents/Resources"
 	cp "$(BUILD_DIR)/$(APP_NAME)" "$(BUNDLE)/Contents/MacOS/"
 	cp "$(DAEMON_REL)" "$(BUNDLE)/Contents/MacOS/"
 	cp "$(BROWSER_MCP_REL)" "$(BUNDLE)/Contents/MacOS/"
+	$(MAKE) prepare-icon
+	cp "$(ICON_OUTPUT)/AppIcon.icns" "$(BUNDLE)/Contents/Resources/"
+	cp "$(ICON_OUTPUT)/bagent-permission.png" "$(BUNDLE)/Contents/Resources/"
+	cp "$(LOCALIZATION_CATALOG)" "$(BUNDLE)/Contents/Resources/"
 	@printf '<?xml version="1.0" encoding="UTF-8"?>\n\
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n\
 <plist version="1.0"><dict>\n\
   <key>CFBundleIdentifier</key>  <string>sk.bagent.app</string>\n\
   <key>CFBundleName</key>        <string>bagent</string>\n\
   <key>CFBundleExecutable</key>  <string>bagent</string>\n\
+  <key>CFBundlePackageType</key> <string>APPL</string>\n\
+  <key>CFBundleIconFile</key>     <string>AppIcon</string>\n\
   <key>CFBundleVersion</key>     <string>0.1.0</string>\n\
   <key>NSPrincipalClass</key>    <string>NSApplication</string>\n\
   <key>LSUIElement</key>         <true/>\n\
   <key>NSHighResolutionCapable</key> <true/>\n\
   <key>NSScreenCaptureUsageDescription</key> <string>bagent captures your screen on demand to answer questions about what is displayed. Screenshots are processed in memory and never saved to disk.</string>\n\
   </dict></plist>\n' > "$(BUNDLE)/Contents/Info.plist"
-	codesign --force --sign $(SIGN_ID) "$(BUNDLE)/Contents/MacOS/$(APP_NAME)"
-	codesign --force --sign $(SIGN_ID) "$(BUNDLE)/Contents/MacOS/$(notdir $(DAEMON_REL))"
-	codesign --force --sign $(SIGN_ID) "$(BUNDLE)/Contents/MacOS/$(notdir $(BROWSER_MCP_REL))"
-	mkdir -p "$(BUNDLE)/Contents/Resources"
-	cp "$(LOCALIZATION_CATALOG)" "$(BUNDLE)/Contents/Resources/"
-	codesign --force --sign $(SIGN_ID) "$(BUNDLE)"
+	codesign --force --sign "$(SIGN_ID)" --identifier sk.bagent.app.daemon "$(BUNDLE)/Contents/MacOS/bagentd"
+	codesign --force --sign "$(SIGN_ID)" --identifier sk.bagent.app.browser-mcp "$(BUNDLE)/Contents/MacOS/$(notdir $(BROWSER_MCP_REL))"
+	codesign --force --sign "$(SIGN_ID)" --identifier sk.bagent.app "$(BUNDLE)/Contents/MacOS/bagent"
+	codesign --force --sign "$(SIGN_ID)" --identifier sk.bagent.app "$(BUNDLE)"
+	codesign --verify --deep --strict "$(BUNDLE)"
+
+prepare-icon:
+	$(REPO_ROOT)/scripts/acceptance/prepare-app-icon.sh "$(ICON_OUTPUT)"
+
+require-signing:
+	@security find-identity -v -p codesigning 2>/dev/null | grep -Fq '"$(EXPECTED_SIGN_ID)"' || { echo "required Apple Development identity unavailable; refusing ad-hoc Stage 7C bundle" >&2; exit 2; }
 
 clean:
 	rm -rf .build $(BUNDLE)

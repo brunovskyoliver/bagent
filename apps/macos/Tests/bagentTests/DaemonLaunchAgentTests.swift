@@ -2,83 +2,44 @@ import XCTest
 @testable import bagent
 
 final class DaemonLaunchAgentTests: XCTestCase {
-    func testRuntimeEnvironmentPreservesExplicitEvidenceRollbackOnly() {
-        let rollback = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "0",
+    func testRuntimeEnvironmentDropsRemovedAuthoritySwitch() {
+        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
             "BAGENT_STAGE8_ACCEPTANCE_FIXTURES": "0",
         ])
-        XCTAssertEqual(rollback["BAGENT_EVIDENCE_ORCHESTRATOR"], "0")
-        XCTAssertNil(rollback["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+        XCTAssertNil(environment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+        XCTAssertNil(environment["BAGENT_SYNTHESIS_FALLBACK_MODEL_PATH"])
+        XCTAssertNotNil(environment["BAGENT_CHAT_MODEL_PATH"])
+    }
 
-        let invalid = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "unexpected",
-        ])
-        XCTAssertEqual(invalid["BAGENT_EVIDENCE_ORCHESTRATOR"], "unexpected")
+    func testResolverModeIsForwardedVerbatimWithoutATopLevelSwitch() {
+        // Typed evidence routing is unconditional after Stage 8, so the resolver
+        // mode is an independent setting with no higher-precedence flag above it.
+        for value in ["enforce", " observe ", "persistence", "Enforce & keep"] {
+            let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
+                "BAGENT_REFERENCE_RESOLVER_MODE": value,
+            ])
+            XCTAssertEqual(environment["BAGENT_REFERENCE_RESOLVER_MODE"], value)
+            XCTAssertNil(environment["BAGENT_EVIDENCE_ORCHESTRATOR"])
+        }
+    }
 
-        let ordinary = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [:])
-        XCTAssertNil(ordinary["BAGENT_EVIDENCE_ORCHESTRATOR"])
-        XCTAssertNil(ordinary["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+    func testAbsentSubordinateResolverModeAddsNothing() {
+        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [:])
 
+        XCTAssertNil(environment["BAGENT_REFERENCE_RESOLVER_MODE"])
+        XCTAssertNil(environment["BAGENT_EVIDENCE_ORCHESTRATOR"])
+        XCTAssertNil(environment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+    }
+
+    func testAcceptanceFixtureSwitchStillForwards() {
         let acceptance = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
             "BAGENT_STAGE8_ACCEPTANCE_FIXTURES": "1",
         ])
         XCTAssertEqual(acceptance["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"], "1")
-
-        var rollbackWithoutRouting = rollback
-        rollbackWithoutRouting.removeValue(forKey: "BAGENT_EVIDENCE_ORCHESTRATOR")
-        XCTAssertEqual(rollbackWithoutRouting, ordinary)
-    }
-
-    func testRollbackOmitsSubordinateResolverMode() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "0",
-            "BAGENT_REFERENCE_RESOLVER_MODE": "enforce",
-        ])
-
-        XCTAssertEqual(environment["BAGENT_EVIDENCE_ORCHESTRATOR"], "0")
-        XCTAssertNil(environment["BAGENT_REFERENCE_RESOLVER_MODE"])
-    }
-
-    func testEnabledTopLevelForwardsSubordinateResolverModeUnchanged() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "1",
-            "BAGENT_REFERENCE_RESOLVER_MODE": " observe ",
-        ])
-
-        XCTAssertEqual(environment["BAGENT_EVIDENCE_ORCHESTRATOR"], "1")
-        XCTAssertEqual(environment["BAGENT_REFERENCE_RESOLVER_MODE"], " observe ")
-    }
-
-    func testAbsentTopLevelStillForwardsSubordinateResolverMode() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_REFERENCE_RESOLVER_MODE": "persistence",
-        ])
-
-        XCTAssertNil(environment["BAGENT_EVIDENCE_ORCHESTRATOR"])
-        XCTAssertEqual(environment["BAGENT_REFERENCE_RESOLVER_MODE"], "persistence")
-    }
-
-    func testInvalidTopLevelPreservesBothValuesForDaemonHandling() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "unexpected",
-            "BAGENT_REFERENCE_RESOLVER_MODE": "enforce",
-        ])
-
-        XCTAssertEqual(environment["BAGENT_EVIDENCE_ORCHESTRATOR"], "unexpected")
-        XCTAssertEqual(environment["BAGENT_REFERENCE_RESOLVER_MODE"], "enforce")
-    }
-
-    func testAbsentSubordinateResolverModeAddsNothing() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "1",
-        ])
-
-        XCTAssertNil(environment["BAGENT_REFERENCE_RESOLVER_MODE"])
     }
 
     func testPlistPreservesSelectedResolverEnvironmentExactly() throws {
         let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "1",
             "BAGENT_REFERENCE_RESOLVER_MODE": "Enforce & keep",
         ])
         let plist = DaemonLaunchAgent.plistContent(
@@ -90,8 +51,8 @@ final class DaemonLaunchAgentTests: XCTestCase {
         ) as? [String: Any]
         let serialized = parsed?["EnvironmentVariables"] as? [String: String]
 
-        XCTAssertEqual(serialized?["BAGENT_EVIDENCE_ORCHESTRATOR"], "1")
         XCTAssertEqual(serialized?["BAGENT_REFERENCE_RESOLVER_MODE"], "Enforce & keep")
+        XCTAssertNil(serialized?["BAGENT_EVIDENCE_ORCHESTRATOR"])
     }
 
     func testPlistContainsBinaryLabelAndSortedEnv() throws {
@@ -99,7 +60,7 @@ final class DaemonLaunchAgentTests: XCTestCase {
             binaryPath: "/Applications/bagent.app/Contents/MacOS/bagentd",
             environment: [
                 "BAGENT_BASERT_BASE_URL": "http://127.0.0.1:8082/v1",
-                "BAGENT_DEFAULT_MODEL": BaseRTLaunchAgent.model,
+                "BAGENT_DEFAULT_MODEL": ModelRuntimeConfiguration.model,
             ]
         )
         XCTAssertTrue(plist.contains("<string>com.bagent.daemon</string>"))
@@ -117,44 +78,17 @@ final class DaemonLaunchAgentTests: XCTestCase {
         XCTAssertEqual(parsed?["Label"] as? String, "com.bagent.daemon")
     }
 
-    func testPlistEscapesExplicitInvalidEvidenceValueWithoutChangingIt() throws {
-        let value = "unexpected<&\"value"
+    func testPlistDoesNotAddRemovedAuthoritySwitch() throws {
         let plist = DaemonLaunchAgent.plistContent(
             binaryPath: "/Applications/bagent.app/Contents/MacOS/bagentd",
-            environment: ["BAGENT_EVIDENCE_ORCHESTRATOR": value]
+            environment: DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
+                "BAGENT_STAGE8_ACCEPTANCE_FIXTURES": "0",
+            ])
         )
         let parsed = try PropertyListSerialization.propertyList(
             from: Data(plist.utf8), options: [], format: nil
         ) as? [String: Any]
         let environment = parsed?["EnvironmentVariables"] as? [String: String]
-        XCTAssertEqual(environment?["BAGENT_EVIDENCE_ORCHESTRATOR"], value)
-    }
-
-    func testBaseRTPlistKeepsServiceResidentWithLazyRegisteredModels() throws {
-        let plist = BaseRTLaunchAgent.plistContent(
-            binaryPath: "/Users/oliver/.basert/basert",
-            modelDirectory: "/Users/oliver/Library/Application Support/bagent/basert-models"
-        )
-        XCTAssertTrue(plist.contains("<string>com.bagent.basert</string>"))
-        XCTAssertTrue(plist.contains("<string>--model-dir</string>"))
-        XCTAssertTrue(plist.contains(
-            "<string>/Users/oliver/Library/Application Support/bagent/basert-models</string>"))
-        XCTAssertTrue(plist.contains("<string>--idle-timeout</string>"))
-        XCTAssertTrue(plist.contains("<string>1200</string>"))
-        XCTAssertTrue(plist.contains("<string>--max-context</string>"))
-        XCTAssertTrue(plist.contains("<string>4096</string>"))
-        XCTAssertTrue(plist.contains("<string>8082</string>"))
-        XCTAssertTrue(plist.contains("<string>basert-local</string>"))
-        XCTAssertFalse(plist.contains("<string>8080</string>"))
-        XCTAssertFalse(plist.contains("<string>basecompute/Qwen3-4B-Instruct-2507</string>"))
-        XCTAssertFalse(plist.contains("<string>basecompute/Qwen3.6-35B-A3B</string>"))
-
-        let parsed = try PropertyListSerialization.propertyList(
-            from: plist.data(using: .utf8)!, options: [], format: nil
-        ) as? [String: Any]
-        let args = parsed?["ProgramArguments"] as? [String]
-        XCTAssertEqual(args?.first, "/Users/oliver/.basert/basert")
-        XCTAssertEqual(args?.dropFirst().first, "serve")
-        XCTAssertEqual(args?.filter { $0 == "--model-dir" }.count, 1)
+        XCTAssertNil(environment?["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
     }
 }

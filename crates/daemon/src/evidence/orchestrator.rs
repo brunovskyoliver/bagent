@@ -29,6 +29,7 @@ pub(crate) struct EvidenceContext<'a> {
     pub state: &'a AppState,
     pub sink: &'a EventSink,
     pub origin: &'a ExecOrigin,
+    pub work_identity: &'a bagentd::work_coordinator::WorkIdentity,
 }
 
 #[derive(Debug)]
@@ -87,6 +88,7 @@ struct ExistingPolicyGate<'a> {
     state: &'a AppState,
     sink: &'a EventSink,
     origin: &'a ExecOrigin,
+    work_identity: &'a bagentd::work_coordinator::WorkIdentity,
     turn_id: &'a str,
     started_activities: HashSet<super::OperationKey>,
     completed_activities: HashMap<super::OperationKey, LogicalActivityCompletion>,
@@ -222,6 +224,7 @@ impl ExistingPolicyGate<'_> {
                     self.state,
                     self.sink,
                     self.origin,
+                    self.work_identity,
                     rule_name,
                     &self.origin.describe(description),
                 )
@@ -246,6 +249,7 @@ pub(crate) async fn execute_evidence_turn(
         state: ctx.state,
         sink: ctx.sink,
         origin: ctx.origin,
+        work_identity: ctx.work_identity,
         turn_id: &request.turn_id,
         started_activities: HashSet::new(),
         completed_activities: HashMap::new(),
@@ -3748,6 +3752,140 @@ mod tests {
         assert!(suppressed_duplicates
             .iter()
             .all(|event| event["duplicates_suppressed"] == 1));
+    }
+
+    #[tokio::test]
+    async fn identical_nonempty_claim_content_remains_a_duplicate() {
+        let first = web_candidate("https://publisher-one.example/slovakia", 1);
+        let second = web_candidate("https://publisher-two.example/slovakia", 2);
+        let claim = "Peter Pellegrini is the President of Slovakia and assumed office in 2024.";
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second.clone()],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    first.requested_url.as_str(),
+                    "publisher-one.example",
+                    claim,
+                )],
+                vec![readable_fetch(
+                    &second,
+                    second.requested_url.as_str(),
+                    "publisher-two.example",
+                    claim,
+                )],
+            ],
+        );
+        let mut gate = EventRecordingGate::new();
+        let mut plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "Who is the current president of Slovakia?".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        plan.budget.web_search_attempts = 1;
+
+        let _ = execute_web_plan(adapter, &mut gate, "turn-content-duplicate", &plan, "en").await;
+
+        let fetch_completions = gate
+            .events
+            .iter()
+            .filter(|event| {
+                event["type"] == "logical_activity_completed"
+                    && event["normalized_operation"] == "web.fetch"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fetch_completions.len(), 2);
+        assert_eq!(fetch_completions[0]["contribution"], "satisfied");
+        assert_eq!(fetch_completions[1]["contribution"], "duplicate");
+        assert_eq!(fetch_completions[0]["duplicates_suppressed"], 0);
+        assert_eq!(fetch_completions[1]["duplicates_suppressed"], 1);
+    }
+
+    #[tokio::test]
+    async fn same_final_url_remains_a_duplicate_when_selected_content_is_empty() {
+        let first = web_candidate("https://publisher-one.example/unrelated", 1);
+        let second = web_candidate("https://publisher-two.example/unrelated", 2);
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second.clone()],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    "https://canonical.example/unrelated",
+                    "publisher-one.example",
+                    "Generic navigation and contact information.",
+                )],
+                vec![readable_fetch(
+                    &second,
+                    "https://canonical.example/unrelated",
+                    "publisher-two.example",
+                    "Different generic navigation and contact information.",
+                )],
+            ],
+        );
+        let mut gate = EventRecordingGate::new();
+        let mut plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava?".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        plan.budget.web_search_attempts = 1;
+
+        let _ = execute_web_plan(adapter, &mut gate, "turn-final-url-duplicate", &plan, "en").await;
+
+        let fetch_completions = gate
+            .events
+            .iter()
+            .filter(|event| {
+                event["type"] == "logical_activity_completed"
+                    && event["normalized_operation"] == "web.fetch"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fetch_completions.len(), 2);
+        assert_eq!(fetch_completions[0]["contribution"], "irrelevant");
+        assert_eq!(fetch_completions[1]["contribution"], "duplicate");
+        assert_eq!(fetch_completions[1]["duplicates_suppressed"], 1);
+    }
+
+    #[tokio::test]
+    async fn same_source_identity_remains_a_duplicate_when_selected_content_is_empty() {
+        let first = web_candidate("https://mirror.example/first", 1);
+        let second = web_candidate("https://mirror.example/second", 2);
+        let adapter = scripted_web_adapter(
+            vec![first.clone(), second.clone()],
+            vec![
+                vec![readable_fetch(
+                    &first,
+                    first.requested_url.as_str(),
+                    "shared-publisher.example",
+                    "Generic navigation and contact information.",
+                )],
+                vec![readable_fetch(
+                    &second,
+                    second.requested_url.as_str(),
+                    "shared-publisher.example",
+                    "Different generic navigation and contact information.",
+                )],
+            ],
+        );
+        let mut gate = EventRecordingGate::new();
+        let mut plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+            query: "What is the current population of Bratislava?".into(),
+            verification: VerificationLevel::Corroborated,
+        });
+        plan.budget.web_search_attempts = 1;
+
+        let _ = execute_web_plan(adapter, &mut gate, "turn-source-duplicate", &plan, "en").await;
+
+        let fetch_completions = gate
+            .events
+            .iter()
+            .filter(|event| {
+                event["type"] == "logical_activity_completed"
+                    && event["normalized_operation"] == "web.fetch"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fetch_completions.len(), 2);
+        assert_eq!(fetch_completions[0]["contribution"], "irrelevant");
+        assert_eq!(fetch_completions[1]["contribution"], "duplicate");
+        assert_eq!(fetch_completions[1]["duplicates_suppressed"], 1);
     }
 
     #[tokio::test]

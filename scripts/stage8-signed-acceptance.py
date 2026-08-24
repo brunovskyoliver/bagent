@@ -119,7 +119,8 @@ def assert_case_semantics(case: str, result: dict) -> None:
         result["citation_set_sha256"],
         result["token_bytes"],
     )
-    if actual_output != EXPECTED_OUTPUTS[case]:
+    expected_output = EXPECTED_OUTPUTS[case]
+    if actual_output != expected_output:
         raise AssertionError(f"{case}: canonical answer or citation bytes changed")
     expected = {
         "mail_complete": ("verified", 3, 3),
@@ -254,9 +255,9 @@ def main() -> None:
         differing = [name for name in campaigns[0] if campaigns[0][name] != campaigns[1][name]]
         raise AssertionError(f"campaigns were not structurally identical: {differing}")
 
-    accepted = campaigns[0]["polish_accepted"]["token_sha256"]
+    canonical_mail = campaigns[0]["mail_complete"]["token_sha256"]
     for name in ["polish_rejected", "polish_unavailable"]:
-        if campaigns[0][name]["token_sha256"] != accepted:
+        if campaigns[0][name]["token_sha256"] != canonical_mail:
             raise AssertionError(f"{name}: canonical bytes changed")
 
     request(args.base_url, token, "/acceptance/stage8/fixture", {"selection": None})

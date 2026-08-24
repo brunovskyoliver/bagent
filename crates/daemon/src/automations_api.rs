@@ -13,11 +13,19 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::json;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use uuid::Uuid;
 
 use bagent_automations::{
     parse_timezone, policy, Automation, AutomationId, AutomationRun, AutomationRunId,
     AutomationRunStatus, AutomationSchedule, ScheduleError,
+};
+use bagentd::work_coordinator::{
+    AutomationDefinitionIdentity, AutomationDefinitionRevision, AutomationRunIdentity,
+    AutomationSessionIdentity, WorkState,
 };
 
 use crate::reference_resolution::{ReferenceOutcomeCode, TurnCompletion};
@@ -30,6 +38,8 @@ pub(crate) enum RepoError {
     NotFound,
     /// Deletion/patch attempted while a run of this automation is active.
     ActiveRun,
+    /// A run that already reached a different terminal state.
+    Immutable,
     Invalid(ScheduleError),
     Db(String),
 }
@@ -60,6 +70,7 @@ fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation> {
     let last_run_status: Option<String> = row.get(10)?;
     Ok(Automation {
         id: AutomationId(Uuid::parse_str(&id).unwrap_or_default()),
+        definition_revision: row.get(13)?,
         name: row.get(1)?,
         prompt: row.get(2)?,
         enabled: row.get::<_, i64>(3)? != 0,
@@ -79,7 +90,7 @@ fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation> {
 
 const AUTOMATION_COLS: &str = "id, name, prompt, enabled, timezone, schedule_json, next_run_at, \
      created_at, updated_at, last_run_at, last_run_status, \
-     last_reference_outcome_code, last_result_summary";
+     last_reference_outcome_code, last_result_summary, definition_revision";
 
 /// Validate fields, compute the first occurrence, insert.
 pub(crate) fn repo_create(
@@ -99,6 +110,7 @@ pub(crate) fn repo_create(
     }
     let automation = Automation {
         id: AutomationId::new(),
+        definition_revision: 1,
         name: name.trim().to_string(),
         prompt: prompt.trim().to_string(),
         enabled,
@@ -113,8 +125,8 @@ pub(crate) fn repo_create(
         last_result_summary: None,
     };
     conn.execute(
-        "INSERT INTO automations (id, name, prompt, enabled, timezone, schedule_json, next_run_at, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO automations (id, name, prompt, enabled, timezone, schedule_json, next_run_at, created_at, updated_at, definition_revision) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             automation.id.to_string(),
             automation.name,
@@ -125,8 +137,13 @@ pub(crate) fn repo_create(
             automation.next_run_at.map(ts),
             ts(now),
             ts(now),
+            automation.definition_revision,
         ],
     )?;
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO automation_definitions (automation_identity) VALUES (?1)",
+        params![automation.id.to_string()],
+    );
     Ok(automation)
 }
 
@@ -196,9 +213,10 @@ pub(crate) fn repo_update(
         }
     }
     a.updated_at = now;
+    a.definition_revision += 1;
     let changed = conn.execute(
         "UPDATE automations SET name=?2, prompt=?3, enabled=?4, timezone=?5, schedule_json=?6, \
-         next_run_at=?7, updated_at=?8 WHERE id=?1",
+         next_run_at=?7, updated_at=?8, definition_revision=?9 WHERE id=?1",
         params![
             id,
             a.name,
@@ -208,6 +226,7 @@ pub(crate) fn repo_update(
             serde_json::to_string(&a.schedule).map_err(|e| RepoError::Db(e.to_string()))?,
             a.next_run_at.map(ts),
             ts(now),
+            a.definition_revision,
         ],
     )?;
     if changed == 0 {
@@ -232,7 +251,8 @@ pub(crate) fn repo_set_enabled(
         a.next_run_at
     };
     conn.execute(
-        "UPDATE automations SET enabled=?2, next_run_at=?3, updated_at=?4 WHERE id=?1",
+        "UPDATE automations SET enabled=?2, next_run_at=?3, updated_at=?4,
+         definition_revision=definition_revision + 1 WHERE id=?1",
         params![id, enabled as i64, next_run_at.map(ts), ts(now)],
     )?;
     repo_get(conn, id)
@@ -240,7 +260,8 @@ pub(crate) fn repo_set_enabled(
 
 pub(crate) fn repo_has_active_run(conn: &Connection, id: &str) -> Result<bool, RepoError> {
     let active: i64 = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM automation_runs WHERE automation_id=?1 AND status='running')",
+        "SELECT EXISTS(SELECT 1 FROM work_automation_runs
+         WHERE historical_automation_identity=?1 AND active=1)",
         params![id],
         |r| r.get(0),
     )?;
@@ -252,15 +273,13 @@ pub(crate) fn repo_delete(conn: &Connection, id: &str) -> Result<(), RepoError> 
         return Err(RepoError::ActiveRun);
     }
     let changed = conn.execute("DELETE FROM automations WHERE id=?1", params![id])?;
-    // ON DELETE CASCADE needs foreign_keys=ON; enforce manually so run rows
-    // never orphan regardless of connection pragmas.
-    conn.execute(
-        "DELETE FROM automation_runs WHERE automation_id=?1",
-        params![id],
-    )?;
     if changed == 0 {
         return Err(RepoError::NotFound);
     }
+    let _ = conn.execute(
+        "DELETE FROM automation_definitions WHERE automation_identity=?1",
+        params![id],
+    );
     Ok(())
 }
 
@@ -296,7 +315,7 @@ pub(crate) fn repo_recent_runs(
     limit: usize,
 ) -> Result<Vec<AutomationRun>, RepoError> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT {RUN_COLS} FROM automation_runs WHERE automation_id=?1 \
+        "SELECT {RUN_COLS} FROM automation_run_records WHERE automation_id=?1 \
          ORDER BY created_at DESC LIMIT ?2"
     ))?;
     let rows = stmt
@@ -305,11 +324,25 @@ pub(crate) fn repo_recent_runs(
     Ok(rows)
 }
 
+pub(crate) fn repo_run(
+    conn: &Connection,
+    automation_id: &str,
+    run_id: &str,
+) -> Result<AutomationRun, RepoError> {
+    conn.query_row(
+        &format!("SELECT {RUN_COLS} FROM automation_run_records WHERE automation_id=?1 AND id=?2"),
+        params![automation_id, run_id],
+        row_to_run,
+    )
+    .optional()?
+    .ok_or(RepoError::NotFound)
+}
+
 /// Insert a run row (skip records; claims go through repo_claim_run).
 pub(crate) fn repo_insert_run(conn: &Connection, run: &AutomationRun) -> Result<(), RepoError> {
     conn.execute(
         &format!(
-            "INSERT INTO automation_runs ({RUN_COLS}, created_at) \
+            "INSERT OR IGNORE INTO automation_run_records ({RUN_COLS}, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
         ),
         params![
@@ -352,7 +385,7 @@ fn read_run_terminal_tuple(
     Ok(conn
         .query_row(
             "SELECT finished_at, status, result_summary, reference_outcome_code
-             FROM automation_runs WHERE id=?1",
+             FROM automation_run_records WHERE id=?1",
             params![run_id],
             |row| {
                 Ok(StoredRunTerminalTuple {
@@ -412,7 +445,7 @@ fn finish_run_transaction(
 ) -> Result<(), RepoError> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let changed = tx.execute(
-        "UPDATE automation_runs
+        "UPDATE automation_run_records
          SET status=?3, finished_at=?4, result_summary=?5,
              reference_outcome_code=?6
          WHERE id=?1 AND automation_id=?2 AND status='running'",
@@ -533,21 +566,30 @@ fn repo_finish_run_with_commit_mode(
         &intended_automation,
         report_ambiguous_after_commit,
     ) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(error) => {
-            if terminal_readback_matches(
+            if !terminal_readback_matches(
                 conn,
                 run_id,
                 automation_id,
                 &intended_run,
                 &intended_automation,
             )? {
-                Ok(())
-            } else {
-                Err(error)
+                // A run that already reached a different terminal state is
+                // immutable, not a storage failure.
+                if let Some(current) = read_run_terminal_tuple(conn, run_id)? {
+                    if current.status != AutomationRunStatus::Running.as_str() {
+                        return Err(RepoError::Immutable);
+                    }
+                }
+                return Err(error);
             }
         }
     }
+    // Retention prune stays on the terminal path so run history cannot grow
+    // past the cap once a run commits.
+    repo_prune_runs(conn, automation_id)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -577,9 +619,19 @@ pub(crate) fn repo_finish_run_ambiguous_commit_for_test(
 /// pruned here.
 pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<(), RepoError> {
     let deleted = conn.execute(
-        "DELETE FROM automation_runs WHERE automation_id=?1 AND id NOT IN (\
-             SELECT id FROM automation_runs WHERE automation_id=?1 \
-             ORDER BY created_at DESC LIMIT ?2)",
+        "DELETE FROM automation_run_records
+         WHERE automation_id=?1
+           AND status <> 'running'
+           AND (julianday(finished_at) < julianday('now', '-90 days') OR id NOT IN (
+             SELECT id FROM automation_run_records WHERE automation_id=?1
+             ORDER BY created_at DESC LIMIT ?2
+           ))
+           AND NOT EXISTS (
+             SELECT 1 FROM work_automation_runs wr
+             JOIN work_approvals wa ON wa.work_identity = wr.work_identity
+             WHERE wr.automation_run_identity = automation_run_records.id
+               AND wa.state = 'pending'
+           )",
         params![automation_id, policy::RUN_HISTORY_RETAINED as i64],
     )?;
     if deleted > 0 {
@@ -592,17 +644,6 @@ pub(crate) fn repo_prune_runs(conn: &Connection, automation_id: &str) -> Result<
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
-
-/// Concise redacted lifecycle event: ids/status/next-run only, no prompts or
-/// summaries — clients refetch the authoritative record.
-fn publish_automation_event(
-    state: &AppState,
-    event_type: &str,
-    a_id: &str,
-    extra: serde_json::Value,
-) {
-    state.publish_event(automation_event(event_type, a_id, extra));
-}
 
 fn automation_event(event_type: &str, a_id: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut ev = json!({"type": event_type, "automation_id": a_id});
@@ -724,6 +765,10 @@ fn repo_error_response(e: RepoError) -> (StatusCode, Json<serde_json::Value>) {
             StatusCode::CONFLICT,
             Json(json!({"error": "automation has an active run"})),
         ),
+        RepoError::Immutable => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "automation session content is immutable"})),
+        ),
         RepoError::Invalid(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),
@@ -787,12 +832,6 @@ pub(crate) async fn automations_create(
                 &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
             );
             state.automations_changed.notify_waiters();
-            publish_automation_event(
-                &state,
-                "automation_created",
-                &a.id.to_string(),
-                json!({"next_run_at": a.next_run_at.map(ts)}),
-            );
             (
                 StatusCode::CREATED,
                 Json(serde_json::to_value(&a).unwrap_or_default()),
@@ -833,12 +872,6 @@ pub(crate) async fn automation_patch(
                 &json!({"id": a.id.to_string(), "name": a.name, "enabled": a.enabled}),
             );
             state.automations_changed.notify_waiters();
-            publish_automation_event(
-                &state,
-                "automation_updated",
-                &a.id.to_string(),
-                json!({"next_run_at": a.next_run_at.map(ts)}),
-            );
             (
                 StatusCode::OK,
                 Json(serde_json::to_value(&a).unwrap_or_default()),
@@ -860,7 +893,6 @@ pub(crate) async fn automation_delete(
         Ok(()) => {
             audit_fs(&state.db, "automation_delete", &json!({"id": id}));
             state.automations_changed.notify_waiters();
-            publish_automation_event(&state, "automation_deleted", &id, json!({}));
             (StatusCode::OK, Json(json!({"ok": true})))
         }
         Err(e) => repo_error_response(e),
@@ -902,16 +934,6 @@ async fn set_enabled(
                 &json!({"id": id}),
             );
             state.automations_changed.notify_waiters();
-            publish_automation_event(
-                &state,
-                if enabled {
-                    "automation_enabled"
-                } else {
-                    "automation_disabled"
-                },
-                &id,
-                json!({"next_run_at": a.next_run_at.map(ts)}),
-            );
             (
                 StatusCode::OK,
                 Json(serde_json::to_value(&a).unwrap_or_default()),
@@ -946,30 +968,170 @@ pub(crate) async fn automation_runs(
     }
 }
 
+pub(crate) async fn automation_run(
+    State(state): State<AppState>,
+    Path((id, run_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    match repo_run(&conn, &id, &run_id) {
+        Ok(run) => (StatusCode::OK, Json(json!({"run": run}))),
+        Err(e) => repo_error_response(e),
+    }
+}
+
+pub(crate) async fn automation_session_get(
+    State(state): State<AppState>,
+    Path(automation_session_identity): Path<String>,
+) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match read_automation_session(&connection, &automation_session_identity) {
+        Ok(Some(automation_session)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(automation_session).unwrap_or_default()),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "automation session not found" })),
+        ),
+        Err(error) => {
+            tracing::error!(%error, "automation session read failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal error" })),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AutomationSessionContinueRequest {
+    seed: String,
+    confirmed_replacement: bool,
+    command_identity: String,
+}
+
+pub(crate) async fn automation_session_continue(
+    State(state): State<AppState>,
+    Path(automation_session_identity): Path<String>,
+    Json(request): Json<AutomationSessionContinueRequest>,
+) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match continue_automation_session_in_new_chat(
+        &connection,
+        &automation_session_identity,
+        &request.seed,
+        request.confirmed_replacement,
+        &request.command_identity,
+    ) {
+        Ok(provenance) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(provenance).unwrap_or_default()),
+        ),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AutomationSessionOpenRequest {
+    command_identity: String,
+    expected_revision: u64,
+}
+
+pub(crate) async fn automation_session_open(
+    State(state): State<AppState>,
+    Path(automation_session_identity): Path<String>,
+    Json(request): Json<AutomationSessionOpenRequest>,
+) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match open_automation_session(
+        &connection,
+        &automation_session_identity,
+        &request.command_identity,
+        request.expected_revision,
+    ) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "viewed": true, "commandIdentity": request.command_identity })),
+        ),
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
+pub(crate) async fn automation_session_delete(
+    State(state): State<AppState>,
+    Path(automation_session_identity): Path<String>,
+) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match delete_automation_session(&connection, &automation_session_identity) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "deleted": true }))),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
 // ── Execution (run-now; the scheduler reuses these in issue #8) ───────────────
 
 use crate::agent_exec::{self, EventSink, ExecError, ExecOrigin, ExecOutcome};
 use bagent_automations::AutomationExecutionContext;
+use bagentd::automation_sessions::{
+    continue_automation_session_in_new_chat, delete_automation_session, open_automation_session,
+    read_automation_session, register_work as register_automation_session_work,
+    AutomationRunOutcome as SessionRunOutcome, AutomationTaskSnapshot, AutomationTerminalization,
+    SafeActivity,
+};
 use basert_connector::Message;
 
-fn is_evidence_event(event: &serde_json::Value) -> bool {
-    matches!(
-        event.get("type").and_then(serde_json::Value::as_str),
-        Some(
-            "evidence_phase"
-                | "logical_activity_started"
-                | "logical_activity_completed"
-                | "evidence_validation"
-                | "evidence_polish"
-                | "evidence_outcome"
-                | "reference_resolution"
-        )
-    )
+fn safe_activity_from_event(event: &serde_json::Value) -> Option<SafeActivity> {
+    let category = match event.get("type").and_then(serde_json::Value::as_str)? {
+        "evidence_phase" => "evidence_phase",
+        "activity_started" => "activity_started",
+        "activity_completed" => "activity_completed",
+        "tool_call" => "tool_call",
+        "logical_activity_started" => "activity_started",
+        "logical_activity_completed" => "activity_completed",
+        "evidence_validation" => "evidence_validation",
+        "evidence_polish" => "evidence_polish",
+        "evidence_outcome" => "evidence_outcome",
+        _ => return None,
+    };
+    Some(SafeActivity {
+        category: category.to_owned(),
+        caption: "Bezpečná aktivita automatizácie".to_owned(),
+        safety_relevant: category == "activity_completed" || category == "evidence_outcome",
+    })
 }
 
-/// Atomically claim execution: exactly one `running` row per automation.
-/// Returns the claimed run or `ActiveRun` when one is already in flight.
-/// Single short statement under the DB lock — released before any model work.
+fn safe_activity_timeline(
+    result: &Result<ExecOutcome, ExecError>,
+    timeline: Vec<SafeActivity>,
+) -> Vec<SafeActivity> {
+    if timeline.is_empty()
+        && result
+            .as_ref()
+            .map(|outcome| outcome.tool_calls_used > 0)
+            .unwrap_or(false)
+    {
+        vec![SafeActivity {
+            category: "tool_call".to_owned(),
+            caption: "Bezpečná aktivita automatizácie".to_owned(),
+            safety_relevant: false,
+        }]
+    } else {
+        timeline
+    }
+}
+
+/// Prepare an occurrence for authoritative admission by Work Coordinator.
 pub(crate) fn repo_claim_run(
     conn: &Connection,
     automation: &Automation,
@@ -990,12 +1152,14 @@ pub(crate) fn repo_claim_run(
         is_catch_up,
         is_manual,
     };
-    // INSERT … WHERE NOT EXISTS(active run) is atomic on one connection.
+    // INSERT … WHERE NOT EXISTS(active run) is atomic on one connection, so two
+    // concurrent claims cannot both admit a run for the same automation.
     let inserted = conn.execute(
         &format!(
-            "INSERT INTO automation_runs ({RUN_COLS}, created_at) \
+            "INSERT INTO automation_run_records ({RUN_COLS}, created_at) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11 \
-             WHERE NOT EXISTS (SELECT 1 FROM automation_runs WHERE automation_id=?2 AND status='running')"
+             WHERE NOT EXISTS (SELECT 1 FROM automation_run_records \
+                               WHERE automation_id=?2 AND status='running')"
         ),
         params![
             run.id.to_string(),
@@ -1014,7 +1178,39 @@ pub(crate) fn repo_claim_run(
     if inserted == 0 {
         return Err(RepoError::ActiveRun);
     }
+    // The claim above already wrote the run row, so only the frozen definition
+    // snapshot is still outstanding.
+    capture_task_snapshot(conn, automation, &run)?;
     Ok(run)
+}
+
+/// Freeze the historical definition data before an Automation Run can start.
+/// The snapshot is deliberately keyed by the Automation Session identity so
+/// deleting or editing the live Definition cannot change its history.
+pub(crate) fn capture_task_snapshot(
+    conn: &Connection,
+    automation: &Automation,
+    run: &AutomationRun,
+) -> Result<(), RepoError> {
+    let schedule_json = serde_json::to_string(&automation.schedule)
+        .map_err(|error| RepoError::Db(error.to_string()))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO automation_task_snapshots
+         (automation_session_identity, automation_run_identity, automation_identity,
+          display_name, task_text, schedule_json, timezone, definition_revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            format!("automation-session:{}", run.id),
+            run.id.to_string(),
+            automation.id.to_string(),
+            automation.name,
+            automation.prompt,
+            schedule_json,
+            automation.timezone,
+            automation.definition_revision,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Trusted execution context rendered as a system layer. Safety guarantees
@@ -1093,7 +1289,15 @@ pub(crate) fn outcome_to_status(
             },
             TurnCompletion::Partial => AutomationTerminalOutcome {
                 status: AutomationRunStatus::Partial,
-                result_summary: default_result_summary(&outcome.final_text),
+                result_summary: if outcome.approvals_denied > 0 {
+                    format!(
+                        "{}\n({} akcií nebolo schválených)",
+                        default_result_summary(&outcome.final_text),
+                        outcome.approvals_denied
+                    )
+                } else {
+                    default_result_summary(&outcome.final_text)
+                },
                 reference_outcome_code: None,
             },
             TurnCompletion::ReferenceBlocked(code) => AutomationTerminalOutcome {
@@ -1112,7 +1316,24 @@ pub(crate) fn outcome_to_status(
             result_summary: "Execution aborted.".to_string(),
             reference_outcome_code: None,
         },
+        Err(ExecError::DurableState) => AutomationTerminalOutcome {
+            status: AutomationRunStatus::Failed,
+            result_summary: "Durable state update failed.".to_string(),
+            reference_outcome_code: None,
+        },
     }
+}
+
+fn stage8_live_automation_delay() -> Option<Duration> {
+    if std::env::var("BAGENT_STAGE8_ACCEPTANCE_FIXTURES").as_deref() != Ok("1") {
+        return None;
+    }
+    let millis = std::env::var("BAGENT_STAGE8_LIVE_AUTOMATION_DELAY_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()?
+        .min(10_000);
+    (millis > 0).then(|| Duration::from_millis(millis))
 }
 
 /// Execute a claimed run through the shared agent loop and persist the
@@ -1122,17 +1343,55 @@ pub(crate) async fn execute_automation_run(
     automation: Automation,
     run: AutomationRun,
 ) {
-    // Bounded concurrency across scheduled and manual runs. The claim row
-    // already exists, so a queued run simply starts a little later; once the
-    // slot is acquired, started_at is corrected to the actual start.
-    let _permit = state.run_slots.clone().acquire_owned().await.ok();
+    let work_identity = match state.work_authority.submit_automation(
+        format!("automation-admit:{}", run.id),
+        AutomationRunIdentity::new(run.id.to_string()),
+        AutomationSessionIdentity::new(format!("automation-session:{}", run.id)),
+        AutomationDefinitionIdentity::new(automation.id.to_string()),
+        AutomationDefinitionRevision::new(automation.definition_revision.max(0) as u64),
+        Utc::now().timestamp().max(0) as u64,
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(%error, "automation Work admission rejected");
+            return;
+        }
+    };
+    state.work_authority.admit(work_identity.clone()).await;
+    let waiting_revision = match state
+        .work_authority
+        .current(&work_identity)
+        .ok()
+        .flatten()
+        .map(|record| record.revision)
+    {
+        Some(revision) => revision,
+        None => {
+            state.work_authority.release_slot(&work_identity);
+            return;
+        }
+    };
+    let running_revision = match state.work_authority.transition(
+        format!("automation-running:{}", run.id),
+        work_identity.clone(),
+        waiting_revision,
+        WorkState::Running,
+    ) {
+        Ok(revision) => revision,
+        Err(_) => {
+            state.work_authority.release_slot(&work_identity);
+            return;
+        }
+    };
     let started_at = Utc::now();
     {
         let conn = state.db.lock().await;
-        let _ = conn.execute(
-            "UPDATE automation_runs SET started_at=?2 WHERE id=?1",
-            rusqlite::params![run.id.to_string(), ts(started_at)],
-        );
+        let _ = repo_insert_run(&conn, &run);
+        if let Err(error) =
+            register_automation_session_work(&conn, work_identity.as_str(), &run.id.to_string())
+        {
+            tracing::warn!(%error, "automation session work registration failed");
+        }
     }
     let ctx = AutomationExecutionContext {
         automation_id: automation.id,
@@ -1149,12 +1408,6 @@ pub(crate) async fn execute_automation_run(
         automation_name: automation.name.clone(),
         run_id: run.id.to_string(),
     };
-    publish_automation_event(
-        &state,
-        "automation_run_started",
-        &automation.id.to_string(),
-        json!({"run_id": run.id.to_string(), "manual": run.is_manual}),
-    );
     audit_fs(
         &state.db,
         "automation_run_start",
@@ -1205,23 +1458,31 @@ pub(crate) async fn execute_automation_run(
 
     let tools = agent_exec::build_tools(&state, false).await;
 
-    // Automations have no attached chat stream. Evidence events still use the
-    // same contract and are forwarded onto the daemon-wide event stream.
+    // Automations have no attached chat stream. Their privacy-safe activity
+    // timeline is retained in the canonical Automation Session.
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
     let sink = EventSink::with_diagnostics(ev_tx, state.evidence_diagnostics.clone());
-    let event_state = state.clone();
+    let activity_timeline = Arc::new(Mutex::new(Vec::<SafeActivity>::new()));
+    let activity_timeline_for_drain = activity_timeline.clone();
     let drain = tokio::spawn(async move {
         while let Some(event) = ev_rx.recv().await {
-            if is_evidence_event(&event) {
-                event_state.publish_event(event);
+            if let Some(activity) = safe_activity_from_event(&event) {
+                if let Ok(mut timeline) = activity_timeline_for_drain.lock() {
+                    timeline.push(activity);
+                }
             }
         }
     });
+
+    if let Some(delay) = stage8_live_automation_delay() {
+        tokio::time::sleep(delay).await;
+    }
 
     let result = agent_exec::run_agent_loop(
         &state,
         &sink,
         &origin,
+        work_identity.clone(),
         &format!("automation-{}", automation.id),
         &state.default_model,
         messages,
@@ -1232,8 +1493,82 @@ pub(crate) async fn execute_automation_run(
     let _ = drain.await;
 
     let terminal = outcome_to_status(&result);
+    let status = terminal.status;
+    let summary = terminal.result_summary.clone();
+    let terminal_state = match status {
+        AutomationRunStatus::Completed => WorkState::Completed,
+        AutomationRunStatus::Partial => WorkState::Partial,
+        AutomationRunStatus::Abandoned => WorkState::Abandoned,
+        _ => WorkState::Failed,
+    };
+    let terminal_revision = state
+        .work_authority
+        .current(&work_identity)
+        .ok()
+        .flatten()
+        .map(|record| record.revision)
+        .unwrap_or(running_revision);
+    state.work_authority.release_slot(&work_identity);
     let now = Utc::now();
-    let mut audit_records = Vec::new();
+    let session_outcome = match status {
+        AutomationRunStatus::Completed => SessionRunOutcome::Completed,
+        AutomationRunStatus::Partial => SessionRunOutcome::Partial,
+        AutomationRunStatus::Failed => SessionRunOutcome::Failed,
+        AutomationRunStatus::Abandoned => SessionRunOutcome::Abandoned,
+        AutomationRunStatus::SkippedOverlap | AutomationRunStatus::SkippedStale => {
+            SessionRunOutcome::Skipped
+        }
+        AutomationRunStatus::Running => SessionRunOutcome::Failed,
+        // A reference-blocked run started and stopped without completing, so it
+        // terminalizes as failed like the Work state above. The precise reason
+        // stays typed on the run record's reference_outcome_code.
+        AutomationRunStatus::Blocked => SessionRunOutcome::Failed,
+    };
+    let final_output = match &result {
+        Ok(outcome) if !outcome.final_text.trim().is_empty() => Some(outcome.final_text.clone()),
+        _ => None,
+    };
+    let activity_timeline = activity_timeline
+        .lock()
+        .map(|timeline| timeline.clone())
+        .unwrap_or_default();
+    let terminalization = AutomationTerminalization {
+        snapshot: AutomationTaskSnapshot {
+            automation_identity: automation.id.to_string(),
+            automation_run_identity: run.id.to_string(),
+            automation_session_identity: format!("automation-session:{}", run.id),
+            display_name: automation.name.clone(),
+            task_text: automation.prompt.clone(),
+            schedule_json: serde_json::to_string(&automation.schedule).unwrap_or_default(),
+            timezone: automation.timezone.clone(),
+            definition_revision: automation.definition_revision,
+        },
+        work_identity: work_identity.to_string(),
+        outcome: session_outcome,
+        finished_at: now.to_rfc3339(),
+        result_summary: Some(summary.clone()),
+        final_output,
+        activity_timeline: safe_activity_timeline(&result, activity_timeline),
+        validated_sources: Vec::new(),
+        connector_references: Vec::new(),
+        historical_approvals: Vec::new(),
+        truncation_disclosures: Vec::new(),
+    };
+    if let Err(error) = state.work_authority.terminalize_automation_session(
+        format!("automation-terminal:{}", run.id),
+        work_identity.clone(),
+        terminal_revision,
+        terminal_state,
+        terminalization,
+    ) {
+        tracing::error!(%error, "automation Work and session terminalization failed");
+        state.work_authority.release_slot(&work_identity);
+        return;
+    }
+    // Unified Work owns the notch surface, so there is no daemon-wide event
+    // broadcast to publish onto any more. Typed terminal lifecycle events stay
+    // durable by going to the append-only audit trail instead.
+    let audit_records = std::cell::RefCell::new(Vec::new());
     let persisted = {
         let conn = state.db.lock().await;
         finalize_automation_terminal(
@@ -1242,14 +1577,22 @@ pub(crate) async fn execute_automation_run(
             &run.id.to_string(),
             &terminal,
             now,
-            |event| state.publish_event(event),
-            |action, payload| audit_records.push((action.to_string(), payload)),
+            |event| {
+                audit_records
+                    .borrow_mut()
+                    .push(("automation_lifecycle_event".to_string(), event));
+            },
+            |action, payload| {
+                audit_records
+                    .borrow_mut()
+                    .push((action.to_string(), payload));
+            },
         )
     };
     if !persisted {
         return;
     }
-    for (action, payload) in audit_records {
+    for (action, payload) in audit_records.into_inner() {
         audit_fs(&state.db, &action, &payload);
     }
     state.automations_changed.notify_waiters();
@@ -1291,6 +1634,45 @@ pub(crate) async fn automation_run_now(
 }
 
 #[cfg(test)]
+pub(crate) fn test_project_active_work(
+    conn: &Connection,
+    automation: &Automation,
+    run: &AutomationRun,
+) {
+    let work = format!("test-work:{}", run.id);
+    conn.execute(
+        "INSERT OR IGNORE INTO works
+         (identity,origin_kind,origin_primary_identity,origin_secondary_identity,
+          origin_historical_identity,origin_definition_revision,state,revision,created_at,updated_at)
+         VALUES (?1,'automation',?2,?3,?4,0,'running',3,?5,?5)",
+        params![work, run.id.to_string(), format!("test-session:{}", run.id),
+            automation.id.to_string(), ts(Utc::now())],
+    ).unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO work_automation_runs
+         (automation_run_identity,automation_session_identity,historical_automation_identity,
+          frozen_definition_revision,work_identity,active)
+         VALUES (?1,?2,?3,0,?4,1)",
+        params![
+            run.id.to_string(),
+            format!("test-session:{}", run.id),
+            automation.id.to_string(),
+            work
+        ],
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn test_finish_active_work(conn: &Connection, run: &AutomationRun) {
+    conn.execute(
+        "UPDATE work_automation_runs SET active=0 WHERE automation_run_identity=?1",
+        params![run.id.to_string()],
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bagent_automations::RecurrenceRule;
@@ -1309,7 +1691,10 @@ mod tests {
     }
 
     #[test]
-    fn automation_stream_forwards_only_the_shared_evidence_contract() {
+    fn automation_activity_projection_admits_only_the_safe_contract() {
+        // Automations have no attached chat stream, so this projection is the
+        // only path by which an event may leave a run. It must admit exactly
+        // the safe categories and drop everything else.
         for event_type in [
             "evidence_phase",
             "logical_activity_started",
@@ -1317,12 +1702,21 @@ mod tests {
             "evidence_validation",
             "evidence_polish",
             "evidence_outcome",
+            "activity_started",
+            "activity_completed",
+            "tool_call",
         ] {
-            assert!(is_evidence_event(&json!({"type": event_type})));
+            assert!(
+                safe_activity_from_event(&json!({"type": event_type})).is_some(),
+                "{event_type} must project"
+            );
         }
-        assert!(is_evidence_event(&json!({"type": "reference_resolution"})));
-        assert!(!is_evidence_event(&json!({"type": "token"})));
-        assert!(!is_evidence_event(&json!({"type": "activity_completed"})));
+        for event_type in ["token", "delta", "reference_resolution", "mail_found"] {
+            assert!(
+                safe_activity_from_event(&json!({"type": event_type})).is_none(),
+                "{event_type} must not project"
+            );
+        }
     }
 
     fn once_at(h: u32) -> AutomationSchedule {
@@ -1470,8 +1864,10 @@ mod tests {
             is_manual: false,
         };
         repo_insert_run(&conn, &run).unwrap();
+        test_project_active_work(&conn, &a, &run);
         assert!(matches!(repo_delete(&conn, &id), Err(RepoError::ActiveRun)));
 
+        test_finish_active_work(&conn, &run);
         repo_finish_run(
             &conn,
             &run.id.to_string(),
@@ -1495,7 +1891,7 @@ mod tests {
             };
             repo_insert_run(&conn, &r).unwrap();
             conn.execute(
-                "UPDATE automation_runs SET status='completed' WHERE id=?1",
+                "UPDATE automation_run_records SET status='completed' WHERE id=?1",
                 params![r.id.to_string()],
             )
             .unwrap();
@@ -1503,18 +1899,21 @@ mod tests {
         repo_prune_runs(&conn, &id).unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM automation_runs WHERE automation_id=?1",
+                "SELECT COUNT(*) FROM automation_run_records WHERE automation_id=?1",
                 params![id],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(count as usize, policy::RUN_HISTORY_RETAINED);
-        // Deleting after the run finished works and clears history.
+        // Deleting after the run finished detaches the definition but keeps
+        // historical run data for the Automation Session history surface.
         repo_delete(&conn, &id).unwrap();
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM automation_runs", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM automation_run_records", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(left, 0);
+        assert_eq!(left, policy::RUN_HISTORY_RETAINED as i64);
     }
 
     #[test]
@@ -1532,12 +1931,14 @@ mod tests {
         .unwrap();
         let first = repo_claim_run(&conn, &a, now(), false, true, now()).unwrap();
         assert_eq!(first.status, AutomationRunStatus::Running);
+        test_project_active_work(&conn, &a, &first);
         // Second claim while the first is active → conflict.
         assert!(matches!(
             repo_claim_run(&conn, &a, now(), false, true, now()),
             Err(RepoError::ActiveRun)
         ));
         // Finishing releases the claim.
+        test_finish_active_work(&conn, &first);
         repo_finish_run(
             &conn,
             &first.id.to_string(),
@@ -1557,6 +1958,7 @@ mod tests {
             final_text: "Hotovo, 3 maily.".into(),
             tool_calls_used: 2,
             approvals_denied: 0,
+            validated_sources: Vec::new(),
             completion: TurnCompletion::Completed,
         });
         let outcome = outcome_to_status(&ok);
@@ -1567,18 +1969,24 @@ mod tests {
             final_text: "Čiastočne.".into(),
             tool_calls_used: 2,
             approvals_denied: 1,
+            validated_sources: Vec::new(),
             completion: TurnCompletion::Partial,
         });
         let outcome = outcome_to_status(&denied);
         assert_eq!(outcome.status, AutomationRunStatus::Partial);
-        assert_eq!(outcome.result_summary, "Čiastočne.");
+        // Status comes from the typed completion; the denial count is only
+        // annotated onto the user-visible summary.
+        assert_eq!(
+            outcome.result_summary,
+            "Čiastočne.\n(1 akcií nebolo schválených)"
+        );
 
         let failed: Result<ExecOutcome, ExecError> =
             Err(ExecError::Model("connection refused".into()));
         let outcome = outcome_to_status(&failed);
         assert_eq!(outcome.status, AutomationRunStatus::Failed);
 
-        // Persisted summaries are clamped to the 2000-char policy cap.
+        // Persisted summaries are clamped to the 500-character policy cap.
         let long = "x".repeat(5000);
         assert_eq!(
             policy::clamp_result_summary(&long).chars().count(),
@@ -1647,5 +2055,120 @@ mod tests {
         }
         let runs = repo_recent_runs(&conn, &a.id.to_string(), 3).unwrap();
         assert_eq!(runs.len(), 3);
+    }
+
+    #[test]
+    fn targeted_run_lookup_reaches_beyond_recent_page() {
+        let conn = test_conn();
+        let automation = repo_create(
+            &conn,
+            "n",
+            "p",
+            "Europe/Bratislava",
+            &once_at(6),
+            true,
+            now(),
+        )
+        .unwrap();
+        let target = AutomationRun {
+            id: AutomationRunId::new(),
+            automation_id: automation.id,
+            scheduled_for: now(),
+            started_at: None,
+            finished_at: None,
+            status: AutomationRunStatus::Completed,
+            result_summary: None,
+            reference_outcome_code: None,
+            is_catch_up: false,
+            is_manual: false,
+        };
+        repo_insert_run(&conn, &target).unwrap();
+        for offset in 1..=50 {
+            let newer = AutomationRun {
+                id: AutomationRunId::new(),
+                automation_id: automation.id,
+                scheduled_for: now() + chrono::Duration::minutes(offset),
+                started_at: None,
+                finished_at: None,
+                status: AutomationRunStatus::Completed,
+                result_summary: None,
+                reference_outcome_code: None,
+                is_catch_up: false,
+                is_manual: false,
+            };
+            repo_insert_run(&conn, &newer).unwrap();
+        }
+
+        let recent = repo_recent_runs(&conn, &automation.id.to_string(), 50).unwrap();
+        assert!(!recent.iter().any(|run| run.id == target.id));
+        assert_eq!(
+            repo_run(&conn, &automation.id.to_string(), &target.id.to_string())
+                .unwrap()
+                .id,
+            target.id
+        );
+        assert!(matches!(
+            repo_run(
+                &conn,
+                &automation.id.to_string(),
+                &AutomationRunId::new().to_string()
+            ),
+            Err(RepoError::NotFound)
+        ));
+        let other = repo_create(
+            &conn,
+            "other",
+            "p",
+            "Europe/Bratislava",
+            &once_at(7),
+            true,
+            now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            repo_run(&conn, &other.id.to_string(), &target.id.to_string()),
+            Err(RepoError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn safe_activity_projection_keeps_tool_lifecycle_without_tool_payload() {
+        let activity = safe_activity_from_event(&json!({
+            "type": "activity_started",
+            "tool": "filesystem_read_text",
+            "detail": "/private/disposable/path"
+        }))
+        .expect("tool lifecycle should be retained as safe activity");
+        assert_eq!(activity.category, "activity_started");
+        assert_eq!(activity.caption, "Bezpečná aktivita automatizácie");
+        assert!(!activity.safety_relevant);
+    }
+
+    #[test]
+    fn safe_activity_projection_keeps_tool_marker_without_tool_payload() {
+        let activity = safe_activity_from_event(&json!({
+            "type": "tool_call",
+            "tool": "filesystem_read_text"
+        }))
+        .expect("tool marker should be retained as safe activity");
+        assert_eq!(activity.category, "tool_call");
+        assert_eq!(activity.caption, "Bezpečná aktivita automatizácie");
+        assert!(!activity.safety_relevant);
+    }
+
+    #[test]
+    fn safe_activity_timeline_records_generic_tool_use_when_events_are_missing() {
+        let result = Ok(ExecOutcome {
+            final_text: "done".to_owned(),
+            tool_calls_used: 1,
+            approvals_denied: 0,
+            validated_sources: Vec::new(),
+            completion: TurnCompletion::Completed,
+        });
+        let timeline = safe_activity_timeline(&result, Vec::new());
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].category, "tool_call");
+        assert_eq!(timeline[0].caption, "Bezpečná aktivita automatizácie");
+        assert!(!timeline[0].safety_relevant);
     }
 }

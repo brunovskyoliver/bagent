@@ -1384,7 +1384,7 @@ fn fresh_migration_creates_the_complete_resolver_schema_without_backfill() {
             |row| row.get(0),
         )
         .expect("read migration ceiling");
-    assert_eq!(version, 18);
+    assert_eq!(version, 27);
 
     let actual: BTreeSet<String> = connection
         .prepare(
@@ -1443,7 +1443,7 @@ fn v14_upgrade_applies_v15_and_v16_without_resolver_backfill() {
             |row| row.get(0),
         )
         .expect("read upgraded migration ceiling");
-    assert_eq!(version, 18);
+    assert_eq!(version, 27);
     let resolver_rows: i64 = connection
         .query_row(
             "SELECT (SELECT COUNT(*) FROM reference_turns) +
@@ -1456,7 +1456,7 @@ fn v14_upgrade_applies_v15_and_v16_without_resolver_backfill() {
 }
 
 #[test]
-fn v15_migration_set_refuses_a_v16_database_without_mutation() {
+fn v15_migration_set_refuses_a_newer_database_without_mutation() {
     let mut connection = fresh_connection();
     let before_history: Vec<(i64, String)> = connection
         .prepare("SELECT version, name FROM refinery_schema_history ORDER BY version")
@@ -1524,7 +1524,7 @@ fn migrated_database_reopens_with_foreign_keys_enabled() {
             |row| row.get(0),
         )
         .expect("read reopened migration ceiling");
-    assert_eq!(version, 18);
+    assert_eq!(version, 27);
     let foreign_keys: i64 = connection
         .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
         .expect("read reopened foreign-key pragma");
@@ -1620,11 +1620,27 @@ fn session_and_automation_parent_deletes_cascade_resolver_rows() {
             [],
         )
         .unwrap();
+    // Stage 6 detached Automation Run history from the live Definition: deleting
+    // the Definition must leave the run, and therefore the resolver rows that
+    // belong to that retained history, intact.
     connection
         .execute(
             "DELETE FROM automations WHERE id='synthetic-automation'",
             [],
         )
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM reference_turns", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "resolver rows follow the retained Automation Run, not the deleted Definition"
+    );
+
+    // The run record is the actual parent: removing it cascades the resolver rows.
+    connection
+        .execute("DELETE FROM automation_runs WHERE id='synthetic-run'", [])
         .unwrap();
     assert_eq!(
         connection

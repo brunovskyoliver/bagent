@@ -9,14 +9,20 @@ enum ChatAttachmentKind: String, Sendable {
     case image, pdf, text, other
 }
 
+enum ChatAttachmentAvailability: Sendable, Equatable {
+    case available
+    case unavailable
+}
+
 struct ChatAttachment: Identifiable, @unchecked Sendable {
     let id: String          // server-assigned UUID
     let filename: String
     let mime: String
     let kind: ChatAttachmentKind
     /// Local URL where the original file lives (for thumbnail generation).
-    let localURL: URL
+    let localURL: URL?
     let sizeBytes: Int
+    let availability: ChatAttachmentAvailability
     /// Base-64 encoded thumbnail (JPEG, max 120×120) for image attachments.
     var thumbnail: NSImage? = nil
 }
@@ -43,15 +49,6 @@ struct ChatMessage: Identifiable, @unchecked Sendable {
     var odooRef: DaemonClient.OdooRef? = nil
     /// Set when the assistant's response found a WhatsApp chat (Phase 11).
     var whatsappRef: DaemonClient.WhatsappRef? = nil
-    var debugTraceId: String? = nil
-    var debugPreview: String? = nil
-    var debugPromptChars: Int? = nil
-    var debugTokenEstimate: Int? = nil
-    var debugMessageCount: Int? = nil
-    var debugPayload: String? = nil
-    var debugSelectedSkills: [String]? = nil
-    var debugSelectedMemoryIds: [String]? = nil
-    var debugConversationRecallInjected: Bool? = nil
     /// Codex task complexity rating (Phase 8). Set from `task_rating` SSE event.
     var taskRating: (level: String, score: Int, reasons: [String], privacyRisk: String)? = nil
 
@@ -193,13 +190,12 @@ struct TurnActivity: Identifiable, Equatable {
 }
 
 enum AgentStatus {
-    case ready, thinking, error, awaitingApproval
+    case ready, thinking, awaitingApproval
 
     var color: Color {
         switch self {
         case .ready:            return Color(red: 0.18, green: 0.80, blue: 0.44)
         case .thinking:         return Color(red: 0.20, green: 0.60, blue: 1.00)
-        case .error:            return Color(red: 0.95, green: 0.27, blue: 0.27)
         case .awaitingApproval: return Color(red: 1.00, green: 0.78, blue: 0.15)
         }
     }
@@ -208,26 +204,9 @@ enum AgentStatus {
         switch self {
         case .ready:            return "Pripravený"
         case .thinking:         return "Spracováva"
-        case .error:            return "Chyba"
         case .awaitingApproval: return "Čaká na schválenie"
         }
     }
-}
-
-enum ChatSurfaceMode: Equatable {
-    case collapsed
-    case inputOnly
-    case thinkingHidden
-    case outputExpanded
-}
-
-enum NotchInteractionMode: Equatable {
-    case collapsed
-    case input
-    case thinking
-    case output
-    case settings
-    case automations
 }
 
 /// Step-based state of the `/automations` surface (single source of truth
@@ -357,42 +336,6 @@ enum AutomationDraftBuilder {
     }
 }
 
-/// Pages of the notch-style settings surface (`/settings`).
-enum NotchSettingsPage: Int, CaseIterable, Equatable {
-    case general
-    case permissions
-    case model
-    case connectors
-    case setup
-
-    var title: String {
-        switch self {
-        case .general:     return "Všeobecné"
-        case .permissions: return "Povolenia"
-        case .model:       return "Model"
-        case .connectors:  return "Konektory"
-        case .setup:       return "Nastavenie"
-        }
-    }
-
-    var symbolName: String {
-        switch self {
-        case .general:     return "gearshape"
-        case .permissions: return "lock.shield"
-        case .model:       return "cpu"
-        case .connectors:  return "puzzlepiece.extension"
-        case .setup:       return "slider.horizontal.3"
-        }
-    }
-
-    var next: NotchSettingsPage {
-        NotchSettingsPage(rawValue: (rawValue + 1) % Self.allCases.count) ?? .general
-    }
-    var previous: NotchSettingsPage {
-        NotchSettingsPage(rawValue: (rawValue + Self.allCases.count - 1) % Self.allCases.count) ?? .general
-    }
-}
-
 enum SourceMode: String, CaseIterable, Equatable, Identifiable {
     case mail
     case filesystem
@@ -431,22 +374,43 @@ enum SourceMode: String, CaseIterable, Equatable, Identifiable {
 
 @MainActor
 final class ChatViewModel: ObservableObject {
+    enum TerminalAcknowledgementDelivery {
+        case authoritative(DaemonClient.WorkAttentionAcknowledgement)
+        case retryableFailure
+    }
     @Published var messages: [ChatMessage] = []
     @Published var inputText: String = "" {
+        didSet {
+            guard !isApplyingCurrentChatSnapshot else { return }
+            guard inputText.utf8.count <= 16 * 1024 else {
+                isApplyingCurrentChatSnapshot = true
+                inputText = oldValue
+                isApplyingCurrentChatSnapshot = false
+                slashCommandError = String(localized: "currentChat.draft.limit", defaultValue: "Current Chat Draft is limited to 16 KiB")
+                return
+            }
+            slashCommandError = nil
+            updateSlashSuggestions()
+            scheduleDraftPersistence()
+        }
+    }
+    @Published var hasUncommittedMarkedText = false {
         didSet { updateSlashSuggestions() }
     }
-    @Published var isThinking = false
-    /// Transient tool-loop status ("🔎 Searching mail…") shown next to the thinking indicator.
-    @Published var toolStatus: String? = nil
-    @Published var isExpanded = false
-    @Published var chatSurfaceMode: ChatSurfaceMode = .collapsed
-    @Published var notchInteractionMode: NotchInteractionMode = .collapsed
+    var notchPresentation: NotchPresentation { notchEventConsumer.presentation }
+    var notchPresentationPublisher: AnyPublisher<NotchPresentation, Never> {
+        notchEventConsumer.$presentation.eraseToAnyPublisher()
+    }
+    var notchInteractionMode: NotchInteractionMode { notchPresentation.interactionMode }
+    var authoritativePendingApproval: ApprovalItem? {
+        guard let identity = notchPresentation.pendingApprovalIdentity else { return nil }
+        return pendingApprovals.first(where: { $0.id == identity })
+    }
     @Published var notchHoverResetID = UUID()
     @Published var selectedSourceMode: SourceMode? = nil
     @Published var hoveredSourceMode: SourceMode? = nil
     @Published var isSourcePickerForced = false
     @Published var hasNotch = false
-    @Published var availableModels: [String] = [BaseRTLaunchAgent.model]
     @Published var daemonHealth: DaemonHealth?
     @Published var isSyncing = false
     @Published var lastSyncResult: String? = nil
@@ -454,30 +418,207 @@ final class ChatViewModel: ObservableObject {
     @Published var pendingApprovals: [ApprovalItem] = []
     /// Files queued to send with the next message.
     @Published var pendingAttachments: [ChatAttachment] = []
+    @Published private(set) var restoredPendingAttachmentReferences: [String] = []
+    @Published private(set) var restoredSubmittedAttachments: [ChatAttachment] = []
+    @Published private(set) var restoredValidatedSources: [DaemonClient.CurrentChatAvailability] = []
+    @Published private(set) var restoredConnectorReferences: [DaemonClient.CurrentChatAvailability] = []
+    @Published private(set) var restoredApprovalPresentations: [DaemonClient.CompletedApprovalPresentation] = []
     /// True while uploading a file to the daemon.
     @Published var isUploadingAttachment = false
     @Published var streamingAssistantMessageId: UUID? = nil
     @Published var isActivityTranscriptExpanded = false
+    @Published private(set) var currentChatSnapshot: DaemonClient.CurrentChatSnapshot?
+    @Published var clearCurrentChatConfirmationPresented = false
+    @Published var currentChatFocusRequestID = UUID()
+    @Published private(set) var uiOnlyRelaunchError: String? = nil
+    private var pendingCurrentChatCaretRestoration = false
+    private var pendingInputSelection: (caretOffset: Int, selectionLength: Int)?
+    private var clearCurrentChatCommandIdentity: String?
+    private var draftPersistenceTask: Task<Void, Never>?
+    private var isApplyingCurrentChatSnapshot = false
+    private let uiOnlyRelaunchCoordinator = UIOnlyRelaunchCoordinator()
+    var currentInputSelectionProvider: (() -> (caretOffset: Int, selectionLength: Int))?
 
     /// Set to true by NotchWindowController before expanding so the pill
     /// animates to its hover state before the chat panel appears.
     @Published var pillHovered = false
 
-    /// Current page of the notch settings surface.
-    @Published var notchSettingsPage: NotchSettingsPage = .general
+    /// The sole writable settings-selection state for the Compass Rail.
+    @Published var compassRailRoute: CompassRailRoute = .initial
 
     /// Open the notch-style settings surface (`/settings` command).
     func openNotchSettings() {
         inputText = ""
         historyBrowseIndex = nil
-        notchSettingsPage = .general
-        notchInteractionMode = .settings
+        compassRailRoute = .initial
+        applyNotchIntent(.openSettings)
+    }
+
+    func selectCompassRailArea(_ area: CompassRailArea) {
+        compassRailRoute = .area(area)
+    }
+
+    func openCompassRailChild(_ child: CompassRailChild) {
+        compassRailRoute = .child(child)
+    }
+
+    /// Restores only the allowlisted presentation fields from a validated
+    /// permission handoff. Current Chat content and Work remain daemon-owned.
+    func restoreUIOnlyRelaunch(_ handoff: UIRelaunchHandoff) {
+        inputText = handoff.draft
+        restoredPendingAttachmentReferences = handoff.pendingAttachmentReferences
+        pendingCurrentChatCaretRestoration = true
+        pendingInputSelection = (handoff.caretOffset, handoff.selectionLength)
+        currentChatFocusRequestID = UUID()
+        compassRailRoute = handoff.selectedChild.map(CompassRailRoute.child)
+            ?? .area(handoff.selectedArea)
+        permissions.restore(
+            phase: handoff.permissionPhase,
+            for: handoff.selectedChild.map { child in
+                switch child {
+                case .fullDiskAccess: return .fullDiskAccess
+                case .screenRecording: return .screenRecording
+                case .accessibility: return .accessibility
+                default: return .fullDiskAccess
+                }
+            } ?? .fullDiskAccess
+        )
+        if handoff.selectedChild != nil || handoff.selectedArea == .privacyAndPermissions {
+            applyNotchIntent(.openSettings)
+        }
+    }
+
+    func recordUIOnlyRelaunchFailure() {
+        uiOnlyRelaunchError = "The relaunch handoff was invalid or expired. Try again from Permission Grant Assist."
+    }
+
+    var activeConsumerFence: String { notchEventConsumer.activeConsumerFence }
+
+    func pauseForUIOnlyTakeover() {
+        stopEventsMonitor()
+        notchEventConsumer.pauseForTakeover()
+    }
+
+    func resumeAfterUIOnlyTakeoverRollback() {
+        notchEventConsumer.resumeAfterTakeover()
+        startEventsMonitor()
+    }
+
+    func fenceUIOnlyTakeover(
+        transferIdentity: String,
+        oldConsumerFence: String
+    ) async throws -> DaemonClient.UIRelaunchTransferStatus {
+        try await client.fenceOldUI(
+            transferIdentity: transferIdentity,
+            oldConsumerFence: oldConsumerFence
+        )
+    }
+
+    func requestUIOnlyRelaunch(for kind: PermissionGrantKind) {
+        uiOnlyRelaunchError = nil
+        let acceptanceFixture = ProcessInfo.processInfo.environment["BAGENT_STAGE7C_ACCEPTANCE_FIXTURE"] == "1"
+        guard acceptanceFixture || UIOnlyRelaunchEligibility.isAllowed(
+            activeConversationTurn: notchPresentation.hasActiveForegroundWork,
+            pendingApproval: !pendingApprovals.isEmpty
+        ) else {
+            uiOnlyRelaunchError = "Relaunch is unavailable during an active turn or pending approval."
+            return
+        }
+        guard let snapshot = currentChatSnapshot else {
+            uiOnlyRelaunchError = "Current Chat is not ready to hand off."
+            return
+        }
+        let selection = currentInputSelectionProvider?()
+            ?? (inputText.utf16.count, 0)
+        let sourceBundleIdentifier = Bundle.main.bundleIdentifier ?? "sk.bagent.app"
+        let sourceIdentity = sourceBundleIdentifier + ":" + String(ProcessInfo.processInfo.processIdentifier)
+        do {
+            let handoff = try UIRelaunchHandoff(
+                createdAt: Date(),
+                sourceUIIdentity: sourceIdentity,
+                replacementUIIdentity: Bundle.main.bundleIdentifier ?? "sk.bagent.app",
+                sourceConsumerFence: activeConsumerFence,
+                replacementConsumerFence: UUID().uuidString,
+                currentChatIdentity: snapshot.identity,
+                refetchCursor: notchPresentation.revision.cursor,
+                draft: inputText,
+                caretOffset: selection.caretOffset,
+                selectionLength: selection.selectionLength,
+                pendingAttachmentReferences: Array(Set(
+                    pendingAttachments.map(\.id) + restoredPendingAttachmentReferences
+                )).sorted(),
+                selectedArea: compassRailRoute.area,
+                selectedChild: compassRailRoute.child,
+                permissionPhase: .daemonPreservingRelaunchHandoff,
+                semanticFocus: "permission-" + kind.rawValue
+            )
+            permissions.restore(phase: .daemonPreservingRelaunchHandoff, for: kind)
+            uiOnlyRelaunchCoordinator.launchReplacement(
+                handoff: handoff,
+                applicationURL: Bundle.main.bundleURL
+            ) { [weak self] result in
+                guard let self else { return }
+                if case .failure(.failed(let message)) = result {
+                    Stage7CAcceptanceMarker.write("relaunch-launch-failed")
+                    self.uiOnlyRelaunchError = message
+                    self.permissions.restore(phase: .grantedButUIRelaunchRequired, for: kind)
+                } else if case .success = result {
+                    Stage7CAcceptanceMarker.write("relaunch-launch-succeeded")
+                    self.onUIOnlyRelaunchLaunched?(handoff)
+                }
+            }
+        } catch {
+            uiOnlyRelaunchError = "Relaunch could not be prepared."
+        }
+    }
+
+    @discardableResult
+    func goBackInCompassRail() -> Bool {
+        guard let parent = compassRailRoute.parent else { return false }
+        compassRailRoute = parent
+        return true
+    }
+
+    /// Routes settings-only keyboard commands after the native editor has had
+    /// the first opportunity to keep its own left/right keys.
+    @discardableResult
+    func handleCompassRailKey(
+        _ key: CompassRailKey,
+        focusedControl: CompassRailFocusedControl?
+    ) -> CompassRailKeyboardAction? {
+        guard notchInteractionMode == .settings else { return nil }
+        guard let action = CompassRailKeyboard.route(
+            key,
+            route: compassRailRoute,
+            focusedControl: focusedControl
+        ) else { return nil }
+        switch action {
+        case .select(let area): selectCompassRailArea(area)
+        case .back: _ = goBackInCompassRail()
+        case .collapse: break
+        }
+        return action
     }
 
     // MARK: - Automations surface (/automations)
 
-    @Published var automationsSurface: AutomationsSurfaceState = .list
+    @Published var automationsSurface: AutomationsSurfaceState = .list {
+        didSet {
+            guard let pendingTerminalAcknowledgement else { return }
+            guard case .detail(let identity) = automationsSurface,
+                  identity == pendingTerminalAcknowledgement.definitionIdentity
+            else {
+                focusedAutomationSessionIdentity = nil
+                self.pendingTerminalAcknowledgement = nil
+                return
+            }
+        }
+    }
     @Published var automations: [AutomationRecord] = []
+    @Published var automationSessionNavigator = AutomationSplitViewNavigator(
+        projection: AutomationSplitViewProjection.make(active: [], unreadTerminal: []))
+    @Published var automationSessionDetail: AutomationSessionRecord?
+    @Published var automationContinuationConfirmation: AutomationContinuationConfirmation?
     @Published var automationsSelectionIndex: Int = 0
     @Published var automationsError: String? = nil
     /// True while a run-now/enable/delete request is in flight.
@@ -490,7 +631,25 @@ final class ChatViewModel: ObservableObject {
         automationsSurface = .list
         automationsSelectionIndex = 0
         automationsError = nil
-        notchInteractionMode = .automations
+        focusedAutomationSessionIdentity = nil
+        pendingTerminalAcknowledgement = nil
+        automationContinuationConfirmation = nil
+        automationSessionNavigator.resetToSplit()
+        refreshAutomationSessionProjection()
+        applyNotchIntent(.openAutomations)
+        Task { await refreshAutomations() }
+    }
+
+    func openAutomationDetail(_ identity: String, focusedSessionIdentity: String? = nil) {
+        inputText = ""
+        historyBrowseIndex = nil
+        automationsSurface = .detail(identity)
+        automationsError = nil
+        if focusedSessionIdentity == nil {
+            pendingTerminalAcknowledgement = nil
+        }
+        focusedAutomationSessionIdentity = focusedSessionIdentity
+        applyNotchIntent(.openAutomations)
         Task { await refreshAutomations() }
     }
 
@@ -505,11 +664,10 @@ final class ChatViewModel: ObservableObject {
             }
             switch automationsSurface {
             case .detail(let id), .deleteConfirmation(let id):
-                if !automations.contains(where: { $0.id == id }) {
-                    automationsSurface = .list
-                } else if case .detail = automationsSurface {
-                    loadAutomationDetailRuns(id)
-                }
+                // The split view's detail identity is an Automation Session,
+                // not an Automation Definition. Keep it open while the
+                // definition list refreshes.
+                _ = id
             case .list, .editorTask, .editorSchedule, .editorRecurrence, .editorReview,
                  .editorSaving:
                 // Editor keeps its draft through concurrent SSE updates; an
@@ -519,23 +677,184 @@ final class ChatViewModel: ObservableObject {
         } catch {
             automationsError = "Daemon nedostupný"
         }
+        refreshAutomationSessionProjection()
     }
 
-    /// Recent runs shown on the detail page (fetched on entry + on events).
-    @Published var automationDetailRuns: [AutomationRunRecord] = []
-
-    func loadAutomationDetailRuns(_ id: String) {
-        Task {
-            automationDetailRuns = (try? await client.automationRuns(id: id, limit: 3)) ?? []
+    func refreshAutomationSessionProjection() {
+        guard automationSessionNavigator.depth == .split else { return }
+        let next = AutomationSplitViewNavigator(
+            projection: AutomationSplitViewProjection.from(notchPresentation.snapshot))
+        let currentHasSessionRows = automationSessionNavigator.rows.contains { $0.kind != .history }
+        guard currentHasSessionRows else {
+            automationSessionNavigator = next
+            return
+        }
+        let selected = automationSessionNavigator.selectedRow
+        let matchingRow = next.rows.first {
+            $0.id == selected?.id || (
+                selected?.workIdentity != nil && $0.workIdentity == selected?.workIdentity
+            )
+        }
+        if next.rows != automationSessionNavigator.rows {
+            var updated = next
+            if let matchingRow {
+                _ = updated.select(rowID: matchingRow.id)
+            }
+            automationSessionNavigator = updated
         }
     }
 
-    /// Show the full latest result through the existing output presentation.
-    func showAutomationResult(_ automation: AutomationRecord) {
-        guard let summary = automation.lastResultSummary, !summary.isEmpty else { return }
-        messages.append(ChatMessage(role: .assistant, content: "**\(automation.name)**\n\(summary)"))
-        historyBrowseIndex = nil
-        notchInteractionMode = .output
+    @Published private(set) var focusedAutomationSessionIdentity: String?
+    var pendingTerminalAcknowledgement: (
+        definitionIdentity: String,
+        sessionIdentity: String,
+        workIdentity: String,
+        expectedRevision: UInt64
+    )?
+
+    func acknowledgeFocusedAutomationSessionIfPresented(runIdentity: String) {
+        guard let pendingTerminalAcknowledgement,
+              "automation-session:\(runIdentity)" == pendingTerminalAcknowledgement.sessionIdentity
+        else { return }
+        Task {
+            do {
+                let outcome = try await client.acknowledgeWorkAttention(
+                    workIdentity: pendingTerminalAcknowledgement.workIdentity,
+                    expectedRevision: pendingTerminalAcknowledgement.expectedRevision,
+                    consumerFence: notchEventConsumer.activeConsumerFence
+                )
+                handlePendingTerminalAcknowledgement(
+                    sessionIdentity: pendingTerminalAcknowledgement.sessionIdentity,
+                    delivery: .authoritative(outcome)
+                )
+            } catch {
+                handlePendingTerminalAcknowledgement(
+                    sessionIdentity: pendingTerminalAcknowledgement.sessionIdentity,
+                    delivery: .retryableFailure
+                )
+            }
+        }
+    }
+
+    func handlePendingTerminalAcknowledgement(
+        sessionIdentity: String,
+        delivery: TerminalAcknowledgementDelivery
+    ) {
+        guard pendingTerminalAcknowledgement?.sessionIdentity == sessionIdentity else { return }
+        if case .authoritative = delivery {
+            pendingTerminalAcknowledgement = nil
+        }
+    }
+
+    private func openAutomationSession(
+        definitionIdentity: String,
+        sessionIdentity: String,
+        workIdentity: String,
+        expectedRevision: UInt64
+    ) {
+        pendingTerminalAcknowledgement = (
+            definitionIdentity,
+            sessionIdentity,
+            workIdentity,
+            expectedRevision
+        )
+        openAutomationDetail(definitionIdentity, focusedSessionIdentity: sessionIdentity)
+        acknowledgeFocusedAutomationSessionIfPresented(runIdentity: String(sessionIdentity.dropFirst("automation-session:".count)))
+    }
+
+    /// Explicit opening from the Automation Session split view. Preview rows
+    /// never call this path, so selection and passive projection updates do not
+    /// acknowledge Completion Attention.
+    func openTerminalAutomationSession(_ row: AutomationMasterRow) {
+        guard let sessionIdentity = row.sessionIdentity,
+              let workIdentity = row.workIdentity,
+              let runIdentity = row.runIdentity
+        else { return }
+        pendingTerminalAcknowledgement = (
+            definitionIdentity: row.definitionIdentity ?? "detached",
+            sessionIdentity: sessionIdentity,
+            workIdentity: workIdentity,
+            expectedRevision: row.workRevision
+        )
+        openAutomationDetail(
+            row.definitionIdentity ?? "detached",
+            focusedSessionIdentity: sessionIdentity
+        )
+        acknowledgeFocusedAutomationSessionIfPresented(runIdentity: runIdentity)
+        Task {
+            try? await client.openAutomationSession(
+                identity: sessionIdentity,
+                commandIdentity: "open-\(sessionIdentity)-\(row.workRevision)",
+                expectedRevision: row.workRevision)
+            automationSessionDetail = try? await client.automationSession(identity: sessionIdentity)
+        }
+    }
+
+    func continueAutomationSessionFromDetail() {
+        guard let detail = automationSessionDetail else { return }
+        let sessionIdentity = detail.taskSnapshot.automationSessionIdentity
+        let seed = detail.finalOutput ?? detail.resultSummary ?? detail.taskSnapshot.taskText
+        if currentChatHasContent {
+            automationContinuationConfirmation = AutomationContinuationConfirmation(
+                sessionIdentity: sessionIdentity,
+                seed: seed)
+            return
+        }
+        performAutomationContinuation(
+            sessionIdentity: sessionIdentity,
+            seed: seed,
+            confirmedReplacement: false)
+    }
+
+    func confirmAutomationContinuation() {
+        guard let confirmation = automationContinuationConfirmation,
+              automationSessionDetail != nil else { return }
+        automationContinuationConfirmation = nil
+        performAutomationContinuation(
+            sessionIdentity: confirmation.sessionIdentity,
+            seed: confirmation.seed,
+            confirmedReplacement: true)
+    }
+
+    func cancelAutomationContinuation() {
+        automationContinuationConfirmation = nil
+        _ = automationSessionNavigator.goBack()
+    }
+
+    private func performAutomationContinuation(
+        sessionIdentity: String,
+        seed: String,
+        confirmedReplacement: Bool
+    ) {
+        Task {
+            do {
+                _ = try await client.continueAutomationSession(
+                    identity: sessionIdentity,
+                    seed: seed,
+                    confirmedReplacement: confirmedReplacement,
+                    commandIdentity: "continue-" + UUID().uuidString)
+                await MainActor.run {
+                    historyBrowseIndex = nil
+                    automationSessionDetail = nil
+                    automationSessionNavigator.resetToSplit()
+                    applyNotchIntent(.openInput)
+                }
+                await restoreCurrentChat()
+            } catch {
+                await MainActor.run { automationsError = "Pokračovanie zlyhalo" }
+            }
+        }
+    }
+
+    func deleteAutomationSessionFromDetail() {
+        guard let detail = automationSessionDetail else { return }
+        Task {
+            if (try? await client.deleteAutomationSession(
+                identity: detail.taskSnapshot.automationSessionIdentity)) != nil {
+                automationSessionDetail = nil
+                refreshAutomationSessionProjection()
+            }
+        }
     }
 
     var selectedAutomation: AutomationRecord? {
@@ -549,12 +868,24 @@ final class ChatViewModel: ObservableObject {
 
     /// Escape steps back one level; returns false at the list (caller collapses).
     func automationsGoBack() -> Bool {
+        if automationSessionNavigator.depth != .split {
+            if automationContinuationConfirmation != nil {
+                automationContinuationConfirmation = nil
+            }
+            let didGoBack = automationSessionNavigator.goBack()
+            if didGoBack, automationSessionNavigator.depth == .split {
+                refreshAutomationSessionProjection()
+            }
+            return didGoBack
+        }
         switch automationsSurface {
         case .deleteConfirmation(let id):
             automationsSurface = .detail(id)
             return true
         case .detail:
             automationsSurface = .list
+            focusedAutomationSessionIdentity = nil
+            pendingTerminalAcknowledgement = nil
             return true
         case .editorTask:
             // Leaving the editor discards the draft.
@@ -577,18 +908,41 @@ final class ChatViewModel: ObservableObject {
     }
 
     func moveAutomationsSelection(by delta: Int) -> Bool {
-        guard notchInteractionMode == .automations, automationsSurface == .list,
-              !automations.isEmpty else { return false }
+        guard notchInteractionMode == .automations, automationsSurface == .list else {
+            return false
+        }
+        if automationSessionNavigator.rows.contains(where: { $0.kind != .history }) {
+            return automationSessionNavigator.moveSelection(by: delta)
+        }
+        guard !automations.isEmpty else { return false }
         let count = automations.count
         automationsSelectionIndex = (automationsSelectionIndex + delta + count) % count
         return true
     }
 
     func openSelectedAutomationDetail() -> Bool {
-        guard notchInteractionMode == .automations, automationsSurface == .list,
-              let a = automations[safe: automationsSelectionIndex] else { return false }
+        guard notchInteractionMode == .automations, automationsSurface == .list else {
+            return false
+        }
+        let hasSessionRows = automationSessionNavigator.rows.contains { $0.kind != .history }
+        if hasSessionRows,
+           let row = automationSessionNavigator.selectedRow,
+           row.kind != .history {
+            if row.kind == .unreadTerminal {
+                guard automationSessionNavigator.openSelectedTerminal() else { return false }
+                openTerminalAutomationSession(row)
+            } else {
+                guard automationSessionNavigator.openSelectedActive() else { return false }
+                automationsSurface = .detail("automation-session-split")
+            }
+            return true
+        }
+        if hasSessionRows, automationSessionNavigator.selectedRow?.kind == .history {
+            automationSessionNavigator.openChild("history")
+            return true
+        }
+        guard let a = automations[safe: automationsSelectionIndex] else { return false }
         automationsSurface = .detail(a.id)
-        loadAutomationDetailRuns(a.id)
         return true
     }
 
@@ -645,10 +999,12 @@ final class ChatViewModel: ObservableObject {
     func startAutomationCreation() {
         automationDraft = AutomationDraft()
         automationsError = nil
+        automationSessionNavigator.resetToSplit()
         automationsSurface = .editorTask
     }
 
     func startAutomationEdit(_ automation: AutomationRecord) {
+        automationSessionNavigator.resetToSplit()
         var draft = AutomationDraft()
         draft.editingID = automation.id
         draft.name = automation.name
@@ -787,12 +1143,27 @@ final class ChatViewModel: ObservableObject {
     @Published var slashSuggestions: [SlashCommand] = []
     /// Keyboard-selected suggestion row.
     @Published var slashSelectionIndex: Int = 0
+    @Published var slashCommandError: String?
+    private var modifiedReturnEventID: UUID?
+    var onSlashSuggestionCompletion: ((String) -> Bool)?
+
+    func preserveModifiedReturnForNativeEditing() {
+        let eventID = UUID()
+        modifiedReturnEventID = eventID
+        DispatchQueue.main.async { [weak self] in
+            guard self?.modifiedReturnEventID == eventID else { return }
+            self?.modifiedReturnEventID = nil
+        }
+    }
     private func updateSlashSuggestions() {
         // Called only from inputText.didSet — an Escape dismissal therefore
         // holds until the text changes again.
         let matches = notchInteractionMode == .settings
             ? []
-            : SlashCommandRegistry.suggestions(for: inputText)
+            : SlashCommandRegistry.suggestions(
+                for: inputText,
+                hasMarkedText: hasUncommittedMarkedText
+            )
         if matches != slashSuggestions { slashSuggestions = matches }
         if slashSelectionIndex >= matches.count { slashSelectionIndex = 0 }
     }
@@ -810,22 +1181,27 @@ final class ChatViewModel: ObservableObject {
         return true
     }
 
-    /// Return/Tab/click on a suggestion: canonical spelling, then execute.
-    func acceptSlashSuggestion(_ command: SlashCommand? = nil) -> Bool {
+    /// Tab or click completes one candidate. Completion never executes it.
+    func completeSlashSuggestion(_ command: SlashCommand? = nil) -> Bool {
         guard let cmd = command ?? slashSuggestions[safe: slashSelectionIndex] else { return false }
+        if onSlashSuggestionCompletion?(cmd.command) != true {
+            inputText = cmd.command
+        }
         slashSuggestions = []
         slashSelectionIndex = 0
-        inputText = cmd.command
-        execute(cmd)
         return true
     }
 
     func execute(_ command: SlashCommand) {
-        switch command.action {
-        case .openSettings:
+        switch (command.destination, command.confirmationPolicy) {
+        case (.settings, .none):
             openNotchSettings()
-        case .openAutomations:
+        case (.automations, .none):
             openAutomations()
+        case (.currentChat, .whenCurrentChatIsNonEmpty):
+            requestCurrentChatClear()
+        default:
+            assertionFailure("Invalid Slash Command destination and confirmation policy")
         }
     }
 
@@ -849,9 +1225,8 @@ final class ChatViewModel: ObservableObject {
     var savedScrollWasAtBottom: Bool = true
 
     var agentStatus: AgentStatus {
-        if !pendingApprovals.isEmpty { return .awaitingApproval }
-        if isThinking { return .thinking }
-        if let h = daemonHealth, (!h.daemonUp || !h.baseRTUp) { return .error }
+        if notchPresentation.pendingApprovalIdentity != nil { return .awaitingApproval }
+        if notchPresentation.hasActiveForegroundWork { return .thinking }
         return .ready
     }
 
@@ -903,14 +1278,14 @@ final class ChatViewModel: ObservableObject {
 
     /// ↑ on empty input: step to an older response. Returns true if consumed.
     func browseOlderResponse() -> Bool {
-        guard inputText.isEmpty, !isThinking else { return false }
+        guard inputText.isEmpty, !notchPresentation.hasActiveForegroundWork else { return false }
         guard notchInteractionMode == .input || historyBrowseIndex != nil else { return false }
         let list = assistantResponses
         guard !list.isEmpty else { return false }
         let next = (historyBrowseIndex ?? list.count) - 1
         guard next >= 0 else { return true } // already at oldest — swallow the key
         historyBrowseIndex = next
-        notchInteractionMode = .output
+        applyNotchIntent(.openOutput)
         return true
     }
 
@@ -928,7 +1303,7 @@ final class ChatViewModel: ObservableObject {
     func exitHistoryBrowse() {
         guard historyBrowseIndex != nil else { return }
         historyBrowseIndex = nil
-        notchInteractionMode = .input
+        applyNotchIntent(.openInput)
     }
 
     var isLatestAssistantStreaming: Bool {
@@ -958,23 +1333,18 @@ final class ChatViewModel: ObservableObject {
     private var approvalPollTask: Task<Void, Never>?
     private var healthMonitorTask: Task<Void, Never>?
 
-    @Published var selectedModel: String = BaseRTLaunchAgent.model {
-        didSet { UserDefaults.standard.set(selectedModel, forKey: "bagent.model") }
-    }
-
-    @Published var selectedClassifierModel: String = BaseRTLaunchAgent.model {
-        didSet { UserDefaults.standard.set(selectedClassifierModel, forKey: "bagent.classifier_model") }
-    }
-
     // MARK: - Codex (Phase 8)
 
     /// User-configured path to the `codex` binary. Empty = auto-discover from $PATH.
     @Published var codexBinaryPath: String = UserDefaults.standard.string(forKey: "bagent.codex_path") ?? "" {
-        didSet { UserDefaults.standard.set(codexBinaryPath, forKey: "bagent.codex_path") }
+        didSet {
+            if !isSettingsFixture { UserDefaults.standard.set(codexBinaryPath, forKey: "bagent.codex_path") }
+        }
     }
     /// Last result from "Testovať Codex" — nil while not tested, true/false after.
     @Published var codexTestResult: String? = nil
     @Published var isTestingCodex: Bool = false
+    @Published var codexServiceAvailable: Bool? = nil
 
     func testCodex() {
         isTestingCodex = true
@@ -985,14 +1355,17 @@ final class ChatViewModel: ObservableObject {
                 await MainActor.run {
                     if status.available {
                         self.codexTestResult = "✓ \(status.version ?? "dostupný")"
+                        self.codexServiceAvailable = status.available
                     } else {
                         self.codexTestResult = "✗ \(status.error ?? "nenájdený")"
+                        self.codexServiceAvailable = false
                     }
                     self.isTestingCodex = false
                 }
             } catch {
                 await MainActor.run {
                     self.codexTestResult = "✗ \(error.localizedDescription)"
+                    self.codexServiceAvailable = false
                     self.isTestingCodex = false
                 }
             }
@@ -1012,11 +1385,34 @@ final class ChatViewModel: ObservableObject {
 
     @Published var odooTestResult: String? = nil
     @Published var isTestingOdoo: Bool = false
-    @Published var odooMcpAvailable: Bool = false
+    @Published var odooMcpAvailable: Bool? = nil
     @Published var odooToolCount: Int = 0
+    @Published private(set) var rulesPolicySummary: String = "Not reported"
+
+    var canTestOdoo: Bool {
+        !odooURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !odooDB.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !odooUser.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !odooAPIKey.isEmpty
+    }
+
+    func refreshRulesPolicySummary() {
+        Task {
+            do {
+                let yaml = try await client.rulesYaml()
+                let summary = yaml.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "Unavailable"
+                    : "Configured by daemon"
+                await MainActor.run { self.rulesPolicySummary = summary }
+            } catch {
+                await MainActor.run { self.rulesPolicySummary = "Unavailable" }
+            }
+        }
+    }
 
     /// Save creds to Keychain + UserDefaults and authenticate with the daemon via MCP.
     func configureOdoo() {
+        guard canTestOdoo else { return }
         // Persist non-secret fields in UserDefaults (URL, DB, user, uvx path).
         UserDefaults.standard.set(odooURL,     forKey: "bagent.odoo.url")
         UserDefaults.standard.set(odooDB,      forKey: "bagent.odoo.db")
@@ -1050,6 +1446,7 @@ final class ChatViewModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.odooTestResult = "✗ \(error.localizedDescription)"
+                    self.odooMcpAvailable = false
                     self.isTestingOdoo = false
                 }
             }
@@ -1307,14 +1704,19 @@ final class ChatViewModel: ObservableObject {
         UserDefaults.standard.set(UserDefaults.standard.integer(forKey: key) + 1, forKey: key)
     }
 
-    private let client = DaemonClient()
-    let permissions = PermissionsManager()
+    private let client: DaemonClient
+    private let isSettingsFixture: Bool
+    private let notchEventConsumer: NotchEventConsumer
+    private var projectionCancellable: AnyCancellable?
+    let permissions: PermissionsManager
 
     /// Invoked after an input-only turn is submitted so AppKit can collapse the panel.
     var onInputOnlySubmitted: (() -> Void)?
+    /// Called only after the replacement process was launched successfully.
+    /// The application delegate then owns the daemon-preserving fence.
+    var onUIOnlyRelaunchLaunched: ((UIRelaunchHandoff) -> Void)?
     /// Invoked when output becomes displayable, or completion must recover a
     /// missed first-token transition, so AppKit can reveal the output surface.
-    var onFirstAssistantToken: (() -> Void)?
 
     // MARK: - cmux notifications
 
@@ -1487,94 +1889,396 @@ final class ChatViewModel: ObservableObject {
         connectorDeparting.removeAll { $0.id == id }
     }
 
-    // MARK: - Debug trace copy (option+click on the notch)
-
-    /// Transient "copied" checkmark in the left wing after option+click.
-    @Published var traceCopiedFlash = false
-    private var traceFlashTask: Task<Void, Never>?
-
-    /// Option+click anywhere on the notch/panel: copy the latest session +
-    /// debug trace to the clipboard and flash the left-wing checkmark.
-    func copyDebugTrace() {
-        traceFlashTask?.cancel()
-        traceFlashTask = Task {
-            let payload = await latestDebugClipboardPayload()
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.setString(payload, forType: .string)
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.68)) {
-                traceCopiedFlash = true
-            }
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.3)) {
-                traceCopiedFlash = false
-            }
-        }
-    }
-    // Session ID persisted in UserDefaults so it survives app restarts
-    private var sessionId: String? {
-        get { UserDefaults.standard.string(forKey: "bagent.session_id") }
-        set { UserDefaults.standard.set(newValue, forKey: "bagent.session_id") }
-    }
-
-    var currentSessionId: String? { sessionId }
-
     // MARK: - Init
 
-    init(startMonitoring: Bool = true) {
+    init(
+        startMonitoring: Bool = true,
+        client: DaemonClient = DaemonClient(),
+        settingsFixture: Bool = false,
+        consumerFence: String? = nil
+    ) {
+        self.client = client
+        self.isSettingsFixture = settingsFixture
+        self.permissions = PermissionsManager(probesOnAssistStart: !settingsFixture)
+        if settingsFixture {
+            codexBinaryPath = ""
+            odooURL = ""
+            odooDB = ""
+            odooUser = ""
+            odooUvxPath = ""
+        }
+        notchEventConsumer = NotchEventConsumer(
+            transport: client,
+            consumerFence: consumerFence ?? UUID().uuidString
+        )
+        projectionCancellable = notchEventConsumer.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         if startMonitoring {
             startHealthMonitor()
             startCmuxMonitor()
             Task { await refreshHealth() }
         }
+        if startMonitoring {
+            Task { await restoreCurrentChat() }
+        }
     }
 
-    func ensureCompletedTurnOutputPresented() {
-        if notchInteractionMode != .output || chatSurfaceMode != .outputExpanded {
-            onFirstAssistantToken?()
+    func applyNotchIntent(_ intent: NotchLocalIntent) {
+        try? notchEventConsumer.applyLocalIntent(intent)
+    }
+
+    func setNotchReduceMotion(_ enabled: Bool) {
+        try? notchEventConsumer.setReduceMotion(enabled)
+    }
+
+    func applyAuthoritativeSnapshot(_ snapshot: NotchWorkSnapshot) throws {
+        try notchEventConsumer.replace(with: snapshot)
+    }
+
+    func activateFocusedNotchActivity() {
+        switch notchPresentation.focusedDestination {
+        case .currentChat:
+            applyNotchIntent(.openOutput)
+        case .activeAutomation(let definitionIdentity):
+            if notchPresentation.activeAutomationCount > 1 {
+                applyNotchIntent(.cycleAutomation)
+            } else {
+                openAutomationDetail(definitionIdentity)
+            }
+        case .terminalAutomation(
+            let definitionIdentity,
+            let sessionIdentity,
+            let workIdentity,
+            let expectedRevision
+        ):
+            openAutomationSession(
+                definitionIdentity: definitionIdentity,
+                sessionIdentity: sessionIdentity,
+                workIdentity: workIdentity,
+                expectedRevision: expectedRevision
+            )
+        case nil:
+            break
         }
-        // Tests and non-window consumers may not install the AppKit callback.
-        // Completion is authoritative even if click-away collapsed the thinking
-        // surface before the first token reached the main actor.
-        if notchInteractionMode != .output || chatSurfaceMode != .outputExpanded {
-            isExpanded = true
-            chatSurfaceMode = .outputExpanded
-            notchInteractionMode = .output
-        }
+    }
+
+    func openActiveAutomations() {
+        guard notchPresentation.activeAutomationCount > 0 else { return }
+        openAutomations()
     }
 
     // MARK: - Actions
 
-    func clear() {
-        messages = []
-        inputText = ""
-        isThinking = false
-        streamingAssistantMessageId = nil
+    private var currentChatHasContent: Bool {
+        guard let snapshot = currentChatSnapshot else { return false }
+        let draftCommand = snapshot.draft.flatMap {
+            SlashCommandRegistry.exactMatch($0.text)
+        }
+        let draftIsOnlyClearCommand = draftCommand?.destination == .currentChat
+            && draftCommand?.confirmationPolicy == .whenCurrentChatIsNonEmpty
+            && snapshot.draft?.pendingAttachmentReferences.isEmpty == true
+        return !snapshot.turns.isEmpty
+            || (snapshot.draft != nil && !draftIsOnlyClearCommand)
+            || snapshot.continuation != nil
+            || !snapshot.submittedAttachments.isEmpty
+            || !snapshot.validatedSources.isEmpty
+            || !snapshot.connectorReferences.isEmpty
+            || !snapshot.completedApprovalPresentations.isEmpty
+    }
+
+    func restoreCurrentChat(preservingActivePresentation: Bool = false) async {
+        do {
+            let snapshot = try await client.currentChat()
+            var restoredPending: [ChatAttachment] = []
+            for identity in snapshot.draft?.pendingAttachmentReferences ?? [] {
+                if let attachment = try? await client.attachment(id: identity) {
+                    restoredPending.append(attachment)
+                } else {
+                    restoredPending.append(Self.unavailablePendingAttachment(identity: identity))
+                }
+            }
+            applyCurrentChatSnapshot(
+                snapshot,
+                rebuildMessages: !preservingActivePresentation,
+                restoreCaretAtEnd: !preservingActivePresentation)
+            pendingAttachments = restoredPending
+            restoredPendingAttachmentReferences = restoredPending.map(\.id)
+        } catch {
+            if currentChatSnapshot == nil {
+                slashCommandError = String(localized: "currentChat.restore.failure", defaultValue: "Current Chat could not be restored")
+            }
+        }
+    }
+
+    func applyCurrentChatSnapshot(
+        _ snapshot: DaemonClient.CurrentChatSnapshot,
+        rebuildMessages: Bool,
+        restoreCaretAtEnd: Bool = false
+    ) {
+        currentChatSnapshot = snapshot
+        restoredSubmittedAttachments = snapshot.submittedAttachments.map(Self.restoredChatAttachment)
+        restoredValidatedSources = snapshot.validatedSources
+        restoredConnectorReferences = snapshot.connectorReferences
+        restoredApprovalPresentations = snapshot.completedApprovalPresentations
+        isApplyingCurrentChatSnapshot = true
+        inputText = snapshot.draft?.text ?? ""
+        restoredPendingAttachmentReferences = snapshot.draft?.pendingAttachmentReferences ?? []
+        isApplyingCurrentChatSnapshot = false
+        updateSlashSuggestions()
+        if restoreCaretAtEnd {
+            pendingCurrentChatCaretRestoration = true
+            currentChatFocusRequestID = UUID()
+        }
+        guard rebuildMessages else { return }
+
+        var restored: [ChatMessage] = []
+        if let continuation = snapshot.continuation {
+            restored.append(ChatMessage(role: .assistant, content: continuation.seed))
+        }
+        for turn in snapshot.turns {
+            var userMessage = ChatMessage(role: .user, content: turn.userMessage)
+            userMessage.attachments = snapshot.submittedAttachments
+                .filter { $0.conversationTurnIdentity == turn.identity }
+                .map(Self.restoredChatAttachment)
+            restored.append(userMessage)
+            if let output = turn.assistantOutput {
+                restored.append(ChatMessage(role: .assistant, content: output))
+            } else if turn.state == "interrupted" {
+                restored.append(ChatMessage(
+                    role: .assistant,
+                    content: String(localized: "currentChat.turn.interrupted", defaultValue: "This response was interrupted. Submit a new message to continue.")))
+            }
+        }
+        messages = restored
+        historyBrowseIndex = nil
+    }
+
+    private static func restoredChatAttachment(
+        _ attachment: DaemonClient.SubmittedAttachment
+    ) -> ChatAttachment {
+        let kind: ChatAttachmentKind
+        if attachment.mime.hasPrefix("image/") {
+            kind = .image
+        } else if attachment.mime == "application/pdf" {
+            kind = .pdf
+        } else if attachment.mime.hasPrefix("text/") {
+            kind = .text
+        } else {
+            kind = .other
+        }
+        return ChatAttachment(
+            id: attachment.identity,
+            filename: attachment.filename,
+            mime: attachment.mime,
+            kind: kind,
+            localURL: nil,
+            sizeBytes: Int(attachment.sizeBytes),
+            availability: attachment.available ? .available : .unavailable)
+    }
+
+    static func unavailablePendingAttachment(identity: String) -> ChatAttachment {
+        ChatAttachment(
+            id: identity,
+            filename: String(
+                localized: "currentChat.attachment.unavailable",
+                defaultValue: "Attachment unavailable"),
+            mime: "application/octet-stream",
+            kind: .other,
+            localURL: nil,
+            sizeBytes: 0,
+            availability: .unavailable)
+    }
+
+    func applyRejectedSubmissionDraft(
+        text: String,
+        attachments: [ChatAttachment],
+        availableAttachmentIdentities: Set<String>
+    ) {
+        isApplyingCurrentChatSnapshot = true
+        inputText = text
+        pendingAttachments = attachments.map { attachment in
+            guard !availableAttachmentIdentities.contains(attachment.id) else { return attachment }
+            return ChatAttachment(
+                id: attachment.id,
+                filename: attachment.filename,
+                mime: attachment.mime,
+                kind: attachment.kind,
+                localURL: attachment.localURL,
+                sizeBytes: attachment.sizeBytes,
+                availability: .unavailable,
+                thumbnail: attachment.thumbnail)
+        }
+        restoredPendingAttachmentReferences = attachments.map(\.id)
+        isApplyingCurrentChatSnapshot = false
+        updateSlashSuggestions()
+        scheduleDraftPersistence()
+    }
+
+    static func submissionWasAdmitted(
+        before: DaemonClient.CurrentChatSnapshot,
+        after: DaemonClient.CurrentChatSnapshot?,
+        exactText: String
+    ) -> Bool {
+        guard let after, after.identity == before.identity, let newest = after.turns.last else {
+            return false
+        }
+        let previousTurnIdentities = Set(before.turns.map(\.identity))
+        return !previousTurnIdentities.contains(newest.identity) && newest.userMessage == exactText
+    }
+
+    func consumeCurrentChatCaretRestoration() -> Bool {
+        defer { pendingCurrentChatCaretRestoration = false }
+        return pendingCurrentChatCaretRestoration
+    }
+
+    func restoreCurrentChatCaret(in editor: NSTextView) {
+        if let selection = pendingInputSelection {
+            let length = editor.string.utf16.count
+            let location = min(max(selection.caretOffset, 0), length)
+            let selectedLength = min(max(selection.selectionLength, 0), length - location)
+            editor.setSelectedRange(NSRange(location: location, length: selectedLength))
+            pendingInputSelection = nil
+        } else {
+            CurrentChatTextRestoration.placeCaretAtEnd(in: editor)
+        }
+    }
+
+    private func scheduleDraftPersistence() {
+        draftPersistenceTask?.cancel()
+        guard let snapshot = currentChatSnapshot else { return }
+        let text = inputText
+        let references = Array(Set(
+            pendingAttachments.map(\.id) + restoredPendingAttachmentReferences)).sorted()
+        draftPersistenceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled, let self else { return }
+            do {
+                let updated = try await client.saveCurrentChatDraft(
+                    identity: snapshot.identity,
+                    expectedRevision: snapshot.revision,
+                    text: text,
+                    pendingAttachmentReferences: references)
+                guard inputText == text else { return }
+                currentChatSnapshot = updated
+            } catch {
+                guard inputText == text else { return }
+                if let authoritative = try? await client.currentChat(),
+                   authoritative.identity == snapshot.identity,
+                   let retried = try? await client.saveCurrentChatDraft(
+                       identity: authoritative.identity,
+                       expectedRevision: authoritative.revision,
+                       text: text,
+                       pendingAttachmentReferences: references),
+                   inputText == text {
+                    currentChatSnapshot = retried
+                } else {
+                    slashCommandError = String(localized: "currentChat.draft.saveFailure", defaultValue: "Current Chat Draft could not be saved")
+                }
+            }
+        }
+    }
+
+    func requestCurrentChatClear() {
+        guard currentChatSnapshot != nil else {
+            slashCommandError = String(localized: "currentChat.loading", defaultValue: "Current Chat is still loading")
+            return
+        }
+        guard !notchPresentation.hasActiveForegroundWork, authoritativePendingApproval == nil else {
+            slashCommandError = String(localized: "currentChat.clear.active", defaultValue: "Finish the active turn or approval before clearing Current Chat")
+            return
+        }
+        clearCurrentChatCommandIdentity = clearCurrentChatCommandIdentity ?? UUID().uuidString
+        if currentChatHasContent {
+            clearCurrentChatConfirmationPresented = true
+        } else {
+            performCurrentChatClear(confirmedNonEmpty: false)
+        }
+    }
+
+    func cancelCurrentChatClear() {
+        clearCurrentChatConfirmationPresented = false
+        clearCurrentChatCommandIdentity = nil
+    }
+
+    func confirmCurrentChatClear() {
+        clearCurrentChatConfirmationPresented = false
+        performCurrentChatClear(confirmedNonEmpty: true)
+    }
+
+    private func performCurrentChatClear(confirmedNonEmpty: Bool) {
+        guard let snapshot = currentChatSnapshot,
+              let commandIdentity = clearCurrentChatCommandIdentity
+        else { return }
+        draftPersistenceTask?.cancel()
+        Task {
+            if let replacement = await resolveCurrentChatClear(
+                original: snapshot,
+                commandIdentity: commandIdentity,
+                confirmedNonEmpty: confirmedNonEmpty
+            ) {
+                completeCurrentChatClear(with: replacement)
+            }
+        }
+    }
+
+    private func resolveCurrentChatClear(
+        original: DaemonClient.CurrentChatSnapshot,
+        commandIdentity: String,
+        confirmedNonEmpty: Bool
+    ) async -> DaemonClient.CurrentChatSnapshot? {
+        var requestSnapshot = original
+        var lastAuthoritative: DaemonClient.CurrentChatSnapshot?
+        for _ in 0..<3 {
+            do {
+                return try await client.clearCurrentChat(
+                    identity: requestSnapshot.identity,
+                    expectedRevision: requestSnapshot.revision,
+                    commandIdentity: commandIdentity,
+                    confirmedNonEmpty: confirmedNonEmpty)
+            } catch {
+                guard let authoritative = try? await client.currentChat() else { continue }
+                lastAuthoritative = authoritative
+                // Same identity means a draft/revision race: retry the same
+                // command key at the refetched revision. A changed identity
+                // may be this command's lost response, so replay its original
+                // arguments and let the daemon's idempotency record decide.
+                requestSnapshot = authoritative.identity == original.identity
+                    ? authoritative : original
+            }
+        }
+        if let authoritative = lastAuthoritative {
+            applyCurrentChatSnapshot(
+                authoritative,
+                rebuildMessages: true,
+                restoreCaretAtEnd: true)
+            slashCommandError = authoritative.identity == original.identity
+                ? String(localized: "currentChat.clear.failure", defaultValue: "Current Chat could not be cleared. Try again.")
+                : String(localized: "currentChat.clear.changed", defaultValue: "Current Chat changed in another window. Review it before clearing.")
+        } else {
+            slashCommandError = String(localized: "currentChat.clear.failure", defaultValue: "Current Chat could not be cleared. Try again.")
+        }
+        return nil
+    }
+
+    private func completeCurrentChatClear(with snapshot: DaemonClient.CurrentChatSnapshot) {
+        applyCurrentChatSnapshot(snapshot, rebuildMessages: true, restoreCaretAtEnd: true)
         pendingAttachments = []
+        restoredPendingAttachmentReferences = []
         pendingConnectorActions = []
         selectedSourceMode = nil
         hoveredSourceMode = nil
         savedScrollAnchorId = nil
         savedScrollWasAtBottom = true
-        // Start a new session on explicit clear
-        sessionId = nil
-        Task { await startNewSession() }
-    }
-
-    func loadModels() async {
-        do {
-            let fetched = try await client.models()
-            if !fetched.isEmpty {
-                availableModels = fetched
-                if !fetched.contains(selectedModel) {
-                    selectedModel = fetched.first ?? BaseRTLaunchAgent.model
-                }
-                if !fetched.contains(selectedClassifierModel) {
-                    selectedClassifierModel = fetched.first ?? BaseRTLaunchAgent.model
-                }
-            }
-        } catch {}
+        slashSuggestions = []
+        slashCommandError = nil
+        clearCurrentChatCommandIdentity = nil
+        let announcement = String(localized: "currentChat.clear.announcement", defaultValue: "Current Chat cleared")
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [.announcement: announcement, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+        applyNotchIntent(.openInput)
     }
 
     func syncMail() async {
@@ -1603,9 +2307,6 @@ final class ChatViewModel: ObservableObject {
         // Keychain prompts during app launch.
         await refreshWhatsappStatusNow()
         permissions.refresh()
-        if !messages.isEmpty && sessionId == nil {
-            await startNewSession()
-        }
     }
 
     func startHealthMonitor() {
@@ -1622,112 +2323,51 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    func loadDebugTrace(for messageId: UUID) async {
-        guard let idx = messages.firstIndex(where: { $0.id == messageId }),
-              let traceId = messages[idx].debugTraceId
-        else { return }
-        let currentPayload = messages[idx].debugPayload ?? ""
-        guard currentPayload.isEmpty || currentPayload.contains("trace not found") || currentPayload.hasPrefix("Chyba:") else {
-            return
-        }
-        messages[idx].debugPayload = "Načítavam trace…"
-        for attempt in 0..<6 {
-            do {
-                messages[idx].debugPayload = try await client.debugTrace(id: traceId)
-                return
-            } catch {
-                if attempt == 5 {
-                    messages[idx].debugPayload = "Chyba: \(error.localizedDescription)"
-                } else {
-                    try? await Task.sleep(for: .seconds(1))
-                }
-            }
-        }
-    }
-
-    func latestDebugClipboardPayload() async -> String {
-        guard let latest = latestAssistantMessage,
-              let traceId = latest.debugTraceId
-        else {
-            return "No debug trace is available for the latest assistant message."
-        }
-
-        await loadDebugTrace(for: latest.id)
-        let tracePayload = messages
-            .first(where: { $0.id == latest.id })?
-            .debugPayload ?? "Trace payload unavailable."
-
-        let conversationPayload: String
-        if let sessionId {
-            do {
-                conversationPayload = try await client.debugConversation(id: sessionId)
-            } catch {
-                conversationPayload = "Conversation debug unavailable: \(error.localizedDescription)"
-            }
-        } else {
-            conversationPayload = "No conversation id yet."
-        }
-
-        let sessionLine = sessionId ?? "(none)"
-        let assistantText = messages
-            .first(where: { $0.id == latest.id })?
-            .content ?? latest.content
-
-        return """
-        bagent debug payload
-        generated_at: \(Date().ISO8601Format())
-        session_id: \(sessionLine)
-        prompt_trace_id: \(traceId)
-
-        latest_assistant_response:
-        \(assistantText)
-
-        debug_trace:
-        \(tracePayload)
-
-        conversation_debug:
-        \(conversationPayload)
-        """
-
-    }
-
     func send() {
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || !pendingAttachments.isEmpty else { return }
-        // A keyboard-selected suggestion wins over raw text; only complete
-        // recognized commands execute. Unknown slash text submits normally.
-        if !slashSuggestions.isEmpty, acceptSlashSuggestion() {
+        let text = inputText
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !pendingAttachments.isEmpty
+        else { return }
+        if modifiedReturnEventID != nil {
+            modifiedReturnEventID = nil
             return
         }
-        if let cmd = SlashCommandRegistry.exactMatch(text) {
+        if let cmd = SlashCommandRegistry.exactMatch(
+            text,
+            hasMarkedText: hasUncommittedMarkedText
+        ) {
             execute(cmd)
             return
         }
-        guard !isThinking else { return }
+        guard !notchPresentation.hasActiveForegroundWork else { return }
         let sourceMode = selectedSourceMode
-        let wasInputOnly = chatSurfaceMode == .inputOnly
-        if messages.isEmpty {
-            sessionId = nil
+        let wasInputOnly = notchInteractionMode == .input
+        guard let currentChatSnapshot else {
+            slashCommandError = String(localized: "currentChat.loading", defaultValue: "Current Chat is still loading")
+            return
         }
+        let submissionSnapshot = currentChatSnapshot
+        draftPersistenceTask?.cancel()
+        isApplyingCurrentChatSnapshot = true
         inputText = ""
+        isApplyingCurrentChatSnapshot = false
+        updateSlashSuggestions()
         historyBrowseIndex = nil
         pendingConnectorActions = []
-        let model = selectedModel
-        let sid = sessionId
+        guard let model = daemonHealth?.model,
+              !model.isEmpty,
+              model != "—"
+        else {
+            slashCommandError = "Model Runtime is unavailable."
+            return
+        }
         let attachments = pendingAttachments
         pendingAttachments = []
+        restoredPendingAttachmentReferences = []
         let attachmentIds = attachments.map { $0.id }
-        // Sliding-window history so the model can resolve follow-ups.
-        // Daemon clamps again (10 turns / 8k chars) — these caps must match.
-        let history: [DaemonClient.HistoryTurn] = messages
-            .filter { !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .suffix(10)
-            .map { .init(role: $0.role == .user ? "user" : "assistant",
-                         content: String($0.content.prefix(1500))) }
         var userMsg = ChatMessage(role: .user, content: text)
         userMsg.attachments = attachments
         messages.append(userMsg)
-        isThinking = true
         if let sourceMode {
             recordSourceModeUse(sourceMode)
         }
@@ -1736,6 +2376,7 @@ final class ChatViewModel: ObservableObject {
         }
 
         Task {
+            var admissionWasObserved = false
             let assistantMsg = ChatMessage(role: .assistant, content: "")
             messages.append(assistantMsg)
             isActivityTranscriptExpanded = false
@@ -1765,8 +2406,14 @@ final class ChatViewModel: ObservableObject {
                     }
                 }
 
-                let stream = client.chatStream(text: text, sessionId: sid, model: model, attachmentIds: attachmentIds, screenContext: screenCtx, sourceMode: sourceMode, history: history)
-                var first = true
+                let stream = client.chatStream(
+                    text: text,
+                    currentChatIdentity: currentChatSnapshot.identity,
+                    expectedRevision: currentChatSnapshot.revision,
+                    model: model,
+                    attachmentIds: attachmentIds,
+                    screenContext: screenCtx,
+                    sourceMode: sourceMode)
                 var didAutoOpen = false
                 let presenter = AdaptiveStreamPresenter { [weak self] edit in
                     guard let self, messages.indices.contains(idx) else { return }
@@ -1774,26 +2421,12 @@ final class ChatViewModel: ObservableObject {
                     streamingChunk += 1
                 }
                 for try await event in stream {
+                    admissionWasObserved = true
                     switch event {
-                    case .debugTrace(let trace):
-                        messages[idx].debugTraceId = trace.prompt_trace_id
-                        messages[idx].debugPreview = trace.preview
-                        messages[idx].debugPromptChars = trace.prompt_chars
-                        messages[idx].debugTokenEstimate = trace.prompt_token_estimate
-                        messages[idx].debugMessageCount = trace.message_count
-                        messages[idx].debugSelectedSkills = trace.selected_skill_names
-                        messages[idx].debugSelectedMemoryIds = trace.selected_memory_ids
-                        messages[idx].debugConversationRecallInjected = trace.conversation_recall_injected
-                        if let sid = trace.session_id { sessionId = sid }
                     case .token(let t):
                         messages[idx].content += t
                         presenter.enqueue(t)
-                        if first {
-                            isThinking = false
-                            first = false
-                            ensureCompletedTurnOutputPresented()
-                        }
-                        // toolStatus intentionally NOT cleared here — the action chip
+                        // The canonical rail caption intentionally remains visible — the action chip
                         // stays visible while the answer streams; cleared on .done.
                         // Auto-open Mail after the first sentence has appeared in the response.
                         if !didAutoOpen,
@@ -1819,7 +2452,6 @@ final class ChatViewModel: ObservableObject {
                         )
                         messages[idx].activities.removeAll { $0.id == event.id }
                         messages[idx].activities.append(activity)
-                        toolStatus = event.title
                     case .activityCompleted(let event):
                         if let activityIndex = messages[idx].activities.firstIndex(where: { $0.id == event.id }) {
                             messages[idx].activities[activityIndex].status = event.status ?? "completed"
@@ -1827,9 +2459,7 @@ final class ChatViewModel: ObservableObject {
                         }
                     case .evidencePhase, .logicalActivityStarted, .logicalActivityCompleted,
                          .evidenceOutcome, .evidencePolish:
-                        if let status = EvidencePresentation.apply(event, to: &messages[idx]) {
-                            toolStatus = status
-                        }
+                        _ = EvidencePresentation.apply(event, to: &messages[idx])
                     case .evidenceAcquisitionDiagnostic:
                         break
                     case .sourceDiscovered(let source):
@@ -1862,8 +2492,7 @@ final class ChatViewModel: ObservableObject {
                             durationMs: nil
                         ))
                     case .toolCall(let tool):
-                        isThinking = true
-                        toolStatus = Self.toolStatusLabel(for: tool)
+                        _ = tool
                     case .mailAttachments(let refs):
                         let chips = refs.map { ref in
                             ChatAttachment(
@@ -1872,7 +2501,8 @@ final class ChatViewModel: ObservableObject {
                                 mime: "application/pdf",
                                 kind: .pdf,
                                 localURL: URL(fileURLWithPath: ref.path),
-                                sizeBytes: ref.size
+                                sizeBytes: ref.size,
+                                availability: .available
                             )
                         }
                         messages[idx].attachments.append(contentsOf: chips)
@@ -1891,65 +2521,84 @@ final class ChatViewModel: ObservableObject {
                     case .fileOpened:
                         break // no UI action for now; daemon already opened the file
                     case .actionTaken(let message):
-                        isThinking = false
                         streamingAssistantMessageId = nil
                         messages[idx].content = message
-                        ensureCompletedTurnOutputPresented()
                     case .taskRating(let level, let score, let reasons, let privacyRisk):
                         messages[idx].taskRating = (level: level, score: score, reasons: reasons, privacyRisk: privacyRisk)
-                    case .done(let returnedSessionId):
+                    case .done:
                         await presenter.finish()
                         for activityIndex in messages[idx].activities.indices
                             where messages[idx].activities[activityIndex].status == "running" {
                             messages[idx].activities[activityIndex].status = "completed"
                         }
-                        if let sid = returnedSessionId { sessionId = sid }
-                        toolStatus = nil
-                        isThinking = false
                         streamingAssistantMessageId = nil
-                        ensureCompletedTurnOutputPresented()
-                        Task { await loadDebugTrace(for: messages[idx].id) }
                     }
                 }
                 await presenter.finish()
-                isThinking = false
                 streamingAssistantMessageId = nil
-                ensureCompletedTurnOutputPresented()
+                await restoreCurrentChat(preservingActivePresentation: true)
             } catch {
-                isThinking = false
-                toolStatus = nil
                 streamingAssistantMessageId = nil
                 messages[idx].content = "Chyba: \(error.localizedDescription)"
-                ensureCompletedTurnOutputPresented()
+                await restoreCurrentChat(preservingActivePresentation: true)
+                let authoritativeAdmission = Self.submissionWasAdmitted(
+                    before: submissionSnapshot,
+                    after: self.currentChatSnapshot,
+                    exactText: text)
+                if !admissionWasObserved && !authoritativeAdmission {
+                    var availableIdentities = Set<String>()
+                    for attachment in attachments {
+                        if (try? await client.attachment(id: attachment.id)) != nil {
+                            availableIdentities.insert(attachment.id)
+                        }
+                    }
+                    applyRejectedSubmissionDraft(
+                        text: text,
+                        attachments: attachments,
+                        availableAttachmentIdentities: availableIdentities)
+                }
             }
         }
     }
 
-    // MARK: - Daemon-wide events (automations + background approvals)
+    // MARK: - Authoritative Work projection
 
-    /// Set by AppDelegate — opens the notch when a background approval arrives.
-    var onApprovalArrived: (() -> Void)?
-    /// Bumped on any automation lifecycle event; the automations surface
-    /// refetches authoritative records when it changes.
+    /// Bumped after an authoritative Work revision advances; the Automations
+    /// content projection then refetches its authorized records.
     @Published var automationsRefreshID = UUID()
     private var eventsMonitorTask: Task<Void, Never>?
 
-    /// Subscribe to GET /events with reconnect. Pending approvals are fetched
-    /// at start and after every reconnect so durable approvals are not missed.
+    /// Maintain one fenced consumer. Ordered events carry Work revisions; a
+    /// one-second snapshot reconciliation also observes Model Runtime phase.
+    /// Transport failures never synthesize presentation state.
     func startEventsMonitor() {
         eventsMonitorTask?.cancel()
         eventsMonitorTask = Task {
+            var lastCursor: UInt64?
+            var pollCount = 0
             while !Task.isCancelled {
-                await refreshPendingApprovals()
                 do {
-                    for try await event in client.globalEvents() {
-                        guard !Task.isCancelled else { return }
-                        await handleGlobalEvent(event)
+                    try await notchEventConsumer.synchronize()
+                    pollCount += 1
+                    if pollCount.isMultiple(of: 4) {
+                        try await notchEventConsumer.reconcileSnapshot()
                     }
+                    let cursor = notchPresentation.revision.cursor
+                    if cursor != lastCursor {
+                        lastCursor = cursor
+                        refreshAutomationSessionProjection()
+                        await refreshPendingApprovals()
+                        automationsRefreshID = UUID()
+                        if notchInteractionMode == .automations {
+                            await refreshAutomations()
+                        }
+                    }
+                } catch NotchEventTransportError.consumerFenced {
+                    return
                 } catch {
-                    // Daemon restarting or unreachable — retry shortly.
+                    notchEventConsumer.invalidateConsumerFence()
                 }
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .milliseconds(250))
             }
         }
     }
@@ -1959,30 +2608,11 @@ final class ChatViewModel: ObservableObject {
         eventsMonitorTask = nil
     }
 
-    private func handleGlobalEvent(_ event: DaemonClient.GlobalEvent) async {
-        switch event.type {
-        case "approval_requested":
-            // Event payloads are notifications, not truth — refetch.
-            await refreshPendingApprovals()
-        case let t where t.hasPrefix("automation"):
-            automationsRefreshID = UUID()
-            if notchInteractionMode == .automations {
-                await refreshAutomations()
-            }
-        default:
-            break
-        }
-    }
-
     /// Refetch the authoritative pending-approval list; opens the notch when
     /// approvals exist and nothing is being shown.
     func refreshPendingApprovals() async {
         guard let items = try? await client.pendingApprovals() else { return }
-        let hadNone = pendingApprovals.isEmpty
         pendingApprovals = items
-        if hadNone && !items.isEmpty {
-            onApprovalArrived?()
-        }
     }
 
     func startApprovalPolling() {
@@ -2004,6 +2634,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     func decideApproval(_ item: ApprovalItem, allow: Bool) {
+        guard item.id == notchPresentation.pendingApprovalIdentity else { return }
         pendingApprovals.removeAll { $0.id == item.id }
         Task {
             try? await client.decideApproval(id: item.id, allow: allow)
@@ -2038,12 +2669,15 @@ final class ChatViewModel: ObservableObject {
                 }
             }
             pendingAttachments.append(contentsOf: added)
+            scheduleDraftPersistence()
             isUploadingAttachment = false
         }
     }
 
     func removeAttachment(id: String) {
         pendingAttachments.removeAll { $0.id == id }
+        restoredPendingAttachmentReferences.removeAll { $0 == id }
+        scheduleDraftPersistence()
     }
 
     // MARK: - Image paste (Part B — Phase 7)
@@ -2128,15 +2762,4 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Private
 
-    private func startFreshSession() async {
-        sessionId = nil
-        await startNewSession()
-    }
-
-    private func startNewSession() async {
-        guard sessionId == nil else { return }
-        do {
-            sessionId = try await client.createSession()
-        } catch {}
-    }
 }

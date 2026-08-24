@@ -28,7 +28,6 @@ impl From<super::SynthesisPhase> for EvidencePhase {
             super::SynthesisPhase::LoadingSynthesisModel => Self::LoadingSynthesisModel,
             super::SynthesisPhase::PreparingAnswer => Self::PreparingAnswer,
             super::SynthesisPhase::Repairing => Self::Repairing,
-            super::SynthesisPhase::FallingBack => Self::FallingBack,
             super::SynthesisPhase::Validating => Self::Validating,
             super::SynthesisPhase::DeterministicRendering => Self::DeterministicRendering,
         }

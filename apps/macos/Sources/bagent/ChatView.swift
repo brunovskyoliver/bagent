@@ -24,10 +24,11 @@ enum NotchWrapMetrics {
     static let cmuxBridgeHeight: CGFloat  = 19   // single caption line, minimal growth
     static let settingsWingWidth: CGFloat   = 205  // /settings surface
     static let settingsBridgeHeight: CGFloat = 252
-    static let automationsWingWidth: CGFloat = 205   // /automations surface
-    static let automationsBridgeHeight: CGFloat = 214
-    /// The setup page carries credentials + the rules editor — it needs the full bridge.
-    static let setupBridgeHeight: CGFloat   = 280
+    /// Automation Session split view: 190 pt master + divider/gutters inside
+    /// the 252 pt bridge. The accepted status pill remains at its Stage 5
+    /// origin because the outer panel geometry is unchanged.
+    static let automationsWingWidth: CGFloat = 248
+    static let automationsBridgeHeight: CGFloat = 252
     static let slashSuggestionRowHeight: CGFloat = 24  // one command suggestion row
     static let wheelWingWidth: CGFloat    = 196  // paste wheel — 5 chips along the arc
     static let wheelBridgeHeight: CGFloat = 36   // thin strip; the dome carries the height
@@ -299,6 +300,8 @@ struct NotchWrapView: View {
     let onTap: () -> Void
     let onHoverChanged: (Bool) -> Void
     @ObservedObject var browserCoordinator: BrowserCoordinator
+    var acceptanceReduceMotionOverride: Bool? = nil
+    var acceptanceSettingsState: CompassRailAcceptanceState? = nil
 
     init(
         notchWidth: CGFloat,
@@ -306,7 +309,9 @@ struct NotchWrapView: View {
         viewModel: ChatViewModel,
         onTap: @escaping () -> Void,
         onHoverChanged: @escaping (Bool) -> Void,
-        browserCoordinator: BrowserCoordinator = BrowserCoordinator()
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator(),
+        acceptanceReduceMotionOverride: Bool? = nil,
+        acceptanceSettingsState: CompassRailAcceptanceState? = nil
     ) {
         self.notchWidth = notchWidth
         self.notchHeight = notchHeight
@@ -314,6 +319,8 @@ struct NotchWrapView: View {
         self.onTap = onTap
         self.onHoverChanged = onHoverChanged
         self.browserCoordinator = browserCoordinator
+        self.acceptanceReduceMotionOverride = acceptanceReduceMotionOverride
+        self.acceptanceSettingsState = acceptanceSettingsState
     }
 
     // Explicit @State so withAnimation directly tweens the shape's animatableData.
@@ -336,7 +343,6 @@ struct NotchWrapView: View {
     @State private var hoverIconRevealID = UUID()
     @State private var inlineRevealID = UUID()
     @State private var borderPulseOpacity: CGFloat = 0.35
-    @State private var previousNotchInteractionMode: NotchInteractionMode = .collapsed
     @State private var returningStatusDotFromOutput = false
     /// Content-fit output wing — grow-only per assistant message so the panel
     /// never pumps narrower mid-stream; reset when a new message starts.
@@ -344,7 +350,13 @@ struct NotchWrapView: View {
     @State private var outputStatusReturnStartPos: CGPoint = .zero
     @State private var outputStatusReturnStartBridgeHeight: CGFloat = NotchWrapMetrics.outputMinBridgeHeight
     /// Multiple left-wing icons rest as an overlapped deck; hover fans them out.
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var leftWingFanned = false
+    @State private var leftWingRestackWork: DispatchWorkItem?
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
+
+    private var reduceMotion: Bool {
+        acceptanceReduceMotionOverride ?? systemReduceMotion
+    }
 
     // Panel is sized for voice mode (the widest/tallest state) so the frame never needs
     // AppKit resizing. notchOffset = voiceWingWidth = left edge of the physical notch.
@@ -352,7 +364,7 @@ struct NotchWrapView: View {
 
     private var surfaceAnimation: Animation {
         reduceMotion
-            ? .easeInOut(duration: 0.18)
+            ? .linear(duration: 0)
             : .easeInOut(duration: NotchWrapMetrics.surfaceDuration)
     }
     private var status: AgentStatus { viewModel.agentStatus }
@@ -360,6 +372,13 @@ struct NotchWrapView: View {
         viewModel.notchInteractionMode == .input || viewModel.notchInteractionMode == .output
             || viewModel.notchInteractionMode == .settings
             || viewModel.notchInteractionMode == .automations
+            || isProjectionSurfaceActive
+    }
+    private var isProjectionSurfaceActive: Bool {
+        (viewModel.notchPresentation.geometry.bridgeHeight > 0
+            || viewModel.notchPresentation.statusPill.label != nil)
+            && (viewModel.notchInteractionMode == .collapsed
+                || viewModel.notchInteractionMode == .thinking)
     }
     private var isSettingsActive: Bool { viewModel.notchInteractionMode == .settings }
 
@@ -385,30 +404,39 @@ struct NotchWrapView: View {
     }
 
     private func inlineWingWidth(for mode: NotchInteractionMode) -> CGFloat {
+        if isProjectionSurfaceActive { return viewModel.notchPresentation.geometry.wingWidth }
+        let base: CGFloat
         switch mode {
-        case .output:      return outputWingWidth()
-        case .settings:    return NotchWrapMetrics.settingsWingWidth
-        case .automations: return NotchWrapMetrics.automationsWingWidth
-        default:           return NotchWrapMetrics.inlineWingWidth
+        case .output:      base = outputWingWidth()
+        case .settings:    base = NotchWrapMetrics.settingsWingWidth
+        case .automations: base = NotchWrapMetrics.automationsWingWidth
+        default:           base = NotchWrapMetrics.inlineWingWidth
         }
+        if mode == .settings { return base }
+        return viewModel.notchPresentation.statusPill.label == nil
+            ? base
+            : max(base, viewModel.notchPresentation.geometry.wingWidth)
     }
 
     private func inlineBridgeHeight(for mode: NotchInteractionMode) -> CGFloat {
+        if isProjectionSurfaceActive { return viewModel.notchPresentation.geometry.bridgeHeight }
+        if mode == .output, viewModel.notchPresentation.focusedWorkIdentity != nil {
+            return viewModel.notchPresentation.geometry.bridgeHeight
+        }
         switch mode {
         case .output:   return outputBridgeHeight()
-        case .settings:
-            return viewModel.notchSettingsPage == .setup
-                ? NotchWrapMetrics.setupBridgeHeight
-                : NotchWrapMetrics.settingsBridgeHeight
+        case .settings: return NotchWrapMetrics.settingsBridgeHeight
         case .automations:
             return NotchWrapMetrics.automationsBridgeHeight
         default:
             // Slash-command suggestion rows sit under the input field.
             let suggestionsExtra = CGFloat(viewModel.slashSuggestions.count)
                 * NotchWrapMetrics.slashSuggestionRowHeight
+            let commandErrorExtra = viewModel.slashCommandError == nil
+                ? 0 : NotchWrapMetrics.slashSuggestionRowHeight
             return min(
                 NotchWrapMetrics.maxBridgeHeight,
-                NotchWrapMetrics.inlineBridgeHeight + suggestionsExtra
+                NotchWrapMetrics.inlineBridgeHeight + suggestionsExtra + commandErrorExtra
             )
         }
     }
@@ -417,7 +445,7 @@ struct NotchWrapView: View {
         NotchOutputLayout.responseText(
             latestText: viewModel.latestAssistantText,
             isStreaming: viewModel.isLatestAssistantStreaming,
-            isThinking: viewModel.isThinking
+            isThinking: viewModel.notchPresentation.hasActiveForegroundWork
         )
     }
 
@@ -459,7 +487,7 @@ struct NotchWrapView: View {
         // Browse header row (‹n/N› + prompt) sits above the response text.
         let browseExtra: CGFloat = viewModel.historyBrowseIndex == nil ? 0 : 20
         // Tool-status chip also sits above the response text during streaming.
-        let toolChipExtra: CGFloat = viewModel.toolStatus == nil ? 0 : 20
+        let toolChipExtra: CGFloat = viewModel.notchPresentation.rail.selectedStage == .tool ? 20 : 0
         let activityExtra = NotchActivityLayout.extraHeight(
             activityCount: viewModel.latestTranscriptActivityCount,
             expanded: viewModel.isActivityTranscriptExpanded
@@ -511,10 +539,6 @@ struct NotchWrapView: View {
     }
 
     private func refreshSurface() {
-        // Captured before updateStatusDotTravelState() mutates previousNotchInteractionMode.
-        let previousModeWasOutput = previousNotchInteractionMode == .output
-        updateStatusDotTravelState()
-
         let hoverExpanded = isHovered || isDragTargeted || viewModel.pillHovered
         var targetWing: CGFloat
         let targetBridge: CGFloat
@@ -542,7 +566,7 @@ struct NotchWrapView: View {
         // Width/height growth while already in output mode must not replay the
         // inline reveal — only the initial transition into output resets it.
         let outputContentOnlyResize = viewModel.notchInteractionMode == .output
-            && previousModeWasOutput
+            && inlineContentOpacity > 0
         var instantTargetUpdate = Transaction()
         instantTargetUpdate.disablesAnimations = true
         withTransaction(instantTargetUpdate) {
@@ -610,9 +634,11 @@ struct NotchWrapView: View {
         }
     }
 
-    private func updateStatusDotTravelState() {
-        let currentMode = viewModel.notchInteractionMode
-        if previousNotchInteractionMode == .output && currentMode != .output {
+    private func updateStatusDotTravelState(
+        previousMode: NotchInteractionMode,
+        currentMode: NotchInteractionMode
+    ) {
+        if previousMode == .output && currentMode != .output {
             outputStatusReturnStartPos = outputStatusTargetPos
             outputStatusReturnStartBridgeHeight = max(1, targetBridgeHeight)
             returningStatusDotFromOutput = !reduceMotion
@@ -621,15 +647,14 @@ struct NotchWrapView: View {
         } else if returningStatusDotFromOutput && bridgeHeight <= NotchWrapMetrics.idleBridgeHeight + 0.5 {
             returningStatusDotFromOutput = false
         }
-        previousNotchInteractionMode = currentMode
     }
 
     private func updateInlineOpacity(active: Bool) {
         if active {
             let delay = reduceMotion ? 0.0 : NotchWrapMetrics.surfaceDuration * 0.62
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard viewModel.notchInteractionMode != .collapsed else { return }
-                withAnimation(.easeOut(duration: reduceMotion ? 0.10 : 0.24)) {
+                guard isInlineActive else { return }
+                withAnimation(.easeOut(duration: reduceMotion ? 0.12 : 0.24)) {
                     inlineContentOpacity = 1
                 }
             }
@@ -711,7 +736,7 @@ struct NotchWrapView: View {
                 y: collapsedStatusPos.y + (outputStatusTargetPos.y - collapsedStatusPos.y) * progress
             )
         }
-        if returningStatusDotFromOutput || (previousNotchInteractionMode == .output && viewModel.notchInteractionMode != .output) {
+        if returningStatusDotFromOutput {
             let startPos = returningStatusDotFromOutput ? outputStatusReturnStartPos : outputStatusTargetPos
             let startBridgeHeight = returningStatusDotFromOutput
                 ? outputStatusReturnStartBridgeHeight
@@ -751,7 +776,9 @@ struct NotchWrapView: View {
                     viewModel: viewModel,
                     outputGrowthPhase: viewModel.isLatestAssistantStreaming
                         && targetBridgeHeight < NotchWrapMetrics.outputMaxBridgeHeight,
-                    browserCoordinator: browserCoordinator
+                    browserCoordinator: browserCoordinator,
+                    acceptanceSettingsState: acceptanceSettingsState,
+                    acceptanceReduceMotionOverride: acceptanceReduceMotionOverride
                 )
                     .frame(
                         width: (notchWidth + 2 * contentWing) * NotchWrapMetrics.inlineContentScale,
@@ -770,8 +797,9 @@ struct NotchWrapView: View {
 
     @ViewBuilder
     private var statusDotLayer: some View {
-        if !viewModel.traceCopiedFlash,
-           status != .ready || (viewModel.isExpanded && !isInlineActive) {
+        if viewModel.notchPresentation.statusPill.label == nil,
+           status != .ready || ((viewModel.notchPresentation.interactionMode != .collapsed
+                && viewModel.notchPresentation.interactionMode != .thinking) && !isInlineActive) {
             StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
                 .position(statusDotPos)
                 .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
@@ -779,34 +807,38 @@ struct NotchWrapView: View {
         }
     }
 
-    /// Transient "trace copied" confirmation (⌥-click). It lives on the right
-    /// wing with the status pills — in the left-wing row it landed on top of
-    /// the Browser Cues.
-    private var traceCopiedLayer: some View {
-        // Always in the tree, so appearing is a fade/scale in place. As a
-        // conditional insertion SwiftUI animated it in from the layer's origin
-        // — the tick flew up from the bottom-left corner.
-        Image(systemName: "checkmark.circle.fill")
-            .font(.system(size: Self.leftWingIconSize * 0.8, weight: .semibold))
-            .symbolRenderingMode(.palette)
-            .foregroundStyle(.white, .green)
-            .frame(width: Self.leftWingIconSize, height: Self.leftWingIconSize)
-            .opacity(viewModel.traceCopiedFlash ? 1 : 0)
-            .scaleEffect(viewModel.traceCopiedFlash ? 1 : 0.5)
-            .animation(reduceMotion ? nil : .spring(response: 0.26, dampingFraction: 0.7),
-                       value: viewModel.traceCopiedFlash)
-            .accessibilityLabel("Trace skopírovaný do schránky")
-            .allowsHitTesting(false)
-            .position(statusDotPos)
+    @ViewBuilder
+    private var invariantStatusPillLayer: some View {
+        if viewModel.notchPresentation.statusPill.label != nil {
+            InvariantNotchStatusPill(
+                presentation: viewModel.notchPresentation.statusPill,
+                activeAutomationCount: viewModel.notchPresentation.activeAutomationCount,
+                action: viewModel.openActiveAutomations
+            )
+            .position(
+                x: (isSettingsActive
+                    ? NotchPillLayout.settingsOrigin(maxPanelWidth: maxSize.width)
+                    : NotchPillLayout.origin(maxPanelWidth: maxSize.width)).x
+                    + NotchPillLayout.size.width / 2,
+                y: (isSettingsActive
+                    ? NotchPillLayout.settingsOrigin(maxPanelWidth: maxSize.width)
+                    : NotchPillLayout.origin(maxPanelWidth: maxSize.width)).y
+                    + NotchPillLayout.size.height / 2
+            )
             .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
+            .opacity(inlineContentOpacity)
             .clipShape(animatedNotchClipShape)
+        }
     }
 
     /// Pending cmux events — animated dot on the right wing, own agent status wins.
     @ViewBuilder
     private var cmuxDotLayer: some View {
         if let kind = viewModel.cmuxDotKind,
-           !isInlineActive, !viewModel.isExpanded, status == .ready {
+           !isInlineActive,
+           viewModel.notchPresentation.interactionMode == .collapsed
+                || viewModel.notchPresentation.interactionMode == .thinking,
+           status == .ready {
             CmuxStatusDotView(kind: kind, reduceMotion: reduceMotion)
                 .position(rightIconPos)
                 .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
@@ -958,7 +990,9 @@ struct NotchWrapView: View {
     /// The left cmux icon shows while any cmux event is pending and the notch is in
     /// its collapsed presentation (not inline/expanded).
     private var showsCmuxLeftIcon: Bool {
-        guard !isInlineActive, !viewModel.isExpanded else { return false }
+        guard !isInlineActive,
+              viewModel.notchPresentation.interactionMode == .collapsed
+                || viewModel.notchPresentation.interactionMode == .thinking else { return false }
         return displayedCmuxNotification != nil
     }
 
@@ -1001,20 +1035,7 @@ struct NotchWrapView: View {
     }
 
     /// Click-through on a cmux banner/reveal focuses the cmux workspace/tab.
-    /// Option+click in any state copies the session/debug trace instead.
     private func handleTap() {
-        if NSApp.currentEvent?.modifierFlags.contains(.option) == true {
-            // A cue owns its own ⌥-click. Checked against the cue's tracked
-            // screen rect rather than a hit test: the busy shake is a render
-            // transform, so the icon can sit a few points off its own view.
-            if let event = NSApp.currentEvent,
-               let window = event.window,
-               browserCoordinator.isPointOverCue(window.convertPoint(toScreen: event.locationInWindow)) {
-                return
-            }
-            viewModel.copyDebugTrace()
-            return
-        }
         if isCmuxSurfaceActive, let notification = displayedCmuxNotification {
             viewModel.focusCmux(notification)
             refreshSurface()
@@ -1053,7 +1074,8 @@ struct NotchWrapView: View {
         !isInlineActive
             && !isCmuxSurfaceActive
             && viewModel.notchInteractionMode != .thinking
-            && (viewModel.isExpanded || isHovered)
+            && ((viewModel.notchPresentation.interactionMode != .collapsed
+                && viewModel.notchPresentation.interactionMode != .thinking) || isHovered)
     }
 
     private func isNearVisibleSurface(_ point: CGPoint) -> Bool {
@@ -1129,12 +1151,12 @@ struct NotchWrapView: View {
             iconDepartureLayer
 
             // Left icon — only when chat open, hovered, or voice active (idle = blank notch).
-            // In settings mode it shows the current page's icon; DrawInSymbol's
-            // symbolEffect(.replace) animates the swap between pages.
+            // In settings mode it shows the selected top-level area's icon;
+            // child routes keep the same parent icon.
             if showsLeftStatusIcon || isSettingsActive {
                 DrawInSymbol(
                     systemName: isSettingsActive
-                        ? viewModel.notchSettingsPage.symbolName
+                        ? viewModel.compassRailRoute.area.symbolName
                         : (viewModel.selectedSourceMode?.symbolName ?? "sparkles"),
                     trigger: hoverIconRevealID,
                     duration: NotchWrapMetrics.surfaceDuration,
@@ -1147,9 +1169,9 @@ struct NotchWrapView: View {
             // bg); shown when chat open, task running, approval pending, or error
             // (so a down daemon always surfaces).
             inlineSurfaceLayer
+            invariantStatusPillLayer
             cmuxBannerLayer
             statusDotLayer
-            traceCopiedLayer
             cmuxDotLayer
             pasteWheelLayer
         }
@@ -1229,16 +1251,22 @@ struct NotchWrapView: View {
             refreshSurface()
             updateWheelOpacity(active: active)
         }
-        .onChange(of: viewModel.notchInteractionMode) { _, mode in
+        .onChange(of: viewModel.notchInteractionMode) { previousMode, mode in
+            updateStatusDotTravelState(previousMode: previousMode, currentMode: mode)
             if mode != .output { outputWingRatchet = NotchWrapMetrics.outputMinWingWidth }
             refreshSurface()
         }
-        // The setup page is taller than the other settings pages.
-        .onChange(of: viewModel.notchSettingsPage) {
+        .onChange(of: viewModel.notchPresentation.revision) {
+            refreshSurface()
+        }
+        .onChange(of: viewModel.compassRailRoute) {
             refreshSurface()
         }
         // Slash-command suggestion rows grow the input bridge.
         .onChange(of: viewModel.slashSuggestions) {
+            refreshSurface()
+        }
+        .onChange(of: viewModel.slashCommandError) {
             refreshSurface()
         }
         .onChange(of: viewModel.cmuxBanner) {
@@ -1248,9 +1276,6 @@ struct NotchWrapView: View {
             refreshSurface()
         }
         .onChange(of: browserCoordinator.cues) {
-            refreshSurface()
-        }
-        .onChange(of: viewModel.traceCopiedFlash) {
             refreshSurface()
         }
         .onChange(of: viewModel.isActivityTranscriptExpanded) {
@@ -1281,6 +1306,11 @@ struct NotchWrapView: View {
         }
         .onAppear {
             pulsing = (status == .thinking)
+            viewModel.setNotchReduceMotion(reduceMotion)
+            refreshSurface()
+        }
+        .onChange(of: reduceMotion) { _, enabled in
+            viewModel.setNotchReduceMotion(enabled)
             refreshSurface()
         }
         .onReceive(NotificationCenter.default.publisher(for: .bagentCodeCopied)) { _ in
@@ -1290,10 +1320,59 @@ struct NotchWrapView: View {
                 withAnimation(.easeInOut(duration: 0.3)) { copyFlashed = false }
             }
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("bagent — \(status.accessibilityLabel)")
-        .accessibilityHint("Otvoriť chat")
-        .accessibilityAddTraits(.isButton)
+        .modifier(NotchProjectionAccessibilityModifier(
+            enabled: isProjectionSurfaceActive,
+            presentation: viewModel.notchPresentation,
+            approval: viewModel.authoritativePendingApproval,
+            activateActivity: viewModel.activateFocusedNotchActivity,
+            openAutomations: viewModel.openActiveAutomations,
+            allowApproval: { item in viewModel.decideApproval(item, allow: true) },
+            denyApproval: { item in viewModel.decideApproval(item, allow: false) }
+        ))
+    }
+}
+
+private struct NotchProjectionAccessibilityModifier: ViewModifier {
+    let enabled: Bool
+    let presentation: NotchPresentation
+    let approval: ApprovalItem?
+    let activateActivity: () -> Void
+    let openAutomations: () -> Void
+    let allowApproval: (ApprovalItem) -> Void
+    let denyApproval: (ApprovalItem) -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.accessibilityRepresentation {
+                VStack {
+                    if let approval {
+                        Text("Approval required")
+                            .accessibilityValue(approval.description ?? "Pending action")
+                        Button("Allow") { allowApproval(approval) }
+                        Button("Deny") { denyApproval(approval) }
+                    } else if presentation.geometry.bridgeHeight > 0 {
+                        Button("Activity", action: activateActivity)
+                            .disabled(!presentation.canOpenFocusedDestination)
+                            .keyboardShortcut(.return, modifiers: [])
+                            .accessibilityValue(presentation.rail.accessibilityValue)
+                    }
+                    if presentation.statusPill.label != nil {
+                        if presentation.statusPill.opensAutomations(
+                            activeAutomationCount: presentation.activeAutomationCount
+                        ) {
+                            Button("Status", action: openAutomations)
+                                .accessibilityValue(presentation.statusPill.accessibilityValue)
+                        } else {
+                            Text("Status")
+                                .accessibilityValue(presentation.statusPill.accessibilityValue)
+                        }
+                    }
+                }
+            }
+        } else {
+            content
+        }
     }
 }
 
@@ -1340,8 +1419,10 @@ struct InlineNotchContent: View {
     @ObservedObject var browserCoordinator: BrowserCoordinator
     let showsInputLeadingIcon: Bool
     let outputGrowthPhase: Bool
+    let acceptanceSettingsState: CompassRailAcceptanceState?
+    let acceptanceReduceMotionOverride: Bool?
     @FocusState private var inputFocused: Bool
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceMotion) private var systemReduceMotion
     @State private var placeholderRevealID = UUID()
     @State private var inlineFocusRetryID = UUID()
 
@@ -1349,42 +1430,63 @@ struct InlineNotchContent: View {
         viewModel: ChatViewModel,
         showsInputLeadingIcon: Bool = true,
         outputGrowthPhase: Bool = false,
-        browserCoordinator: BrowserCoordinator = BrowserCoordinator()
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator(),
+        acceptanceSettingsState: CompassRailAcceptanceState? = nil,
+        acceptanceReduceMotionOverride: Bool? = nil
     ) {
         self.viewModel = viewModel
         self.showsInputLeadingIcon = showsInputLeadingIcon
         self.outputGrowthPhase = outputGrowthPhase
         self.browserCoordinator = browserCoordinator
+        self.acceptanceSettingsState = acceptanceSettingsState
+        self.acceptanceReduceMotionOverride = acceptanceReduceMotionOverride
     }
+
+    private var reduceMotion: Bool { acceptanceReduceMotionOverride ?? systemReduceMotion }
 
     private var canSend: Bool {
         (!viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !viewModel.pendingAttachments.isEmpty)
-            && !viewModel.isThinking
+            && !viewModel.notchPresentation.hasActiveForegroundWork
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             // A pending approval preempts every other mode — it is the only place
             // a gated write can be allowed, and it auto-denies after 60 s.
-            if let approval = viewModel.pendingApprovals.first {
+            if let approval = viewModel.authoritativePendingApproval {
                 ApprovalModalOverlay(approval: approval, viewModel: viewModel)
+            } else if viewModel.notchPresentation.statusPill.label == "APPROVE" {
+                ActivityPeekStageRailView(
+                    presentation: viewModel.notchPresentation,
+                    action: viewModel.activateFocusedNotchActivity
+                )
             } else if viewModel.showWhatsappPairing {
                 WhatsAppPairingView(viewModel: viewModel)
+            } else if viewModel.clearCurrentChatConfirmationPresented {
+                CurrentChatClearConfirmation(viewModel: viewModel)
             } else {
                 switch viewModel.notchInteractionMode {
                 case .input:
                     inputWithSuggestions
                 case .thinking:
-                    thinkingRow
+                    ActivityPeekStageRailView(
+                        presentation: viewModel.notchPresentation,
+                        action: viewModel.activateFocusedNotchActivity
+                    )
                 case .output:
                     outputView
                 case .settings:
-                    NotchSettingsContent(viewModel: viewModel, browserCoordinator: browserCoordinator)
+                    NotchSettingsContent(viewModel: viewModel, browserCoordinator: browserCoordinator, acceptanceState: acceptanceSettingsState, reduceMotionOverride: acceptanceReduceMotionOverride)
                 case .automations:
                     AutomationsNotchContent(viewModel: viewModel)
                 case .collapsed:
-                    EmptyView()
+                    if viewModel.notchPresentation.geometry.bridgeHeight > 0 {
+                        ActivityPeekStageRailView(
+                            presentation: viewModel.notchPresentation,
+                            action: viewModel.activateFocusedNotchActivity
+                        )
+                    }
                 }
             }
         }
@@ -1401,6 +1503,9 @@ struct InlineNotchContent: View {
         }
         .onChange(of: viewModel.inputText.isEmpty) { _, isEmpty in
             if isEmpty { placeholderRevealID = UUID() }
+        }
+        .onChange(of: viewModel.currentChatFocusRequestID) {
+            keepInlineInputFocused(reason: "current-chat-cleared")
         }
     }
 
@@ -1445,9 +1550,18 @@ struct InlineNotchContent: View {
     private var inputWithSuggestions: some View {
         VStack(alignment: .leading, spacing: 4) {
             inputRow
+            pendingAttachmentRows
+            restoredCurrentChatRecords
             if !viewModel.slashSuggestions.isEmpty {
                 slashSuggestionRows
                     .transition(.opacity)
+            }
+            if let error = viewModel.slashCommandError {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red.opacity(0.9))
+                    .lineLimit(1)
+                    .accessibilityAddTraits(.isStaticText)
             }
         }
         .animation(
@@ -1460,22 +1574,28 @@ struct InlineNotchContent: View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(Array(viewModel.slashSuggestions.enumerated()), id: \.element.id) { index, cmd in
                 let selected = index == viewModel.slashSelectionIndex
-                HStack(spacing: 8) {
-                    if let symbol = cmd.symbol {
-                        Image(systemName: symbol)
-                            .font(.system(size: 10, weight: .medium))
+                Button {
+                    _ = viewModel.completeSlashSuggestion(cmd)
+                    inputFocused = true
+                } label: {
+                    HStack(spacing: 8) {
+                        if let symbol = cmd.symbol {
+                            Image(systemName: symbol)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                                .frame(width: 14)
+                        }
+                        Text(cmd.command)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
+                        Text(cmd.subtitle)
+                            .font(.system(size: 11))
                             .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                            .frame(width: 14)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
                     }
-                    Text(cmd.command)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
-                    Text(cmd.subtitle)
-                        .font(.system(size: 11))
-                        .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
                 }
+                .buttonStyle(.plain)
                 .padding(.horizontal, 8)
                 .frame(height: NotchWrapMetrics.slashSuggestionRowHeight - 2)
                 .background(
@@ -1483,26 +1603,31 @@ struct InlineNotchContent: View {
                         .fill(Color.white.opacity(selected ? 0.12 : 0.06))
                 )
                 .contentShape(Rectangle())
-                .onTapGesture {
-                    _ = viewModel.acceptSlashSuggestion(cmd)
-                }
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("Command \(cmd.command), \(cmd.subtitle)")
+                .accessibilityLabel(String(
+                    format: String(
+                        localized: "slashCommand.suggestion.accessibilityLabel",
+                        defaultValue: "Command %@, %@"),
+                    cmd.command,
+                    cmd.subtitle))
                 .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
             }
         }
     }
 
     private var thinkingRow: some View {
-        HStack(spacing: 10) {
+        let toolCaption = viewModel.notchPresentation.rail.selectedStage == .tool
+            ? viewModel.notchPresentation.rail.caption
+            : nil
+        return HStack(spacing: 10) {
             ThinkingIndicator()
                 .scaleEffect(0.74)
             VStack(alignment: .leading, spacing: 3) {
-                Text(viewModel.latestEvidenceStatus ?? viewModel.toolStatus ?? "Thinking")
+                Text(viewModel.latestEvidenceStatus ?? toolCaption ?? "Thinking")
                     .font(.system(size: 14, weight: .regular))
                     .foregroundStyle(NotchWrapMetrics.notchTextPrimary)
                     .lineLimit(1)
-                    .animation(.easeOut(duration: 0.18), value: viewModel.toolStatus)
+                    .animation(.easeOut(duration: 0.18), value: viewModel.notchPresentation.rail.caption)
                 if !viewModel.latestUserText.isEmpty {
                     Text(viewModel.latestUserText)
                         .font(.system(size: 12, weight: .regular))
@@ -1519,7 +1644,7 @@ struct InlineNotchContent: View {
         let text = NotchOutputLayout.responseText(
             latestText: viewModel.latestAssistantText,
             isStreaming: viewModel.isLatestAssistantStreaming,
-            isThinking: viewModel.isThinking
+            isThinking: viewModel.notchPresentation.hasActiveForegroundWork
         )
         return VStack(alignment: .leading, spacing: 6) {
             // History-browse header (↑/↓ on empty input): position + the prompt
@@ -1557,6 +1682,87 @@ struct InlineNotchContent: View {
             .accessibilityValue(text)
             if let sources = viewModel.latestAssistantMessage?.sources, !sources.isEmpty {
                 sourceLinks(sources)
+            }
+            restoredCurrentChatRecords
+        }
+    }
+
+    @ViewBuilder
+    private var pendingAttachmentRows: some View {
+        if !viewModel.pendingAttachments.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(viewModel.pendingAttachments) { attachment in
+                    HStack(spacing: 6) {
+                        Image(systemName: attachment.availability == .available
+                            ? "paperclip" : "exclamationmark.triangle")
+                        Text(attachment.filename).lineLimit(1)
+                        if attachment.availability == .unavailable {
+                            Text(String(
+                                localized: "currentChat.attachment.unavailable",
+                                defaultValue: "Attachment unavailable"))
+                                .foregroundStyle(.orange)
+                        }
+                        Spacer(minLength: 2)
+                        Button {
+                            viewModel.removeAttachment(id: attachment.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(String(
+                            localized: "currentChat.attachment.remove",
+                            defaultValue: "Remove attachment"))
+                    }
+                }
+            }
+            .font(.system(size: 10.5))
+            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+        }
+    }
+
+    @ViewBuilder
+    private var restoredCurrentChatRecords: some View {
+        let attachments = viewModel.restoredSubmittedAttachments
+        let sources = viewModel.restoredValidatedSources
+        let connectors = viewModel.restoredConnectorReferences
+        let approvals = viewModel.restoredApprovalPresentations
+        if !attachments.isEmpty || !sources.isEmpty || !connectors.isEmpty || !approvals.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(attachments) { attachment in
+                    retainedRecord(
+                        icon: "paperclip",
+                        label: attachment.filename,
+                        available: attachment.availability == .available)
+                }
+                ForEach(sources, id: \.identity) { source in
+                    retainedRecord(icon: "link", label: source.label, available: source.availability == "available")
+                }
+                ForEach(connectors, id: \.identity) { reference in
+                    retainedRecord(icon: "point.3.connected.trianglepath.dotted", label: reference.label,
+                                   available: reference.availability == "available")
+                }
+                ForEach(approvals, id: \.identity) { approval in
+                    Label("\(approval.category): \(approval.outcome)", systemImage: "checkmark.shield")
+                }
+            }
+            .font(.system(size: 10.5))
+            .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(String(
+                localized: "currentChat.restoredRecords.accessibilityLabel",
+                defaultValue: "Restored Current Chat records"))
+        }
+    }
+
+    private func retainedRecord(icon: String, label: String, available: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: available ? icon : "exclamationmark.triangle")
+            Text(label).lineLimit(1)
+            if !available {
+                Text(String(
+                    localized: "currentChat.attachment.unavailable",
+                    defaultValue: "Unavailable"))
+                    .foregroundStyle(.orange)
             }
         }
     }
@@ -1722,6 +1928,10 @@ struct InlineNotchContent: View {
     }
 
     private func focusIfNeeded() {
+        guard !viewModel.clearCurrentChatConfirmationPresented else {
+            inputFocused = false
+            return
+        }
         guard viewModel.notchInteractionMode == .input else {
             inlineFocusRetryID = UUID()
             inputFocused = false
@@ -1732,17 +1942,58 @@ struct InlineNotchContent: View {
 
     private func keepInlineInputFocused(reason: String) {
         _ = reason
+        let restoreCaretAtEnd = viewModel.consumeCurrentChatCaretRestoration()
         let retryID = UUID()
         inlineFocusRetryID = retryID
-        for attempt in 0..<5 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 + Double(attempt) * 0.06) {
+        for attempt in 0..<12 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 + Double(attempt) * 0.08) {
                 guard inlineFocusRetryID == retryID,
-                      viewModel.notchInteractionMode == .input
+                      viewModel.notchInteractionMode == .input,
+                      !viewModel.clearCurrentChatConfirmationPresented
                 else { return }
                 NSApp.activate(ignoringOtherApps: true)
                 inputFocused = true
+                DispatchQueue.main.async {
+                    guard restoreCaretAtEnd,
+                          let editor = NSApp.keyWindow?.firstResponder as? NSTextView
+                    else { return }
+                    viewModel.restoreCurrentChatCaret(in: editor)
+                }
             }
         }
+    }
+}
+
+private struct CurrentChatClearConfirmation: View {
+    @ObservedObject var viewModel: ChatViewModel
+    @FocusState private var cancelFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(String(localized: "currentChat.clear.title", defaultValue: "Clear Current Chat?"))
+                .font(.system(size: 14, weight: .semibold))
+            Text(String(
+                localized: "currentChat.clear.explanation",
+                defaultValue: "Clears completed and interrupted turns, the draft, attachments, sources, Connector References, approvals, and any Continuation Seed and Provenance. No hidden archive is kept. Automation Sessions, Runs and Definitions, Saved Long-Term Memory, external side effects, and source-session viewed state remain; no Automation Work is cancelled."))
+                .font(.system(size: 12))
+                .foregroundStyle(NotchWrapMetrics.notchTextSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button(String(localized: "currentChat.clear.cancel", defaultValue: "Cancel")) {
+                    viewModel.cancelCurrentChatClear()
+                }
+                .focused($cancelFocused)
+                .keyboardShortcut(.cancelAction)
+                Button(
+                    String(localized: "currentChat.clear.confirm", defaultValue: "Clear Current Chat"),
+                    role: .destructive
+                ) {
+                    viewModel.confirmCurrentChatClear()
+                }
+            }
+        }
+        .onAppear { cancelFocused = true }
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -2603,9 +2854,15 @@ struct ThinkingIndicator: View {
 /// The only approval surface — the daemon auto-denies after 60 s, so this must
 /// stay reachable whenever `pendingApprovals` is non-empty.
 struct ApprovalModalOverlay: View {
+    private enum FocusedAction: Hashable {
+        case deny
+        case allow
+    }
+
     let approval: ApprovalItem
     @ObservedObject var viewModel: ChatViewModel
     @State private var secondsLeft: Int = 60
+    @FocusState private var focusedAction: FocusedAction?
 
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -2667,6 +2924,8 @@ struct ApprovalModalOverlay: View {
                         .contentShape(RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
+                .focusable()
+                .focused($focusedAction, equals: .deny)
                 .keyboardShortcut(.escape, modifiers: [])
                 Button { viewModel.decideApproval(approval, allow: true) } label: {
                     Text("Schváliť")
@@ -2678,9 +2937,16 @@ struct ApprovalModalOverlay: View {
                         .contentShape(RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
+                .focusable()
+                .focused($focusedAction, equals: .allow)
                 .keyboardShortcut(.return, modifiers: [])
             }
+            .onKeyPress(.tab) {
+                focusedAction = focusedAction == .deny ? .allow : .deny
+                return .handled
+            }
         }
+        .onAppear { focusedAction = .deny }
         .onReceive(timer) { _ in
             if secondsLeft > 0 {
                 secondsLeft -= 1

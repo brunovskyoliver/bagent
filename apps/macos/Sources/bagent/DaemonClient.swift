@@ -10,6 +10,7 @@ struct DaemonHealth: Sendable {
     let baseRTUp: Bool
     let model: String
     let classifierModel: String
+    let modelRuntime: ModelRuntimeHealth?
     let mailConnector: Bool
     let notesConnector: Bool
     let codexConnector: Bool
@@ -23,6 +24,7 @@ struct DaemonHealth: Sendable {
         baseRTUp: Bool,
         model: String,
         classifierModel: String,
+        modelRuntime: ModelRuntimeHealth? = nil,
         mailConnector: Bool,
         notesConnector: Bool,
         codexConnector: Bool,
@@ -35,11 +37,28 @@ struct DaemonHealth: Sendable {
         self.baseRTUp = baseRTUp
         self.model = model
         self.classifierModel = classifierModel
+        self.modelRuntime = modelRuntime
         self.mailConnector = mailConnector
         self.notesConnector = notesConnector
         self.codexConnector = codexConnector
         self.odooConnector = odooConnector
         self.whatsappConnector = whatsappConnector
+    }
+}
+
+struct ModelRuntimeHealth: Sendable, Equatable, Decodable {
+    let phase: String
+    let leaseCount: Int
+    let residencyPinned: Bool
+    let queuedDemandCount: Int
+    let changedPIDRecovery: String
+    let preloadOnInput: Bool?
+    let sharedIdleTimeoutSeconds: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case phase, leaseCount = "lease_count", residencyPinned = "residency_pinned"
+        case queuedDemandCount = "queued_demand_count", changedPIDRecovery = "changed_pid_recovery"
+        case preloadOnInput = "preload_on_input", sharedIdleTimeoutSeconds = "shared_idle_timeout_seconds"
     }
 }
 
@@ -103,19 +122,57 @@ struct ScreenIntentResponse: Decodable, Sendable {
 
 // MARK: - Client
 
-struct DaemonClient: Sendable {
+struct DaemonClient: Sendable, NotchEventTransport {
+    enum CurrentChatMutationError: Error {
+        case conflict
+        case bound
+        case unavailable
+    }
+
+    enum UIRelaunchTransferError: Error, Equatable {
+        case staleConsumer
+        case duplicateReplacement
+        case expired
+        case notReady
+        case unavailable
+    }
+
+    struct UIRelaunchTransferStatus: Decodable, Sendable, Equatable {
+        let status: String
+        let timeoutSeconds: Int
+
+        enum CodingKeys: String, CodingKey {
+            case status
+            case timeoutSeconds = "timeoutSeconds"
+        }
+    }
+
+    private struct UIRelaunchTransferRequest: Encodable {
+        let transferIdentity: String
+        let oldConsumerFence: String?
+        let replacementConsumerFence: String?
+    }
 
     enum TavilyConfigurationStatus: String, Codable, Sendable, Equatable {
         case pending
-        case configured
         case absent
+        case configured
         case configurationFailed = "configuration_failed"
     }
 
-    private static let dataDir = FileManager.default
-        .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-        .first!
-        .appendingPathComponent("bagent")
+    private static let dataDir: URL = {
+        if (ProcessInfo.processInfo.environment["BAGENT_STAGE7A_ACCEPTANCE_FIXTURE"] == "1"
+            || ProcessInfo.processInfo.environment["BAGENT_STAGE7B_SETTINGS_FIXTURE"] == "1"
+            || ProcessInfo.processInfo.environment["BAGENT_STAGE7C_ACCEPTANCE_FIXTURE"] == "1"
+            || ProcessInfo.processInfo.environment[Stage8AcceptanceCLI.environmentKey] == "1"),
+           let path = ProcessInfo.processInfo.environment["BAGENT_DATA_DIR"] {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        return FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!
+            .appendingPathComponent("bagent")
+    }()
 
     private struct Creds {
         let port: Int
@@ -162,6 +219,21 @@ struct DaemonClient: Sendable {
 
     // MARK: Health
 
+    /// The daemon opens the exact Mail and Notes resources it owns. Only the
+    /// normalized per-resource outcome crosses into the UI.
+    func fullDiskAccessProbe() async -> DaemonFullDiskAccessSnapshot {
+        do {
+            let c = try await loadCreds()
+            var request = authedRequest("/permissions/full-disk-access", creds: c)
+            request.timeoutInterval = 3
+            let (data, response) = try await URLSession.shared.data(for: request)
+            try validateOK(data: data, response: response)
+            return try JSONDecoder().decode(DaemonFullDiskAccessSnapshot.self, from: data)
+        } catch {
+            return DaemonFullDiskAccessSnapshot(mail: .indeterminate, notes: .indeterminate)
+        }
+    }
+
     func healthStatus() async -> DaemonHealth {
         do {
             let c = try await loadCreds()
@@ -205,6 +277,7 @@ struct DaemonClient: Sendable {
             struct HealthResp: Decodable {
                 let status: String; let basert: Bool; let model: String
                 let classifier_model: String?
+                let model_runtime: ModelRuntimeHealth?
                 let process_id: Int?
                 let tavily_configuration: TavilyConfigurationStatus?
                 let connectors: ConnectorResp?
@@ -216,7 +289,8 @@ struct DaemonClient: Sendable {
                 tavilyConfiguration: h.tavily_configuration ?? .pending,
                 baseRTUp: h.basert,
                 model: h.model,
-                classifierModel: h.classifier_model ?? BaseRTLaunchAgent.model,
+                classifierModel: h.classifier_model ?? ModelRuntimeConfiguration.model,
+                modelRuntime: h.model_runtime,
                 mailConnector:      h.connectors?.mail      ?? false,
                 notesConnector:     h.connectors?.notes     ?? false,
                 codexConnector:     h.connectors?.codex     ?? false,
@@ -434,7 +508,6 @@ struct DaemonClient: Sendable {
         case evidenceOutcome(EvidenceOutcomeEvent)
         case evidenceAcquisitionDiagnostic(EvidenceAcquisitionDiagnostic)
         case sourceDiscovered(TranscriptSource)
-        case debugTrace(DebugTraceSummary)
         case memorySaved(id: String)
         case approvalRequested(id: String, tool: String, description: String?)
         case toolBlocked(tool: String)
@@ -452,7 +525,7 @@ struct DaemonClient: Sendable {
         case odooFound(OdooRef)
         /// Phase 11: WhatsApp chat found.
         case whatsappFound(WhatsappRef)
-        case done(sessionId: String?)
+        case done
     }
 
     static func evidenceChatEvent(from event: SSEEvent) -> ChatEvent? {
@@ -546,18 +619,6 @@ struct DaemonClient: Sendable {
         let snippet: String?
     }
 
-    struct DebugTraceSummary: Decodable, Sendable {
-        let prompt_trace_id: String
-        let session_id: String?
-        let preview: String
-        let prompt_chars: Int?
-        let prompt_token_estimate: Int?
-        let message_count: Int?
-        let selected_skill_names: [String]?
-        let selected_memory_ids: [String]?
-        let conversation_recall_injected: Bool?
-    }
-
     /// Upload a local file to `POST /attachments` and return a `ChatAttachment`.
     func uploadAttachment(url: URL) async throws -> ChatAttachment {
         let c = try await loadCreds()
@@ -613,8 +674,42 @@ struct DaemonClient: Sendable {
             kind: kind,
             localURL: url,
             sizeBytes: resp.size,
+            availability: .available,
             thumbnail: thumbnail
         )
+    }
+
+    /// Refetch daemon-owned metadata for a pending attachment reference.
+    func attachment(id: String) async throws -> ChatAttachment {
+        let c = try await loadCreds()
+        let encodedID = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/attachments/\(encodedID)", creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.badStatus
+        }
+        struct Response: Decodable {
+            let id: String
+            let filename: String
+            let mime: String
+            let size: Int
+        }
+        let metadata = try JSONDecoder().decode(Response.self, from: data)
+        return ChatAttachment(
+            id: metadata.id,
+            filename: metadata.filename,
+            mime: metadata.mime,
+            kind: Self.attachmentKind(for: metadata.mime),
+            localURL: nil,
+            sizeBytes: metadata.size,
+            availability: .available)
+    }
+
+    private static func attachmentKind(for mime: String) -> ChatAttachmentKind {
+        if mime.hasPrefix("image/") { return .image }
+        if mime == "application/pdf" { return .pdf }
+        if mime.hasPrefix("text/") { return .text }
+        return .other
     }
 
     private func mimeType(for url: URL) -> String {
@@ -635,9 +730,99 @@ struct DaemonClient: Sendable {
         }
     }
 
-    struct HistoryTurn: Encodable {
-        let role: String
-        let content: String
+    struct CurrentChatSnapshot: Codable, Sendable, Equatable {
+        let identity: String
+        let revision: UInt64
+        let turnCount: UInt64
+        let contentBytes: UInt64
+        let turns: [CurrentChatTurn]
+        let draft: CurrentChatDraft?
+        let continuation: CurrentChatContinuation?
+        let submittedAttachments: [SubmittedAttachment]
+        let validatedSources: [CurrentChatAvailability]
+        let connectorReferences: [CurrentChatAvailability]
+        let completedApprovalPresentations: [CompletedApprovalPresentation]
+
+        enum CodingKeys: String, CodingKey {
+            case identity, revision, turns, draft, continuation
+            case turnCount = "turn_count"
+            case contentBytes = "content_bytes"
+            case submittedAttachments = "submitted_attachments"
+            case validatedSources = "validated_sources"
+            case connectorReferences = "connector_references"
+            case completedApprovalPresentations = "completed_approval_presentations"
+        }
+    }
+
+    struct CurrentChatTurn: Codable, Sendable, Equatable {
+        let identity: String
+        let userMessage: String
+        let assistantOutput: String?
+        let state: String
+        let interruptionReason: String?
+        let submittedAt: String
+        let completedAt: String?
+
+        enum CodingKeys: String, CodingKey {
+            case identity, state
+            case userMessage = "user_message"
+            case assistantOutput = "assistant_output"
+            case interruptionReason = "interruption_reason"
+            case submittedAt = "submitted_at"
+            case completedAt = "completed_at"
+        }
+    }
+
+    struct CurrentChatDraft: Codable, Sendable, Equatable {
+        let text: String
+        let editedAt: String
+        let pendingAttachmentReferences: [String]
+
+        enum CodingKeys: String, CodingKey {
+            case text
+            case editedAt = "edited_at"
+            case pendingAttachmentReferences = "pending_attachment_references"
+        }
+    }
+
+    struct CurrentChatContinuation: Codable, Sendable, Equatable {
+        let identity: String
+        let sourceAutomationSessionIdentity: String
+        let seed: String
+        let sourceDeleted: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case identity, seed
+            case sourceAutomationSessionIdentity = "source_automation_session_identity"
+            case sourceDeleted = "source_deleted"
+        }
+    }
+
+    struct SubmittedAttachment: Codable, Sendable, Equatable {
+        let conversationTurnIdentity: String
+        let identity: String
+        let filename: String
+        let mime: String
+        let sizeBytes: UInt64
+        let available: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case identity, filename, mime, available
+            case conversationTurnIdentity = "conversation_turn_identity"
+            case sizeBytes = "size_bytes"
+        }
+    }
+
+    struct CurrentChatAvailability: Codable, Sendable, Equatable {
+        let identity: String
+        let label: String
+        let availability: String
+    }
+
+    struct CompletedApprovalPresentation: Codable, Sendable, Equatable {
+        let identity: String
+        let category: String
+        let outcome: String
     }
 
     func configureStage8Acceptance(acquisition: String?, polish: String?) async throws {
@@ -664,12 +849,12 @@ struct DaemonClient: Sendable {
 
     func chatStream(
         text: String,
-        sessionId: String?,
+        currentChatIdentity: String,
+        expectedRevision: UInt64,
         model: String,
         attachmentIds: [String] = [],
         screenContext: ScreenContextFields? = nil,
-        sourceMode: SourceMode? = nil,
-        history: [HistoryTurn] = []
+        sourceMode: SourceMode? = nil
     ) -> AsyncThrowingStream<ChatEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -683,10 +868,9 @@ struct DaemonClient: Sendable {
                     struct Body: Encodable {
                         let message: String
                         let model: String
-                        let session_id: String?
+                        let current_chat_identity: String
+                        let expected_revision: UInt64
                         let attachment_ids: [String]
-                        // Sliding-window conversation history (oldest first)
-                        let history: [HistoryTurn]
                         // OCR/selection context — ephemeral, never persisted
                         let screen_ocr_text: String?
                         let active_app: String?
@@ -696,9 +880,9 @@ struct DaemonClient: Sendable {
                     req.httpBody = try JSONEncoder().encode(Body(
                         message: text,
                         model: model,
-                        session_id: sessionId,
+                        current_chat_identity: currentChatIdentity,
+                        expected_revision: expectedRevision,
                         attachment_ids: attachmentIds,
-                        history: history,
                         screen_ocr_text: screenContext?.ocrText.isEmpty == false ? screenContext?.ocrText : nil,
                         active_app: screenContext?.activeApp,
                         selected_text: screenContext?.selectedText,
@@ -723,20 +907,6 @@ struct DaemonClient: Sendable {
                         }
 
                         switch event.type {
-                        case "debug_trace":
-                            if let id = event.prompt_trace_id {
-                                continuation.yield(.debugTrace(DebugTraceSummary(
-                                    prompt_trace_id: id,
-                                    session_id: event.session_id,
-                                    preview: event.preview ?? "",
-                                    prompt_chars: event.prompt_chars,
-                                    prompt_token_estimate: event.prompt_token_estimate,
-                                    message_count: event.message_count,
-                                    selected_skill_names: event.selected_skill_names,
-                                    selected_memory_ids: event.selected_memory_ids,
-                                    conversation_recall_injected: event.conversation_recall_injected
-                                )))
-                            }
                         case "token":
                             if let content = event.content {
                                 continuation.yield(.token(content))
@@ -855,7 +1025,7 @@ struct DaemonClient: Sendable {
                                 ))
                             }
                         case "done":
-                            continuation.yield(.done(sessionId: event.session_id))
+                            continuation.yield(.done)
                             continuation.finish(); return
                         case "error":
                             throw DaemonError.serverError(event.message ?? "unknown")
@@ -870,15 +1040,217 @@ struct DaemonClient: Sendable {
         }
     }
 
-    // MARK: Sessions
+    // MARK: Current Chat
 
-    func createSession() async throws -> String {
+    func currentChat() async throws -> CurrentChatSnapshot {
         let c = try await loadCreds()
-        var req = authedRequest("/sessions", creds: c)
-        req.httpMethod = "POST"
-        let (data, _) = try await URLSession.shared.data(for: req)
-        struct Resp: Decodable { let session_id: String }
-        return try JSONDecoder().decode(Resp.self, from: data).session_id
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/current-chat", creds: c))
+        try validateOK(data: data, response: response)
+        return try JSONDecoder().decode(CurrentChatSnapshot.self, from: data)
+    }
+
+    func reserveUIRelaunch(
+        transferIdentity: String,
+        oldConsumerFence: String,
+        replacementConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/reserve",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: oldConsumerFence,
+                replacementConsumerFence: replacementConsumerFence
+            )
+        )
+    }
+
+    func uiRelaunchStatus(transferIdentity: String) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/status",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: nil,
+                replacementConsumerFence: nil
+            )
+        )
+    }
+
+    func fetchReservedUIRelaunchSnapshot(
+        transferIdentity: String,
+        replacementConsumerFence: String
+    ) async throws -> NotchWorkSnapshot {
+        let c = try await loadCreds()
+        var request = authedRequest("/work/ui-relaunch/snapshot", creds: c)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(UIRelaunchTransferRequest(
+            transferIdentity: transferIdentity,
+            oldConsumerFence: nil,
+            replacementConsumerFence: replacementConsumerFence
+        ))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateUIRelaunchResponse(data: data, response: response)
+        return try NotchProjectionDecoder.decodeSnapshot(data)
+    }
+
+    func fetchAuthoritativeSnapshot() async throws -> NotchWorkSnapshot {
+        let c = try await loadCreds()
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest("/work/snapshot/read", creds: c)
+        )
+        try validateOK(data: data, response: response)
+        return try NotchProjectionDecoder.decodeSnapshot(data)
+    }
+
+    func markUIRelaunchReady(
+        transferIdentity: String,
+        replacementConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/ready",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: nil,
+                replacementConsumerFence: replacementConsumerFence
+            )
+        )
+    }
+
+    func fenceOldUI(
+        transferIdentity: String,
+        oldConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/fence-old",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: oldConsumerFence,
+                replacementConsumerFence: nil
+            )
+        )
+    }
+
+    func activateUIRelaunch(
+        transferIdentity: String,
+        replacementConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/activate",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: nil,
+                replacementConsumerFence: replacementConsumerFence
+            )
+        )
+    }
+
+    func acknowledgeUIRelaunch(
+        transferIdentity: String,
+        replacementConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/acknowledge",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: nil,
+                replacementConsumerFence: replacementConsumerFence
+            )
+        )
+    }
+
+    func rollbackUIRelaunch(
+        transferIdentity: String,
+        oldConsumerFence: String
+    ) async throws -> UIRelaunchTransferStatus {
+        try await uiRelaunchRequest(
+            path: "/work/ui-relaunch/rollback",
+            body: UIRelaunchTransferRequest(
+                transferIdentity: transferIdentity,
+                oldConsumerFence: oldConsumerFence,
+                replacementConsumerFence: nil
+            )
+        )
+    }
+
+    private func uiRelaunchRequest(
+        path: String,
+        body: UIRelaunchTransferRequest
+    ) async throws -> UIRelaunchTransferStatus {
+        let c = try await loadCreds()
+        var request = authedRequest(path, creds: c)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateUIRelaunchResponse(data: data, response: response)
+        return try JSONDecoder().decode(UIRelaunchTransferStatus.self, from: data)
+    }
+
+    private func validateUIRelaunchResponse(data: Data, response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else {
+            throw UIRelaunchTransferError.unavailable
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String
+            switch code {
+            case "stale_consumer_fence": throw UIRelaunchTransferError.staleConsumer
+            case "duplicate_replacement": throw UIRelaunchTransferError.duplicateReplacement
+            case "takeover_expired": throw UIRelaunchTransferError.expired
+            case "takeover_not_ready", "takeover_already_acknowledged": throw UIRelaunchTransferError.notReady
+            default: throw UIRelaunchTransferError.unavailable
+            }
+        }
+    }
+
+    func saveCurrentChatDraft(identity: String, expectedRevision: UInt64, text: String,
+                              pendingAttachmentReferences: [String]) async throws -> CurrentChatSnapshot {
+        struct Body: Encodable {
+            let current_chat_identity: String
+            let expected_revision: UInt64
+            let text: String
+            let pending_attachment_references: [String]
+        }
+        return try await currentChatMutation(path: "/current-chat/draft", body: Body(
+            current_chat_identity: identity, expected_revision: expectedRevision, text: text,
+            pending_attachment_references: pendingAttachmentReferences))
+    }
+
+    func clearCurrentChat(identity: String, expectedRevision: UInt64, commandIdentity: String,
+                          confirmedNonEmpty: Bool) async throws -> CurrentChatSnapshot {
+        struct Body: Encodable {
+            let current_chat_identity: String
+            let expected_revision: UInt64
+            let command_identity: String
+            let confirmed_non_empty: Bool
+        }
+        return try await currentChatMutation(path: "/current-chat/clear", body: Body(
+            current_chat_identity: identity, expected_revision: expectedRevision,
+            command_identity: commandIdentity, confirmed_non_empty: confirmedNonEmpty))
+    }
+
+    private func currentChatMutation<Body: Encodable>(path: String, body: Body) async throws -> CurrentChatSnapshot {
+        let c = try await loadCreds()
+        var request = authedRequest(path, creds: c)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CurrentChatMutationError.unavailable
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["code"] as? String
+            switch code {
+            case "current_chat_conflict", "current_chat_invalid":
+                throw CurrentChatMutationError.conflict
+            case "current_chat_bound":
+                throw CurrentChatMutationError.bound
+            default:
+                throw CurrentChatMutationError.unavailable
+            }
+        }
+        return try JSONDecoder().decode(CurrentChatSnapshot.self, from: data)
     }
 
     // MARK: Memory
@@ -927,59 +1299,119 @@ struct DaemonClient: Sendable {
         return try JSONDecoder().decode(SkillItem.self, from: data)
     }
 
-    func debugContextPlan(message: String) async throws -> String {
+    // MARK: - Authoritative Work projection
+
+    func fetchSnapshot(consumerFence: String) async throws -> NotchWorkSnapshot {
         let c = try await loadCreds()
-        var req = authedRequest("/debug/context-plan", creds: c)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        struct Body: Encodable { let message: String }
-        req.httpBody = try JSONEncoder().encode(Body(message: message))
-        let (data, response) = try await URLSession.shared.data(for: req)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
+        var components = URLComponents(
+            url: authedRequest("/work/snapshot", creds: c).url!,
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [URLQueryItem(name: "consumer_fence", value: consumerFence)]
+        var request = authedRequest("/work/snapshot", creds: c)
+        request.url = components.url
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if (response as? HTTPURLResponse)?.statusCode == 409 {
+            throw NotchEventTransportError.consumerFenced
         }
-        return prettyJSONString(data)
+        try validateOK(data: data, response: response)
+        return try NotchProjectionDecoder.decodeSnapshot(data)
     }
 
-    // MARK: - Daemon-wide events (GET /events)
+    func fetchEvents(
+        after cursor: UInt64,
+        daemonGeneration: String,
+        consumerFence: String
+    ) async throws -> NotchEventBatch {
+        let c = try await loadCreds()
+        var components = URLComponents(
+            url: authedRequest("/work/events", creds: c).url!,
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "after", value: String(cursor)),
+            URLQueryItem(name: "daemon_generation", value: daemonGeneration),
+            URLQueryItem(name: "consumer_fence", value: consumerFence),
+        ]
+        var request = authedRequest("/work/events", creds: c)
+        request.url = components.url
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if (response as? HTTPURLResponse)?.statusCode == 409 {
+            throw NotchEventTransportError.consumerFenced
+        }
+        try validateOK(data: data, response: response)
 
-    /// One typed envelope per daemon broadcast event. Payloads are concise —
-    /// callers refetch authoritative records instead of trusting them.
-    struct GlobalEvent: Decodable, Sendable {
-        let type: String
-        let automation_id: String?
-        let run_id: String?
-        let status: String?
-        let id: String?          // approval id for approval_requested
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = object["kind"] as? String
+        else { throw DaemonError.badResponse }
+        switch kind {
+        case "events":
+            guard Set(object.keys) == ["kind", "events"],
+                  let values = object["events"] as? [Any]
+            else { throw DaemonError.badResponse }
+            return .events(try values.map { value in
+                try NotchProjectionDecoder.decodeEvent(JSONSerialization.data(withJSONObject: value))
+            })
+        case "gap":
+            guard Set(object.keys) == ["kind", "snapshot"],
+                  let value = object["snapshot"]
+            else { throw DaemonError.badResponse }
+            return .gap(try NotchProjectionDecoder.decodeSnapshot(
+                JSONSerialization.data(withJSONObject: value)
+            ))
+        default:
+            throw DaemonError.badResponse
+        }
     }
 
-    /// Long-lived SSE subscription to the daemon broadcast. Throws on
-    /// disconnect — callers loop with a backoff to reconnect.
-    func globalEvents() -> AsyncThrowingStream<GlobalEvent, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    let c = try await loadCreds()
-                    let req = authedRequest("/events", creds: c)
-                    let (bytes, response) = try await URLSession.shared.bytes(for: req)
-                    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                        throw DaemonError.badStatus
-                    }
-                    for try await line in bytes.lines {
-                        guard line.hasPrefix("data: ") else { continue }
-                        let json = String(line.dropFirst(6))
-                        if let data = json.data(using: .utf8),
-                           let event = try? JSONDecoder().decode(GlobalEvent.self, from: data) {
-                            continuation.yield(event)
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
+    enum WorkAttentionAcknowledgement: Equatable {
+        case acknowledged
+        case authoritativeConflict
+    }
+
+    static func decodeWorkAttentionAcknowledgement(
+        statusCode: Int,
+        data: Data
+    ) throws -> WorkAttentionAcknowledgement {
+        if (200..<300).contains(statusCode) { return .acknowledged }
+        if statusCode == 409 {
+            struct ErrorResponse: Decodable { let code: String }
+            let code = try JSONDecoder().decode(ErrorResponse.self, from: data).code
+            if code == "stale_consumer_fence" {
+                throw NotchEventTransportError.consumerFenced
             }
-            continuation.onTermination = { _ in task.cancel() }
+            if code == "work_conflict" { return .authoritativeConflict }
+            throw DaemonError.badResponse
         }
+        throw DaemonError.badStatus
+    }
+
+    func acknowledgeWorkAttention(
+        workIdentity: String,
+        expectedRevision: UInt64,
+        consumerFence: String
+    ) async throws -> WorkAttentionAcknowledgement {
+        let credentials = try await loadCreds()
+        var request = authedRequest("/work/attention/acknowledge", creds: credentials)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable {
+            let commandIdentity: String
+            let consumerFence: String
+            let workIdentity: String
+            let expectedRevision: UInt64
+        }
+        request.httpBody = try JSONEncoder().encode(Body(
+            commandIdentity: UUID().uuidString,
+            consumerFence: consumerFence,
+            workIdentity: workIdentity,
+            expectedRevision: expectedRevision
+        ))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let statusCode = (response as? HTTPURLResponse)?.statusCode else {
+            throw DaemonError.badResponse
+        }
+        return try Self.decodeWorkAttentionAcknowledgement(statusCode: statusCode, data: data)
     }
 
     // MARK: - Automations
@@ -1067,6 +1499,93 @@ struct DaemonClient: Sendable {
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw DaemonError.badStatus }
         struct Resp: Decodable { let runs: [AutomationRunRecord] }
         return try JSONDecoder().decode(Resp.self, from: data).runs
+    }
+
+    func automationRun(id: String, runIdentity: String) async throws -> AutomationRunRecord {
+        let credentials = try await loadCreds()
+        let path = "/automations/\(id)/runs/\(runIdentity)"
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest(path, creds: credentials)
+        )
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.badStatus
+        }
+        struct Response: Decodable { let run: AutomationRunRecord }
+        return try JSONDecoder().decode(Response.self, from: data).run
+    }
+
+    func automationSession(identity: String) async throws -> AutomationSessionRecord {
+        let c = try await loadCreds()
+        let path = "/automation-sessions/\(identity)"
+        let (data, response) = try await URLSession.shared.data(
+            for: authedRequest(path, creds: c))
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw DaemonError.badStatus
+        }
+        return try JSONDecoder().decode(AutomationSessionRecord.self, from: data)
+    }
+
+    func openAutomationSession(
+        identity: String,
+        commandIdentity: String,
+        expectedRevision: UInt64
+    ) async throws {
+        struct Body: Encodable {
+            let commandIdentity: String
+            let expectedRevision: UInt64
+        }
+        let credentials = try await loadCreds()
+        var request = authedRequest("/automation-sessions/\(identity)/open", creds: credentials)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(commandIdentity: commandIdentity, expectedRevision: expectedRevision))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            throw DaemonError.serverError(serverErrorMessage(from: data))
+        }
+    }
+
+    func continueAutomationSession(
+        identity: String,
+        seed: String,
+        confirmedReplacement: Bool,
+        commandIdentity: String
+    ) async throws -> AutomationContinuationProvenance {
+        let body = ContinueAutomationSessionBody(
+            seed: seed,
+            confirmedReplacement: confirmedReplacement,
+            commandIdentity: commandIdentity)
+        let c = try await loadCreds()
+        var request = authedRequest(
+            "/automation-sessions/\(identity)/continue", creds: c)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(status) else {
+            throw DaemonError.serverError(serverErrorMessage(from: data))
+        }
+        return try JSONDecoder().decode(AutomationContinuationProvenance.self, from: data)
+    }
+
+    func deleteAutomationSession(identity: String) async throws {
+        try await automationAction(
+            path: "/automation-sessions/\(identity)", method: "DELETE")
+    }
+
+    private struct ContinueAutomationSessionBody: Encodable {
+        let seed: String
+        let confirmedReplacement: Bool
+        let commandIdentity: String
+
+        enum CodingKeys: String, CodingKey {
+            case seed
+            case confirmedReplacement = "confirmedReplacement"
+            case commandIdentity = "commandIdentity"
+        }
     }
 
     // MARK: - Approvals
@@ -1548,7 +2067,7 @@ struct DaemonClient: Sendable {
         let db_bytes: Int
         let attachments_bytes: Int
         let memory_items_count: Int
-        let chat_turns_count: Int
+        let current_chat_turns_count: Int
         let mail_cache_count: Int
         let embeddings_count: Int
         let total_bytes: Int
@@ -1570,24 +2089,6 @@ struct DaemonClient: Sendable {
         let c = try await loadCreds()
         let (data, _) = try await URLSession.shared.data(for: authedRequest("/usage", creds: c))
         return try JSONDecoder().decode(UsageStats.self, from: data)
-    }
-
-    func debugTrace(id: String) async throws -> String {
-        let c = try await loadCreds()
-        let (data, response) = try await URLSession.shared.data(for: authedRequest("/debug/traces/\(id)", creds: c))
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
-        }
-        return prettyJSONString(data)
-    }
-
-    func debugConversation(id: String) async throws -> String {
-        let c = try await loadCreds()
-        let (data, response) = try await URLSession.shared.data(for: authedRequest("/debug/conversations/\(id)", creds: c))
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw DaemonError.serverError(String(decoding: data, as: UTF8.self))
-        }
-        return prettyJSONString(data)
     }
 
     func evidenceDiagnosticExport(turnId: String) async throws -> String {
@@ -1674,12 +2175,14 @@ struct ApprovalOrigin: Decodable, Sendable {
 enum DaemonError: LocalizedError {
     case notReady
     case badStatus
+    case badResponse
     case serverError(String)
 
     var errorDescription: String? {
         switch self {
         case .notReady:           return "Daemon sa nespustil včas"
         case .badStatus:          return "Neplatná odpoveď od daemona"
+        case .badResponse:        return "Neplatný formát odpovede daemona"
         case .serverError(let m): return "Chyba servera: \(m)"
         }
     }
@@ -1737,15 +2240,6 @@ struct SSEEvent: Decodable {
     let record_id: Int?
     let name: String?
     let url: String?
-    // debug_trace event fields
-    let prompt_trace_id: String?
-    let preview: String?
-    let prompt_chars: Int?
-    let prompt_token_estimate: Int?
-    let message_count: Int?
-    let selected_skill_names: [String]?
-    let selected_memory_ids: [String]?
-    let conversation_recall_injected: Bool?
     // task_rating event fields (Phase 8)
     let level: String?
     let score: Int?

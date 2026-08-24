@@ -1,4 +1,3 @@
-use crate::agent_exec::EvidenceOrchestratorFlag;
 use crate::evidence::EvidenceOrigin;
 use crate::reference_resolution::{
     extract, parse_resolver_mode, production, resolve, select_resolver_mode, BlockedPresentation,
@@ -35,25 +34,13 @@ fn resolver_mode_parser_accepts_only_the_closed_lowercase_grammar() {
 }
 
 #[test]
-fn stage9_rollback_precedes_subordinate_mode_parsing() {
+fn startup_uses_the_closed_subordinate_mode() {
     assert_eq!(
-        select_resolver_mode(EvidenceOrchestratorFlag::Disabled, Some("not-a-mode")),
-        ResolverMode::LegacyStage9
-    );
-    assert_eq!(
-        select_resolver_mode(EvidenceOrchestratorFlag::Disabled, Some("enforce")),
-        ResolverMode::LegacyStage9
-    );
-}
-
-#[test]
-fn enabled_stage9_uses_the_closed_subordinate_mode() {
-    assert_eq!(
-        select_resolver_mode(EvidenceOrchestratorFlag::Enabled, Some("observe")),
+        select_resolver_mode(Some("observe")),
         ResolverMode::Observe
     );
     assert_eq!(
-        select_resolver_mode(EvidenceOrchestratorFlag::Enabled, Some("invalid")),
+        select_resolver_mode(Some("invalid")),
         ResolverMode::Off
     );
 }
@@ -524,7 +511,14 @@ fn run_slice6_case(case_id: &str) {
     let trace = resolve(&input, &extraction, &candidates, origin, confirmation, &order);
     assert_eq!(trace.outcome, expected, "wrong structural outcome for {case_id}: {trace:?}");
     assert!(trace.model_order_invariant, "model ordering influenced {case_id}");
-    assert_eq!(trace.input_digest, trace.input_digest, "digest must be stable");
+    // The digest must not depend on candidate ordering: resolve again with the
+    // forward order and require the same digest.
+    let forward_order = candidates.iter().map(|candidate| candidate.mention_id).collect::<Vec<_>>();
+    let reresolved = resolve(&input, &extraction, &candidates, origin, confirmation, &forward_order);
+    assert_eq!(
+        trace.input_digest, reresolved.input_digest,
+        "digest must be stable across candidate ordering for {case_id}"
+    );
 }
 
 macro_rules! slice6_named_cases {

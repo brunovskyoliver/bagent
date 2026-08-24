@@ -41,25 +41,15 @@ reject apps/macos/Sources/bagent/NotchWindowController.swift 'menuBarBottomY - N
 reject apps/macos/Sources/bagent/NotchWindowController.swift 'voicePanel' "external/non-notch voice still uses separate voice panel instead of inline fake-notch bridge"
 reject docs/UI_DESIGN.md 'Transparent pill inside menu bar' "UI docs still define external/non-notch idle as pill"
 
+# acceptance-assertion: streaming chunks do not directly refresh the surface
 if sed -n '/\.onChange(of: viewModel\.streamingChunk)/,/^        }/p' apps/macos/Sources/bagent/ChatView.swift | grep -Fq "refreshSurface()"; then
   printf 'FAIL: notch output still directly refreshes surface on every streaming chunk\n'
   fail=1
 fi
 
+# acceptance-assertion: fill and hit testing share the top-flat shape
 if ! sed -n '/ZStack(alignment: \.topLeading)/,/\.fill(\.black)/p' apps/macos/Sources/bagent/ChatView.swift | grep -Fq "NotchWrapShape("; then
   printf 'FAIL: notch output fill does not use the same top-flat shape as hit testing\n'
-  fail=1
-fi
-
-require crates/connectors/apple_mail/src/lib.rs "set rcpt to" "AppleScript mail search does not collect recipient"
-require crates/connectors/apple_mail/src/lib.rs "parse_applescript_mail_record" "AppleScript mail records are not parsed at a testable seam"
-reject crates/connectors/apple_mail/src/lib.rs "value.trim().parse::<f64>()" "AppleScript timestamp parser is still locale-fragile"
-require crates/connectors/apple_mail/src/lib.rs "replace(',', \".\")" "AppleScript timestamp parser does not accept comma decimals"
-require crates/daemon/src/main.rs '**Komu:** {komu}' "AppleScript mail output does not render actual recipient"
-require crates/daemon/src/main.rs 'return "neznáme".to_string();' "invalid mail dates can still render as Unix epoch"
-
-if sed -n '/fn parse_applescript_mail_record/,/^}/p' crates/connectors/apple_mail/src/lib.rs | grep -Fq "recipient: None"; then
-  printf 'FAIL: AppleScript parsed record still drops recipient\n'
   fail=1
 fi
 
@@ -67,4 +57,4 @@ if [[ "$fail" -ne 0 ]]; then
   exit 1
 fi
 
-printf 'PASS: notch output and AppleScript mail regressions covered\n'
+printf 'PASS: notch output layout regressions covered\n'

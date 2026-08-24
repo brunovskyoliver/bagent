@@ -17,3 +17,10 @@ chrono     = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Stage 1 lint waiver — owner: GitHub #25; reason: pre-existing agent lint debt
+# is unrelated to Stage 1 acceptance infrastructure; expires: 2026-09-17.
+[lints.clippy]
+empty_line_after_doc_comments = "allow"
+too_many_arguments = "allow"
+bool_assert_comparison = "allow"

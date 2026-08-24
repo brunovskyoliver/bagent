@@ -108,7 +108,7 @@ final class AutomationRecurrenceDraftTests: XCTestCase {
 final class AutomationEditorFlowTests: XCTestCase {
     func testEditorStepNavigationAndValidation() {
         let vm = ChatViewModel()
-        vm.notchInteractionMode = .automations
+        vm.applyNotchIntent(.openAutomations)
         vm.startAutomationCreation()
         XCTAssertEqual(vm.automationsSurface, .editorTask)
 

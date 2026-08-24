@@ -35,7 +35,8 @@ fn reference_blocked_completion_maps_to_blocked_with_a_fixed_summary() {
         final_text: "hostile model output must be ignored".into(),
         tool_calls_used: 0,
         approvals_denied: 0,
-        completion: completion,
+        validated_sources: Vec::new(),
+        completion,
     });
 
     let status = outcome_to_status(&result).status;
@@ -66,6 +67,7 @@ fn every_closed_blocked_code_has_the_exact_safe_terminal_tuple() {
             final_text: hostile.into(),
             tool_calls_used: 999,
             approvals_denied: 999,
+            validated_sources: Vec::new(),
             completion: TurnCompletion::ReferenceBlocked(code),
         }));
         assert_eq!(terminal.status, AutomationRunStatus::Blocked);
@@ -88,6 +90,7 @@ fn completion_mapping_uses_typed_completion_not_approval_counts_or_text() {
         final_text: "synthetic completed text".into(),
         tool_calls_used: 0,
         approvals_denied: 44,
+        validated_sources: Vec::new(),
         completion: TurnCompletion::Completed,
     }));
     assert_eq!(completed.status, AutomationRunStatus::Completed);
@@ -96,6 +99,7 @@ fn completion_mapping_uses_typed_completion_not_approval_counts_or_text() {
         final_text: "synthetic partial text".into(),
         tool_calls_used: 0,
         approvals_denied: 0,
+        validated_sources: Vec::new(),
         completion: TurnCompletion::Partial,
     }));
     assert_eq!(partial.status, AutomationRunStatus::Partial);
@@ -193,7 +197,7 @@ fn red_finish_failure_cannot_expose_a_partial_terminal_update() {
 
     let stored_status: String = conn
         .query_row(
-            "SELECT status FROM automation_runs WHERE id=?1",
+            "SELECT status FROM automation_run_records WHERE id=?1",
             params![run.id.to_string()],
             |row| row.get(0),
         )
@@ -318,7 +322,7 @@ fn identical_retry_is_idempotent_and_conflicting_retry_fails_closed() {
     .is_err());
     let status: String = conn
         .query_row(
-            "SELECT status FROM automation_runs WHERE id=?1",
+            "SELECT status FROM automation_run_records WHERE id=?1",
             params![run.id.to_string()],
             |row| row.get(0),
         )
@@ -499,7 +503,10 @@ fn committed_blocked_rows_survive_reopen_and_restart_recovery() {
     };
     let mut conn = Connection::open(path).unwrap();
     crate::embedded::migrations::runner().run(&mut conn).unwrap();
-    assert_eq!(crate::scheduler::recover_on_startup(&conn, now()), 0);
+    // Daemon-restart recovery is owned by the canonical Current Chat authority
+    // now; it must leave an already-terminal Blocked run untouched.
+    bagentd::current_chat::initialize_schema(&conn).unwrap();
+    bagentd::current_chat::recover_after_daemon_restart(&conn, now()).unwrap();
     let run = repo_recent_runs(&conn, &automation_id, 1).unwrap();
     assert_eq!(run[0].id.to_string(), run_id);
     assert_eq!(run[0].status, AutomationRunStatus::Blocked);
@@ -603,7 +610,7 @@ fn terminal_event_order_and_persistence_failure_are_structural() {
     assert_eq!(failed_events[0].as_object().unwrap().len(), 3);
     let status: String = conn
         .query_row(
-            "SELECT status FROM automation_runs WHERE id=?1",
+            "SELECT status FROM automation_run_records WHERE id=?1",
             params![run.id.to_string()],
             |row| row.get(0),
         )
@@ -621,7 +628,7 @@ fn migration_runs_on_a_fresh_temporary_database() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 27);
 }
 
 #[test]
@@ -694,7 +701,7 @@ fn sqlite_rejects_invalid_status_and_reference_code_tuples() {
     .unwrap();
 
     let invalid_code = conn.execute(
-        "INSERT INTO automation_runs
+        "INSERT INTO automation_run_records
          (id, automation_id, scheduled_for, status, created_at, reference_outcome_code)
          VALUES ('synthetic-invalid-code', ?1, ?2, 'blocked', ?2, 'not_allowed')",
         params![automation.id.to_string(), now().to_rfc3339()],
@@ -702,7 +709,7 @@ fn sqlite_rejects_invalid_status_and_reference_code_tuples() {
     assert!(invalid_code.is_err());
 
     let non_blocked_with_code = conn.execute(
-        "INSERT INTO automation_runs
+        "INSERT INTO automation_run_records
          (id, automation_id, scheduled_for, status, created_at, reference_outcome_code)
          VALUES ('synthetic-invalid-status', ?1, ?2, 'completed', ?2, 'ambiguous')",
         params![automation.id.to_string(), now().to_rfc3339()],
@@ -710,7 +717,7 @@ fn sqlite_rejects_invalid_status_and_reference_code_tuples() {
     assert!(non_blocked_with_code.is_err());
 
     let blocked_without_code = conn.execute(
-        "INSERT INTO automation_runs
+        "INSERT INTO automation_run_records
          (id, automation_id, scheduled_for, status, created_at)
          VALUES ('synthetic-missing-code', ?1, ?2, 'blocked', ?2)",
         params![automation.id.to_string(), now().to_rfc3339()],

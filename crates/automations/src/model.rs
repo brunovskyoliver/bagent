@@ -56,6 +56,8 @@ impl std::fmt::Display for AutomationRunId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Automation {
     pub id: AutomationId,
+    /// Monotonic revision captured into each immutable Task Snapshot.
+    pub definition_revision: i64,
     pub name: String,
     /// Natural-language task prompt — user-authored, never a policy override.
     pub prompt: String,

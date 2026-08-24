@@ -5,4 +5,7 @@
 
 mod authorized_adapter;
 
+// Slice 10 connects this boundary to the final transport adapters. Until then
+// the re-export deliberately has no in-crate consumer.
+#[allow(unused_imports)]
 pub(crate) use authorized_adapter::*;

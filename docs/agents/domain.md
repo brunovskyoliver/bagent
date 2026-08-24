@@ -1,37 +1,47 @@
 # Domain docs
 
-This is a single-context repository.
-
-## Before exploring
-
-Read:
-
-- root `CONTEXT.md` for canonical evidence and grounding language; and
-- relevant system ADRs matching `docs/ADR-*.md`.
-
-Proceed silently when a referenced domain document does not exist. Create
-domain documentation lazily only when a domain-modeling session resolves a new
-term or a qualifying architectural decision.
+How the engineering skills should consume this repository's domain documentation
+when exploring the codebase.
 
 ## Layout
+
+This is a single-context repository. There is no `CONTEXT-MAP.md` and no
+per-module context split.
 
 ```text
 /
 ├── CONTEXT.md
-└── docs/
-    ├── ADR-0001-DETERMINISTIC-GROUNDING.md
-    └── ADR-0002-REPRODUCIBLE-STAGE8-RELEASE-GATE.md
+├── docs/
+│   ├── ADR-0001-DETERMINISTIC-GROUNDING.md
+│   ├── ADR-0002-REPRODUCIBLE-STAGE8-RELEASE-GATE.md
+│   └── adr/
+│       └── 0001-own-webkit-browser-profile.md …
+└── crates/
 ```
 
-There is no `CONTEXT-MAP.md` and no per-module context split.
+Two ADR locations coexist and both are authoritative:
 
-## Vocabulary
+- `docs/ADR-*.md` — system-wide decisions (grounding, release gating).
+- `docs/adr/NNNN-*.md` — subsystem decisions, currently the browser ADRs.
 
-Use the terms defined in `CONTEXT.md` in issue titles, questions, decisions,
-test names, and implementation plans. Do not substitute synonyms that the
-glossary explicitly rejects.
+## Before exploring
 
-## ADR conflicts
+- Read the root `CONTEXT.md` for canonical evidence and grounding language.
+- Read the ADRs from either location that touch the area being explored.
+- If a referenced domain document does not exist, proceed silently. The
+  domain-modeling skill creates domain documentation lazily, only when a session
+  actually resolves a new term or a qualifying architectural decision.
 
-If a proposed decision contradicts an existing ADR, surface the conflict
-explicitly rather than silently overriding it.
+## Use the glossary's vocabulary
+
+When output names a domain concept in an issue title, question, decision,
+proposal, hypothesis, test name, or implementation plan, use the term defined in
+`CONTEXT.md`. Do not drift to a synonym the glossary explicitly rejects.
+
+If a needed concept is missing, reconsider whether it belongs to the existing
+language or record the gap for a domain-modeling session.
+
+## Flag ADR conflicts
+
+If proposed work contradicts an existing ADR, surface the conflict explicitly
+instead of silently overriding it.

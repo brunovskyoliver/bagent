@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use apple_mail_connector::MailSearchFilter;
 use apple_mail_connector::{self, MailConnector};
 use apple_notes_connector::NotesConnector;
@@ -13,15 +13,33 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use bagent_agent::{PromptBuilder, PromptTrace, ScreenIntentClassifier, SelectedSkill, TaskRater};
+use bagent_agent::{
+    AgentInference, PromptBuilder, ScreenIntentClassifier, SelectedSkill, TaskRater,
+};
 use bagent_attachments::extract as extract_attachment;
 use bagent_memory::MemoryStore;
 use bagent_rules::{ApprovalLevel, RuleEngine, DEFAULT_RULES_YAML};
 use bagent_skills::{selector as skill_selector, LoadedSkill};
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use basert_connector::{
-    BaseRtClient, Message, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL,
+#[cfg(feature = "stage7a-acceptance")]
+use bagentd::current_chat::seed_stage7a_acceptance_records;
+use bagentd::current_chat::{
+    capture_recovered_approval_presentations, clear_current_chat, open_or_create_current_chat,
+    read_current_chat, recover_after_daemon_restart, save_draft, upsert_connector_reference,
+    ClearCurrentChatCommand, SubmittedAttachmentMetadata, ValidatedSourceMetadata,
 };
+use bagentd::model_runtime::{ModelRuntime, ProductionModelConfig, RuntimePhase};
+use bagentd::permission_probe::DaemonFullDiskAccessProbe;
+use bagentd::ui_relaunch::{
+    TransferStatus, UiConsumerAuthority, UiConsumerTransferError, TRANSFER_TIMEOUT,
+};
+use bagentd::unified_work::UnifiedWorkAuthority;
+use bagentd::work_coordinator::{
+    ApprovalState, CommandError, ConversationTurnIdentity, CoordinatorConfig, CurrentChatIdentity,
+    CurrentChatTerminalOutcome, DaemonGeneration, EventCursor, EventRead, WorkCoordinator,
+    WorkIdentity, WorkOrigin, WorkRecord, WorkRevision, WorkSnapshot, WorkState,
+};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use basert_connector::{Message, DEFAULT_API_KEY, DEFAULT_BASE_URL, DEFAULT_CHAT_MODEL};
 use codex_connector::{
     CodexConfig, CodexConnector, CodexContextPacket, CodexExpectedOutput, CodexTask, ContextItem,
 };
@@ -32,14 +50,8 @@ use odoo_connector::{OdooConfig, OdooConnector, OdooError, OdooRecordRef};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{HashMap, HashSet},
-    convert::Infallible,
-    io::Write,
-    path::PathBuf,
-    sync::Arc,
-};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 use whatsapp_connector::{
@@ -63,17 +75,16 @@ struct AppState {
     db_path: PathBuf,
     token: String,
     default_model: String,
-    debug_dir: PathBuf,
     /// Small fast model for intent/correction classifiers — never blocks chat TTFT.
     classifier_model: String,
     /// Local opt-in rollback flag for deterministic typed Mail/web evidence routing.
-    evidence_orchestrator: agent_exec::EvidenceOrchestratorFlag,
     /// Optional inert resolver runtime selected at startup; no request path
     /// consumes it in this slice.
     #[allow(dead_code)]
     resolver_runtime: Option<reference_resolution::ResolverRuntime>,
     attachments_dir: PathBuf,
-    inference: BaseRtClient,
+    model_runtime: Arc<ModelRuntime>,
+    work_authority: Arc<UnifiedWorkAuthority>,
     /// Shared preferred/fallback synthesis lifecycle for chat and automations.
     synthesis: Arc<evidence::SynthesisService>,
     /// Privacy-safe bounded structural traces for routed evidence turns.
@@ -84,7 +95,6 @@ struct AppState {
     memory: Arc<MemoryStore>,
     prompt_builder: Arc<PromptBuilder>,
     rules: Arc<RuleEngine>,
-    pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     /// Loaded skill manifests + bodies, scanned at startup.
     skills: Arc<Vec<LoadedSkill>>,
     /// Deterministic task rater — classifies local vs Codex tasks.
@@ -104,24 +114,18 @@ struct AppState {
     /// Bridge can autostart when a prior LocalAuth session exists, and is also
     /// controlled explicitly via `/whatsapp/start` and `/whatsapp/stop`.
     whatsapp: Arc<WhatsappConnector>,
-    /// Ephemeral connector refs for current daemon run only. Never persisted.
+    /// Hot cache for durable chat-scoped Connector References. SQLite remains
+    /// authoritative; restart invalidates cached payloads before reuse.
     runtime_refs: Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     /// Pinged whenever an automation is created/edited/enabled/disabled/deleted
     /// so the scheduler recomputes its next wake-up immediately.
     automations_changed: Arc<tokio::sync::Notify>,
-    /// Daemon-wide event broadcast (GET /events): automation lifecycle +
-    /// background approval notifications. Payloads are concise and redacted —
-    /// clients refetch authoritative records.
-    events_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
-    /// Bounded automation concurrency (scheduled + run-now share the slots).
-    run_slots: Arc<tokio::sync::Semaphore>,
-}
-
-impl AppState {
-    /// Fire-and-forget daemon-wide event. Lagging/absent subscribers are fine.
-    fn publish_event(&self, event: serde_json::Value) {
-        let _ = self.events_tx.send(event);
-    }
+    /// The current Swift projection consumer. A newer snapshot claim fences
+    /// every older UI process without affecting daemon-owned Work.
+    ui_consumer_authority: Arc<Mutex<UiConsumerAuthority>>,
+    ui_consumer_authority_path: PathBuf,
+    /// The daemon process that owns Mail and Notes access performs this probe.
+    full_disk_access_probe: Arc<DaemonFullDiskAccessProbe>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -135,12 +139,9 @@ struct RuntimeRefs {
 #[derive(Deserialize)]
 struct ChatRequest {
     message: String,
-    /// Sliding-window conversation history (user/assistant turns, oldest first).
-    /// Clamped server-side to 10 turns / 8k chars.
-    #[serde(default)]
-    history: Vec<Message>,
+    current_chat_identity: String,
+    expected_revision: u64,
     model: Option<String>,
-    session_id: Option<String>,
     /// IDs returned by POST /attachments — empty when no files attached.
     #[serde(default)]
     attachment_ids: Vec<String>,
@@ -158,31 +159,6 @@ struct ChatRequest {
     /// Values: mail, filesystem, whatsapp, odoo.
     #[serde(default)]
     source_mode: Option<String>,
-}
-
-#[derive(Serialize)]
-struct PromptDebugRecord {
-    prompt_trace_id: String,
-    session_id: String,
-    created_at: String,
-    user_message: String,
-    model: String,
-    language: String,
-    prompt_chars: usize,
-    prompt_token_estimate: usize,
-    message_count: usize,
-    prompt_messages: Vec<PromptDebugMessage>,
-    trace: PromptTrace,
-    response_preview: String,
-    response_chars: usize,
-    elapsed_ms: u128,
-}
-
-#[derive(Serialize)]
-struct PromptDebugMessage {
-    role: String,
-    content: String,
-    images_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -252,8 +228,8 @@ fn default_limit() -> usize {
 }
 
 /// Stable reference to a found mail message — surfaced to the frontend so
-/// Stable reference to the most recently found local file/folder, persisted in
-/// `sessions.metadata_json` so cross-turn references ("open it", "otvor ho") resolve correctly.
+/// Stable reference to the most recently found local file/folder used by the
+/// current chat's bounded runtime reference store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileRef {
     path: String,
@@ -300,13 +276,26 @@ struct HealthResponse {
     basert: bool,
     model: String,
     classifier_model: String,
+    model_runtime: ModelRuntimeHealth,
     connectors: ConnectorStatus,
+}
+
+#[derive(Serialize)]
+struct ModelRuntimeHealth {
+    phase: &'static str,
+    lease_count: usize,
+    residency_pinned: bool,
+    queued_demand_count: usize,
+    changed_pid_recovery: &'static str,
+    preload_on_input: Option<bool>,
+    shared_idle_timeout_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
 struct ConnectorStatus {
     mail: bool,
     notes: bool,
+    codex: bool,
     odoo: bool,
     whatsapp: WhatsappHealthStatus,
 }
@@ -344,68 +333,13 @@ async fn wait_for_shutdown_signal() {
 }
 
 async fn cleanup_runtime_resources(state: &AppState) {
-    state.synthesis.shutdown().await;
-    cleanup_basert_models(state).await;
+    if let Err(error) = state.synthesis.shutdown().await {
+        tracing::error!(%error, "shutdown: Model Runtime retirement was not proven");
+    }
 
     if let Err(e) = state.whatsapp.stop().await {
         tracing::debug!("shutdown: WhatsApp stop skipped: {e}");
     }
-}
-
-async fn cleanup_basert_models(state: &AppState) {
-    let loaded_models = match state.inference.models().await {
-        Ok(models) => models,
-        Err(e) => {
-            tracing::debug!("shutdown: BaseRT model check skipped: {e}");
-            return;
-        }
-    };
-
-    let mut seen = HashSet::new();
-    let mut models_to_unload = Vec::new();
-    for model in [
-        state.default_model.as_str(),
-        state.classifier_model.as_str(),
-    ] {
-        let trimmed = model.trim();
-        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-            if let Some(loaded_name) = matching_loaded_model(&loaded_models, trimmed) {
-                models_to_unload.push(loaded_name);
-            }
-        }
-    }
-
-    for model in models_to_unload {
-        match state.inference.unload_model(&model).await {
-            Ok(()) => tracing::info!(model = %model, "shutdown: BaseRT model unloaded"),
-            Err(e) => tracing::debug!(model = %model, "shutdown: BaseRT unload skipped: {e}"),
-        }
-    }
-}
-
-fn matching_loaded_model(loaded_models: &[String], requested: &str) -> Option<String> {
-    let requested = requested.trim();
-    if requested.is_empty() {
-        return None;
-    }
-    loaded_models.iter().find_map(|loaded| {
-        let loaded = loaded.trim();
-        let exact = loaded == requested;
-        let requested_latest = !requested.contains(':') && loaded == format!("{requested}:latest");
-        let loaded_latest = loaded
-            .strip_suffix(":latest")
-            .map(|base| base == requested)
-            .unwrap_or(false);
-        let requested_latest_alias = requested
-            .strip_suffix(":latest")
-            .map(|base| base == loaded)
-            .unwrap_or(false);
-        if exact || requested_latest || loaded_latest || requested_latest_alias {
-            Some(loaded.to_string())
-        } else {
-            None
-        }
-    })
 }
 
 #[tokio::main]
@@ -416,22 +350,39 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let attachments_dir = data_dir.join("attachments");
     std::fs::create_dir_all(&attachments_dir)?;
-    let debug_dir = data_dir.join("debug");
-    std::fs::create_dir_all(&debug_dir)?;
     let evidence_diagnostics = Arc::new(evidence::DiagnosticRecorder::new(
         data_dir.join("evidence-diagnostics"),
     )?);
     std::fs::write(data_dir.join("daemon.pid"), std::process::id().to_string())?;
 
-    let mut conn = Connection::open(data_dir.join("bagent.db"))?;
+    let db_path = data_dir.join("bagent.db");
+    #[cfg(feature = "stage8-acceptance")]
+    bagentd::cutover::stage8_migration_killpoint("before-migration")
+        .map_err(|error| anyhow::anyhow!("pause before Stage 8 migration: {error}"))?;
+    let pre_cutover_backup_hash = bagentd::cutover::prepare_pre_cutover_backup(
+        &db_path,
+        &data_dir.join("bagent.pre-stage4.sqlite"),
+    )
+    .map_err(|error| anyhow::anyhow!("prepare Stage 4 database backup: {error}"))?;
+    let mut conn = Connection::open(&db_path)?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     embedded::migrations::runner()
         .run(&mut conn)
         .map_err(|e| anyhow::anyhow!("migration error: {e}"))?;
+    if let Some(hash) = pre_cutover_backup_hash.as_deref() {
+        bagentd::cutover::record_pre_cutover_backup(&db_path, hash)
+            .map_err(|error| anyhow::anyhow!("record Stage 4 backup: {error}"))?;
+    }
+    bagentd::current_chat::initialize_schema(&conn)
+        .map_err(|error| anyhow::anyhow!("initialize Current Chat: {error}"))?;
+    recover_after_daemon_restart(&conn, chrono::Utc::now())
+        .map_err(|error| anyhow::anyhow!("recover Current Chat: {error}"))?;
+    open_or_create_current_chat(&conn)
+        .map_err(|error| anyhow::anyhow!("open Current Chat: {error}"))?;
+    bagentd::cutover::finalize_legacy_boundary(&db_path)
+        .map_err(|error| anyhow::anyhow!("finalize Stage 8 authority boundary: {error}"))?;
     let db = Arc::new(Mutex::new(conn));
-    let evidence_orchestrator = agent_exec::EvidenceOrchestratorFlag::from_local_env();
     let resolver_selection = reference_resolution::select_runtime(
-        evidence_orchestrator,
         || std::env::var(reference_resolution::REFERENCE_RESOLVER_MODE_ENV).ok(),
         |_mode| {
             Ok::<
@@ -441,11 +392,6 @@ async fn main() -> Result<()> {
                 &db,
             )))
         },
-    );
-    tracing::info!(
-        enabled = evidence_orchestrator == agent_exec::EvidenceOrchestratorFlag::Enabled,
-        env = agent_exec::EVIDENCE_ORCHESTRATOR_FLAG_ENV,
-        "typed evidence production routing"
     );
     let resolver_selection_fields = (
         resolver_selection.selection_label(),
@@ -474,11 +420,6 @@ async fn main() -> Result<()> {
             .await
             .map_err(|_| anyhow::anyhow!("resolver readiness failed"))?;
         runtime.start_scheduled_prune();
-    }
-
-    {
-        let mut connection = db.lock().await;
-        purge_legacy_context_data(&data_dir, &mut connection);
     }
 
     let token_path = data_dir.join("daemon.token");
@@ -514,7 +455,69 @@ async fn main() -> Result<()> {
         std::env::var("BAGENT_BASERT_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     let basert_api_key =
         std::env::var("BAGENT_BASERT_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
-    let inference = BaseRtClient::new(basert_base_url, basert_api_key);
+    let default_model =
+        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
+    let classifier_model =
+        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
+    let synthesis_config = evidence::SynthesisConfig::from_environment();
+    let model_config = ProductionModelConfig::from_environment(
+        default_model.clone(),
+        synthesis_config.preferred_model.clone(),
+        basert_api_key.clone(),
+    );
+    #[cfg(feature = "stage7a-acceptance")]
+    let stage7a_fixture = std::env::var("BAGENT_STAGE7A_ACCEPTANCE_FIXTURE").as_deref() == Ok("1");
+    #[cfg(feature = "stage7a-acceptance")]
+    let model_runtime = if stage7a_fixture {
+        ModelRuntime::external_fixture_from_endpoint(basert_base_url, basert_api_key, model_config)
+    } else {
+        ModelRuntime::production_from_endpoint(basert_base_url, basert_api_key, model_config)
+    };
+    #[cfg(not(feature = "stage7a-acceptance"))]
+    let model_runtime =
+        ModelRuntime::production_from_endpoint(basert_base_url, basert_api_key, model_config);
+    #[cfg(feature = "stage7a-acceptance")]
+    if stage7a_fixture {
+        let allow_retained_chat_model =
+            std::env::var("BAGENT_STAGE7A_ACCEPTANCE_RESTART").as_deref() == Ok("1");
+        model_runtime
+            .initialize_external_fixture(allow_retained_chat_model)
+            .await
+            .context("initialize external Stage 7A Model Runtime fixture")?;
+    } else {
+        model_runtime
+            .initialize()
+            .await
+            .context("initialize daemon-owned Model Runtime")?;
+    }
+    #[cfg(not(feature = "stage7a-acceptance"))]
+    model_runtime
+        .initialize()
+        .await
+        .context("initialize daemon-owned Model Runtime")?;
+    let daemon_generation = DaemonGeneration::new(Uuid::new_v4().to_string());
+    let work_authority = Arc::new(UnifiedWorkAuthority::new(
+        Arc::new(
+            WorkCoordinator::open(
+                &db_path,
+                CoordinatorConfig::default(),
+                daemon_generation.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("open unified Work authority: {error}"))?,
+        ),
+        daemon_generation,
+    ));
+    {
+        let connection = db.lock().await;
+        capture_recovered_approval_presentations(&connection, chrono::Utc::now()).map_err(
+            |error| anyhow::anyhow!("capture recovered Current Chat approvals: {error}"),
+        )?;
+    }
+    tokio::spawn(
+        work_authority
+            .clone()
+            .run_dispatcher(|| chrono::Utc::now().timestamp().max(0) as u64),
+    );
     #[cfg(feature = "stage8-acceptance")]
     let acceptance = evidence::acceptance_runtime_enabled(
         std::env::var(evidence::STAGE8_ACCEPTANCE_FIXTURES_ENV)
@@ -522,30 +525,14 @@ async fn main() -> Result<()> {
             .as_deref(),
     )
     .then(evidence::AcceptanceControl::default);
-    #[cfg(feature = "stage8-acceptance")]
-    let synthesis_client: Arc<dyn evidence::SynthesisModelClient> = match &acceptance {
-        Some(control) => Arc::new(control.synthesis_client(inference.clone())),
-        None => Arc::new(inference.clone()),
-    };
-    #[cfg(not(feature = "stage8-acceptance"))]
-    let synthesis_client: Arc<dyn evidence::SynthesisModelClient> = Arc::new(inference.clone());
-    let synthesis = evidence::SynthesisService::new(
-        synthesis_client,
-        Arc::new(evidence::SystemSynthesisClock::default()),
-        Arc::new(evidence::SystemMemoryPressureSignal::from_environment()),
-        evidence::SynthesisConfig::from_environment(),
-    );
+    let synthesis = evidence::SynthesisService::new(model_runtime.clone(), synthesis_config);
 
     // MemoryStore uses a separate connection with std::sync::Mutex (blocking SQLite ops)
-    let mem_conn = rusqlite::Connection::open(data_dir.join("bagent.db"))?;
+    let mem_conn = rusqlite::Connection::open(&db_path)?;
     let mem_db = Arc::new(std::sync::Mutex::new(mem_conn));
     let memory = Arc::new(MemoryStore::new(mem_db).with_data_dir(data_dir.clone()));
     let prompt_builder = Arc::new(PromptBuilder::new());
 
-    let default_model =
-        std::env::var("BAGENT_DEFAULT_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
-    let classifier_model =
-        std::env::var("BAGENT_CLASSIFIER_MODEL").unwrap_or_else(|_| DEFAULT_CHAT_MODEL.to_string());
     // Automated mail sync: battery-aware interval poller
     // On AC power:      every 5 minutes
     // On battery power: no background polling — sync only on demand when user asks about mail
@@ -653,9 +640,6 @@ async fn main() -> Result<()> {
     let rules = Arc::new(RuleEngine::load_or_default(&rules_path));
     Arc::clone(&rules).spawn_hot_reload();
 
-    let pending_approvals: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-
     // Scan skills directories: repo skills/ first, then user skills dir (override by name).
     let skills = {
         let mut skills_dirs: Vec<std::path::PathBuf> = vec![];
@@ -732,17 +716,33 @@ async fn main() -> Result<()> {
         });
     }
 
+    let ui_consumer_authority_path = data_dir.join("ui-consumer-authority.json");
+    let ui_consumer_authority =
+        UiConsumerAuthority::load(&ui_consumer_authority_path, std::time::Instant::now())?;
+    let full_disk_access_probe = {
+        #[cfg(feature = "stage7a-acceptance")]
+        {
+            if std::env::var("BAGENT_STAGE7C_FDA_FIXTURE").as_deref() == Ok("granted") {
+                DaemonFullDiskAccessProbe::acceptance_granted()
+            } else {
+                DaemonFullDiskAccessProbe::production()
+            }
+        }
+        #[cfg(not(feature = "stage7a-acceptance"))]
+        {
+            DaemonFullDiskAccessProbe::production()
+        }
+    };
     let state = AppState {
         db,
-        db_path: data_dir.join("bagent.db"),
+        db_path,
         token,
         default_model,
-        debug_dir,
         classifier_model,
-        evidence_orchestrator,
         resolver_runtime,
         attachments_dir,
-        inference,
+        model_runtime,
+        work_authority,
         synthesis,
         evidence_diagnostics,
         mail,
@@ -751,7 +751,6 @@ async fn main() -> Result<()> {
         memory,
         prompt_builder,
         rules,
-        pending_approvals,
         skills,
         task_rater,
         codex,
@@ -762,10 +761,9 @@ async fn main() -> Result<()> {
         whatsapp,
         runtime_refs: Arc::new(Mutex::new(HashMap::new())),
         automations_changed: Arc::new(tokio::sync::Notify::new()),
-        events_tx: tokio::sync::broadcast::channel(256).0,
-        run_slots: Arc::new(tokio::sync::Semaphore::new(
-            bagent_automations::policy::MAX_CONCURRENT_RUNS,
-        )),
+        ui_consumer_authority: Arc::new(Mutex::new(ui_consumer_authority)),
+        ui_consumer_authority_path,
+        full_disk_access_probe: Arc::new(full_disk_access_probe),
     };
     state.synthesis.start_maintenance().await;
 
@@ -782,9 +780,30 @@ async fn main() -> Result<()> {
     #[allow(unused_mut)]
     let mut app = Router::new()
         .route("/health", get(health))
-        .route("/events", get(events_stream))
+        .route("/permissions/full-disk-access", get(full_disk_access))
+        .route("/work/snapshot", get(work_snapshot))
+        .route("/work/snapshot/read", get(work_snapshot_read))
+        .route("/work/events", get(work_events))
+        .route("/work/ui-relaunch/reserve", post(ui_relaunch_reserve))
+        .route("/work/ui-relaunch/status", post(ui_relaunch_status))
+        .route("/work/ui-relaunch/snapshot", post(ui_relaunch_snapshot))
+        .route("/work/ui-relaunch/ready", post(ui_relaunch_ready))
+        .route("/work/ui-relaunch/fence-old", post(ui_relaunch_fence_old))
+        .route("/work/ui-relaunch/activate", post(ui_relaunch_activate))
+        .route(
+            "/work/ui-relaunch/acknowledge",
+            post(ui_relaunch_acknowledge),
+        )
+        .route("/work/ui-relaunch/rollback", post(ui_relaunch_rollback))
+        .route(
+            "/work/attention/acknowledge",
+            post(acknowledge_work_attention),
+        )
         .route("/models", get(models))
         .route("/chat", post(chat))
+        .route("/current-chat", get(current_chat_get))
+        .route("/current-chat/draft", post(current_chat_draft_save))
+        .route("/current-chat/clear", post(current_chat_clear))
         .route("/embeddings", post(embeddings))
         .route("/approvals/pending", get(approvals_pending))
         .route("/approvals/:id/decide", post(approval_decide))
@@ -816,10 +835,23 @@ async fn main() -> Result<()> {
             "/automations/:id/runs",
             get(automations_api::automation_runs),
         )
-        // Phase 4B — Sessions
-        .route("/sessions", post(session_create).get(sessions_list))
-        .route("/sessions/:id/turns", get(session_turns))
-        .route("/sessions/:id", delete(session_delete))
+        .route(
+            "/automations/:id/runs/:run_id",
+            get(automations_api::automation_run),
+        )
+        .route(
+            "/automation-sessions/:automation_session_identity",
+            get(automations_api::automation_session_get)
+                .delete(automations_api::automation_session_delete),
+        )
+        .route(
+            "/automation-sessions/:automation_session_identity/open",
+            post(automations_api::automation_session_open),
+        )
+        .route(
+            "/automation-sessions/:automation_session_identity/continue",
+            post(automations_api::automation_session_continue),
+        )
         // Phase 4B — Memory
         .route("/memory", post(memory_insert).get(memory_list))
         .route("/memory/search", get(memory_search))
@@ -849,9 +881,6 @@ async fn main() -> Result<()> {
         // Phase 4G — Disk usage
         .route("/usage", get(disk_usage))
         .route("/mail/cache/clear", post(mail_cache_clear))
-        // Phase 4H — Prompt trace debug
-        .route("/debug/conversations/:id", get(debug_conversation))
-        .route("/debug/traces/:id", get(debug_trace))
         .route(
             "/diagnostics/evidence/:turn_id/export",
             get(evidence_diagnostic_export),
@@ -888,7 +917,10 @@ async fn main() -> Result<()> {
         .route("/web/tavily/status", get(tavily_status_handler))
         // Phase 11 — WhatsApp connector
         .route("/notifications/status", get(notifications_status_handler))
-        .route("/notifications/settings", post(notifications_settings_handler))
+        .route(
+            "/notifications/settings",
+            post(notifications_settings_handler),
+        )
         .route("/notifications/forget", post(notifications_forget_handler))
         .route("/whatsapp/status", get(whatsapp_status_handler))
         .route("/whatsapp/start", post(whatsapp_start_handler))
@@ -905,10 +937,23 @@ async fn main() -> Result<()> {
         .route("/whatsapp/send", post(whatsapp_send_handler));
     #[cfg(feature = "stage8-acceptance")]
     if state.acceptance.is_some() {
-        app = app.route(
-            "/acceptance/stage8/fixture",
-            post(stage8_acceptance_fixture_handler),
-        );
+        app = app
+            .route(
+                "/acceptance/stage8/fixture",
+                post(stage8_acceptance_fixture_handler),
+            )
+            .route(
+                "/acceptance/stage8/approval",
+                post(stage8_acceptance_approval_handler),
+            )
+            .route(
+                "/acceptance/stage8/model-reload",
+                post(stage8_acceptance_model_reload_handler),
+            )
+            .route(
+                "/acceptance/stage8/privacy-diagnostic",
+                post(stage8_acceptance_privacy_diagnostic_handler),
+            );
     } else {
         app = app.route(
             "/acceptance/stage8/fixture",
@@ -922,10 +967,22 @@ async fn main() -> Result<()> {
             post(stage8_acceptance_not_found_handler),
         );
     }
+    #[cfg(feature = "stage7a-acceptance")]
+    if std::env::var("BAGENT_STAGE7A_ACCEPTANCE_FIXTURE").as_deref() == Ok("1") {
+        app = app
+            .route("/acceptance/stage7a/state", get(stage7a_acceptance_state))
+            .route(
+                "/acceptance/stage7a/seed-retained",
+                post(stage7a_acceptance_seed),
+            );
+    }
     let app = app
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
+    #[cfg(feature = "stage8-acceptance")]
+    bagentd::cutover::stage8_migration_killpoint("before-route-admission")
+        .map_err(|error| anyhow::anyhow!("pause before Stage 8 route admission: {error}"))?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     std::fs::write(data_dir.join("daemon.port"), port.to_string())?;
@@ -937,28 +994,6 @@ async fn main() -> Result<()> {
     let _ = std::fs::remove_file(data_dir.join("daemon.pid"));
     let _ = std::fs::remove_file(data_dir.join("daemon.port"));
     Ok(())
-}
-
-fn purge_legacy_context_data(data_dir: &std::path::Path, conn: &mut Connection) {
-    let cleanup_sql = [
-        "DELETE FROM memory_items",
-        "DELETE FROM chat_turn_attachments",
-        "DELETE FROM chat_turns",
-        "DELETE FROM embeddings WHERE source IN ('memory_item','chat_turn')",
-        "UPDATE sessions SET summary = NULL, metadata_json = NULL",
-    ];
-    for sql in cleanup_sql {
-        if let Err(e) = conn.execute(sql, []) {
-            tracing::debug!("legacy context purge skipped `{sql}`: {e}");
-        }
-    }
-
-    let memories_dir = data_dir.join("memories");
-    if memories_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&memories_dir) {
-            tracing::debug!("legacy memory mirror purge skipped: {e}");
-        }
-    }
 }
 
 // ── Filesystem handlers ───────────────────────────────────────────────────────
@@ -1420,29 +1455,117 @@ struct ScreenIntentRequest {
 /// Uses `ContextPlanner` as the single source of truth: returns
 /// `{ wants_screen, wants_ocr, wants_selection, task_type }` so the Swift
 /// side can decide what to capture before sending the `/chat` request.
+fn screen_intent_degraded() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "action": "none",
+            "wants_screen": false,
+            "wants_ocr": false,
+            "wants_selection": false
+        })),
+    )
+}
+
 async fn screen_intent_handler(
     State(state): State<AppState>,
     Json(req): Json<ScreenIntentRequest>,
 ) -> impl IntoResponse {
-    let classifier =
-        ScreenIntentClassifier::new(state.inference.clone(), state.classifier_model.clone());
-    match classifier.classify(&req.message, "").await {
-        Ok(intent) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(&intent).unwrap_or_default()),
-        ),
+    let work_identity = match state.work_authority.submit_conversation(
+        format!("screen-intent-admit:{}", Uuid::new_v4()),
+        CurrentChatIdentity::new(format!("screen-intent-chat:{}", Uuid::new_v4())),
+        ConversationTurnIdentity::new(format!("screen-intent-turn:{}", Uuid::new_v4())),
+        chrono::Utc::now().timestamp().max(0) as u64,
+    ) {
+        Ok(identity) => identity,
         Err(_) => {
-            // Graceful degrade — caller treats unknown as "no screen needed"
-            (
-                StatusCode::OK,
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "action": "none",
-                    "wants_screen": false,
-                    "wants_ocr": false,
-                    "wants_selection": false
+                    "wants_screen": false, "wants_ocr": false, "wants_selection": false
                 })),
             )
         }
+    };
+    // Runs detached in a spawned task so a client disconnect (axum drops this
+    // handler's future on the response side) cannot cancel execution between
+    // `admit` granting a capacity slot and the terminal `release_slot` — a
+    // dropped future here would otherwise leak the slot forever (`admit` has
+    // no timeout, and the foreground dispatch rule requires
+    // `foreground_running == 0`).
+    let task_state = state.clone();
+    let task_work_identity = work_identity.clone();
+    let task = tokio::spawn(async move {
+        let state = task_state;
+        let work_identity = task_work_identity;
+        state.work_authority.admit(work_identity.clone()).await;
+        let waiting_revision = state
+            .work_authority
+            .current(&work_identity)
+            .ok()
+            .flatten()
+            .map(|record| record.revision);
+        let running = waiting_revision.and_then(|revision| {
+            state
+                .work_authority
+                .transition(
+                    format!("screen-intent-running:{}", Uuid::new_v4()),
+                    work_identity.clone(),
+                    revision,
+                    WorkState::Running,
+                )
+                .ok()
+        });
+        if running.is_none() {
+            // admit() already granted this Work its execution slot; a failed
+            // WaitingForModel/Running lookup or transition still owes a release.
+            state.work_authority.release_slot(&work_identity);
+        }
+        let classifier_runtime: Arc<dyn AgentInference> =
+            Arc::new(state.work_authority.model_runtime(
+                state.model_runtime.clone(),
+                work_identity.clone(),
+                bagentd::unified_work::ExecutionOrigin::Foreground,
+            ));
+        let classifier =
+            ScreenIntentClassifier::new(classifier_runtime, state.classifier_model.clone());
+        match classifier.classify(&req.message, "").await {
+            Ok(intent) => {
+                if let Some(revision) = running {
+                    state.work_authority.release_slot(&work_identity);
+                    let _ = state.work_authority.transition(
+                        format!("screen-intent-complete:{}", Uuid::new_v4()),
+                        work_identity,
+                        revision,
+                        WorkState::Completed,
+                    );
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(&intent).unwrap_or_default()),
+                )
+            }
+            Err(_) => {
+                if let Some(revision) = running {
+                    state.work_authority.release_slot(&work_identity);
+                    let _ = state.work_authority.transition(
+                        format!("screen-intent-failed:{}", Uuid::new_v4()),
+                        work_identity,
+                        revision,
+                        WorkState::Failed,
+                    );
+                }
+                // Graceful degrade — caller treats unknown as "no screen needed"
+                screen_intent_degraded()
+            }
+        }
+    });
+    match task.await {
+        Ok(response) => response,
+        // The spawned task already released its slot on every one of its own
+        // exit paths before this join could fail (join only fails on panic,
+        // never on the caller side dropping this outer future).
+        Err(_) => screen_intent_degraded(),
     }
 }
 
@@ -1464,9 +1587,68 @@ fn sha256_str(s: &str) -> String {
 }
 
 fn app_data_dir() -> PathBuf {
+    #[cfg(feature = "stage7a-acceptance")]
+    if std::env::var("BAGENT_STAGE7A_ACCEPTANCE_FIXTURE").as_deref() == Ok("1") {
+        if let Some(path) = std::env::var_os("BAGENT_DATA_DIR") {
+            return PathBuf::from(path);
+        }
+    }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("bagent")
+}
+
+#[cfg(feature = "stage7a-acceptance")]
+async fn stage7a_acceptance_state(State(state): State<AppState>) -> impl IntoResponse {
+    let snapshot = state
+        .work_authority
+        .coordinator()
+        .snapshot()
+        .map_err(|error| error.to_string());
+    let current_chat = {
+        let connection = state.db.lock().await;
+        read_current_chat(&connection).map_err(|error| error.to_string())
+    };
+    match (snapshot, current_chat) {
+        (Ok(work), Ok(chat)) => {
+            let runtime = state.model_runtime.snapshot();
+            let active_work = work
+                .works
+                .into_iter()
+                .filter(|record| !record.state.is_terminal())
+                .collect::<Vec<_>>();
+            Json(serde_json::json!({
+                "daemon_pid": std::process::id(),
+                "active_work": active_work,
+                "lease_count": runtime.lease_count,
+                "runtime_phase": format!("{:?}", runtime.phase),
+                "runtime_queued_demand_count": runtime.queued_demand_count,
+                "runtime_generation": runtime.generation,
+                "current_chat_identity": chat.identity,
+                "current_chat_revision": chat.revision,
+                "current_chat_content_sha256": sha256_str(
+                    &serde_json::to_string(&chat).unwrap_or_default()),
+            }))
+            .into_response()
+        }
+        (Err(error), _) | (_, Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "stage7a-acceptance")]
+async fn stage7a_acceptance_seed(State(state): State<AppState>) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match seed_stage7a_acceptance_records(&connection, chrono::Utc::now()) {
+        Ok(snapshot) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(snapshot).unwrap_or_default()),
+        ),
+        Err(error) => current_chat_error_response(error),
+    }
 }
 
 // ── Disk usage ────────────────────────────────────────────────────────────────
@@ -1478,7 +1660,7 @@ async fn disk_usage(State(state): State<AppState>) -> impl IntoResponse {
 
     let attachments_bytes = dir_size(&state.attachments_dir);
 
-    let (memory_items_count, chat_turns_count, mail_cache_count, embeddings_count): (
+    let (memory_items_count, current_chat_turns_count, mail_cache_count, embeddings_count): (
         i64,
         i64,
         i64,
@@ -1489,7 +1671,7 @@ async fn disk_usage(State(state): State<AppState>) -> impl IntoResponse {
             .query_row("SELECT COUNT(*) FROM memory_items", [], |r| r.get(0))
             .unwrap_or(0);
         let ct: i64 = db
-            .query_row("SELECT COUNT(*) FROM chat_turns", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM current_chat_turns", [], |r| r.get(0))
             .unwrap_or(0);
         let mail: i64 = db
             .query_row("SELECT COUNT(*) FROM mail_cache", [], |r| r.get(0))
@@ -1508,7 +1690,7 @@ async fn disk_usage(State(state): State<AppState>) -> impl IntoResponse {
             "db_bytes": db_bytes,
             "attachments_bytes": attachments_bytes,
             "memory_items_count": memory_items_count,
-            "chat_turns_count": chat_turns_count,
+            "current_chat_turns_count": current_chat_turns_count,
             "mail_cache_count": mail_cache_count,
             "embeddings_count": embeddings_count,
             "total_bytes": total_bytes
@@ -1525,40 +1707,6 @@ async fn mail_cache_clear(State(state): State<AppState>) -> impl IntoResponse {
         )
         .unwrap_or(0);
     (StatusCode::OK, Json(serde_json::json!({ "deleted": n })))
-}
-
-async fn debug_trace(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    match find_prompt_debug_record(&state.debug_dir, |v| {
-        v.get("prompt_trace_id").and_then(|x| x.as_str()) == Some(id.as_str())
-    }) {
-        Ok(Some(record)) => (StatusCode::OK, Json(record)),
-        Ok(None) => {
-            let matching_session_traces = read_prompt_debug_records(&state.debug_dir)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|v| v.get("session_id").and_then(|x| x.as_str()) == Some(id.as_str()))
-                .map(|v| {
-                    serde_json::json!({
-                        "prompt_trace_id": v.get("prompt_trace_id").cloned().unwrap_or_default(),
-                        "created_at": v.get("created_at").cloned().unwrap_or_default(),
-                        "user_message": v.get("user_message").cloned().unwrap_or_default(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "trace not found",
-                    "hint": "This may be a conversation/session id. Use /debug/conversations/:id, or one of matching_prompt_traces with /debug/traces/:prompt_trace_id.",
-                    "matching_prompt_traces": matching_session_traces,
-                })),
-            )
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
-    }
 }
 
 async fn evidence_diagnostic_export(
@@ -1616,154 +1764,6 @@ async fn skills_get(State(state): State<AppState>, Path(name): Path<String>) -> 
     }
 }
 
-// ── Debug: context plan ───────────────────────────────────────────────────────
-
-async fn debug_conversation(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    let (session, turns, stats) = {
-        let db = state.db.lock().await;
-        let session: Option<serde_json::Value> = db
-            .query_row(
-                "SELECT id, started_at, ended_at, language, summary, metadata_json \
-                 FROM sessions WHERE id = ?1",
-                rusqlite::params![id],
-                |r| {
-                    Ok(serde_json::json!({
-                        "id": r.get::<_, String>(0)?,
-                        "started_at": r.get::<_, String>(1)?,
-                        "ended_at": r.get::<_, Option<String>>(2)?,
-                        "language": r.get::<_, Option<String>>(3)?,
-                        "summary": r.get::<_, Option<String>>(4)?,
-                        "metadata_json": r.get::<_, Option<String>>(5)?,
-                    }))
-                },
-            )
-            .ok();
-
-        let turns: Vec<serde_json::Value> = db
-            .prepare(
-                "SELECT id, role, content, language, model, created_at FROM chat_turns \
-                 WHERE session_id = ?1 ORDER BY created_at",
-            )
-            .ok()
-            .and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![id], |r| {
-                    let content: String = r.get(2)?;
-                    Ok(serde_json::json!({
-                        "id": r.get::<_, String>(0)?,
-                        "role": r.get::<_, String>(1)?,
-                        "content_preview": preview_text(&content, 500),
-                        "chars": content.len(),
-                        "language": r.get::<_, String>(3)?,
-                        "model": r.get::<_, Option<String>>(4)?,
-                        "created_at": r.get::<_, String>(5)?,
-                    }))
-                })
-                .ok()
-                .map(|rows| rows.flatten().collect())
-            })
-            .unwrap_or_default();
-
-        let stats = serde_json::json!({
-            "memory_items_count": db.query_row("SELECT COUNT(*) FROM memory_items", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
-            "chat_turns_count": db.query_row("SELECT COUNT(*) FROM chat_turns WHERE session_id = ?1", rusqlite::params![id], |r| r.get::<_, i64>(0)).unwrap_or(0),
-            "embeddings_count": db.query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
-            "mail_cache_count": db.query_row("SELECT COUNT(*) FROM mail_cache", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
-        });
-        (session, turns, stats)
-    };
-
-    let traces = read_prompt_debug_records(&state.debug_dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|v| v.get("session_id").and_then(|x| x.as_str()) == Some(id.as_str()))
-        .collect::<Vec<_>>();
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "conversation_id": id,
-            "session": session,
-            "stats": stats,
-            "turns": turns,
-            "traces": traces,
-        })),
-    )
-}
-
-fn append_prompt_debug_record(
-    debug_dir: &std::path::Path,
-    record: &PromptDebugRecord,
-) -> Result<()> {
-    std::fs::create_dir_all(debug_dir)?;
-    let path = debug_dir.join("prompt-traces.jsonl");
-    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 5 * 1024 * 1024 {
-        let rotated = debug_dir.join("prompt-traces.1.jsonl");
-        let _ = std::fs::remove_file(&rotated);
-        let _ = std::fs::rename(&path, rotated);
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let line = serde_json::to_string(record)?;
-    writeln!(file, "{line}")?;
-    Ok(())
-}
-
-fn read_prompt_debug_records(debug_dir: &std::path::Path) -> Result<Vec<serde_json::Value>> {
-    let path = debug_dir.join("prompt-traces.jsonl");
-    let content = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(e.into()),
-    };
-    Ok(content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .collect())
-}
-
-fn find_prompt_debug_record<F>(
-    debug_dir: &std::path::Path,
-    pred: F,
-) -> Result<Option<serde_json::Value>>
-where
-    F: Fn(&serde_json::Value) -> bool,
-{
-    Ok(read_prompt_debug_records(debug_dir)?
-        .into_iter()
-        .rev()
-        .find(pred))
-}
-
-fn debug_trace_preview(trace: &PromptTrace) -> String {
-    let layers = trace
-        .layers
-        .iter()
-        .filter(|l| l.included)
-        .map(|l| l.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let recall = if trace.past_turn_candidates.is_empty() {
-        "no past-chat candidates".to_string()
-    } else {
-        format!(
-            "{} past-chat candidates not injected",
-            trace.past_turn_candidates.len()
-        )
-    };
-    let mail = trace
-        .mail_search_trace
-        .as_ref()
-        .and_then(|v| v.get("attempts").and_then(|a| a.as_array()).map(Vec::len))
-        .map(|n| format!("; mail search attempts={n}"))
-        .unwrap_or_default();
-    preview_text(&format!("{layers}; {recall}{mail}"), 180)
-}
-
 fn preview_text(s: &str, max: usize) -> String {
     let compact = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.len() <= max {
@@ -1772,24 +1772,6 @@ fn preview_text(s: &str, max: usize) -> String {
         let end = compact.floor_char_boundary(max);
         format!("{}…", &compact[..end])
     }
-}
-
-fn redact_debug_text(s: &str) -> String {
-    s.split_whitespace()
-        .map(|part| {
-            let lower = part.to_ascii_lowercase();
-            if lower.starts_with("bearer")
-                || lower.starts_with("sk-")
-                || lower.contains("api_key")
-                || lower.contains("authorization:")
-            {
-                "[REDACTED]"
-            } else {
-                part
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Returns true when the Mac is connected to AC power (not running on battery).
@@ -1882,16 +1864,43 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             error: Some("status unavailable".into()),
             diagnostics: None,
         });
+    let runtime = state.model_runtime.snapshot();
+    let policy = state.model_runtime.policy();
+    let phase = match runtime.phase {
+        RuntimePhase::Unavailable => "unavailable",
+        RuntimePhase::Unloaded => "unloaded",
+        RuntimePhase::Loading(_) => "loading",
+        RuntimePhase::LoadedNotReady(_) => "loaded_not_ready",
+        RuntimePhase::Ready(_) => "ready",
+        RuntimePhase::Retiring(_) => "retiring",
+        RuntimePhase::Poisoned(_) => "poisoned",
+        RuntimePhase::Restarting => "restarting",
+    };
+    let changed_pid_recovery = match runtime.phase {
+        RuntimePhase::Poisoned(_) | RuntimePhase::Restarting => "in progress",
+        _ if runtime.clean_changed_pid_boundary => "ready",
+        _ => "not reported",
+    };
     Json(HealthResponse {
         status: "ok",
         process_id: std::process::id(),
         tavily_configuration,
-        basert: state.inference.is_up().await,
+        basert: state.model_runtime.health().await,
         model: state.default_model,
         classifier_model: state.classifier_model,
+        model_runtime: ModelRuntimeHealth {
+            phase,
+            lease_count: runtime.lease_count,
+            residency_pinned: runtime.residency_pinned,
+            queued_demand_count: runtime.queued_demand_count,
+            changed_pid_recovery,
+            preload_on_input: Some(policy.preload_on_input),
+            shared_idle_timeout_seconds: Some(policy.shared_idle_timeout_seconds),
+        },
         connectors: ConnectorStatus {
             mail: state.mail.is_some(),
             notes: state.notes.is_some(),
+            codex: state.codex.is_some(),
             odoo: odoo_configured,
             whatsapp: WhatsappHealthStatus {
                 connected: wa_status.status == WhatsappConnectionStatus::Ready,
@@ -1903,38 +1912,732 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-/// Daemon-wide SSE stream: automation lifecycle + approval notifications.
-/// Typed envelopes only — clients refetch authoritative records on receipt.
-async fn events_stream(
+async fn full_disk_access(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.full_disk_access_probe.probe())
+}
+
+#[derive(Deserialize)]
+struct WorkSnapshotQuery {
+    consumer_fence: String,
+}
+
+#[derive(Deserialize)]
+struct WorkEventsQuery {
+    after: u64,
+    daemon_generation: String,
+    consumer_fence: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AcknowledgeWorkAttentionRequest {
+    command_identity: String,
+    consumer_fence: String,
+    work_identity: String,
+    expected_revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UIRelaunchTransferRequest {
+    transfer_identity: String,
+    old_consumer_fence: Option<String>,
+    replacement_consumer_fence: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UIRelaunchTransferResponse {
+    status: String,
+    timeout_seconds: u64,
+}
+
+fn ui_relaunch_error_response(
+    error: UiConsumerTransferError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, code) = match error {
+        UiConsumerTransferError::StaleConsumer => (StatusCode::CONFLICT, "stale_consumer_fence"),
+        UiConsumerTransferError::DuplicateReplacement => {
+            (StatusCode::CONFLICT, "duplicate_replacement")
+        }
+        UiConsumerTransferError::Expired => (StatusCode::CONFLICT, "takeover_expired"),
+        UiConsumerTransferError::AlreadyAcknowledged => {
+            (StatusCode::CONFLICT, "takeover_already_acknowledged")
+        }
+        UiConsumerTransferError::InvalidTransfer | UiConsumerTransferError::NotReady => {
+            (StatusCode::CONFLICT, "takeover_not_ready")
+        }
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "code": code,
+            "error": "UI takeover could not proceed"
+        })),
+    )
+}
+
+fn ui_relaunch_transfer_response(status: TransferStatus) -> Json<UIRelaunchTransferResponse> {
+    Json(UIRelaunchTransferResponse {
+        status: status.as_str().to_owned(),
+        timeout_seconds: TRANSFER_TIMEOUT.as_secs(),
+    })
+}
+
+fn persist_ui_consumer_authority(state: &AppState, authority: &UiConsumerAuthority) {
+    if let Err(error) = authority.save(&state.ui_consumer_authority_path) {
+        tracing::error!(%error, "failed to persist UI consumer authority; stopping daemon");
+        // Serving after an authority write failure could create two consumers
+        // after restart. Keep the old durable record authoritative and fail
+        // closed instead of acknowledging a mutation that was not persisted.
+        std::process::exit(1);
+    }
+}
+
+async fn ui_relaunch_reserve(
     State(state): State<AppState>,
-) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
-    let mut sub = state.events_tx.subscribe();
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
-    tokio::spawn(async move {
-        loop {
-            match sub.recv().await {
-                Ok(v) => {
-                    if tx
-                        .send(Ok(Event::default().data(v.to_string())))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(old_fence) = request.old_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.reserve(
+        &request.transfer_identity,
+        old_fence,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::Reserved).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_status(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let status = authority.status(&request.transfer_identity, std::time::Instant::now());
+    persist_ui_consumer_authority(&state, &authority);
+    ui_relaunch_transfer_response(status).into_response()
+}
+
+async fn ui_relaunch_snapshot(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.refetch_reserved(
+        &request.transfer_identity,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    if let Err(error) = result {
+        return ui_relaunch_error_response(error).into_response();
+    }
+    drop(authority);
+    match authoritative_notch_snapshot(&state) {
+        Ok((snapshot, context)) => Json(notch_snapshot_value(&snapshot, &context)).into_response(),
+        Err(_error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "daemon_unavailable",
+                "error": "authoritative UI state is unavailable"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn ui_relaunch_ready(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.ready(
+        &request.transfer_identity,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::Ready).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_activate(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.activate(
+        &request.transfer_identity,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::Active).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_fence_old(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(old_fence) = request.old_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.fence_old(
+        &request.transfer_identity,
+        old_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::OldFenced).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_acknowledge(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(replacement_fence) = request.replacement_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.acknowledge(
+        &request.transfer_identity,
+        replacement_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::Acknowledged).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn ui_relaunch_rollback(
+    State(state): State<AppState>,
+    Json(request): Json<UIRelaunchTransferRequest>,
+) -> impl IntoResponse {
+    let Some(old_fence) = request.old_consumer_fence.as_deref() else {
+        return ui_relaunch_error_response(UiConsumerTransferError::InvalidTransfer)
+            .into_response();
+    };
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.rollback(
+        &request.transfer_identity,
+        old_fence,
+        std::time::Instant::now(),
+    );
+    persist_ui_consumer_authority(&state, &authority);
+    match result {
+        Ok(()) => ui_relaunch_transfer_response(TransferStatus::RolledBack).into_response(),
+        Err(error) => ui_relaunch_error_response(error).into_response(),
+    }
+}
+
+async fn acknowledge_work_attention(
+    State(state): State<AppState>,
+    Json(request): Json<AcknowledgeWorkAttentionRequest>,
+) -> impl IntoResponse {
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let fence_matches = authority
+        .active_fence(std::time::Instant::now())
+        .is_some_and(|active| active == request.consumer_fence);
+    persist_ui_consumer_authority(&state, &authority);
+    if !fence_matches {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "code": "stale_consumer_fence",
+                "error": "stale consumer fence"
+            })),
+        );
+    }
+    match state.work_authority.acknowledge_attention(
+        request.command_identity,
+        WorkIdentity::new(request.work_identity),
+        WorkRevision::new(request.expected_revision),
+    ) {
+        Ok(revision) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "revision": revision.value() })),
+        ),
+        Err(error) => acknowledge_attention_error_response(error),
+    }
+}
+
+fn acknowledge_attention_error_response(
+    error: CommandError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        error @ (CommandError::Conflict { .. } | CommandError::TerminalTarget) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "code": "work_conflict",
+                "error": format!("{error}")
+            })),
+        ),
+        error => {
+            tracing::error!(%error, "failed to acknowledge Work attention");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "code": "internal_error",
+                    "error": "failed to acknowledge Work attention"
+                })),
+            )
+        }
+    }
+}
+
+async fn work_snapshot(
+    State(state): State<AppState>,
+    Query(query): Query<WorkSnapshotQuery>,
+) -> impl IntoResponse {
+    if query.consumer_fence.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing consumer fence" })),
+        )
+            .into_response();
+    }
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let result = authority.claim_snapshot(&query.consumer_fence, std::time::Instant::now());
+    persist_ui_consumer_authority(&state, &authority);
+    drop(authority);
+    if let Err(error) = result {
+        return ui_relaunch_error_response(error).into_response();
+    }
+    match authoritative_notch_snapshot(&state) {
+        Ok((snapshot, context)) => (
+            StatusCode::OK,
+            Json(notch_snapshot_value(&snapshot, &context)),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{error}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn work_snapshot_read(State(state): State<AppState>) -> impl IntoResponse {
+    match authoritative_notch_snapshot(&state) {
+        Ok((snapshot, context)) => (
+            StatusCode::OK,
+            Json(notch_snapshot_value(&snapshot, &context)),
+        )
+            .into_response(),
+        Err(_error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "code": "daemon_unavailable",
+                "error": "authoritative UI state is unavailable"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn work_events(
+    State(state): State<AppState>,
+    Query(query): Query<WorkEventsQuery>,
+) -> impl IntoResponse {
+    let mut authority = state.ui_consumer_authority.lock().await;
+    let fence_matches = authority
+        .active_fence(std::time::Instant::now())
+        .is_some_and(|active| active == query.consumer_fence);
+    persist_ui_consumer_authority(&state, &authority);
+    if !fence_matches {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "stale consumer fence" })),
+        );
+    }
+
+    let coordinator = state.work_authority.coordinator();
+    match coordinator.notch_events(
+        EventCursor::new(query.after),
+        &DaemonGeneration::new(query.daemon_generation),
+    ) {
+        Ok(EventRead::Gap { .. }) => match authoritative_notch_snapshot(&state) {
+            Ok((snapshot, context)) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "kind": "gap",
+                    "snapshot": notch_snapshot_value(&snapshot, &context),
+                })),
+            ),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{error}") })),
+            ),
+        },
+        Ok(EventRead::Events(events)) if events.is_empty() => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "kind": "events", "events": [] })),
+        ),
+        Ok(EventRead::Events(events)) => match authoritative_notch_snapshot(&state) {
+            Ok((snapshot, context)) => {
+                if event_batch_requires_snapshot(&events, &snapshot) {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "kind": "gap",
+                            "snapshot": notch_snapshot_value(&snapshot, &context),
+                        })),
+                    );
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                let projected = events
+                    .iter()
+                    .filter_map(|event| {
+                        snapshot
+                            .works
+                            .iter()
+                            .enumerate()
+                            .find(|(_, work)| work.identity == event.work_identity)
+                            .map(|(index, work)| {
+                                let mut value = notch_work_value(work, index as u64, &context);
+                                let object = value.as_object_mut().expect("work projection object");
+                                object.insert(
+                                    "revision".to_owned(),
+                                    serde_json::json!(event.work_revision.value()),
+                                );
+                                object.insert(
+                                    "state".to_owned(),
+                                    serde_json::to_value(event.state)
+                                        .expect("serializable Work state"),
+                                );
+                                object.insert(
+                                    "activity".to_owned(),
+                                    event
+                                        .activity
+                                        .map(|category| serde_json::json!({ "category": category }))
+                                        .unwrap_or(serde_json::Value::Null),
+                                );
+                                serde_json::json!({
+                                    "schemaVersion": event.schema_version,
+                                    "cursor": event.event_cursor.value(),
+                                    "daemonGeneration": event.daemon_generation.as_str(),
+                                    "work": value,
+                                    "pendingApprovals": notch_pending_approvals_value(&snapshot),
+                                    "model": context.model_phase,
+                                })
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "kind": "events", "events": projected })),
+                )
+            }
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("{error}") })),
+            ),
+        },
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": format!("{error}") })),
+        ),
+    }
+}
+
+fn event_batch_requires_snapshot(
+    events: &[bagentd::work_coordinator::WorkEvent],
+    snapshot: &WorkSnapshot,
+) -> bool {
+    events.len() != 1
+        || events[0].event_cursor.value() != snapshot.cursor.value()
+        || !snapshot
+            .works
+            .iter()
+            .any(|work| work.identity == events[0].work_identity)
+}
+
+struct NotchProjectionContext {
+    model_phase: &'static str,
+    automation_names: HashMap<String, String>,
+    automation_definition_identities: HashMap<String, String>,
+    automation_session_identities: HashMap<String, String>,
+    automation_detached: HashMap<String, bool>,
+    terminal_attention: HashMap<String, &'static str>,
+    terminal_finished_at: HashMap<String, String>,
+    terminal_orders: HashMap<String, u64>,
+    queue_positions: HashMap<String, u64>,
+    claimed_orders: HashMap<String, u64>,
+}
+
+fn authoritative_notch_snapshot(
+    state: &AppState,
+) -> Result<(WorkSnapshot, NotchProjectionContext)> {
+    let model_phase = match state.model_runtime.snapshot().phase {
+        RuntimePhase::Unavailable => "unavailable",
+        RuntimePhase::Unloaded => "unloaded",
+        RuntimePhase::Loading(_) => "loading",
+        RuntimePhase::LoadedNotReady(_) => "loaded_not_ready",
+        RuntimePhase::Ready(_) => "ready",
+        RuntimePhase::Retiring(_) => "retiring",
+        RuntimePhase::Poisoned(_) => "poisoned",
+        RuntimePhase::Restarting => "restarting",
+    };
+    state
+        .work_authority
+        .coordinator()
+        .projected_snapshot(|connection, snapshot| {
+            notch_projection_context(connection, snapshot, model_phase)
+                .map_err(|error| CommandError::Storage(error.to_string()))
+        })
+        .map_err(Into::into)
+}
+
+const NOTCH_PROJECTION_CONTEXT_SQL: &str =
+    "SELECT w.identity, w.rowid, COALESCE(a.name, t.display_name),
+            a.id IS NULL AND t.display_name IS NOT NULL,
+            r.historical_automation_identity, r.automation_session_identity,
+            s.attention_state, w.state, w.updated_at
+     FROM json_each(?1) projected
+     JOIN works w ON w.identity = projected.value
+     LEFT JOIN work_automation_runs r ON r.work_identity = w.identity
+     LEFT JOIN automations a ON a.id = r.historical_automation_identity
+     LEFT JOIN automation_task_snapshots t
+       ON t.automation_session_identity = r.automation_session_identity
+     LEFT JOIN work_automation_sessions s
+       ON s.automation_session_identity = r.automation_session_identity
+     ORDER BY w.identity ASC";
+
+fn notch_projection_context(
+    db: &Connection,
+    snapshot: &WorkSnapshot,
+    model_phase: &'static str,
+) -> Result<NotchProjectionContext> {
+    let mut automation_names = HashMap::new();
+    let mut automation_definition_identities = HashMap::new();
+    let mut automation_session_identities = HashMap::new();
+    let mut automation_detached = HashMap::new();
+    let mut terminal_attention = HashMap::new();
+    let mut terminal_finished_at = HashMap::new();
+    let mut terminal_orders = HashMap::new();
+    let mut queue_positions = HashMap::new();
+    let mut claimed_orders = HashMap::new();
+    let identities = snapshot
+        .works
+        .iter()
+        .map(|work| work.identity.as_str())
+        .collect::<Vec<_>>();
+    let projected_identities = serde_json::to_string(&identities)?;
+    let mut statement = db.prepare(NOTCH_PROJECTION_CONTEXT_SQL)?;
+    let rows = statement.query_map(rusqlite::params![projected_identities], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+    let mut terminal_candidates = Vec::new();
+    for row in rows {
+        let (
+            identity,
+            claimed_order,
+            automation_name,
+            detached,
+            definition_identity,
+            session_identity,
+            attention_state,
+            state,
+            updated_at,
+        ) = row?;
+        claimed_orders.insert(identity.clone(), claimed_order);
+        if let Some(name) = automation_name {
+            automation_names.insert(identity.clone(), name);
+        }
+        automation_detached.insert(identity.clone(), detached);
+        if let Some(definition_identity) = definition_identity {
+            automation_definition_identities.insert(identity.clone(), definition_identity);
+        }
+        if let Some(session_identity) = session_identity {
+            automation_session_identities.insert(identity.clone(), session_identity);
+        }
+        if state.as_str() == "completed"
+            || state.as_str() == "partial"
+            || state.as_str() == "failed"
+            || state.as_str() == "cancelled"
+            || state.as_str() == "abandoned"
+        {
+            terminal_finished_at.insert(identity.clone(), updated_at.clone());
+        }
+        if attention_state.as_deref() == Some("unread") {
+            let attention = match state.as_str() {
+                "failed" => Some("failed"),
+                "partial" => Some("partial"),
+                "completed" | "cancelled" | "abandoned" => Some("unread"),
+                _ => None,
+            };
+            if let Some(attention) = attention {
+                terminal_attention.insert(identity.clone(), attention);
             }
         }
-    });
-    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
+        if matches!(
+            state.as_str(),
+            "completed" | "partial" | "failed" | "cancelled" | "abandoned"
+        ) {
+            terminal_candidates.push((updated_at, identity));
+        }
+    }
+    terminal_candidates.sort();
+    let mut terminal_order = 0;
+    let mut previous_timestamp = None;
+    for (timestamp, identity) in terminal_candidates {
+        if previous_timestamp.as_deref() != Some(timestamp.as_str()) {
+            terminal_order += 1;
+            previous_timestamp = Some(timestamp);
+        }
+        terminal_orders.insert(identity, terminal_order);
+    }
+    let mut queued_automations = snapshot
+        .works
+        .iter()
+        .filter(|work| {
+            work.state == WorkState::Queued && matches!(work.origin, WorkOrigin::Automation { .. })
+        })
+        .map(|work| {
+            (
+                claimed_orders
+                    .get(work.identity.as_str())
+                    .copied()
+                    .unwrap_or(u64::MAX),
+                work.identity.as_str().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    queued_automations.sort_by_key(|(claimed_order, _)| *claimed_order);
+    for (index, (_, identity)) in queued_automations.into_iter().enumerate() {
+        queue_positions.insert(identity, index as u64 + 1);
+    }
+    Ok(NotchProjectionContext {
+        model_phase,
+        automation_names,
+        automation_definition_identities,
+        automation_session_identities,
+        automation_detached,
+        terminal_attention,
+        terminal_finished_at,
+        terminal_orders,
+        queue_positions,
+        claimed_orders,
+    })
+}
+
+fn notch_snapshot_value(
+    snapshot: &WorkSnapshot,
+    context: &NotchProjectionContext,
+) -> serde_json::Value {
+    let works = snapshot
+        .works
+        .iter()
+        .enumerate()
+        .filter(|(_, work)| context.claimed_orders.contains_key(work.identity.as_str()))
+        .map(|(index, work)| notch_work_value(work, index as u64, context))
+        .collect::<Vec<_>>();
+    let pending_approvals = notch_pending_approvals_value(snapshot);
+    serde_json::json!({
+        "schemaVersion": snapshot.schema_version,
+        "cursor": snapshot.cursor.value(),
+        "daemonGeneration": snapshot.daemon_generation.as_str(),
+        "works": works,
+        "pendingApprovals": pending_approvals,
+        "model": context.model_phase,
+    })
+}
+
+fn notch_pending_approvals_value(snapshot: &WorkSnapshot) -> serde_json::Value {
+    serde_json::Value::Array(
+        snapshot
+            .approvals
+            .iter()
+            .filter(|approval| approval.state == ApprovalState::Pending)
+            .map(|approval| {
+                serde_json::json!({
+                    "identity": approval.identity.as_str(),
+                    "workIdentity": approval.work_identity.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn notch_work_value(
+    work: &WorkRecord,
+    claimed_order: u64,
+    context: &NotchProjectionContext,
+) -> serde_json::Value {
+    let origin = match &work.origin {
+        WorkOrigin::Conversation { .. } => "conversation",
+        WorkOrigin::Automation { .. } => "automation",
+    };
+    serde_json::json!({
+        "identity": work.identity.as_str(),
+        "revision": work.revision.value(),
+        "origin": origin,
+        "state": work.state,
+        "activity": work.activity.map(|category| serde_json::json!({ "category": category })),
+        "queuePosition": context.queue_positions.get(work.identity.as_str()),
+        "automationDisplayName": context.automation_names.get(work.identity.as_str()),
+        "automationDefinitionIdentity": context.automation_definition_identities.get(work.identity.as_str()),
+        "automationDefinitionDetached": context.automation_detached.get(work.identity.as_str()).copied().unwrap_or(false),
+        "automationSessionIdentity": context.automation_session_identities.get(work.identity.as_str()),
+        "terminalAttention": context.terminal_attention.get(work.identity.as_str()),
+        "terminalFinishedAt": context.terminal_finished_at.get(work.identity.as_str()),
+        "terminalOrder": context.terminal_orders.get(work.identity.as_str()),
+        "claimedOrder": context.claimed_orders.get(work.identity.as_str()).copied().unwrap_or(claimed_order),
+    })
 }
 
 async fn models(State(state): State<AppState>) -> impl IntoResponse {
-    match state.inference.models().await {
-        Ok(names) => {
-            let chat_models = names
+    match state.model_runtime.models().await {
+        Ok(models) => {
+            let chat_models = models
                 .into_iter()
+                .map(|model| model.id)
                 .filter(|name| name == &state.default_model)
                 .collect::<Vec<_>>();
             (
@@ -1953,8 +2656,8 @@ async fn approvals_pending(State(state): State<AppState>) -> impl IntoResponse {
     let db = state.db.lock().await;
     let items: Vec<serde_json::Value> = db
         .prepare(
-            "SELECT id, tool_name, description, expires_at, created_at, origin_json \
-             FROM pending_approvals \
+            "SELECT identity, tool_name, description, expires_at, created_at, origin_json \
+             FROM work_approval_requests \
              WHERE decision IS NULL AND expires_at > datetime('now') \
              ORDER BY created_at",
         )
@@ -1984,21 +2687,79 @@ async fn approval_decide(
     Path(id): Path<String>,
     Json(req): Json<ApprovalDecideRequest>,
 ) -> impl IntoResponse {
-    let sender = state.pending_approvals.lock().unwrap().remove(&id);
-    if let Some(tx) = sender {
-        let _ = tx.send(req.allow);
-        let decision = if req.allow { "allow" } else { "deny" };
-        let decided_at = chrono::Utc::now().to_rfc3339();
-        if let Ok(db) = state.db.try_lock() {
-            let _ = db.execute(
-                "UPDATE pending_approvals SET decision = ?1, decided_at = ?2 WHERE id = ?3",
-                rusqlite::params![decision, decided_at, id],
-            );
-            let _ = db.execute(
-                "INSERT INTO audit_entries (action, payload, model) VALUES ('approval_decide', ?1, '')",
-                rusqlite::params![serde_json::json!({"id": id, "decision": decision}).to_string()],
-            );
+    let decision = if req.allow { "allow" } else { "deny" };
+    let decided_at = chrono::Utc::now().to_rfc3339();
+    // Read the canonical presentation and Work approval before mutating
+    // either. For Work approvals, the coordinator commit wins first.
+    let canonical = {
+        let db = state.db.lock().await;
+        db.query_row(
+            "SELECT a.work_identity, w.revision, w.origin_kind
+             FROM work_approval_requests p
+             LEFT JOIN work_approvals a ON a.identity=p.identity AND a.state='pending'
+             LEFT JOIN works w ON w.identity=a.work_identity
+             WHERE p.identity=?1 AND p.decision IS NULL AND p.expires_at > ?2",
+            rusqlite::params![id, decided_at],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<u64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .ok()
+    };
+    let Some((work, revision, origin_kind)) = canonical else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "approval not found or already decided" })),
+        );
+    };
+    if let (Some(work), Some(revision), Some(origin_kind)) = (work, revision, origin_kind) {
+        let execution_origin = if origin_kind == "automation" {
+            bagentd::unified_work::ExecutionOrigin::Automation
+        } else {
+            bagentd::unified_work::ExecutionOrigin::Foreground
+        };
+        let work_identity = bagentd::work_coordinator::WorkIdentity::new(work);
+        match state.work_authority.resolve_approval(
+            format!("approval-decision:{id}"),
+            work_identity.clone(),
+            WorkRevision::new(revision),
+            bagentd::work_coordinator::ApprovalIdentity::new(id.clone()),
+            req.allow,
+            0,
+        ) {
+            Ok(_) => {
+                state
+                    .work_authority
+                    .resume(work_identity, execution_origin)
+                    .await
+            }
+            Err(error) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                );
+            }
         }
+    }
+    let changed = {
+        let db = state.db.lock().await;
+        db.execute(
+            "UPDATE work_approval_requests SET decision = ?1, decided_at = ?2
+             WHERE identity = ?3 AND decision IS NULL AND expires_at > ?2",
+            rusqlite::params![decision, decided_at, id],
+        )
+        .unwrap_or(0)
+    };
+    if changed == 1 {
+        let db = state.db.lock().await;
+        let _ = db.execute(
+            "INSERT INTO audit_entries (action, payload, model) VALUES ('approval_decide', ?1, '')",
+            rusqlite::params![serde_json::json!({"id": id, "decision": decision}).to_string()],
+        );
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
         (
@@ -2048,6 +2809,10 @@ async fn embeddings(
     )
 }
 
+fn chat_acceptance_fixture_active(stage7a_fixture: bool, stage8_fixture: bool) -> bool {
+    stage7a_fixture || stage8_fixture
+}
+
 async fn chat(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
@@ -2057,7 +2822,6 @@ async fn chat(
     let db = state.db.clone();
     let user_message = req.message.clone();
     let prompt_builder = state.prompt_builder.clone();
-    let debug_dir = state.debug_dir.clone();
     let attachment_ids = req.attachment_ids.clone();
     // Screen context is text-only: screenshot bytes are intentionally ignored.
     let screen_ocr_text = req.screen_ocr_text.clone();
@@ -2067,52 +2831,150 @@ async fn chat(
     let skills = state.skills.clone();
     let task_rater = state.task_rater.clone();
     let runtime_refs = state.runtime_refs.clone();
+    #[cfg(feature = "stage7a-acceptance")]
+    let stage7a_fixture_active =
+        std::env::var("BAGENT_STAGE7A_ACCEPTANCE_FIXTURE").as_deref() == Ok("1");
+    #[cfg(not(feature = "stage7a-acceptance"))]
+    let stage7a_fixture_active = false;
     #[cfg(feature = "stage8-acceptance")]
-    let acceptance_runtime_active = state.acceptance.is_some();
-    #[cfg(not(feature = "stage8-acceptance"))]
-    let acceptance_runtime_active = false;
-    #[cfg(feature = "stage8-acceptance")]
-    let acceptance_fixture_active = state
+    let stage8_fixture_active = state
         .acceptance
         .as_ref()
         .is_some_and(|control| control.selection().is_some());
     #[cfg(not(feature = "stage8-acceptance"))]
-    let acceptance_fixture_active = false;
+    let stage8_fixture_active = false;
+    let acceptance_runtime_active =
+        chat_acceptance_fixture_active(stage7a_fixture_active, stage8_fixture_active);
+    let acceptance_fixture_active = acceptance_runtime_active;
 
     tokio::spawn(async move {
         let t0 = std::time::Instant::now();
-        // Ensure session exists
-        let session_id = match req.session_id.clone() {
-            Some(id) => id,
-            None => {
-                let id = Uuid::new_v4().to_string();
-                let now = chrono::Utc::now().to_rfc3339();
-                if let Ok(db) = db.try_lock() {
-                    let _ = db.execute(
-                        "INSERT OR IGNORE INTO sessions (id, started_at) VALUES (?1, ?2)",
-                        rusqlite::params![id, now],
-                    );
+        // The daemon owns Current Chat identity, history, and turn admission.
+        let (session_id, conversation_turn_identity, work_identity, mut history) = {
+            let connection = db.lock().await;
+            let snapshot = match read_current_chat(&connection) {
+                Ok(snapshot)
+                    if snapshot.identity == req.current_chat_identity
+                        && snapshot.revision == req.expected_revision =>
+                {
+                    snapshot
                 }
-                id
+                Ok(_) => {
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "stale_current_chat",
+                                "message": "Current Chat changed; refetch and retry."
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_unavailable",
+                                "message": error.to_string()
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let attachments = req
+                .attachment_ids
+                .iter()
+                .filter_map(|identity| {
+                    connection
+                        .query_row(
+                            "SELECT filename, mime, size_bytes FROM attachments WHERE id=?1",
+                            rusqlite::params![identity],
+                            |row| {
+                                Ok(SubmittedAttachmentMetadata {
+                                    identity: identity.clone(),
+                                    filename: row.get(0)?,
+                                    mime: row.get(1)?,
+                                    size_bytes: row.get(2)?,
+                                    available: true,
+                                })
+                            },
+                        )
+                        .ok()
+                })
+                .collect::<Vec<_>>();
+            if attachments.len() != req.attachment_ids.len() {
+                let _ = tx
+                    .send(Ok(Event::default().data(
+                        serde_json::json!({
+                            "type": "error",
+                            "code": "attachment_not_found",
+                            "message": "A pending attachment is no longer available."
+                        })
+                        .to_string(),
+                    )))
+                    .await;
+                return;
             }
+            let (work_identity, begun) = match state.work_authority.submit_current_chat_turn(
+                format!("chat-admit:{}", Uuid::new_v4()),
+                CurrentChatIdentity::new(snapshot.identity.clone()),
+                snapshot.revision,
+                &user_message,
+                &attachments,
+                chrono::Utc::now(),
+                chrono::Utc::now().timestamp().max(0) as u64,
+            ) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_rejected",
+                                "message": error.to_string()
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            let history = snapshot
+                .turns
+                .iter()
+                .rev()
+                .take(5)
+                .rev()
+                .flat_map(|turn| {
+                    let mut messages = vec![Message::user(&turn.user_message)];
+                    if let Some(output) = turn.assistant_output.as_deref() {
+                        messages.push(Message::assistant(output));
+                    }
+                    messages
+                })
+                .collect::<Vec<_>>();
+            (snapshot.identity, begun.identity, work_identity, history)
         };
 
-        // Sliding-window conversation history supplied by the client so
-        // follow-ups ("what other options do I have?") resolve. Clamped here —
-        // the client is trusted UI but the caps are the contract.
         const HISTORY_MAX_TURNS: usize = 10;
         const HISTORY_MAX_TURN_CHARS: usize = 1_500;
         const HISTORY_MAX_TOTAL_CHARS: usize = 8_000;
-        let mut history: Vec<Message> = req
-            .history
-            .iter()
+        history = history
+            .into_iter()
             .rev()
-            .filter(|m| (m.role == "user" || m.role == "assistant") && !m.content.trim().is_empty())
             .take(HISTORY_MAX_TURNS)
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.chars().take(HISTORY_MAX_TURN_CHARS).collect(),
-                ..Message::user("")
+            .map(|mut message| {
+                message.content = message
+                    .content
+                    .chars()
+                    .take(HISTORY_MAX_TURN_CHARS)
+                    .collect();
+                message
             })
             .collect();
         history.reverse();
@@ -2226,6 +3088,13 @@ async fn chat(
         };
 
         if att_data.has_unsupported_image {
+            let _ = fail_current_chat_work(
+                &state,
+                &session_id,
+                &conversation_turn_identity,
+                &work_identity,
+                "unsupported-image",
+            );
             let _ = tx
                 .send(Ok(Event::default().data(
                     serde_json::json!({
@@ -2330,8 +3199,6 @@ async fn chat(
         );
 
         // ── Build layered prompt ──────────────────────────────────────────────
-        let prompt_trace_id = Uuid::new_v4().to_string();
-        let mut prompt_trace: Option<PromptTrace> = None;
         let messages = match prompt_builder
             .build(
                 &user_message,
@@ -2379,25 +3246,6 @@ async fn chat(
                     chars: user_message.len(),
                     preview: preview_text(&user_message, 240),
                 });
-                let prompt_chars: usize = built.messages.iter().map(|m| m.content.len()).sum();
-                let _ = tx
-                    .send(Ok(Event::default().data(
-                        serde_json::json!({
-                            "type": "debug_trace",
-                            "prompt_trace_id": &prompt_trace_id,
-                            "session_id": &session_id,
-                            "preview": debug_trace_preview(&built.trace),
-                            "prompt_chars": prompt_chars,
-                            "prompt_token_estimate": prompt_chars / 4,
-                            "message_count": built.messages.len(),
-                            "selected_skill_names": built.trace.selected_skill_names,
-                            "selected_memory_ids": built.trace.selected_memory_ids,
-                            "conversation_recall_injected": built.trace.conversation_recall_injected,
-                        })
-                        .to_string(),
-                    )))
-                    .await;
-                prompt_trace = Some(built.trace);
                 built.messages
             }
             Err(_) => {
@@ -2417,14 +3265,62 @@ async fn chat(
             prompt_chars,
             prompt_chars / 4
         );
-        let prompt_messages_for_log = messages.clone();
-
         // ── Agentic tool loop (shared execution service) ─────────────────────
         // One loop for chat and automations lives in agent_exec. Guardrails
         // live in its dispatcher: rules engine verdicts on the actual args,
+        state.work_authority.admit(work_identity.clone()).await;
+        let waiting_revision = match state
+            .work_authority
+            .current(&work_identity)
+            .ok()
+            .flatten()
+            .map(|record| record.revision)
+        {
+            Some(revision) => revision,
+            None => {
+                if let Err(error) = fail_current_chat_work(
+                    &state,
+                    &session_id,
+                    &conversation_turn_identity,
+                    &work_identity,
+                    "missing-waiting-revision",
+                ) {
+                    tracing::error!(%error, "could not durably fail Current Chat Work");
+                }
+                return;
+            }
+        };
+        let running_revision = match state.work_authority.transition(
+            format!("chat-running:{}", Uuid::new_v4()),
+            work_identity.clone(),
+            waiting_revision,
+            WorkState::Running,
+        ) {
+            Ok(revision) => revision,
+            Err(_) => {
+                if let Err(error) = fail_current_chat_work(
+                    &state,
+                    &session_id,
+                    &conversation_turn_identity,
+                    &work_identity,
+                    "running-transition",
+                ) {
+                    tracing::error!(%error, "could not durably fail Current Chat Work");
+                }
+                return;
+            }
+        };
+
         // PathPolicy (inside the fs connector), approval modal for writes,
         // per-turn budgets, and an audit entry per call.
-        let tools = agent_exec::build_tools(&state, false).await;
+        // The signed Stage 7A fixture proves model Work continuity and never
+        // exercises connectors. Avoid discovering host connectors in the
+        // disposable process so the fixture remains isolated and deterministic.
+        let tools = if acceptance_fixture_active {
+            Vec::new()
+        } else {
+            agent_exec::build_tools(&state, false).await
+        };
 
         // Forward execution events onto this request's SSE stream.
         let (ev_tx, mut ev_rx) = mpsc::channel::<serde_json::Value>(64);
@@ -2450,6 +3346,7 @@ async fn chat(
             &state,
             &sink,
             &agent_exec::ExecOrigin::Chat,
+            work_identity.clone(),
             &session_id,
             &effective_model,
             messages,
@@ -2458,49 +3355,117 @@ async fn chat(
         .await;
         drop(sink);
         let _ = forwarder.await;
-        let full_response = match loop_result {
-            Ok(outcome) => outcome.final_text,
+        match loop_result {
+            Ok(outcome) => {
+                let sources = outcome
+                    .validated_sources
+                    .iter()
+                    .map(|source| ValidatedSourceMetadata {
+                        identity: source.id.clone(),
+                        title: source.title.clone(),
+                        domain: source.domain.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let terminal_revision = state
+                    .work_authority
+                    .current(&work_identity)
+                    .ok()
+                    .flatten()
+                    .map(|record| record.revision)
+                    .unwrap_or(running_revision);
+                let durable_completion = state.work_authority.terminalize_current_chat_turn(
+                    format!("chat-complete:{}", Uuid::new_v4()),
+                    work_identity.clone(),
+                    terminal_revision,
+                    &session_id,
+                    &conversation_turn_identity,
+                    Some(&outcome.final_text),
+                    &sources,
+                    chrono::Utc::now(),
+                );
+                if durable_completion.is_ok() {
+                    state.work_authority.release_slot(&work_identity);
+                }
+                let terminal_outcome = match durable_completion {
+                    Ok((_, terminal_outcome)) => terminal_outcome,
+                    Err(error) => {
+                        let interruption_error = fail_current_chat_work(
+                            &state,
+                            &session_id,
+                            &conversation_turn_identity,
+                            &work_identity,
+                            "completion-commit",
+                        )
+                        .err();
+                        let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_commit_failed",
+                                "message": interruption_error.map_or_else(
+                                    || error.to_string(),
+                                    |durable| format!("{error}; durable interruption failed: {durable}"))
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                        return;
+                    }
+                };
+                if terminal_outcome == CurrentChatTerminalOutcome::InterruptedContentBound {
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_bound",
+                                "message": "assistant output would exceed the 16 MiB Current Chat bound"
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                    return;
+                }
+                outcome.final_text
+            }
             // Error already emitted to the stream / client gone.
-            Err(_) => return,
+            Err(error) => {
+                tracing::warn!(%error, "Current Chat execution failed");
+                if let Err(durable_error) = fail_current_chat_work(
+                    &state,
+                    &session_id,
+                    &conversation_turn_identity,
+                    &work_identity,
+                    "execution",
+                ) {
+                    tracing::error!(%durable_error, "Current Chat interruption was not durable; Work remains nonterminal");
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            serde_json::json!({
+                                "type": "error",
+                                "code": "current_chat_interrupt_failed",
+                                "message": durable_error.to_string()
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                }
+                return;
+            }
         };
 
-        let response_for_audit = full_response.clone();
         if let Ok(db) = db.try_lock() {
             let _ = db.execute(
                 "INSERT INTO audit_entries (action, payload, model) VALUES (?1, ?2, ?3)",
-                rusqlite::params!["chat", &user_message, &effective_model],
+                rusqlite::params![
+                    "chat",
+                    serde_json::json!({
+                        "message_chars": user_message.chars().count(),
+                        "message_sha256": sha256_str(&user_message),
+                    })
+                    .to_string(),
+                    &effective_model,
+                ],
             );
-        }
-
-        if !acceptance_runtime_active {
-            if let Some(trace) = prompt_trace {
-                let record = PromptDebugRecord {
-                    prompt_trace_id: prompt_trace_id.clone(),
-                    session_id: session_id.clone(),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    user_message: redact_debug_text(&user_message),
-                    model: effective_model.clone(),
-                    language: lang.to_string(),
-                    prompt_chars,
-                    prompt_token_estimate: prompt_chars / 4,
-                    message_count: prompt_messages_for_log.len(),
-                    prompt_messages: prompt_messages_for_log
-                        .iter()
-                        .map(|m| PromptDebugMessage {
-                            role: m.role.clone(),
-                            content: redact_debug_text(&m.content),
-                            images_count: 0,
-                        })
-                        .collect(),
-                    trace,
-                    response_preview: redact_debug_text(&preview_text(&response_for_audit, 600)),
-                    response_chars: response_for_audit.len(),
-                    elapsed_ms: t0.elapsed().as_millis(),
-                };
-                if let Err(e) = append_prompt_debug_record(&debug_dir, &record) {
-                    tracing::warn!("prompt debug log write failed: {e}");
-                }
-            }
         }
 
         let _ = tx
@@ -2513,57 +3478,124 @@ async fn chat(
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
-// ── Session handlers ──────────────────────────────────────────────────────────
+fn fail_current_chat_work(
+    state: &AppState,
+    current_chat_identity: &str,
+    conversation_turn_identity: &str,
+    work_identity: &WorkIdentity,
+    reason: &str,
+) -> std::result::Result<(), CommandError> {
+    let record = state
+        .work_authority
+        .current(work_identity)?
+        .ok_or(CommandError::Conflict {
+            current_revision: None,
+        })?;
+    state.work_authority.terminalize_current_chat_turn(
+        format!("chat-failed-{reason}:{}", Uuid::new_v4()),
+        work_identity.clone(),
+        record.revision,
+        current_chat_identity,
+        conversation_turn_identity,
+        None,
+        &[],
+        chrono::Utc::now(),
+    )?;
+    state.work_authority.release_slot(work_identity);
+    Ok(())
+}
 
-async fn session_create(State(state): State<AppState>) -> impl IntoResponse {
-    let id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let db = state.db.lock().await;
-    match db.execute(
-        "INSERT INTO sessions (id, started_at) VALUES (?1, ?2)",
-        rusqlite::params![id, now],
-    ) {
-        Ok(_) => (
+async fn current_chat_get(State(state): State<AppState>) -> impl IntoResponse {
+    let connection = state.db.lock().await;
+    match open_or_create_current_chat(&connection) {
+        Ok(snapshot) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "session_id": id })),
+            Json(serde_json::to_value(snapshot).unwrap_or_default()),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
+        Err(error) => current_chat_error_response(error),
     }
 }
 
-async fn sessions_list(State(_state): State<AppState>) -> impl IntoResponse {
-    (StatusCode::OK, Json(serde_json::json!({ "sessions": [] })))
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentChatDraftSaveRequest {
+    current_chat_identity: String,
+    expected_revision: u64,
+    text: String,
+    #[serde(default)]
+    pending_attachment_references: Vec<String>,
 }
 
-async fn session_turns(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
-) -> impl IntoResponse {
-    (
-        StatusCode::GONE,
-        Json(serde_json::json!({ "error": "session history is disabled", "turns": [] })),
-    )
-}
-
-async fn session_delete(
+async fn current_chat_draft_save(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    Json(request): Json<CurrentChatDraftSaveRequest>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().await;
-    match db.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id]) {
-        Ok(n) if n > 0 => (StatusCode::OK, Json(serde_json::json!({ "deleted": true }))),
-        Ok(_) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "session not found" })),
+    let connection = state.db.lock().await;
+    match save_draft(
+        &connection,
+        &request.current_chat_identity,
+        request.expected_revision,
+        &request.text,
+        &request.pending_attachment_references,
+        chrono::Utc::now(),
+    ) {
+        Ok(snapshot) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(snapshot).unwrap_or_default()),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ),
+        Err(error) => current_chat_error_response(error),
     }
+}
+
+async fn current_chat_clear(
+    State(state): State<AppState>,
+    Json(command): Json<ClearCurrentChatCommand>,
+) -> impl IntoResponse {
+    let old_identity = command.current_chat_identity.clone();
+    let connection = state.db.lock().await;
+    match clear_current_chat(&connection, command, None) {
+        Ok(snapshot) => {
+            drop(connection);
+            state.runtime_refs.lock().await.remove(&old_identity);
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(snapshot).unwrap_or_default()),
+            )
+        }
+        Err(error) => current_chat_error_response(error),
+    }
+}
+
+fn current_chat_error_response(
+    error: bagentd::current_chat::CurrentChatError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, code, message) = match &error {
+        bagentd::current_chat::CurrentChatError::Bound(_) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "current_chat_bound",
+            "Current Chat has reached its retained-content limit.",
+        ),
+        bagentd::current_chat::CurrentChatError::Conflict(_) => (
+            StatusCode::CONFLICT,
+            "current_chat_conflict",
+            "Current Chat changed; refetch and retry.",
+        ),
+        bagentd::current_chat::CurrentChatError::Invalid(_) => (
+            StatusCode::CONFLICT,
+            "current_chat_invalid",
+            "The Current Chat request is invalid.",
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "current_chat_unavailable",
+            "Current Chat is temporarily unavailable.",
+        ),
+    };
+    tracing::warn!(%error, code, "Current Chat mutation rejected");
+    (
+        status,
+        Json(serde_json::json!({ "code": code, "error": message })),
+    )
 }
 
 // ── Memory handlers ───────────────────────────────────────────────────────────
@@ -3084,9 +4116,23 @@ async fn notes_get(State(state): State<AppState>, Path(pk): Path<i64>) -> impl I
 
 // ── Approval helpers ─────────────────────────────────────────────────────────
 
-/// Core approval logic: insert a `pending_approvals` DB row, register the
-/// oneshot channel, optionally emit an SSE notification, then block until the
-/// user decides (Allow/Deny) or the 60 s countdown elapses.
+fn safe_approval_description(tool_name: &str) -> String {
+    format!("Approval required for {}", tool_name.trim())
+}
+
+fn safe_approval_origin(raw: Option<&str>) -> Option<serde_json::Value> {
+    let value = raw.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())?;
+    let kind = value.get("kind").and_then(serde_json::Value::as_str)?;
+    if kind != "automation" {
+        return None;
+    }
+    // Provenance kind is enough for routing. User-authored automation names
+    // are private identities and must not enter the approval projection.
+    Some(serde_json::json!({"kind": kind}))
+}
+
+/// Core approval logic: persist one authoritative request, then observe its
+/// durable decision until the user decides or the 60 s deadline wins.
 ///
 /// `sse_tx` — pass `Some(&tx)` from the chat SSE flow to emit the
 /// `approval_requested` event; pass `None` for REST callers (the Swift app's
@@ -3094,81 +4140,158 @@ async fn notes_get(State(state): State<AppState>, Path(pk): Path<i64>) -> impl I
 async fn request_approval_core(
     state: &AppState,
     tool_name: &str,
-    description: &str,
+    _description: &str,
     sink: Option<&agent_exec::EventSink>,
     origin_json: Option<String>,
+    work_context: Option<(CanonicalApprovalWork, agent_exec::ExecOrigin)>,
 ) -> bool {
-    let db = &state.db;
-    let pending = &state.pending_approvals;
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
 
-    if let Ok(db) = db.try_lock() {
-        let _ = db.execute(
-            "INSERT INTO pending_approvals (id, tool_name, description, expires_at, created_at, origin_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![id, tool_name, description, expires_at, now, origin_json],
-        );
-    }
+    let canonical_approval = work_context.as_ref().and_then(|(context, origin)| {
+        let record = state
+            .work_authority
+            .current(&context.work_identity)
+            .ok()
+            .flatten()?;
+        let execution_origin = if origin.unattended() {
+            bagentd::unified_work::ExecutionOrigin::Automation
+        } else {
+            bagentd::unified_work::ExecutionOrigin::Foreground
+        };
+        state
+            .work_authority
+            .request_approval(
+                format!("approval-request:{id}"),
+                context.work_identity.clone(),
+                record.revision,
+                bagentd::work_coordinator::ApprovalIdentity::new(id.clone()),
+                tool_name,
+            )
+            .ok()
+            .map(|revision| (context.work_identity.clone(), revision, execution_origin))
+    });
 
-    let (send, recv) = oneshot::channel::<bool>();
-    pending.lock().unwrap().insert(id.clone(), send);
+    if work_context.is_some() && canonical_approval.is_none() {
+        return false;
+    }
+    let safe_description = safe_approval_description(tool_name);
+    let safe_origin = safe_approval_origin(origin_json.as_deref());
+    let work_identity = canonical_approval
+        .as_ref()
+        .map(|(work, _, _)| work.as_str().to_owned());
+    {
+        let db = state.db.lock().await;
+        if db
+            .execute(
+                "INSERT INTO work_approval_requests
+                 (identity, work_identity, tool_name, description, expires_at,
+                  created_at, origin_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    id,
+                    work_identity,
+                    tool_name,
+                    safe_description,
+                    expires_at,
+                    now,
+                    safe_origin.as_ref().map(serde_json::Value::to_string),
+                ],
+            )
+            .is_err()
+        {
+            return false;
+        }
+    }
 
     let approval_event = serde_json::json!({
         "type":        "approval_requested",
         "id":          id,
         "tool":        tool_name,
-        "description": description,
+        "description": safe_approval_description(tool_name),
         "expires_in":  60,
-        "origin":      origin_json
-            .as_deref()
-            .and_then(|o| serde_json::from_str::<serde_json::Value>(o).ok()),
+        "origin":      safe_origin,
     });
-    // Chat streams get it inline; the daemon-wide broadcast reaches the app
-    // even when no chat stream is open (background automation approvals).
+    // Chat streams get the sanitized event inline. Background approvals are
+    // surfaced by the canonical approval projection.
     if let Some(s) = sink {
         let _ = s.emit(approval_event.clone()).await;
     }
-    state.publish_event(approval_event);
-
-    match tokio::time::timeout(tokio::time::Duration::from_secs(60), recv).await {
-        Ok(Ok(decision)) => {
-            let decision_str = if decision { "allow" } else { "deny" };
-            if let Ok(db) = db.try_lock() {
-                let decided_at = chrono::Utc::now().to_rfc3339();
-                let _ = db.execute(
-                    "UPDATE pending_approvals SET decision=?1, decided_at=?2 WHERE id=?3",
-                    rusqlite::params![decision_str, decided_at, id],
-                );
-                let _ = db.execute(
-                    "INSERT INTO audit_entries (action, payload, model) VALUES ('approval', ?1, '')",
-                    rusqlite::params![
-                        serde_json::json!({"id": id, "tool": tool_name, "decision": decision_str})
-                            .to_string()
-                    ],
-                );
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+    loop {
+        let decision = {
+            let db = state.db.lock().await;
+            db.query_row(
+                "SELECT decision FROM work_approval_requests WHERE identity=?1",
+                rusqlite::params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+        if let Some(decision) = decision {
+            if let Some((work, revision, execution_origin)) = canonical_approval.as_ref() {
+                if state
+                    .work_authority
+                    .current(work)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.state == WorkState::WaitingForApproval)
+                {
+                    let resolved = state.work_authority.resolve_approval(
+                        format!("approval-observed:{id}"),
+                        work.clone(),
+                        *revision,
+                        bagentd::work_coordinator::ApprovalIdentity::new(id.clone()),
+                        decision == "allow",
+                        0,
+                    );
+                    if resolved.is_ok() {
+                        state
+                            .work_authority
+                            .resume(work.clone(), *execution_origin)
+                            .await;
+                    }
+                }
             }
-            decision
+            return decision == "allow";
         }
-        _ => {
-            pending.lock().unwrap().remove(&id);
-            if let Ok(db) = db.try_lock() {
-                let now2 = chrono::Utc::now().to_rfc3339();
-                let _ = db.execute(
-                    "UPDATE pending_approvals SET decision='deny', decided_at=?1 WHERE id=?2",
-                    rusqlite::params![now2, id],
-                );
-                let _ = db.execute(
-                    "INSERT INTO audit_entries (action, payload, model) VALUES ('approval_timeout', ?1, '')",
-                    rusqlite::params![
-                        serde_json::json!({"id": id, "tool": tool_name}).to_string()
-                    ],
-                );
-            }
-            false
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    let now2 = chrono::Utc::now().to_rfc3339();
+    let db = state.db.lock().await;
+    let _ = db.execute(
+        "UPDATE work_approval_requests SET decision='deny', decided_at=?1 WHERE identity=?2 AND decision IS NULL",
+        rusqlite::params![now2, id],
+    );
+    let _ = db.execute(
+        "INSERT INTO audit_entries (action, payload, model) VALUES ('approval_timeout', ?1, '')",
+        rusqlite::params![serde_json::json!({"id": id, "tool": tool_name}).to_string()],
+    );
+    drop(db);
+    if let Some((work, revision, execution_origin)) = canonical_approval {
+        let resolved = state.work_authority.resolve_approval(
+            format!("approval-expired:{id}"),
+            work.clone(),
+            revision,
+            bagentd::work_coordinator::ApprovalIdentity::new(id),
+            false,
+            0,
+        );
+        if resolved.is_ok() {
+            state.work_authority.resume(work, execution_origin).await;
         }
     }
+    false
+}
+
+#[derive(Clone)]
+struct CanonicalApprovalWork {
+    work_identity: bagentd::work_coordinator::WorkIdentity,
 }
 
 /// Convenience wrapper for streaming execution paths (always emits the event).
@@ -3176,6 +4299,7 @@ async fn request_tool_approval(
     state: &AppState,
     sink: &agent_exec::EventSink,
     origin: &agent_exec::ExecOrigin,
+    work_identity: &bagentd::work_coordinator::WorkIdentity,
     tool_name: &str,
     description: &str,
 ) -> bool {
@@ -3185,6 +4309,12 @@ async fn request_tool_approval(
         description,
         Some(sink),
         origin.provenance_json(),
+        Some((
+            CanonicalApprovalWork {
+                work_identity: work_identity.clone(),
+            },
+            origin.clone(),
+        )),
     )
     .await
 }
@@ -3357,6 +4487,7 @@ async fn codex_run_task_handler(
         "codex.run_task",
         &approval_description,
         None, // REST path — Swift polls GET /approvals/pending
+        None,
         None,
     )
     .await;
@@ -3679,6 +4810,20 @@ struct Stage8AcceptanceFixtureRequest {
     selection: Option<evidence::AcceptanceFixtureSelection>,
 }
 
+#[cfg(feature = "stage8-acceptance")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Stage8AcceptanceApprovalRequest {
+    work_identity: String,
+}
+
+#[cfg(feature = "stage8-acceptance")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Stage8AcceptancePrivacyDiagnosticRequest {
+    canaries: Vec<String>,
+}
+
 /// Acceptance-only authenticated control. Both the compile-time feature and
 /// exact runtime environment flag are required before the route is registered.
 #[cfg(feature = "stage8-acceptance")]
@@ -3694,6 +4839,111 @@ async fn stage8_acceptance_fixture_handler(
     };
     control.set(body.selection);
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
+/// Moves an already-running disposable Work through the production approval
+/// authority. The caller must supply a Work created through a normal API.
+#[cfg(feature = "stage8-acceptance")]
+async fn stage8_acceptance_approval_handler(
+    State(state): State<AppState>,
+    Json(body): Json<Stage8AcceptanceApprovalRequest>,
+) -> impl IntoResponse {
+    if state.acceptance.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false })),
+        );
+    }
+    let work = WorkIdentity::new(body.work_identity);
+    let result = state.work_authority.current(&work).and_then(|record| {
+        record
+            .ok_or_else(|| CommandError::CorruptState("acceptance Work missing".into()))
+            .and_then(|record| {
+                state.work_authority.request_approval(
+                    format!("stage8-live-approval:{}", work.as_str()),
+                    work.clone(),
+                    record.revision,
+                    bagentd::work_coordinator::ApprovalIdentity::new(format!(
+                        "stage8-live-approval:{}",
+                        work.as_str()
+                    )),
+                    "filesystem.write",
+                )
+            })
+    });
+    match result {
+        Ok(revision) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "workRevision": revision.value() })),
+        ),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": error.to_string() })),
+        ),
+    }
+}
+
+/// Issues one bounded demand through the production Model Runtime and the real
+/// disposable BaseRT adapter. Generated text is neither returned nor retained.
+#[cfg(feature = "stage8-acceptance")]
+async fn stage8_acceptance_model_reload_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    if state.acceptance.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false })),
+        );
+    }
+    let result = state
+        .model_runtime
+        .complete_stage8_acceptance_reload(WorkIdentity::new(format!(
+            "stage8-reload-demand:{}",
+            Uuid::new_v4()
+        )))
+        .await;
+    match result {
+        Ok(output) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "outputBytes": output.len() })),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": error.to_string() })),
+        ),
+    }
+}
+
+/// Sends forbidden fixture values through the production diagnostic sanitizer.
+/// Only the structural allowlist may reach the persisted trace and export.
+#[cfg(feature = "stage8-acceptance")]
+async fn stage8_acceptance_privacy_diagnostic_handler(
+    State(state): State<AppState>,
+    Json(body): Json<Stage8AcceptancePrivacyDiagnosticRequest>,
+) -> impl IntoResponse {
+    if state.acceptance.is_none() || body.canaries.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false })),
+        );
+    }
+    let turn_id = format!("stage8-privacy:{}", Uuid::new_v4());
+    let forbidden = body.canaries.join(":");
+    state.evidence_diagnostics.record(&serde_json::json!({
+        "type": "evidence_acquisition_diagnostic",
+        "turn_id": turn_id,
+        "normalized_operation": "privacy.acceptance",
+        "status": "completed",
+        "hidden_reasoning": forbidden,
+        "raw_arguments": body.canaries,
+        "credential": forbidden,
+        "evidence_content": forbidden,
+        "unknown_field": forbidden,
+    }));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "turnId": turn_id })),
+    )
 }
 
 /// Receives the Tavily credential from the signed app's Keychain and keeps it
@@ -4067,6 +5317,7 @@ async fn whatsapp_send_handler(
         &audit_description, // stored in audit_entries — redacted (trap #2)
         None,               // REST path; no SSE channel
         None,
+        None,
     )
     .await;
 
@@ -4262,56 +5513,377 @@ async fn load_runtime_refs(
 }
 
 async fn save_last_mail_ref(
+    db: &Arc<Mutex<Connection>>,
     refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     mail_ref: &MailRef,
-) {
+    durable_current_chat: bool,
+) -> anyhow::Result<()> {
+    if durable_current_chat {
+        persist_runtime_ref(db, session_id, "mail", mail_ref).await?;
+    }
     refs.lock()
         .await
         .entry(session_id.to_string())
         .or_default()
         .mail = Some(mail_ref.clone());
+    Ok(())
 }
 
 async fn save_last_file_ref(
+    db: &Arc<Mutex<Connection>>,
     refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     file_ref: &FileRef,
-) {
+    durable_current_chat: bool,
+) -> anyhow::Result<()> {
+    if durable_current_chat {
+        persist_runtime_ref(db, session_id, "files", file_ref).await?;
+    }
     refs.lock()
         .await
         .entry(session_id.to_string())
         .or_default()
         .file = Some(file_ref.clone());
+    Ok(())
 }
 
 async fn save_last_odoo_ref(
+    db: &Arc<Mutex<Connection>>,
     refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     odoo_ref: &OdooRecordRef,
-) {
+    durable_current_chat: bool,
+) -> anyhow::Result<()> {
+    if durable_current_chat {
+        persist_runtime_ref(db, session_id, "odoo", odoo_ref).await?;
+    }
     refs.lock()
         .await
         .entry(session_id.to_string())
         .or_default()
         .odoo = Some(odoo_ref.clone());
+    Ok(())
 }
 
 async fn save_last_whatsapp_ref(
+    db: &Arc<Mutex<Connection>>,
     refs: &Arc<Mutex<HashMap<String, RuntimeRefs>>>,
     session_id: &str,
     whatsapp_ref: &WhatsappRef,
-) {
+    durable_current_chat: bool,
+) -> anyhow::Result<()> {
+    if durable_current_chat {
+        persist_runtime_ref(db, session_id, "whatsapp", whatsapp_ref).await?;
+    }
     refs.lock()
         .await
         .entry(session_id.to_string())
         .or_default()
         .whatsapp = Some(whatsapp_ref.clone());
+    Ok(())
+}
+
+async fn persist_runtime_ref<T: Serialize>(
+    db: &Arc<Mutex<Connection>>,
+    current_chat_identity: &str,
+    connector_kind: &str,
+    reference: &T,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_string(reference)
+        .map_err(|_| anyhow::anyhow!("failed to encode Connector Reference"))?;
+    let reference_identity = format!("{connector_kind}:{}", &sha256_str(&payload)[..24]);
+    let connection = db.lock().await;
+    upsert_connector_reference(
+        &connection,
+        current_chat_identity,
+        &reference_identity,
+        connector_kind,
+        &payload,
+        chrono::Utc::now(),
+    )
+    .map_err(|_| anyhow::anyhow!("failed to persist Connector Reference"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage7a_signed_fixture_uses_isolated_chat_execution_policy() {
+        assert!(chat_acceptance_fixture_active(true, false));
+        assert!(chat_acceptance_fixture_active(false, true));
+        assert!(!chat_acceptance_fixture_active(false, false));
+    }
+
+    #[test]
+    fn approval_origin_drops_private_automation_identity() {
+        let origin = safe_approval_origin(Some(
+            r#"{"kind":"automation","automation_name":"PRIVATE_AUTOMATION"}"#,
+        ));
+        assert_eq!(origin, Some(serde_json::json!({"kind": "automation"})));
+    }
+
+    #[test]
+    fn acknowledgement_errors_distinguish_authoritative_conflicts_from_server_failures() {
+        for error in [
+            CommandError::Conflict {
+                current_revision: Some(WorkRevision::new(7)),
+            },
+            CommandError::TerminalTarget,
+        ] {
+            let (status, Json(body)) = acknowledge_attention_error_response(error);
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["code"], "work_conflict");
+        }
+
+        for error in [
+            CommandError::Storage("disk unavailable".to_owned()),
+            CommandError::CorruptState("bad state".to_owned()),
+            CommandError::InjectedFailure(
+                bagentd::work_coordinator::FailurePoint::BeforeTransaction,
+            ),
+        ] {
+            let (status, Json(body)) = acknowledge_attention_error_response(error);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(body["code"], "internal_error");
+            assert_eq!(body["error"], "failed to acknowledge Work attention");
+            assert!(!body.to_string().contains("disk unavailable"));
+        }
+    }
+
+    #[test]
+    fn notch_projection_context_uses_one_structured_identity_parameter() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE works (
+                 identity TEXT PRIMARY KEY,
+                 state TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE work_automation_runs (
+                 work_identity TEXT,
+                 historical_automation_identity TEXT,
+                 automation_session_identity TEXT
+             );
+             CREATE TABLE automations (id TEXT PRIMARY KEY, name TEXT);
+             CREATE TABLE automation_task_snapshots (
+                 automation_session_identity TEXT PRIMARY KEY,
+                 display_name TEXT
+             );
+             CREATE TABLE work_automation_sessions (
+                 automation_session_identity TEXT,
+                 attention_state TEXT
+             );",
+        )
+        .unwrap();
+
+        let statement = db.prepare(NOTCH_PROJECTION_CONTEXT_SQL).unwrap();
+        assert_eq!(statement.parameter_count(), 1);
+    }
+
+    #[test]
+    fn retained_transition_batches_replace_with_one_current_snapshot() {
+        let snapshot = WorkSnapshot {
+            schema_version: 1,
+            cursor: EventCursor::new(22),
+            daemon_generation: DaemonGeneration::new("daemon-a"),
+            works: vec![WorkRecord {
+                identity: WorkIdentity::new("work-a"),
+                origin: WorkOrigin::Conversation {
+                    current_chat_identity: CurrentChatIdentity::new("chat-a"),
+                    conversation_turn_identity: ConversationTurnIdentity::new("turn-a"),
+                },
+                state: WorkState::Running,
+                revision: WorkRevision::new(3),
+                activity: None,
+            }],
+            automation_runs: vec![],
+            approvals: vec![],
+            interruptions: vec![],
+            model_runtime_generation: None,
+            model_runtime_trusted: true,
+        };
+        let transition = |cursor, state| bagentd::work_coordinator::WorkEvent {
+            schema_version: 1,
+            event_cursor: EventCursor::new(cursor),
+            daemon_generation: DaemonGeneration::new("daemon-a"),
+            committed_at: "2026-08-19T00:00:00Z".to_owned(),
+            event_kind: bagentd::work_coordinator::EventKind::WorkStateChanged,
+            work_identity: WorkIdentity::new("work-a"),
+            work_revision: WorkRevision::new(cursor - 19),
+            state,
+            activity: None,
+        };
+
+        let approval_requested_then_resolved = vec![
+            transition(21, WorkState::WaitingForApproval),
+            transition(22, WorkState::Running),
+        ];
+        let completed_then_acknowledged = vec![
+            transition(21, WorkState::Completed),
+            transition(22, WorkState::Completed),
+        ];
+
+        assert!(event_batch_requires_snapshot(
+            &approval_requested_then_resolved,
+            &snapshot
+        ));
+        assert!(event_batch_requires_snapshot(
+            &completed_then_acknowledged,
+            &snapshot
+        ));
+        assert!(!event_batch_requires_snapshot(
+            &[transition(22, WorkState::Running)],
+            &snapshot
+        ));
+    }
+
+    #[test]
+    fn notch_projection_is_a_strict_privacy_allowlist() {
+        let snapshot = WorkSnapshot {
+            schema_version: 1,
+            cursor: EventCursor::new(7),
+            daemon_generation: DaemonGeneration::new("daemon-fixture"),
+            works: vec![WorkRecord {
+                identity: bagentd::work_coordinator::WorkIdentity::new("opaque-work"),
+                origin: WorkOrigin::Conversation {
+                    current_chat_identity: CurrentChatIdentity::new("opaque-chat"),
+                    conversation_turn_identity: ConversationTurnIdentity::new("opaque-turn"),
+                },
+                state: WorkState::Running,
+                revision: WorkRevision::new(2),
+                activity: None,
+            }],
+            automation_runs: vec![],
+            approvals: vec![],
+            interruptions: vec![],
+            model_runtime_generation: None,
+            model_runtime_trusted: true,
+        };
+        let context = NotchProjectionContext {
+            model_phase: "ready",
+            automation_names: HashMap::new(),
+            automation_definition_identities: HashMap::new(),
+            automation_session_identities: HashMap::new(),
+            automation_detached: HashMap::new(),
+            terminal_attention: HashMap::new(),
+            terminal_finished_at: HashMap::new(),
+            terminal_orders: HashMap::new(),
+            queue_positions: HashMap::new(),
+            claimed_orders: HashMap::from([("opaque-work".to_owned(), 1)]),
+        };
+
+        let value = notch_snapshot_value(&snapshot, &context);
+        let work = value["works"][0].as_object().unwrap();
+        let actual = work
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "identity",
+            "revision",
+            "origin",
+            "state",
+            "activity",
+            "queuePosition",
+            "automationDisplayName",
+            "automationDefinitionIdentity",
+            "automationDefinitionDetached",
+            "automationSessionIdentity",
+            "terminalAttention",
+            "terminalFinishedAt",
+            "terminalOrder",
+            "claimedOrder",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(actual, expected);
+        assert_eq!(value["model"], "ready");
+        let serialized = value.to_string();
+        for forbidden in [
+            "prompt",
+            "reasoning",
+            "toolArguments",
+            "connectorIdentifier",
+            "evidenceContent",
+            "providerError",
+            "credential",
+            "modelOutput",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn notch_projection_emits_revisioned_terminal_attention_and_destination() {
+        let snapshot = WorkSnapshot {
+            schema_version: 1,
+            cursor: EventCursor::new(12),
+            daemon_generation: DaemonGeneration::new("daemon-terminal"),
+            works: vec![WorkRecord {
+                identity: WorkIdentity::new("work-terminal"),
+                origin: WorkOrigin::Automation {
+                    automation_run_identity: bagentd::work_coordinator::AutomationRunIdentity::new(
+                        "run-terminal",
+                    ),
+                    automation_session_identity:
+                        bagentd::work_coordinator::AutomationSessionIdentity::new(
+                            "session-terminal",
+                        ),
+                    historical_automation_identity:
+                        bagentd::work_coordinator::AutomationDefinitionIdentity::new(
+                            "definition-terminal",
+                        ),
+                    frozen_definition_revision:
+                        bagentd::work_coordinator::AutomationDefinitionRevision::new(3),
+                },
+                state: WorkState::Failed,
+                revision: WorkRevision::new(4),
+                activity: None,
+            }],
+            automation_runs: vec![],
+            approvals: vec![],
+            interruptions: vec![],
+            model_runtime_generation: None,
+            model_runtime_trusted: true,
+        };
+        let context = NotchProjectionContext {
+            model_phase: "ready",
+            automation_names: HashMap::from([(
+                "work-terminal".to_owned(),
+                "Saved name".to_owned(),
+            )]),
+            automation_definition_identities: HashMap::from([(
+                "work-terminal".to_owned(),
+                "definition-terminal".to_owned(),
+            )]),
+            automation_session_identities: HashMap::from([(
+                "work-terminal".to_owned(),
+                "session-terminal".to_owned(),
+            )]),
+            automation_detached: HashMap::new(),
+            terminal_attention: HashMap::from([("work-terminal".to_owned(), "failed")]),
+            terminal_finished_at: HashMap::new(),
+            terminal_orders: HashMap::from([("work-terminal".to_owned(), 12)]),
+            queue_positions: HashMap::new(),
+            claimed_orders: HashMap::from([("work-terminal".to_owned(), 1)]),
+        };
+
+        let value = notch_snapshot_value(&snapshot, &context);
+        assert_eq!(value["works"][0]["terminalAttention"], "failed");
+        assert_eq!(value["works"][0]["terminalOrder"], 12);
+        assert_eq!(
+            value["works"][0]["automationDefinitionIdentity"],
+            "definition-terminal"
+        );
+        assert_eq!(
+            value["works"][0]["automationSessionIdentity"],
+            "session-terminal"
+        );
+    }
 
     #[test]
     fn tavily_configuration_status_never_exposes_credential_material() {
@@ -4381,52 +5953,51 @@ mod tests {
     }
 
     #[test]
-    fn purge_legacy_context_data_clears_memory_chat_and_mirror() {
-        let mut conn = Connection::open_in_memory().unwrap();
+    fn current_chat_initialization_preserves_saved_memory_and_legacy_records() {
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "
             CREATE TABLE memory_items (id TEXT);
             CREATE TABLE chat_turns (id TEXT);
-            CREATE TABLE chat_turn_attachments (chat_turn_id TEXT, attachment_id TEXT);
-            CREATE TABLE embeddings (item_id TEXT, source TEXT);
-            CREATE TABLE sessions (id TEXT, summary TEXT, metadata_json TEXT);
             INSERT INTO memory_items VALUES ('m1');
             INSERT INTO chat_turns VALUES ('t1');
-            INSERT INTO chat_turn_attachments VALUES ('t1', 'a1');
-            INSERT INTO embeddings VALUES ('m1', 'memory_item');
-            INSERT INTO embeddings VALUES ('t1', 'chat_turn');
-            INSERT INTO embeddings VALUES ('wa1', 'whatsapp');
-            INSERT INTO sessions VALUES ('s1', 'old summary', '{\"last_mail_ref\":{}}');
             ",
         )
         .unwrap();
-
-        let data_dir = std::env::temp_dir().join(format!("bagent-purge-test-{}", Uuid::new_v4()));
-        let memories_dir = data_dir.join("memories");
-        std::fs::create_dir_all(&memories_dir).unwrap();
-        std::fs::write(memories_dir.join("old.md"), "old memory").unwrap();
-
-        purge_legacy_context_data(&data_dir, &mut conn);
-
-        for table in ["memory_items", "chat_turns", "chat_turn_attachments"] {
+        bagentd::current_chat::initialize_schema(&conn).unwrap();
+        open_or_create_current_chat(&conn).unwrap();
+        for table in ["memory_items", "chat_turns"] {
             let count: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(count, 0, "{table} should be empty");
+            assert_eq!(count, 1, "{table} must be preserved");
         }
-        let embeddings: i64 = conn
-            .query_row("SELECT COUNT(*) FROM embeddings", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(embeddings, 1, "non memory/chat embeddings must remain");
-        let cleared: (Option<String>, Option<String>) = conn
-            .query_row("SELECT summary, metadata_json FROM sessions", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(cleared, (None, None));
-        assert!(!memories_dir.exists());
+    }
 
-        let _ = std::fs::remove_dir_all(data_dir);
+    #[tokio::test]
+    async fn connector_reference_bound_failure_never_installs_memory_only_authority() {
+        let connection = Connection::open_in_memory().unwrap();
+        bagentd::current_chat::initialize_schema(&connection).unwrap();
+        let chat = open_or_create_current_chat(&connection).unwrap();
+        let db = Arc::new(Mutex::new(connection));
+        let refs = Arc::new(Mutex::new(HashMap::<String, RuntimeRefs>::new()));
+        let reference = FileRef {
+            path: "x".repeat(bagentd::current_chat::MAX_RETAINED_CONTENT_BYTES as usize),
+            display_name: "bounded".to_owned(),
+            kind: "file".to_owned(),
+        };
+
+        assert!(
+            save_last_file_ref(&db, &refs, &chat.identity, &reference, true)
+                .await
+                .is_err()
+        );
+        assert!(refs.lock().await.get(&chat.identity).is_none());
+        let connection = db.lock().await;
+        assert!(read_current_chat(&connection)
+            .unwrap()
+            .connector_references
+            .is_empty());
     }
 }
 

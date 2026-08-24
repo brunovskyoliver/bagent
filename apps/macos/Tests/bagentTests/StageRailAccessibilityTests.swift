@@ -1,0 +1,84 @@
+import AppKit
+import XCTest
+@testable import bagent
+
+final class StageRailAccessibilityTests: XCTestCase {
+    func testRailAndPillExposeCompleteStableAccessibilityValues() throws {
+        let snapshot = NotchWorkSnapshot(
+            schemaVersion: 1,
+            cursor: 1,
+            daemonGeneration: "accessibility-fixture",
+            works: [
+                automation("older", order: 1, category: .mail),
+                automation("newer", order: 2, category: .web),
+            ],
+            pendingApprovals: [],
+            model: .ready
+        )
+        var presentation = try NotchProjection.reduce(
+            previous: .idle,
+            input: .snapshot(snapshot),
+            reduceMotion: true
+        )
+
+        XCTAssertEqual(presentation.statusPill.accessibilityLabel, "Status")
+        XCTAssertEqual(presentation.statusPill.accessibilityValue, "2 active Automation Runs")
+        XCTAssertTrue(presentation.rail.accessibilityValue.contains("Tool"))
+        XCTAssertTrue(presentation.rail.accessibilityValue.contains("Checking Mail"))
+        XCTAssertTrue(presentation.rail.accessibilityValue.contains("background"))
+        XCTAssertTrue(presentation.rail.accessibilityValue.contains("run 1 of 2"))
+        XCTAssertTrue(presentation.rail.accessibilityValue.contains("2 active"))
+
+        let revision = presentation.revision
+        presentation = try NotchProjection.reduce(
+            previous: presentation,
+            input: .localIntent(.cycleAutomation),
+            reduceMotion: true
+        )
+        XCTAssertEqual(presentation.revision, revision, "navigation cannot mutate Work")
+        XCTAssertTrue(presentation.rail.accessibilityValue.contains("run 2 of 2"))
+        XCTAssertTrue(presentation.motion.reduceMotion)
+        XCTAssertFalse(presentation.motion.iconMotionEnabled)
+        XCTAssertEqual(presentation.motion.contentRevealDuration, 0.12)
+    }
+
+    func testAcceptedTextTokensMeetSmallTextContrastAgainstBlack() throws {
+        let primary = try XCTUnwrap(NSColor(NotchWrapMetrics.notchTextPrimary).usingColorSpace(.sRGB))
+        let secondary = try XCTUnwrap(NSColor(NotchWrapMetrics.notchTextSecondary).usingColorSpace(.sRGB))
+
+        XCTAssertGreaterThanOrEqual(contrastRatio(sRGB: primary.redComponent), 4.5)
+        XCTAssertGreaterThanOrEqual(
+            contrastRatio(sRGB: secondary.redComponent * 0.86),
+            4.5,
+            "inactive rail labels remain readable at their rendered opacity"
+        )
+    }
+
+    private func automation(
+        _ identity: String,
+        order: UInt64,
+        category: NotchActivityCategory
+    ) -> NotchWork {
+        NotchWork(
+            identity: identity,
+            revision: 1,
+            origin: .automation,
+            state: .running,
+            activity: .init(category: category),
+            queuePosition: nil,
+            automationDisplayName: "Saved Automation",
+            automationDefinitionIdentity: "definition-\(identity)",
+            automationSessionIdentity: "session-\(identity)",
+            terminalAttention: nil,
+            claimedOrder: order
+        )
+    }
+
+    private func contrastRatio(sRGB component: CGFloat) -> CGFloat {
+        let linear = component <= 0.04045
+            ? component / 12.92
+            : pow((component + 0.055) / 1.055, 2.4)
+        return (linear + 0.05) / 0.05
+    }
+
+}

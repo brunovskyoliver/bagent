@@ -3,66 +3,53 @@ import XCTest
 
 final class NotchInteractionStateTests: XCTestCase {
     @MainActor
-    func testHiddenThinkingCompletionAlwaysPresentsOutputSurface() {
+    func testAuthoritativeForegroundCompletionPresentsOutputAfterCollapse() throws {
         let viewModel = ChatViewModel(startMonitoring: false)
-        viewModel.isThinking = true
-        viewModel.chatSurfaceMode = .thinkingHidden
-        viewModel.notchInteractionMode = .thinking
-        var outputPresentationRequested = false
-        viewModel.onFirstAssistantToken = {
-            outputPresentationRequested = true
-            viewModel.chatSurfaceMode = .outputExpanded
-            viewModel.notchInteractionMode = .output
-        }
+        try viewModel.installThinkingFixture()
+        viewModel.applyNotchIntent(.collapse)
 
-        viewModel.isThinking = false
-        viewModel.ensureCompletedTurnOutputPresented()
+        try viewModel.installCompletedFixture()
 
-        XCTAssertTrue(outputPresentationRequested)
-        XCTAssertEqual(viewModel.chatSurfaceMode, .outputExpanded)
         XCTAssertEqual(viewModel.notchInteractionMode, .output)
     }
 
     @MainActor
-    func testHiddenThinkingWithVisibleOutputUsesOutputPresentationCallback() {
+    func testTransportContentDeliveryCannotChangeInteractionMode() throws {
         let viewModel = ChatViewModel(startMonitoring: false)
-        viewModel.chatSurfaceMode = .thinkingHidden
-        viewModel.notchInteractionMode = .thinking
-        var presented = false
-        viewModel.onFirstAssistantToken = {
-            presented = true
-            viewModel.chatSurfaceMode = .outputExpanded
-            viewModel.notchInteractionMode = .output
-        }
+        try viewModel.installThinkingFixture()
+        let mode = viewModel.notchInteractionMode
 
-        viewModel.ensureCompletedTurnOutputPresented()
+        viewModel.messages = [ChatMessage(role: .assistant, content: "delivered token")]
+        viewModel.streamingChunk += 1
 
-        XCTAssertTrue(presented)
-        XCTAssertEqual(viewModel.chatSurfaceMode, .outputExpanded)
+        XCTAssertEqual(viewModel.notchInteractionMode, mode)
+    }
+
+    @MainActor
+    func testExplicitUserIntentCanOpenForegroundOutput() throws {
+        let viewModel = ChatViewModel(startMonitoring: false)
+        try viewModel.installThinkingFixture()
+
+        viewModel.applyNotchIntent(.openOutput)
+
         XCTAssertEqual(viewModel.notchInteractionMode, .output)
     }
 
     @MainActor
-    func testCompletionReopensOutputAfterThinkingWasCollapsed() {
+    func testApprovalPayloadCannotAuthorizeUIWithoutMatchingWorkProjection() {
         let viewModel = ChatViewModel(startMonitoring: false)
-        viewModel.isThinking = false
-        viewModel.isExpanded = false
-        viewModel.chatSurfaceMode = .collapsed
-        viewModel.notchInteractionMode = .collapsed
-        var presentationRequests = 0
-        viewModel.onFirstAssistantToken = {
-            presentationRequests += 1
-            viewModel.isExpanded = true
-            viewModel.chatSurfaceMode = .outputExpanded
-            viewModel.notchInteractionMode = .output
+        viewModel.pendingApprovals = [ApprovalItem(
+            id: "stale-approval",
+            toolName: "private-tool",
+            description: "stale payload",
+            expiresAt: "",
+            createdAt: "",
+            origin: nil
+        )]
+
+        XCTAssertNil(viewModel.authoritativePendingApproval)
+        if case .awaitingApproval = viewModel.agentStatus {
+            XCTFail("payload-only approval must not authorize the approval surface")
         }
-
-        viewModel.ensureCompletedTurnOutputPresented()
-        viewModel.ensureCompletedTurnOutputPresented()
-
-        XCTAssertEqual(presentationRequests, 1)
-        XCTAssertTrue(viewModel.isExpanded)
-        XCTAssertEqual(viewModel.chatSurfaceMode, .outputExpanded)
-        XCTAssertEqual(viewModel.notchInteractionMode, .output)
     }
 }

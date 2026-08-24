@@ -2,6 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with this repository.
 
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues are canonical; external pull requests are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the standard `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository. See `docs/agents/domain.md`.
+
 ## Commands
 
 ### Rust daemon
@@ -68,7 +82,7 @@ BaseRT  ·  Connectors  ·  SQLite/FTS5 (refinery migrations)
 
 - Daemon writes its port to `~/Library/Application Support/bagent/daemon.port` and bearer token to `daemon.token`.
 - Swift `DaemonLauncher` starts `bagentd`, polls port file (40 × 100 ms), then `DaemonClient` attaches.
-- Chat uses `POST /chat` → SSE stream of typed JSON events (`delta`, `done`, `mail_found`, `file_found`, `task_rating`, `debug_trace`, `memory_saved`, …).
+- Chat uses `POST /chat` → SSE stream of typed JSON events (`delta`, `done`, `mail_found`, `file_found`, `task_rating`, `memory_saved`, …).
 - Every write action goes through `GET /approvals/pending` + `POST /approvals/:id/decide` before execution.
 
 ### Rust crates
@@ -112,7 +126,8 @@ and the browser ADRs before any UI change.
 | `AppDelegate.swift` | App lifecycle; `⌥Space` toggles the notch input |
 | `NotchWindowController.swift` | The single `BagentPanel`: geometry, monitors, present/collapse, paste wheel |
 | `ChatView.swift` | `NotchWrapView` + `InlineNotchContent` — every notch state renders here |
-| `NotchSettingsContent.swift` | Settings pages (general / permissions / model / connectors / setup) |
+| `NotchSettingsContent.swift` | Persistent four-peer Compass Rail settings and bounded child destinations |
+| `CompassRail.swift` | Typed settings areas, child routes, keyboard policy, focus memory, and deterministic catalog |
 | `ChatViewModel.swift` | `@MainActor ObservableObject`; all daemon calls; session/attachment/screen state; `notchInteractionMode` |
 | `DaemonClient.swift` | HTTP + SSE client; all REST/SSE types |
 | `ScreenContextProvider.swift` | ScreenCaptureKit capture → local Vision OCR; only text reaches `/chat` |

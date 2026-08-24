@@ -6,6 +6,16 @@ Revision under test: `877da8341d3de3c8fb01a472784e9fcb0793a3f4`
 
 Overall verdict: **CONDITIONAL PASS**
 
+Current Stage 7C/8 qualification boundary: signed/live qualification covers
+macOS 26 only. macOS 14 and 15 remain compile targets when configuration
+permits them, without runtime, System Settings, TCC, visual, or accessibility
+qualification claims. Live TCC grant, denial, revocation, and
+drag-to-System-Settings mutation are outside the campaign. This historical
+Stage 8 record does not turn omitted macOS 14/15 or live-TCC checks into PASS.
+Deterministic permission adapters, signed-bundle and drag-payload validation,
+privacy tests, and daemon-preserving relaunch remain required; release
+evidence must carry this limitation.
+
 Stage 9 default enablement is **not authorized**.
 
 The deterministic canonical path passed the 90-request reliability campaign,

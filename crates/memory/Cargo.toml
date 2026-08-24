@@ -16,3 +16,13 @@ serde_yaml = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Stage 1 lint waiver — owner: GitHub #25; reason: pre-existing memory lint
+# debt is outside the acceptance-infrastructure-only scope; expires: 2026-09-17.
+[lints.rust]
+dead_code = "allow"
+
+[lints.clippy]
+unnecessary_map_or = "allow"
+too_many_arguments = "allow"
+await_holding_lock = "allow"

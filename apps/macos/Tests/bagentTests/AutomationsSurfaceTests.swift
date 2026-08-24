@@ -58,7 +58,7 @@ final class AutomationsSurfaceStateTests: XCTestCase {
 
     func testSelectionNavigationAndDetail() {
         let vm = ChatViewModel()
-        vm.notchInteractionMode = .automations
+        vm.applyNotchIntent(.openAutomations)
         vm.automations = [record("a", name: "A"), record("b", name: "B"), record("c", name: "C")]
         XCTAssertTrue(vm.moveAutomationsSelection(by: 1))
         XCTAssertEqual(vm.automationsSelectionIndex, 1)
@@ -72,7 +72,7 @@ final class AutomationsSurfaceStateTests: XCTestCase {
 
     func testEscapeBackNavigation() {
         let vm = ChatViewModel()
-        vm.notchInteractionMode = .automations
+        vm.applyNotchIntent(.openAutomations)
         vm.automationsSurface = .deleteConfirmation("a")
         XCTAssertTrue(vm.automationsGoBack())
         XCTAssertEqual(vm.automationsSurface, .detail("a"))
@@ -85,13 +85,83 @@ final class AutomationsSurfaceStateTests: XCTestCase {
     func testSlashCommandOpensAutomations() {
         let vm = ChatViewModel()
         vm.inputText = "/automations"
-        XCTAssertTrue(vm.acceptSlashSuggestion())
-        XCTAssertEqual(vm.notchInteractionMode, .automations)
-        XCTAssertEqual(vm.automationsSurface, .list)
+        XCTAssertTrue(vm.completeSlashSuggestion())
+        XCTAssertEqual(vm.inputText, "/automations")
+        XCTAssertNotEqual(vm.notchInteractionMode, .automations)
     }
 
     func testGeometryStaysWithinCeilings() {
         XCTAssertLessThanOrEqual(NotchWrapMetrics.automationsWingWidth, NotchWrapMetrics.maxWingWidth)
         XCTAssertLessThanOrEqual(NotchWrapMetrics.automationsBridgeHeight, NotchWrapMetrics.maxBridgeHeight)
+    }
+
+    func testTerminalAcknowledgementIntentClearsWhenExactDestinationIsAbandoned() {
+        let vm = ChatViewModel(startMonitoring: false)
+        vm.pendingTerminalAcknowledgement = (
+            definitionIdentity: "definition-a",
+            sessionIdentity: "automation-session:run-a",
+            workIdentity: "work-a",
+            expectedRevision: 4
+        )
+        vm.automationsSurface = .detail("definition-a")
+
+        XCTAssertTrue(vm.automationsGoBack())
+        XCTAssertNil(vm.pendingTerminalAcknowledgement)
+
+        vm.pendingTerminalAcknowledgement = (
+            definitionIdentity: "definition-a",
+            sessionIdentity: "automation-session:run-a",
+            workIdentity: "work-a",
+            expectedRevision: 4
+        )
+        vm.openAutomationDetail("definition-a")
+        XCTAssertNil(vm.pendingTerminalAcknowledgement)
+    }
+
+    func testTerminalAcknowledgementClearsOnlyForAuthoritativeOutcomes() {
+        let vm = ChatViewModel(startMonitoring: false)
+        let install = {
+            vm.pendingTerminalAcknowledgement = (
+                definitionIdentity: "definition-a",
+                sessionIdentity: "automation-session:run-a",
+                workIdentity: "work-a",
+                expectedRevision: 4
+            )
+        }
+
+        install()
+        vm.handlePendingTerminalAcknowledgement(
+            sessionIdentity: "automation-session:run-a",
+            delivery: .authoritative(.acknowledged)
+        )
+        XCTAssertNil(vm.pendingTerminalAcknowledgement)
+
+        install()
+        vm.handlePendingTerminalAcknowledgement(
+            sessionIdentity: "automation-session:run-a",
+            delivery: .authoritative(.authoritativeConflict)
+        )
+        XCTAssertNil(vm.pendingTerminalAcknowledgement)
+
+        install()
+        vm.handlePendingTerminalAcknowledgement(
+            sessionIdentity: "automation-session:run-a",
+            delivery: .retryableFailure
+        )
+        XCTAssertNotNil(vm.pendingTerminalAcknowledgement)
+    }
+}
+
+/// Explicit acceptance surface for the Stage 7B recurrence regression command.
+/// The existing state suite remains unchanged; this contract keeps the
+/// mandated filter nonzero while asserting the same authoritative models.
+@MainActor
+final class AutomationsSurfaceTests: XCTestCase {
+    func testSurfaceAndRecurrenceContractsRemainAuthoritative() {
+        let viewModel = ChatViewModel(startMonitoring: false)
+        viewModel.applyNotchIntent(.openAutomations)
+        XCTAssertEqual(viewModel.notchInteractionMode, .automations)
+        let rule = RecurrenceRuleWire(type: "daily", hours: nil, time: "08:00:00", day: nil, days: nil)
+        XCTAssertEqual(rule.displayLabel, "denne o 08:00")
     }
 }

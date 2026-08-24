@@ -1,0 +1,616 @@
+import AppKit
+import ApplicationServices
+import SwiftUI
+
+/// Signed, disposable macOS 26 Accessibility evidence for the projection
+/// surface. It never grants or changes TCC state and emits only public labels,
+/// values, counts, and the final verdict.
+@MainActor
+enum Stage8AccessibilityCLI {
+    static let environmentKey = "BAGENT_STAGE8_ACCESSIBILITY_FIXTURE"
+
+    static func run(outputURL: URL) async -> Int32 {
+        guard ProcessInfo.processInfo.environment[environmentKey] == "1" else { return 64 }
+        do {
+            try await runFixture(outputURL: outputURL)
+            return 0
+        } catch {
+            try? writeEvidence(
+                [
+                    "status": "failed",
+                    "accessibility_available": AXIsProcessTrusted(),
+                    "active_element_count": 0,
+                    "approval_element_count": 0,
+                    "assertion_count": 0,
+                    "skipped_count": 0,
+                    "error": String(describing: error),
+                ],
+                to: outputURL
+            )
+            fputs("Stage 8 live notch Accessibility fixture failed: \(error)\n", stderr)
+            return 1
+        }
+    }
+
+    private enum FixtureError: Error, CustomStringConvertible {
+        case unavailable
+        case assertion(String)
+
+        var description: String {
+            switch self {
+            case .unavailable: "Accessibility API is unavailable"
+            case .assertion(let message): message
+            }
+        }
+    }
+
+    private static func runFixture(outputURL: URL) async throws {
+        guard AXIsProcessTrusted() else {
+            throw FixtureError.unavailable
+        }
+
+        NSApplication.shared.setActivationPolicy(.accessory)
+        NSApplication.shared.finishLaunching()
+        let viewModel = ChatViewModel(startMonitoring: false)
+        try viewModel.applyAuthoritativeSnapshot(
+            .init(
+                schemaVersion: 1,
+                cursor: 1,
+                daemonGeneration: "stage8-accessibility",
+                works: [
+                    automation("automation-a", order: 1, category: .web),
+                    automation("automation-b", order: 2, category: .mail),
+                ],
+                pendingApprovals: [],
+                model: .ready
+            )
+        )
+        viewModel.setNotchReduceMotion(true)
+
+        let host = NSHostingView(
+            rootView: NotchWrapView(
+                notchWidth: 221,
+                notchHeight: 38,
+                viewModel: viewModel,
+                onTap: {},
+                onHoverChanged: { _ in },
+                acceptanceReduceMotionOverride: true
+            )
+            .environment(\.dynamicTypeSize, .accessibility2)
+        )
+        host.setAccessibilityElement(false)
+        host.frame = CGRect(x: 0, y: 0, width: 741, height: 318)
+        let panel = NSPanel(
+            contentRect: host.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isReleasedWhenClosed = false
+        panel.contentView = host
+        panel.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        defer { panel.close() }
+
+        host.layoutSubtreeIfNeeded()
+        let applicationElement = AXUIElementCreateApplication(getpid())
+        let activeElements = try await waitForAccessibilityTree(
+            from: applicationElement,
+            host: host,
+            panel: panel
+        ) { elements in
+            (try? verifyActiveProjection(elements)) != nil
+        }
+        let activeAssertions = try verifyActiveProjection(activeElements)
+        let interactionEvidence = try await verifyKeyboardAndFocusContract(
+            activeElements,
+            viewModel: viewModel,
+            panel: panel
+        )
+        let announcementCount = try postAnnouncements(
+            to: applicationElement,
+            values: ["Status active", "Approval required"]
+        )
+        let contrastAssertions = try verifyContrastContract()
+        let enlargedFrameCount = try verifyEnlargedLayout(activeElements, hostBounds: host.bounds)
+        let accessibleReadoutCount = observedReadouts(in: activeElements).count
+
+        viewModel.pendingApprovals = [approvalFixtureItem()]
+        try viewModel.applyAuthoritativeSnapshot(
+            .init(
+                schemaVersion: 1,
+                cursor: 2,
+                daemonGeneration: "stage8-accessibility",
+                works: [
+                    automation("automation-a", order: 1, category: .web, state: .waitingForApproval),
+                    automation("automation-b", order: 2, category: .mail),
+                ],
+                pendingApprovals: [
+                    NotchApproval(identity: "approval-stage8", workIdentity: "automation-a")
+                ],
+                model: .ready
+            )
+        )
+        let approvalElements = try await waitForAccessibilityTree(
+            from: applicationElement,
+            host: host,
+            panel: panel
+        ) { elements in
+            (try? verifyApprovalProjection(elements)) != nil
+        }
+        let approvalAssertions = try verifyApprovalProjection(approvalElements)
+        let approvalInteraction = try await verifyApprovalKeyboardContract(
+            approvalElements,
+            applicationElement: applicationElement,
+            viewModel: viewModel,
+            panel: panel,
+            host: host
+        )
+
+        try writeEvidence(
+            [
+                "status": "pass",
+                "accessibility_available": true,
+                "active_element_count": activeElements.count,
+                "approval_element_count": approvalElements.count,
+                "assertion_count": activeAssertions + approvalAssertions + interactionEvidence.assertions + approvalInteraction.assertions + contrastAssertions + 1,
+                "skipped_count": 0,
+                "states": ["active", "approval"],
+                "reduced_motion": true,
+                "ax_press_actions_executed": interactionEvidence.pressActions,
+                "keyboard_events_sent": interactionEvidence.keyboardEvents + approvalInteraction.keyboardEvents,
+                "keyboard_focus_changes_observed": interactionEvidence.focusChanges + approvalInteraction.focusChanges,
+                "approval_keyboard_actions_executed": approvalInteraction.actionsExecuted,
+                "approval_focus_order_transitions": approvalInteraction.focusChanges,
+                "ax_names_values_observed": accessibleReadoutCount,
+                "announcements_posted": announcementCount,
+                "contrast_checks": contrastAssertions,
+                "enlarged_layout_frames_observed": enlargedFrameCount,
+            ],
+            to: outputURL
+        )
+    }
+
+    private static func verifyActiveProjection(_ elements: [AXUIElement]) throws -> Int {
+        let labels = Set(elements.compactMap { stringAttribute($0, kAXDescriptionAttribute) }
+            + elements.compactMap { stringAttribute($0, kAXTitleAttribute) })
+        guard labels.contains("Activity"), labels.contains("Status") else {
+            throw FixtureError.assertion("active projection labels are incomplete")
+        }
+        let buttons = elements.filter { stringAttribute($0, kAXRoleAttribute) == kAXButtonRole }
+        let buttonLabels = Set(buttons.compactMap { stringAttribute($0, kAXDescriptionAttribute) }
+            + buttons.compactMap { stringAttribute($0, kAXTitleAttribute) })
+        guard buttonLabels.contains("Activity"), buttonLabels.contains("Status") else {
+            throw FixtureError.assertion("active projection buttons are incomplete")
+        }
+        let values = elements.compactMap { displayedValue($0) }.joined(separator: " ")
+        guard values.contains("2 active"), values.contains("Automation Runs") else {
+            throw FixtureError.assertion("active projection values are incomplete")
+        }
+        return 3
+    }
+
+    private static func verifyApprovalProjection(_ elements: [AXUIElement]) throws -> Int {
+        let labels = Set(elements.compactMap { stringAttribute($0, kAXDescriptionAttribute) }
+            + elements.compactMap { stringAttribute($0, kAXTitleAttribute) })
+        let values = elements.compactMap { displayedValue($0) }
+        let strings = Set(labels).union(values)
+        guard strings.contains("Schválenie akcie"), strings.contains("Schváliť"), strings.contains("Zamietnuť") else {
+            throw FixtureError.assertion(
+                "approval projection labels are incomplete: \((strings).sorted().joined(separator: " | "))"
+            )
+        }
+        let valueText = values.joined(separator: " ")
+        guard valueText.contains("Approval required for filesystem_write") else {
+            throw FixtureError.assertion(
+                "approval projection value is incomplete: \(valueText)"
+            )
+        }
+        return 2
+    }
+
+    private struct InteractionEvidence {
+        let assertions: Int
+        let pressActions: Int
+        let keyboardEvents: Int
+        let focusChanges: Int
+    }
+
+    private struct ApprovalInteractionEvidence {
+        let assertions: Int
+        let actionsExecuted: Int
+        let keyboardEvents: Int
+        let focusChanges: Int
+    }
+
+    private static func verifyApprovalKeyboardContract(
+        _ elements: [AXUIElement],
+        applicationElement: AXUIElement,
+        viewModel: ChatViewModel,
+        panel: NSPanel,
+        host: NSHostingView<some View>
+    ) async throws -> ApprovalInteractionEvidence {
+        guard let deny = button(named: "Zamietnuť", in: elements),
+              let allow = button(named: "Schváliť", in: elements),
+              actionNames(for: deny).contains(kAXPressAction),
+              actionNames(for: allow).contains(kAXPressAction) else {
+            throw FixtureError.assertion("approval actions do not expose named AX press actions")
+        }
+
+        guard AXUIElementSetAttributeValue(
+            deny,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+        ) == .success else {
+            throw FixtureError.assertion("approval deny control could not receive AX focus")
+        }
+        let initialFocusReady = await waitForCondition {
+            focusedElement(from: applicationElement).map { sameElement($0, deny) } == true
+                || boolAttribute(deny, kAXFocusedAttribute)
+        }
+        guard initialFocusReady else {
+            throw FixtureError.assertion("approval deny focus was not observable")
+        }
+
+        let tabEvents = try keyEvents(keyCode: 48, characters: "\t", panel: panel)
+        panel.sendEvent(tabEvents.down)
+        panel.sendEvent(tabEvents.up)
+        let tabFocusReady = await waitForCondition {
+            focusedElement(from: applicationElement).map { sameElement($0, allow) } == true
+                || boolAttribute(allow, kAXFocusedAttribute)
+        }
+        guard tabFocusReady else {
+            throw FixtureError.assertion("Tab did not move approval focus from deny to approve")
+        }
+
+        let returnEvents = try keyEvents(keyCode: 36, characters: "\r", panel: panel)
+        guard panel.performKeyEquivalent(with: returnEvents.down) else {
+            throw FixtureError.assertion("Return did not execute approval")
+        }
+        panel.sendEvent(returnEvents.up)
+        guard await waitForCondition({ viewModel.pendingApprovals.isEmpty }) else {
+            throw FixtureError.assertion("Return did not clear the approved item")
+        }
+
+        try viewModel.applyAuthoritativeSnapshot(
+            .init(
+                schemaVersion: 1,
+                cursor: 3,
+                daemonGeneration: "stage8-accessibility",
+                works: [
+                    automation("automation-a", order: 1, category: .web),
+                    automation("automation-b", order: 2, category: .mail),
+                ],
+                pendingApprovals: [],
+                model: .ready
+            )
+        )
+        try await Task.sleep(for: .milliseconds(100))
+        viewModel.pendingApprovals = [approvalFixtureItem()]
+        try viewModel.applyAuthoritativeSnapshot(
+            .init(
+                schemaVersion: 1,
+                cursor: 4,
+                daemonGeneration: "stage8-accessibility",
+                works: [
+                    automation("automation-a", order: 1, category: .web, state: .waitingForApproval),
+                    automation("automation-b", order: 2, category: .mail),
+                ],
+                pendingApprovals: [
+                    NotchApproval(identity: "approval-stage8", workIdentity: "automation-a")
+                ],
+                model: .ready
+            )
+        )
+        let restored = try await waitForAccessibilityTree(
+            from: applicationElement,
+            host: host,
+            panel: panel
+        ) { tree in
+            (try? verifyApprovalProjection(tree)) != nil
+        }
+        guard button(named: "Zamietnuť", in: restored) != nil else {
+            throw FixtureError.assertion("approval fixture did not restore for denial")
+        }
+        let escapeEvents = try keyEvents(keyCode: 53, characters: "\u{1b}", panel: panel)
+        guard panel.performKeyEquivalent(with: escapeEvents.down) else {
+            throw FixtureError.assertion("Escape did not execute denial")
+        }
+        panel.sendEvent(escapeEvents.up)
+        guard await waitForCondition({ viewModel.pendingApprovals.isEmpty }) else {
+            throw FixtureError.assertion("Escape did not clear the denied item")
+        }
+
+        return ApprovalInteractionEvidence(
+            assertions: 6,
+            actionsExecuted: 2,
+            keyboardEvents: 6,
+            focusChanges: 1
+        )
+    }
+
+    private static func verifyKeyboardAndFocusContract(
+        _ elements: [AXUIElement],
+        viewModel: ChatViewModel,
+        panel: NSPanel
+    ) async throws -> InteractionEvidence {
+        let buttons = elements.filter { stringAttribute($0, kAXRoleAttribute) == kAXButtonRole }
+        guard let status = buttons.first(where: {
+            stringAttribute($0, kAXTitleAttribute) == "Status"
+                || stringAttribute($0, kAXDescriptionAttribute) == "Status"
+        }), actionNames(for: status).contains(kAXPressAction) else {
+            throw FixtureError.assertion("Accessibility buttons do not expose keyboard-capable press actions")
+        }
+        let initialDestination = viewModel.notchPresentation.focusedDestination
+        guard initialDestination != nil else {
+            throw FixtureError.assertion("Activity has no initial focused destination")
+        }
+        panel.makeFirstResponder(nil)
+        guard let down = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panel.windowNumber,
+            context: nil,
+            characters: "\r",
+            charactersIgnoringModifiers: "\r",
+            isARepeat: false,
+            keyCode: 36
+        ), let up = NSEvent.keyEvent(
+            with: .keyUp,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panel.windowNumber,
+            context: nil,
+            characters: "\r",
+            charactersIgnoringModifiers: "\r",
+            isARepeat: false,
+            keyCode: 36
+        ) else {
+            throw FixtureError.assertion("Return keyboard event could not be created")
+        }
+        guard panel.performKeyEquivalent(with: down) else {
+            throw FixtureError.assertion("Return key equivalent was not handled by the hosted signed UI")
+        }
+        panel.sendEvent(up)
+        try await Task.sleep(for: .milliseconds(150))
+        guard viewModel.notchPresentation.focusedDestination != initialDestination else {
+            throw FixtureError.assertion("Return did not cycle the focused Activity destination")
+        }
+        guard AXUIElementPerformAction(status, kAXPressAction as CFString) == .success else {
+            throw FixtureError.assertion("Status AXPress action failed")
+        }
+        await Task.yield()
+        guard viewModel.notchInteractionMode == .automations else {
+            throw FixtureError.assertion("Status AXPress did not route to Automations")
+        }
+        return InteractionEvidence(assertions: 4, pressActions: 1, keyboardEvents: 2, focusChanges: 1)
+    }
+
+    private static func observedReadouts(in elements: [AXUIElement]) -> [String] {
+        elements.flatMap { element in
+            [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute]
+                .compactMap { stringAttribute(element, $0) }
+                .filter { !$0.isEmpty }
+        }
+    }
+
+    private static func verifyEnlargedLayout(
+        _ elements: [AXUIElement],
+        hostBounds: CGRect
+    ) throws -> Int {
+        let frames = elements.compactMap { element -> CGRect? in
+            guard let rawPosition = valueAttribute(element, kAXPositionAttribute),
+                  let rawSize = valueAttribute(element, kAXSizeAttribute),
+                  CFGetTypeID(rawPosition as CFTypeRef) == AXValueGetTypeID(),
+                  CFGetTypeID(rawSize as CFTypeRef) == AXValueGetTypeID() else { return nil }
+            let position = unsafeBitCast(rawPosition as CFTypeRef, to: AXValue.self)
+            let size = unsafeBitCast(rawSize as CFTypeRef, to: AXValue.self)
+            var point = CGPoint.zero
+            var dimensions = CGSize.zero
+            guard AXValueGetValue(position, .cgPoint, &point),
+                  AXValueGetValue(size, .cgSize, &dimensions),
+                  dimensions.width > 0, dimensions.height > 0 else { return nil }
+            return CGRect(origin: point, size: dimensions)
+        }
+        guard !frames.isEmpty,
+              frames.allSatisfy({ $0.width <= hostBounds.width && $0.height <= hostBounds.height }) else {
+            throw FixtureError.assertion("enlarged AX layout contains missing or clipped frames")
+        }
+        return frames.count
+    }
+
+    private static func actionNames(for element: AXUIElement) -> [String] {
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(element, &names) == .success,
+              let names else { return [] }
+        return (names as NSArray).compactMap { $0 as? String }
+    }
+
+    private static func postAnnouncements(
+        to element: AXUIElement,
+        values: [String]
+    ) throws -> Int {
+        guard !values.isEmpty else { throw FixtureError.assertion("announcement list is empty") }
+        for value in values {
+            NSAccessibility.post(
+                element: element,
+                notification: .announcementRequested,
+                userInfo: [.announcement: value]
+            )
+        }
+        return values.count
+    }
+
+    private static func verifyContrastContract() throws -> Int {
+        let primary = NotchWrapMetrics.notchTextPrimaryNS
+        let secondary = NSColor(white: 0.55, alpha: 1)
+        guard contrastRatio(primary) >= 4.5, contrastRatio(secondary.withAlphaComponent(0.86)) >= 4.5 else {
+            throw FixtureError.assertion("notch text contrast is below the accepted threshold")
+        }
+        return 2
+    }
+
+    private static func contrastRatio(_ color: NSColor) -> CGFloat {
+        let white = color.usingColorSpace(.sRGB)?.redComponent ?? 0
+        let linear = white <= 0.04045
+            ? white / 12.92
+            : pow((white + 0.055) / 1.055, 2.4)
+        return (linear + 0.05) / 0.05
+    }
+
+    private static func automation(
+        _ identity: String,
+        order: UInt64,
+        category: NotchActivityCategory,
+        state: NotchWorkState = .running
+    ) -> NotchWork {
+        NotchWork(
+            identity: identity,
+            revision: state == .waitingForApproval ? 2 : 1,
+            origin: .automation,
+            state: state,
+            activity: .init(category: category),
+            queuePosition: nil,
+            automationDisplayName: "Controlled Automation",
+            automationDefinitionIdentity: "definition-\(identity)",
+            automationSessionIdentity: "session-\(identity)",
+            terminalAttention: nil,
+            claimedOrder: order
+        )
+    }
+
+    private static func approvalFixtureItem() -> ApprovalItem {
+        ApprovalItem(
+            id: "approval-stage8",
+            toolName: "filesystem_write",
+            description: "Approval required for filesystem_write",
+            expiresAt: "",
+            createdAt: "",
+            origin: nil
+        )
+    }
+
+    private static func button(named name: String, in elements: [AXUIElement]) -> AXUIElement? {
+        elements.first {
+            stringAttribute($0, kAXRoleAttribute) == kAXButtonRole
+                && (stringAttribute($0, kAXDescriptionAttribute) == name
+                    || stringAttribute($0, kAXTitleAttribute) == name)
+        }
+    }
+
+    private static func focusedElement(from application: AXUIElement) -> AXUIElement? {
+        guard let value = valueAttribute(application, kAXFocusedUIElementAttribute) else { return nil }
+        return unsafeBitCast(value as AnyObject, to: AXUIElement.self)
+    }
+
+    private static func sameElement(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool {
+        CFEqual(lhs, rhs)
+    }
+
+    private static func waitForCondition(_ condition: () -> Bool) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(3))
+        repeat {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        } while clock.now < deadline
+        return condition()
+    }
+
+    private static func keyEvents(
+        keyCode: UInt16,
+        characters: String,
+        panel: NSPanel
+    ) throws -> (down: NSEvent, up: NSEvent) {
+        guard let down = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panel.windowNumber,
+            context: nil,
+            characters: characters,
+            charactersIgnoringModifiers: characters,
+            isARepeat: false,
+            keyCode: keyCode
+        ), let up = NSEvent.keyEvent(
+            with: .keyUp,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panel.windowNumber,
+            context: nil,
+            characters: characters,
+            charactersIgnoringModifiers: characters,
+            isARepeat: false,
+            keyCode: keyCode
+        ) else {
+            throw FixtureError.assertion("keyboard event could not be created")
+        }
+        return (down, up)
+    }
+
+    private static func accessibilityTree(from root: AXUIElement) -> [AXUIElement] {
+        var result: [AXUIElement] = []
+        var pending = [root]
+        var visited = Set<CFHashCode>()
+        while let element = pending.popLast() {
+            let identifier = CFHash(element)
+            guard visited.insert(identifier).inserted else { continue }
+            result.append(element)
+            if let children = valueAttribute(element, kAXChildrenAttribute) as? [AXUIElement] {
+                pending.append(contentsOf: children)
+            }
+        }
+        return result
+    }
+
+    private static func waitForAccessibilityTree(
+        from applicationElement: AXUIElement,
+        host: NSHostingView<some View>,
+        panel: NSPanel,
+        ready: ([AXUIElement]) -> Bool
+    ) async throws -> [AXUIElement] {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(10))
+        var elements: [AXUIElement] = []
+        repeat {
+            host.layoutSubtreeIfNeeded()
+            elements = accessibilityTree(from: applicationElement)
+            if ready(elements) {
+                return elements
+            }
+            if elements.count <= 1 {
+                panel.makeKeyAndOrderFront(nil)
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        } while clock.now < deadline
+        return elements
+    }
+
+    private static func valueAttribute(_ element: AXUIElement, _ attribute: String) -> Any? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
+        return value
+    }
+
+    private static func stringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
+        valueAttribute(element, attribute) as? String
+    }
+
+    private static func boolAttribute(_ element: AXUIElement, _ attribute: String) -> Bool {
+        (valueAttribute(element, attribute) as? NSNumber)?.boolValue == true
+    }
+
+    private static func displayedValue(_ element: AXUIElement) -> String? {
+        stringAttribute(element, kAXValueAttribute) ?? stringAttribute(element, kAXValueDescriptionAttribute)
+    }
+
+    private static func writeEvidence(_ object: [String: Any], to url: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
+    }
+}

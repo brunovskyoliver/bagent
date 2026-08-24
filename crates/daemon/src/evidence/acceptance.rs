@@ -11,9 +11,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use anyhow::anyhow;
 use async_trait::async_trait;
-use basert_connector::{BaseRtClient, ModelInfo, ModelLoadRequest};
 use chrono::{TimeZone, Utc};
 use serde::Deserialize;
 use url::Url;
@@ -22,9 +20,8 @@ use super::{
     BodyOrigin, BodyState, CandidateId, EvidenceContribution, EvidenceId, EvidenceOperation,
     ExecutionStatus, ExtractionQuality, ExtractionStatus, FailureCode, MailBodyEvidence,
     MailEvidenceAdapter, MailHeaderEvidence, OperationResult, ProviderResult, ProviderSet,
-    ProviderStatus, SourceAuthority, SourceIdentity, SynthesisModelClient, SynthesisModelRequest,
-    TypedWebEvidenceAdapter, ValidatedMailId, WebCandidate, WebFetchEvidence, WebProvider,
-    WebSearchResult, PREFERRED_SYNTHESIS_MODEL,
+    ProviderStatus, SourceAuthority, SourceIdentity, TypedWebEvidenceAdapter, ValidatedMailId,
+    WebCandidate, WebFetchEvidence, WebProvider, WebSearchResult,
 };
 
 pub(crate) const STAGE8_ACCEPTANCE_FIXTURES_ENV: &str = "BAGENT_STAGE8_ACCEPTANCE_FIXTURES";
@@ -96,13 +93,6 @@ impl AcceptanceControl {
     pub(crate) fn web_adapter(&self) -> Option<AcceptanceWebAdapter> {
         let selection = self.selection()?;
         AcceptanceWebAdapter::new(selection.acquisition)
-    }
-
-    pub(crate) fn synthesis_client(&self, production: BaseRtClient) -> AcceptanceSynthesisClient {
-        AcceptanceSynthesisClient {
-            production,
-            control: self.clone(),
-        }
     }
 }
 
@@ -379,79 +369,6 @@ impl TypedWebEvidenceAdapter for AcceptanceWebAdapter {
             );
         }
         OperationResult::succeeded(operation.key(), acceptance_fetch(self.scenario, candidate))
-    }
-}
-
-pub(crate) struct AcceptanceSynthesisClient {
-    production: BaseRtClient,
-    control: AcceptanceControl,
-}
-
-#[async_trait]
-impl SynthesisModelClient for AcceptanceSynthesisClient {
-    async fn inspect_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
-        if self
-            .control
-            .selection()
-            .is_some_and(|selection| selection.polish != AcceptancePolish::Passthrough)
-        {
-            return Ok(vec![ModelInfo {
-                id: PREFERRED_SYNTHESIS_MODEL.to_string(),
-                loaded: true,
-            }]);
-        }
-        self.production.inspect_models().await
-    }
-
-    async fn load_model(&self, request: &ModelLoadRequest) -> anyhow::Result<()> {
-        if self
-            .control
-            .selection()
-            .is_some_and(|selection| selection.polish != AcceptancePolish::Passthrough)
-        {
-            return Ok(());
-        }
-        self.production.load_model(request).await.map(|_| ())
-    }
-
-    async fn unload_model(&self, model: &str) -> anyhow::Result<()> {
-        if self
-            .control
-            .selection()
-            .is_some_and(|selection| selection.polish != AcceptancePolish::Passthrough)
-        {
-            return Ok(());
-        }
-        self.production.unload_model(model).await
-    }
-
-    async fn restart_runtime(&self) -> anyhow::Result<()> {
-        self.production.restart_runtime().await
-    }
-
-    async fn runtime_fault_checkpoint(&self) -> Option<basert_connector::BaseRtLogCheckpoint> {
-        self.production.runtime_fault_checkpoint().await
-    }
-
-    async fn detect_runtime_fault_since(
-        &self,
-        checkpoint: Option<basert_connector::BaseRtLogCheckpoint>,
-        wait: std::time::Duration,
-    ) -> Option<basert_connector::BaseRtRuntimeFault> {
-        self.production
-            .detect_runtime_fault_since(checkpoint, wait)
-            .await
-    }
-
-    async fn complete(&self, request: SynthesisModelRequest) -> anyhow::Result<String> {
-        match self.control.selection().map(|selection| selection.polish) {
-            Some(AcceptancePolish::Accepted) => Ok(acceptance_canonical_mail_text()),
-            Some(AcceptancePolish::Rejected) => {
-                Ok("Unsupported fixture claim 9999 https://invalid.example".into())
-            }
-            Some(AcceptancePolish::Unavailable) => Err(anyhow!("acceptance provider unavailable")),
-            _ => self.production.complete(request).await,
-        }
     }
 }
 

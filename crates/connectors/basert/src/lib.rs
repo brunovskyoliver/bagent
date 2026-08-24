@@ -11,10 +11,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
-    sync::RwLock,
-};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8082/v1";
 pub const DEFAULT_API_KEY: &str = "basert-local";
@@ -252,7 +249,6 @@ pub struct BaseRtClient {
     server_root: String,
     api_key: String,
     http: reqwest::Client,
-    model_lifecycle: Arc<RwLock<()>>,
     runtime_log_path: Option<PathBuf>,
     runtime_fault: Arc<AtomicU8>,
 }
@@ -276,7 +272,6 @@ impl BaseRtClient {
                 .timeout(Duration::from_secs(310))
                 .build()
                 .expect("build BaseRT HTTP client"),
-            model_lifecycle: Arc::new(RwLock::new(())),
             runtime_log_path,
             runtime_fault: Arc::new(AtomicU8::new(0)),
         }
@@ -448,9 +443,6 @@ impl BaseRtClient {
         if request.path.trim().is_empty() {
             return Err(anyhow!("model path must not be empty"));
         }
-        // Clones used by the daemon share this guard, so a legacy 4B
-        // completion cannot overlap a 35B lifecycle transition.
-        let _lifecycle = self.model_lifecycle.write().await;
         let log_cursor = self.runtime_log_checkpoint().await;
         let response = match self
             .post(format!("{}/models/load", self.base_url))
@@ -479,7 +471,6 @@ impl BaseRtClient {
     }
 
     pub async fn unload_model(&self, model: &str) -> Result<()> {
-        let _lifecycle = self.model_lifecycle.write().await;
         let response = self
             .post(format!("{}/models/unload", self.base_url))
             .json(&serde_json::json!({"model": model}))
@@ -513,7 +504,6 @@ impl BaseRtClient {
     ) -> impl futures_core::Stream<Item = Result<ChatStreamEvent>> + Send {
         let client = self.clone();
         async_stream::try_stream! {
-            let _model_request_guard = client.model_lifecycle.read().await;
             let response = client
                 .post(format!("{}/chat/completions", client.base_url))
                 .json(&serde_json::json!({
@@ -600,6 +590,10 @@ impl BaseRtClient {
                 }
             }
 
+            if !done {
+                Err(anyhow!("BaseRT stream ended without a completion boundary"))?;
+            }
+
             let completed = calls
                 .into_values()
                 .map(PartialToolCall::finish)
@@ -627,6 +621,26 @@ impl BaseRtClient {
             .await
     }
 
+    pub async fn chat_complete_json_bounded(
+        &self,
+        model: &str,
+        messages: Vec<Message>,
+        temperature: f32,
+        max_tokens: u32,
+    ) -> Result<String> {
+        if max_tokens == 0 {
+            return Err(anyhow!("max_tokens must be greater than zero"));
+        }
+        self.chat_complete_request(
+            model,
+            messages,
+            temperature,
+            max_tokens,
+            Some(serde_json::json!({"type": "json_object"})),
+        )
+        .await
+    }
+
     async fn chat_complete_request(
         &self,
         model: &str,
@@ -638,7 +652,6 @@ impl BaseRtClient {
         if let Some(fault) = self.runtime_fault() {
             return Err(anyhow!(BaseRtCompletionError::RuntimeFault(fault)));
         }
-        let _model_request_guard = self.model_lifecycle.read().await;
         let log_cursor = self.runtime_log_checkpoint().await;
         let mut body = serde_json::json!({
             "model": model,

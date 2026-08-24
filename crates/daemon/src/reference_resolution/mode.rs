@@ -1,7 +1,5 @@
 #![allow(dead_code)]
 
-pub(crate) use crate::agent_exec::EvidenceOrchestratorFlag;
-
 pub(crate) const REFERENCE_RESOLVER_MODE_ENV: &str = "BAGENT_REFERENCE_RESOLVER_MODE";
 pub(crate) const DEFAULT_RESOLVER_MODE: ResolverMode = ResolverMode::Off;
 
@@ -89,15 +87,10 @@ pub(crate) fn parse_resolver_mode_with_status(value: Option<&str>) -> ParsedReso
     ParsedResolverMode { mode, status }
 }
 
-/// Apply the Stage 9 flag before considering the subordinate resolver mode.
-/// The function is deliberately pure so flag precedence can be tested without
-/// reading process configuration.
-pub(crate) fn select_resolver_mode(
-    flag: EvidenceOrchestratorFlag,
-    subordinate: Option<&str>,
-) -> ResolverMode {
-    match flag {
-        EvidenceOrchestratorFlag::Disabled => ResolverMode::LegacyStage9,
-        EvidenceOrchestratorFlag::Enabled => parse_resolver_mode(subordinate),
-    }
+/// Resolve the startup resolver mode. Typed evidence routing is unconditional
+/// after Stage 8, so the resolver mode is an independent setting with no
+/// higher-precedence rollback flag above it. Kept pure so the parse
+/// precedence can be tested without reading process configuration.
+pub(crate) fn select_resolver_mode(subordinate: Option<&str>) -> ResolverMode {
+    parse_resolver_mode(subordinate)
 }

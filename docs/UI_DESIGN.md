@@ -92,7 +92,7 @@ All points, in `NotchWrapMetrics`:
 | Hover | 72 | 22 |
 | Input | 221 | 72 |
 | Output | 154 (min 72) | 96, grows to 280 |
-| Settings | 205 | 252 (setup page: 280) |
+| Settings | 205 | 252 |
 | Automations | 205 | 214 |
 | cmux banner | 84 | 19 |
 | Paste wheel | 196 | 36 + 96 bulge dome |
@@ -147,20 +147,26 @@ black — do not add materials, blur, or shadows inside the shape.
 
 ## Settings
 
-`/settings` opens `.settings` mode. `NotchSettingsContent` renders one page at a
-time; `←`/`→` or the header icons switch pages, and the left wing mirrors the
-current page icon.
+`/settings` opens `.settings` mode on General. `NotchSettingsContent` renders a
+persistent four-peer Compass Rail inside the ordinary 205 pt wings and 252 pt
+bridge:
 
-| Page | Carries |
+| Peer | Carries |
 |---|---|
-| `general` | paste wheel, cmux notifications |
-| `permissions` | Full Disk, mic, screen recording, Accessibility |
-| `model` | chat model picker |
-| `connectors` | connector status (read-only) |
-| `setup` | Odoo credentials, Codex path, WhatsApp pairing, `rules.yaml` editor |
+| General | paste wheel with its Accessibility dependency, cmux notifications, Option-Space guidance |
+| Model and Runtime | daemon-projected model, residency phase, preload policy, shared idle policy, lease/work waiting and changed-PID recovery summaries |
+| Integrations | Apple Mail, Apple Notes, WhatsApp, Odoo, Codex and local connector-service summaries; WhatsApp, Odoo and Codex have bounded children |
+| Privacy and Permissions | Full Disk Access, Screen Recording and Accessibility summaries, plus a bounded Rules and approval policy child |
 
-`setup` is the only page that scrolls and the only one at full bridge height —
-credentials plus the rules editor do not fit otherwise.
+The rail remains visible for every child. Direct peer selection changes the
+top-level area; Back and Escape return one level and restore the opener's focus.
+Plain Left and Right wrap across exactly the four peers and yield to native
+editable controls. The selected peer's icon stays in the left wing, including
+inside children. Settings has no home page, fifth peer, Setup route, scrolling
+page, provider/fallback controls, raw policy editor, or special geometry.
+Model, connector, permission, rules, and recurrence state remain projections of
+their existing authorities; Stage 7B does not implement permission rechecks,
+System Settings routing, signed-app drag, or UI-only relaunch.
 
 ---
 
@@ -186,12 +192,15 @@ It is a **1-second surface**: glanceable, tappable, always visible.
 - No long-lived free-form text outside `.input`.
 - No long labels or multi-word status messages.
 - Nothing needing more than a second of attention.
-- No scrollable content — `setup` is the deliberate exception.
-- **No new windows for ordinary features.** bagent Browser is the sole accepted
-  exception: each live Browser Session may own one chromeless, resizable,
-  floating Browser Panel because an interactive web page cannot fit the notch.
-  Browser Panels use `.floating`, support all Spaces/full-screen auxiliary
-  placement, and never replace or move the notch panel.
+- No scrollable settings content. The Compass Rail bounds every settings
+  destination to a fixed height instead of scrolling.
+- **No new windows for ordinary features.** If a feature seems to need one, it
+  belongs in a settings destination or it does not belong in bagent. bagent
+  Browser is the sole accepted exception: each live Browser Session may own one
+  chromeless, resizable, floating Browser Panel because an interactive web page
+  cannot fit the notch. Browser Panels use `.floating`, support all
+  Spaces/full-screen auxiliary placement, and never replace or move the notch
+  panel.
 
 ---
 

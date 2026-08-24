@@ -1,6 +1,6 @@
 use super::{
-    parse_resolver_mode_with_status, ConversationalReferenceResolver, EvidenceOrchestratorFlag,
-    ResolverMode, ResolverModeParseStatus,
+    parse_resolver_mode_with_status, ConversationalReferenceResolver, ResolverMode,
+    ResolverModeParseStatus,
 };
 use std::{
     fmt,
@@ -182,7 +182,6 @@ impl RuntimeSelection {
 /// Select the resolver startup state. The top-level rollback flag is checked
 /// before either lazy supplier is evaluated.
 pub(crate) fn select_runtime<Subordinate, Factory, Error>(
-    flag: EvidenceOrchestratorFlag,
     subordinate_supplier: Subordinate,
     resolver_factory: Factory,
 ) -> RuntimeSelection
@@ -190,10 +189,6 @@ where
     Subordinate: FnOnce() -> Option<String>,
     Factory: FnOnce(ResolverMode) -> Result<Arc<dyn ConversationalReferenceResolver>, Error>,
 {
-    if flag == EvidenceOrchestratorFlag::Disabled {
-        return RuntimeSelection::LegacyStage9;
-    }
-
     let subordinate = subordinate_supplier();
     let parsed = parse_resolver_mode_with_status(subordinate.as_deref());
     if parsed.mode() == ResolverMode::Off {

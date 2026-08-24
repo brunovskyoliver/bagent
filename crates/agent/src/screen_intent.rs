@@ -1,6 +1,8 @@
 use anyhow::Result;
-use basert_connector::BaseRtClient;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use crate::AgentInference;
 
 /// LLM-classified intent for a screen-context user turn.
 ///
@@ -50,12 +52,12 @@ pub enum ScreenAction {
 }
 
 pub struct ScreenIntentClassifier {
-    inference: BaseRtClient,
+    inference: Arc<dyn AgentInference>,
     model: String,
 }
 
 impl ScreenIntentClassifier {
-    pub fn new(inference: BaseRtClient, model: String) -> Self {
+    pub fn new(inference: Arc<dyn AgentInference>, model: String) -> Self {
         Self { inference, model }
     }
 
@@ -116,10 +118,7 @@ Príklady:
 - "write a business email" → {{"action":"none","wants_screen":false,"wants_ocr":false,"wants_selection":false}}"#
         );
 
-        let raw = self
-            .inference
-            .generate_json(&self.model, &prompt, 0.0)
-            .await?;
+        let raw = self.inference.infer_json(&self.model, &prompt, 0.0).await?;
         let intent: ScreenIntent = serde_json::from_str(clean_json(&raw)).unwrap_or_default();
         Ok(intent)
     }

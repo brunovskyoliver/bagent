@@ -6,6 +6,14 @@ Status: Accepted. The definitive campaign at
 `96756b27c1d5798887e3baa379d5b0ab449bbc09` passed every authorization condition;
 Stage 9 default routing is authorized under this decision.
 
+Current campaign boundary: Stage 7C and Stage 8 signed/live qualification is
+limited to macOS 26. macOS 14 and 15 remain compile targets when existing
+configuration permits them, without runtime, System Settings, TCC, visual, or
+accessibility qualification claims. Live TCC grant, denial, revocation, and
+drag-to-System-Settings mutation are outside this campaign; omitted checks are
+never PASS. Deterministic adapters, signed-bundle and drag-payload validation,
+privacy tests, and daemon-preserving relaunch remain required.
+
 ## Context
 
 Revision `8536f0115a50e2c011b39ce31ac79cc16b47d8fc` passes deterministic

@@ -22,7 +22,7 @@ private func sourceModeCommandDigitIndex(for event: NSEvent) -> Int? {
 // Borderless NSPanel by default returns canBecomeKey = false, which silently
 // prevents makeKeyAndOrderFront from making the panel a key window, so keyboard
 // events never reach the text field. Subclass to fix.
-private final class BagentPanel: NSPanel {
+final class BagentPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
@@ -70,9 +70,19 @@ final class NotchWindowController: NSObject {
     /// content view, not a floating window (see BrowserCuePreviewPanel.swift).
     private var cuePreviewView: BrowserCuePreviewView?
     var isNotchInteractionShowing: Bool { chatViewModel.notchInteractionMode != .collapsed }
+    var isTakeoverPresentationActive: Bool { presentationActive && statusPanel.isVisible && statusPanel.isKeyWindow }
+    var takeoverPresentationEvidence: [String: Any] {
+        [
+            "presentation_active": presentationActive,
+            "visible": statusPanel?.isVisible ?? false,
+            "key_window": statusPanel?.isKeyWindow ?? false,
+            "can_become_key": statusPanel?.canBecomeKey ?? false,
+            "application_active": NSApp.isActive,
+        ]
+    }
     private var hasNotch = false
     private var localKeyMonitor: Any?
-    private var localMouseMonitor: Any?
+    private var compassRailKeyMonitor: Any?
     private var globalMouseMonitor: Any?
     /// Clipboard paste wheel (hold right ⌘).
     private let clipboardHistory = ClipboardHistory()
@@ -92,14 +102,21 @@ final class NotchWindowController: NSObject {
     private var approvalCancellable: AnyCancellable?
     private var dropTargetCancellable: AnyCancellable?
     private var previousApp: NSRunningApplication?
+    private var presentationActive: Bool
+    private var auxiliaryMonitoringStarted = false
 
 #if DEBUG
     var statusPanelForTesting: NSPanel { statusPanel }
 #endif
 
-    init(chatViewModel: ChatViewModel, browserCoordinator: BrowserCoordinator = BrowserCoordinator()) {
+    init(
+        chatViewModel: ChatViewModel,
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator(),
+        initiallyHidden: Bool = false
+    ) {
         self.chatViewModel = chatViewModel
         self.browserCoordinator = browserCoordinator
+        self.presentationActive = !initiallyHidden
         super.init()
         computeGeometry()
         buildStatusPanel()
@@ -123,10 +140,23 @@ final class NotchWindowController: NSObject {
         chatViewModel.onInputOnlySubmitted = { [weak self] in
             self?.collapseInputForThinking()
         }
-        chatViewModel.onFirstAssistantToken = { [weak self] in
-            self?.presentOutputChat()
+        chatViewModel.currentInputSelectionProvider = { [weak self] in
+            guard let self else { return (0, 0) }
+            guard let editor = self.statusPanel?.firstResponder as? NSTextView else {
+                return (self.chatViewModel.inputText.utf16.count, 0)
+            }
+            let range = editor.selectedRange()
+            return (range.location, range.length)
         }
-
+        chatViewModel.onSlashSuggestionCompletion = { [weak self] command in
+            guard let self,
+                  let editor = self.statusPanel.firstResponder as? NSTextView,
+                  SlashCommandTextCompletion.replaceDraft(in: editor, with: command)
+            else { return false }
+            self.chatViewModel.inputText = editor.string
+            self.statusPanel.makeFirstResponder(editor)
+            return true
+        }
         // cmux agent event: transient banner in the collapsed notch for 5s, then
         // collapse back to the persistent left icon (still jiggling) + right corner
         // dot, which linger until the event clears. Latest event wins the banner.
@@ -142,24 +172,72 @@ final class NotchWindowController: NSObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: work)
         }
 
-        // A gated write auto-denies after 60 s, so an arriving approval has to open
-        // the notch on its own — the user may never look at the pill in time.
-        approvalCancellable = chatViewModel.$pendingApprovals
-            .map { !$0.isEmpty }
-            .removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] hasPending in
-                guard hasPending else { return }
-                self?.presentOutputChat()
-            }
-
-        visibilityCancellable = chatViewModel.$notchInteractionMode
+        visibilityCancellable = chatViewModel.notchPresentationPublisher
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.reconcileStatusPanelVisibility()
             }
 
+        if presentationActive {
+            startAuxiliaryMonitoringIfNeeded()
+        }
+    }
+
+    @discardableResult
+    func activateForTakeover() async -> Bool {
+        guard !presentationActive else {
+            return presentationActive && statusPanel.isVisible && statusPanel.isKeyWindow && statusPanel.canBecomeKey
+        }
+        presentationActive = true
+        startAuxiliaryMonitoringIfNeeded()
+        statusPanel.styleMask = [.borderless]
+        reconcileStatusPanelVisibility()
+        requestTakeoverActivation()
+        for _ in 0..<20 {
+            guard presentationActive else { return false }
+            if statusPanel.isVisible && statusPanel.isKeyWindow && statusPanel.canBecomeKey {
+                return true
+            }
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(10))
+            requestTakeoverActivation()
+        }
+        return presentationActive && statusPanel.isVisible && statusPanel.isKeyWindow && statusPanel.canBecomeKey
+    }
+
+    private func requestTakeoverActivation() {
+        _ = NSRunningApplication.current.activate(options: [.activateAllWindows])
+        NSApp.activate(ignoringOtherApps: true)
+        showStatusPanel(makeKey: true)
+        statusPanel.orderFrontRegardless()
+        statusPanel.makeKey()
+    }
+
+    func deactivateForTakeover() {
+        guard presentationActive else { return }
+        presentationActive = false
+        stopAuxiliaryMonitoring()
+        dismissPasteWheel()
+        pasteTap.stop()
+        if let m = localKeyMonitor { NSEvent.removeMonitor(m); localKeyMonitor = nil }
+        if let m = compassRailKeyMonitor { NSEvent.removeMonitor(m); compassRailKeyMonitor = nil }
+        if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
+        statusPanel.styleMask = [.borderless, .nonactivatingPanel]
+        statusPanel.orderOut(nil)
+    }
+
+    private func stopAuxiliaryMonitoring() {
+        fullscreenPollTimer?.invalidate()
+        fullscreenPollTimer = nil
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        clipboardHistory.stop()
+        auxiliaryMonitoringStarted = false
+    }
+
+    private func startAuxiliaryMonitoringIfNeeded() {
+        guard !auxiliaryMonitoringStarted else { return }
+        auxiliaryMonitoringStarted = true
         setupFullscreenMonitoring()
         setupPasteWheel()
     }
@@ -377,17 +455,16 @@ final class NotchWindowController: NSObject {
 
     /// Open the notch input surface (⌥Space when collapsed).
     func presentInputOnly() {
+        guard presentationActive else { return }
         BrowserCueTrace.log("presentInputOnly mode=\(chatViewModel.notchInteractionMode)")
         guard chatViewModel.notchInteractionMode == .collapsed else { return }
-        if chatViewModel.isThinking {
+        if chatViewModel.notchPresentation.hasActiveForegroundWork {
             presentOutputChat()
             return
         }
         previousApp = NSWorkspace.shared.frontmostApplication
 
-        chatViewModel.isExpanded = true
-        chatViewModel.chatSurfaceMode = .inputOnly
-        chatViewModel.notchInteractionMode = .input
+        chatViewModel.applyNotchIntent(.openInput)
         hoverChanged(isHovered: true)
 
         statusPanel.styleMask = [.borderless]
@@ -403,9 +480,7 @@ final class NotchWindowController: NSObject {
             previousApp = NSWorkspace.shared.frontmostApplication
         }
 
-        chatViewModel.isExpanded = true
-        chatViewModel.chatSurfaceMode = .outputExpanded
-        chatViewModel.notchInteractionMode = .output
+        chatViewModel.applyNotchIntent(.openOutput)
         hoverChanged(isHovered: true)
 
         statusPanel.styleMask = [.borderless]
@@ -428,21 +503,12 @@ final class NotchWindowController: NSObject {
             }
         }
 
-        // Option+click anywhere in the notch panel copies the debug trace.
-        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
-            guard let self,
-                  event.modifierFlags.contains(.option),
-                  event.window === self.statusPanel
-            else { return event }
-            // ⌥-click on a Browser Cue closes that session (or shakes it) — the
-            // monitor must not swallow it, nor flash "trace copied" over it.
-            if self.browserCoordinator.isPointOverCue(
-                self.statusPanel.convertPoint(toScreen: event.locationInWindow)) {
-                return event
-            }
-            self.chatViewModel.copyDebugTrace()
-            return nil
-        }
+        compassRailKeyMonitor = Self.installCompassRailKeyMonitor(
+            on: statusPanel,
+            viewModel: chatViewModel,
+            focusedControl: { [weak self] in self?.focusedCompassRailControl() }
+        )
+
 
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self else { return event }
@@ -453,13 +519,43 @@ final class NotchWindowController: NSObject {
                 }
                 return event
             }
+            let markedTextActive = (NSApp.keyWindow?.firstResponder as? NSTextView)?
+                .hasMarkedText() == true
+            self.chatViewModel.hasUncommittedMarkedText = markedTextActive
+            if self.chatViewModel.authoritativePendingApproval != nil || markedTextActive {
+                return event
+            }
+            let commandModifiers = event.modifierFlags
+                .intersection(.deviceIndependentFlagsMask)
+                .intersection([.command, .option, .control, .shift])
+            let isPlainKey = commandModifiers.isEmpty
+            if [36, 76].contains(event.keyCode),
+               !isPlainKey,
+               self.chatViewModel.notchInteractionMode == .input {
+                self.chatViewModel.preserveModifiedReturnForNativeEditing()
+            }
             if event.keyCode == 53 {
+                if self.chatViewModel.clearCurrentChatConfirmationPresented {
+                    self.chatViewModel.cancelCurrentChatClear()
+                    return nil
+                }
                 // Esc dismisses slash suggestions first, then steps back in
                 // the automations surface, then exits response-history
                 // browsing, then collapses the notch.
                 if !self.chatViewModel.slashSuggestions.isEmpty {
                     self.chatViewModel.dismissSlashSuggestions()
                     return nil
+                }
+                if self.chatViewModel.notchInteractionMode == .settings {
+                    let action = self.chatViewModel.handleCompassRailKey(
+                        .escape,
+                        focusedControl: self.focusedCompassRailControl()
+                    )
+                    if action == .back { return nil }
+                    if action == .collapse {
+                        self.collapse()
+                        return nil
+                    }
                 }
                 if self.chatViewModel.notchInteractionMode == .automations,
                    self.chatViewModel.automationsGoBack() {
@@ -476,6 +572,10 @@ final class NotchWindowController: NSObject {
             // advances the editor one step (keyboard equivalent of "Ďalej").
             if self.chatViewModel.notchInteractionMode == .automations {
                 switch event.keyCode {
+                case 123:
+                    if self.chatViewModel.automationsGoBack() { return nil }
+                case 124:
+                    if self.chatViewModel.openSelectedAutomationDetail() { return nil }
                 case 126: if self.chatViewModel.moveAutomationsSelection(by: -1) { return nil }
                 case 125: if self.chatViewModel.moveAutomationsSelection(by: 1) { return nil }
                 case 36:
@@ -490,27 +590,24 @@ final class NotchWindowController: NSObject {
                 default: break
                 }
             }
-            // Slash-command suggestions consume ↑/↓ (selection), Tab and
-            // Return (accept) while visible.
+            // Slash suggestions own plain arrows and Tab. Return evaluates the
+            // untouched draft through ChatViewModel.send().
             if !self.chatViewModel.slashSuggestions.isEmpty {
                 switch event.keyCode {
-                case 126: if self.chatViewModel.moveSlashSelection(by: -1) { return nil }
-                case 125: if self.chatViewModel.moveSlashSelection(by: 1) { return nil }
-                case 48, 36:
-                    if self.chatViewModel.acceptSlashSuggestion() { return nil }
+                case 126 where isPlainKey:
+                    if self.chatViewModel.moveSlashSelection(by: -1) { return nil }
+                case 125 where isPlainKey:
+                    if self.chatViewModel.moveSlashSelection(by: 1) { return nil }
+                case 48 where isPlainKey:
+                    if self.chatViewModel.completeSlashSuggestion() { return nil }
                 default: break
                 }
             }
-            // ←/→ switch settings pages while the /settings surface is open.
-            if self.chatViewModel.notchInteractionMode == .settings {
-                if event.keyCode == 123 {
-                    self.chatViewModel.notchSettingsPage = self.chatViewModel.notchSettingsPage.previous
-                    return nil
-                }
-                if event.keyCode == 124 {
-                    self.chatViewModel.notchSettingsPage = self.chatViewModel.notchSettingsPage.next
-                    return nil
-                }
+            if event.keyCode == 76,
+               isPlainKey,
+               self.chatViewModel.notchInteractionMode == .input {
+                self.chatViewModel.send()
+                return nil
             }
             // ↑/↓ on empty notch input browse past assistant responses.
             // Arrow keys always carry .function + .numericPad — ignore those.
@@ -567,23 +664,71 @@ final class NotchWindowController: NSObject {
         return true
     }
 
+    private func focusedCompassRailControl() -> CompassRailFocusedControl? {
+        guard chatViewModel.notchInteractionMode == .settings else { return nil }
+        return Self.compassRailFocusedControl(in: statusPanel)
+    }
+
+    @discardableResult
+    static func routeCompassRailKeyEvent(
+        _ event: NSEvent,
+        viewModel: ChatViewModel,
+        focusedControl: CompassRailFocusedControl?
+    ) -> Bool {
+        guard viewModel.notchInteractionMode == .settings else { return false }
+        let modifiers = event.modifierFlags
+            .intersection(.deviceIndependentFlagsMask)
+            .intersection([.command, .option, .control, .shift])
+        guard modifiers.isEmpty else { return false }
+        switch event.keyCode {
+        case 123:
+            return viewModel.handleCompassRailKey(.left, focusedControl: focusedControl) != nil
+        case 124:
+            return viewModel.handleCompassRailKey(.right, focusedControl: focusedControl) != nil
+        default:
+            return false
+        }
+    }
+
+    @MainActor
+    static func installCompassRailKeyMonitor(
+        on panel: NSPanel,
+        viewModel: ChatViewModel,
+        focusedControl: @escaping () -> CompassRailFocusedControl?
+    ) -> Any? {
+        NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { event in
+            guard event.window === panel else { return event }
+            if routeCompassRailKeyEvent(event, viewModel: viewModel, focusedControl: focusedControl()) {
+                return nil
+            }
+            return event
+        }
+    }
+
+    static func compassRailFocusedControl(in panel: NSPanel) -> CompassRailFocusedControl? {
+        if panel.firstResponder is NSTextView { return .textEditor }
+        if panel.firstResponder is NSSecureTextField { return .secureField }
+        if panel.firstResponder is NSTextField { return .textField }
+        if panel.firstResponder is NSSlider || panel.firstResponder is NSPopUpButton || panel.firstResponder is NSComboBox {
+            return .nativeEditor
+        }
+        return nil
+    }
+
     private func collapseInputForThinking() {
         guard chatViewModel.notchInteractionMode == .input else { return }
-        chatViewModel.chatSurfaceMode = .thinkingHidden
-        chatViewModel.notchInteractionMode = .thinking
+        chatViewModel.applyNotchIntent(.collapse)
         reconcileStatusPanelVisibility()
     }
 
     func collapse() {
         guard isNotchInteractionShowing else { return }
-        chatViewModel.isExpanded = false  // triggers SwiftUI spring-out animation
-        chatViewModel.chatSurfaceMode = .collapsed
-        chatViewModel.notchInteractionMode = .collapsed
+        chatViewModel.applyNotchIntent(.collapse)
         chatViewModel.isSourcePickerForced = false
         resetNotchHoverState()
 
         if let m = localKeyMonitor    { NSEvent.removeMonitor(m); localKeyMonitor    = nil }
-        if let m = localMouseMonitor  { NSEvent.removeMonitor(m); localMouseMonitor  = nil }
+        if let m = compassRailKeyMonitor { NSEvent.removeMonitor(m); compassRailKeyMonitor = nil }
         if let m = globalMouseMonitor { NSEvent.removeMonitor(m); globalMouseMonitor = nil }
         statusPanel.styleMask = [.borderless, .nonactivatingPanel]
         reconcileStatusPanelVisibility()
@@ -617,6 +762,10 @@ final class NotchWindowController: NSObject {
     }
 
     private func showStatusPanel(makeKey: Bool = false) {
+        guard presentationActive else {
+            if statusPanel.isVisible { statusPanel.orderOut(nil) }
+            return
+        }
         guard shouldShowStatusPanel else {
             if statusPanel.isVisible { statusPanel.orderOut(nil) }
             return

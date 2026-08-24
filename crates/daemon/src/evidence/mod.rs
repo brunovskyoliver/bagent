@@ -8,7 +8,6 @@ mod diagnostics;
 mod events;
 mod orchestrator;
 mod planner;
-mod runtime_control;
 mod synthesis;
 mod types;
 mod validator;
@@ -27,6 +26,7 @@ pub(crate) use synthesis::*;
 pub(crate) use types::*;
 pub(crate) use validator::*;
 pub(crate) use web::*;
+#[allow(unused_imports)]
 pub(crate) use web_execution::*;
 
 #[cfg(test)]
