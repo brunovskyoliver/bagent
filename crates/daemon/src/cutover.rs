@@ -328,6 +328,122 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool, String> {
         .map_err(storage)
 }
 
+/// main's conversational reference-resolution schema binds several tables to the
+/// legacy lifecycle tables this cleanup drops (`sessions`, `automation_runs`).
+/// Dropping a parent out from under a live foreign key leaves the schema
+/// unreadable, so rebuild each dependent table first: the Work-owned run records
+/// take over as the run parent, and `session_id` survives as an unconstrained
+/// scope identifier because the roadmap replaced `sessions` with Current Chat and
+/// Work identities that do not share its id space.
+fn detach_legacy_resolver_parents(transaction: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    const DEPENDENTS: &[&str] = &[
+        "reference_session_sequences",
+        "reference_turns",
+        "reference_confirmations",
+        "reference_confirmation_tombstones",
+        "query_authorizations",
+        "query_replay_tombstones",
+    ];
+
+    let present: Vec<&str> = DEPENDENTS
+        .iter()
+        .copied()
+        .filter(|table| table_exists_in_transaction(transaction, table).unwrap_or(false))
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+
+    // Any trigger mentioning a table being rebuilt is re-parsed while that table
+    // is briefly absent, including triggers owned by other tables. Take them all
+    // down first and replay them once every rebuild has landed.
+    let mut trigger_statement = transaction
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL")
+        .map_err(storage)?;
+    let all_triggers = trigger_statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(storage)?;
+    drop(trigger_statement);
+    let affected_triggers: Vec<(String, String)> = all_triggers
+        .into_iter()
+        .filter(|(_, sql)| present.iter().any(|table| sql.contains(table)))
+        .collect();
+    for (name, _) in &affected_triggers {
+        transaction
+            .execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))
+            .map_err(storage)?;
+    }
+
+    for table in present {
+        let create_sql: String = transaction
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        let rewritten = create_sql
+            .replace(
+                "REFERENCES automation_runs(id) ON DELETE CASCADE",
+                "REFERENCES automation_run_records(id) ON DELETE CASCADE",
+            )
+            .replace("REFERENCES sessions(id) ON DELETE CASCADE", "");
+        if rewritten == create_sql {
+            continue;
+        }
+
+        let mut index_statement = transaction
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                 WHERE tbl_name=?1 AND type='index' AND sql IS NOT NULL",
+            )
+            .map_err(storage)?;
+        let indexes = index_statement
+            .query_map(params![table], |row| row.get::<_, String>(0))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        drop(index_statement);
+
+        let mut columns_statement = transaction
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(storage)?;
+        let columns = columns_statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?
+            .join(", ");
+        drop(columns_statement);
+
+        let rebuilt = format!("{table}_stage8_detached");
+        let create_rebuilt =
+            rewritten.replacen(&format!("TABLE {table}"), &format!("TABLE {rebuilt}"), 1);
+        transaction
+            .execute_batch(&create_rebuilt)
+            .map_err(storage)?;
+        transaction
+            .execute_batch(&format!(
+                "INSERT INTO {rebuilt} ({columns}) SELECT {columns} FROM {table};
+                 DROP TABLE {table};
+                 ALTER TABLE {rebuilt} RENAME TO {table};"
+            ))
+            .map_err(storage)?;
+        for statement in indexes {
+            transaction.execute_batch(&statement).map_err(storage)?;
+        }
+    }
+
+    for (_, sql) in affected_triggers {
+        transaction.execute_batch(&sql).map_err(storage)?;
+    }
+    Ok(())
+}
+
 fn table_exists_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     table: &str,
@@ -513,6 +629,8 @@ fn finalize_stage8_cleanup_with_optional_failpoint(
             .execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger};"))
             .map_err(storage)?;
     }
+    detach_legacy_resolver_parents(&transaction)?;
+
     for table in [
         "chat_turns_fts",
         "chat_turns",
