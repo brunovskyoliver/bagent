@@ -1871,6 +1871,20 @@ struct DaemonClient: Sendable, NotchEventTransport {
         return try JSONDecoder().decode(Resp.self, from: data).status
     }
 
+    func recordTavilyConfigurationFailure() async -> Bool {
+        do {
+            let c = try await loadCreds()
+            var req = authedRequest("/web/tavily/config/failure", creds: c)
+            req.httpMethod = "POST"
+            let (data, response) = try await URLSession.shared.data(for: req)
+            try validateOK(data: data, response: response)
+            struct Resp: Decodable { let status: TavilyConfigurationStatus }
+            return try JSONDecoder().decode(Resp.self, from: data).status == .configurationFailed
+        } catch {
+            return false
+        }
+    }
+
     struct OdooConfigResult: Decodable, Sendable {
         let ok: Bool
         let version: String?

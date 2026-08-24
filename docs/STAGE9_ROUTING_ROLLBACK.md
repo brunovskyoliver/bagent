@@ -1,7 +1,9 @@
 # Stage 9 evidence routing and rollback
 
-Stage 9 enables the accepted typed evidence route by default without changing
-the classifier or evidence contracts.
+Stage 9 enables the accepted typed evidence route by default. A post-rollout
+safety amendment adds one deterministic clarification for unresolved SD-card
+specification follow-ups; it does not acquire evidence or change the accepted
+Mail/web evidence contracts.
 
 ## Routing matrix
 
@@ -15,7 +17,15 @@ the classifier or evidence contracts.
 | Supported quoted-evidence wrapper around an intent above | Typed | Typed | Legacy |
 | Targeted or ambiguous Mail | Legacy | Legacy | Legacy |
 | Mixed Mail/web or multiple ambiguous pages | Legacy | Legacy | Legacy |
+| Unresolved SD-card specification follow-up without a user-supplied public identity | Clarification, no tools/model | Clarification, no tools/model | Legacy |
 | Unsupported, unrelated, or ordinary agentic request | Legacy | Legacy | Legacy |
+
+The clarification exception is deliberately narrow. It recognizes a generic
+SD-card or memory-card referent only when it terminates an explicit
+specification-research request. A make/model, URL, or other same-message suffix
+does not match the unresolved form. The fixed response asks the user to provide
+a public make/model or URL; it never converts assistant- or Mail-derived text
+into a provider query. Chat and automation share this decision.
 
 An invalid value follows the absent production default and produces one
 normalized configuration warning. The supplied value is not logged.

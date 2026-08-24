@@ -56,6 +56,9 @@ pub(crate) enum VerificationLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Classification {
     Recognized(EvidenceIntent),
+    RequiresPublicProductIdentity {
+        prompt: String,
+    },
     NeedsClarification {
         prompt: String,
         alternatives: Vec<IntentSummary>,
@@ -585,6 +588,8 @@ pub(crate) struct MailBundleItem {
     pub received_at: DateTime<Utc>,
     pub body: Option<String>,
     pub body_state: Option<BodyState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_origin: Option<BodyOrigin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

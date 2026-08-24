@@ -89,12 +89,36 @@ enum KeychainStore {
 extension KeychainStore {
     static let tavilyAPIKeyKey = "bagent.tavily.apikey"
 
+    enum TavilyCredentialRead: Equatable {
+        case present(String)
+        case absent
+        case failed
+    }
+
     static func saveTavilyAPIKey(_ apiKey: String) -> Bool {
         save(key: tavilyAPIKeyKey, value: apiKey)
     }
 
-    static func loadTavilyAPIKey() -> String? {
-        load(key: tavilyAPIKeyKey)
+    static func readTavilyCredential() -> TavilyCredentialRead {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: tavilyAPIKeyKey,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            return .absent
+        }
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8)
+        else {
+            return .failed
+        }
+        return .present(value)
     }
 }
 

@@ -12,7 +12,7 @@ pub const MAX_DRAFT_BYTES: usize = 16 * 1024;
 pub const DRAFT_RETENTION_DAYS: i64 = 7;
 const TERMINAL_METADATA_RESERVE_BYTES: u64 = 64 * 1024;
 
-const SCHEMA: &str = include_str!("../migrations/V22__durable_current_chat.sql");
+const SCHEMA: &str = include_str!("../migrations/V26__durable_current_chat.sql");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

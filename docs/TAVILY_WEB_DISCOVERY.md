@@ -17,16 +17,26 @@ security add-generic-password -U -s sk.bagent.app -a bagent.tavily.apikey -w "$T
 unset TAVILY_API_KEY
 ```
 
-Quit and reopen bagent after setting the value so its LaunchAgent restarts with the new environment.
-The signed app reads the key and sends it over the authenticated loopback daemon API. The daemon
-keeps it only in memory for that process lifetime. To remove the credential:
+The signed app reads the key and sends it over the authenticated loopback daemon API. A bounded
+configuration monitor waits for daemon readiness and repeats the handoff after daemon PID changes,
+client reconnection, or app relaunch. The daemon keeps the key only in memory for that process
+lifetime. App relaunch deliberately resends once even if the existing daemon reports configured,
+so a changed Keychain value cannot leave stale daemon state. A Keychain read failure is recorded
+as `configuration_failed`; it is never treated as absence and never sends a clearing `null`.
+To remove the credential:
 
 ```zsh
 security delete-generic-password -s sk.bagent.app -a bagent.tavily.apikey
 ```
 
-Quit and reopen bagent after deletion; startup synchronizes the absent Keychain value and clears
-any credential retained by the newly started daemon.
+Quit and reopen bagent after deletion; the monitor synchronizes the absent Keychain value and
+clears any credential retained by the daemon.
+
+Authenticated `GET /web/tavily/status` and `/health` expose only the normalized state `pending`,
+`configured`, `absent`, or `configuration_failed`; they never return credential material. Until
+the app has explicitly synchronized either `configured` or `absent`, a typed web turn reports
+Tavily as unavailable and may consume the single DuckDuckGo fallback. It never silently substitutes
+the Wikipedia/DuckDuckGo provider set while credential handoff is pending or failed.
 
 The daemon never logs or persists the key. It is used only to authenticate the fixed
 `https://api.tavily.com/search` endpoint. Do not add the key to a plist, launch environment, shell

@@ -15,13 +15,13 @@ use crate::current_chat::{
     ValidatedSourceMetadata,
 };
 
-const SCHEMA: &str = include_str!("../migrations/V15__work_coordinator_foundations.sql");
-const CUTOVER_SCHEMA: &str = include_str!("../migrations/V16__unified_work_cutover.sql");
-const ACTIVITY_SCHEMA: &str = include_str!("../migrations/V17__work_activity_projection.sql");
+const SCHEMA: &str = include_str!("../migrations/V19__work_coordinator_foundations.sql");
+const CUTOVER_SCHEMA: &str = include_str!("../migrations/V20__unified_work_cutover.sql");
+const ACTIVITY_SCHEMA: &str = include_str!("../migrations/V21__work_activity_projection.sql");
 const NOTCH_PROJECTION_INDEXES: &str =
-    include_str!("../migrations/V18__notch_projection_indexes.sql");
+    include_str!("../migrations/V22__notch_projection_indexes.sql");
 const AUTOMATION_SESSION_SCHEMA: &str =
-    include_str!("../migrations/V19__automation_session_contract.sql");
+    include_str!("../migrations/V23__automation_session_contract.sql");
 const SCHEMA_VERSION: u32 = 1;
 
 pub(crate) fn insert_work_current_chat_if_present(

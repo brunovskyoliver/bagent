@@ -26,6 +26,11 @@ enum DaemonLaunchAgent {
             "BAGENT_SYNTHESIS_MODEL_PATH":
                 ModelRuntimeConfiguration.cachedModelURL(ModelRuntimeConfiguration.synthesisModel).path,
         ]
+        // Typed evidence routing is unconditional; the resolver mode is an
+        // independent local setting and is forwarded verbatim when present.
+        if let resolverMode = processEnvironment["BAGENT_REFERENCE_RESOLVER_MODE"] {
+            environment["BAGENT_REFERENCE_RESOLVER_MODE"] = resolverMode
+        }
         if processEnvironment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"] == "1" {
             environment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"] = "1"
         }

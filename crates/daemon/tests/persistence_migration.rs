@@ -2,8 +2,9 @@ use bagentd::automation_sessions::{
     AutomationRunOutcome, AutomationTaskSnapshot, AutomationTerminalization,
 };
 use bagentd::cutover::{
-    finalize_stage8_cleanup, mark_first_post_cutover_work, migrate_v14_copy, rollback_boundary,
-    sha256, verified_backup, verified_restore, RollbackBoundary, LEGACY_UNAVAILABLE,
+    finalize_stage8_cleanup, mark_first_post_cutover_work, migrate_v14_copy,
+    prepare_pre_cutover_backup, rollback_boundary, sha256, verified_backup, verified_restore,
+    RollbackBoundary, LEGACY_UNAVAILABLE,
 };
 use bagentd::unified_work::UnifiedWorkAuthority;
 use bagentd::work_coordinator::{
@@ -480,6 +481,77 @@ fn v14_fixture() -> (TempDir, std::path::PathBuf) {
         .unwrap();
     drop(connection);
     (dir, path)
+}
+
+/// Builds a disposable database whose recorded migration ceiling is `version`,
+/// which is all `prepare_pre_cutover_backup` reads to decide whether the
+/// database predates the Unified Work cutover.
+fn database_at_migration_version(version: i64) -> (TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(format!("v{version}.sqlite"));
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             CREATE TABLE refinery_schema_history (
+               version INTEGER PRIMARY KEY, name TEXT, applied_on TEXT, checksum TEXT
+             );
+             CREATE TABLE carried_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO carried_rows (value) VALUES ('pre-cutover row');",
+        )
+        .unwrap();
+    for applied in 1..=version {
+        connection
+            .execute(
+                "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
+                 VALUES (?1, ?2, '2026-08-24T00:00:00Z', '0')",
+                params![applied, format!("migration_{applied}")],
+            )
+            .unwrap();
+    }
+    drop(connection);
+    (dir, path)
+}
+
+/// The Unified Work cutover is `V20__unified_work_cutover.sql` after the
+/// roadmap migrations were renumbered around the V15–V18 sequence main had
+/// already shipped. A database at main's V18 ceiling is therefore still
+/// pre-cutover and must get a verified backup before it is migrated; only a
+/// database that already carries V20 may skip it.
+#[test]
+fn pre_cutover_backup_boundary_follows_the_renumbered_cutover_migration() {
+    let (_pre_dir, pre_path) = database_at_migration_version(18);
+    let pre_backup = pre_path.with_extension("backup.sqlite");
+    let prepared = prepare_pre_cutover_backup(&pre_path, &pre_backup)
+        .expect("prepare a backup for a pre-cutover database");
+    assert!(
+        prepared.is_some(),
+        "a database at main's V18 ceiling predates the V20 Unified Work cutover \
+         and must be backed up before migration"
+    );
+    assert!(pre_backup.exists(), "the pre-cutover backup must be written");
+    assert_eq!(
+        prepared.as_deref(),
+        Some(sha256(&pre_backup).unwrap().as_str()),
+        "the reported hash must match the written backup"
+    );
+    let restored = Connection::open(&pre_backup).unwrap();
+    let carried: i64 = restored
+        .query_row("SELECT COUNT(*) FROM carried_rows", [], |row| row.get(0))
+        .expect("the backup must preserve pre-cutover rows");
+    assert_eq!(carried, 1);
+
+    let (_post_dir, post_path) = database_at_migration_version(20);
+    let post_backup = post_path.with_extension("backup.sqlite");
+    assert_eq!(
+        prepare_pre_cutover_backup(&post_path, &post_backup).unwrap(),
+        None,
+        "a database that already carries the V20 cutover must not be re-backed up"
+    );
+    assert!(
+        !post_backup.exists(),
+        "no backup file may be written for a post-cutover database"
+    );
 }
 
 #[test]

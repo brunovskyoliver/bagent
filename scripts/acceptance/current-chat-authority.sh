@@ -96,14 +96,14 @@ done
 scan_tree "$repo_root"
 
 swift_surfaces="$(rg -l 'currentChat\(\)|clearCurrentChat|saveCurrentChatDraft' "$repo_root/apps/macos/Sources/bagent" --glob '*.swift' | wc -l | tr -d ' ')"
-rust_surfaces="$(rg -l 'current_chat_authority|clear_current_chat|recover_after_daemon_restart' "$repo_root/crates/daemon/src" "$repo_root/crates/daemon/migrations/V22__durable_current_chat.sql" --glob '*.rs' --glob '*.sql' | wc -l | tr -d ' ')"
+rust_surfaces="$(rg -l 'current_chat_authority|clear_current_chat|recover_after_daemon_restart' "$repo_root/crates/daemon/src" "$repo_root/crates/daemon/migrations/V26__durable_current_chat.sql" --glob '*.rs' --glob '*.sql' | wc -l | tr -d ' ')"
 command_entries="$(rg -n 'command: "/(settings|automations|clear)"' "$repo_root/apps/macos/Sources/bagent/SlashCommandRegistry.swift" | wc -l | tr -d ' ')"
 
 if [[ "$swift_surfaces" -eq 0 || "$rust_surfaces" -eq 0 || "$command_entries" -eq 0 ]]; then
     echo "FAIL: production surface measurement was zero"
     exit 1
 fi
-if ! rg -n 'DROP TABLE IF EXISTS automation_current_chats' "$repo_root/crates/daemon/migrations/V22__durable_current_chat.sql" >/dev/null; then
+if ! rg -n 'DROP TABLE IF EXISTS automation_current_chats' "$repo_root/crates/daemon/migrations/V26__durable_current_chat.sql" >/dev/null; then
     echo "FAIL: V22 does not retire the writable legacy identity table"
     exit 1
 fi

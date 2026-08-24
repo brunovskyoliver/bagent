@@ -400,3 +400,46 @@ Stored in `UserDefaults` (SwiftUI layer) — not in the SQLite DB:
 
 The daemon reads this on `/codex/run-task` via the `CodexConfig` passed at startup.
 Binary presence is exposed via `/codex/status` and the `connectors.codex` field in `/health`.
+
+---
+
+## Conversational Reference Ledger (V16)
+
+Migration `V16__conversational_reference_resolution.sql` adds an isolated,
+forward-only ledger. It creates `reference_session_sequences`,
+`reference_turns`, `reference_turn_staging`, `conversation_mentions`,
+`mention_derivations`, `mention_anchors`, `mention_web_mappings`,
+`reference_confirmations`, `reference_confirmation_tombstones`,
+`query_authorizations`, `query_authorization_operations`,
+`provider_attempt_reservations`, and `query_replay_tombstones`. V16 inserts no
+rows for existing sessions or historical mentions.
+
+Resolver IDs are lowercase UUIDs; existing session and automation identifiers
+remain trusted parent identifiers. Resolver instants are UTC Unix milliseconds.
+SQLite foreign keys are enabled and verified before repository access. Owned
+children cascade with their session, automation, run, turn, mention, or
+authorization parent. A live confirmation or authorization uses `RESTRICT` on
+its protected mention.
+
+Human-readable proposal, mention, normalized-term, source, URL, query, evidence,
+Mail, attachment, connector, and credential values do not appear in resolver
+plaintext columns. Public display and normalized values, pending proposals, and
+web mapping source/URL values are XChaCha20-Poly1305 ciphertext. Restricted
+representations use keyed digests or opaque fingerprints. Structural bindings
+use HMAC-SHA-256. The repository and crypto custody are private to
+`reference_resolution`; raw SQL connections, ciphertext, and SQL errors do not
+cross its four use-case operations.
+
+The resolver keeps per-scope sequence counters after turn pruning. Open turns
+expire after one hour, mention rows after 30 minutes, pending confirmations and
+authorizations after five minutes, and confirmation/authorization tombstones
+for 24 hours. Cleanup expires confirmations before authorizations, removes
+unprotected mention graphs, removes due replay tombstones, then removes eligible
+turns. It is serialized, idempotent, and runs at startup, opportunistically no
+more than once per minute, and on a five-minute schedule when an enabled
+resolver runtime is ready.
+
+`BAGENT_EVIDENCE_ORCHESTRATOR=0` and resolver mode `off` construct no resolver
+repository, crypto custody, Keychain access, or maintenance task. Migrations
+remain unconditional and are the only resolver-adjacent startup work on that
+path.

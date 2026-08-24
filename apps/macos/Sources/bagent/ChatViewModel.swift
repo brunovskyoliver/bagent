@@ -145,7 +145,9 @@ enum EvidencePresentation {
     }
 
     static func activityDetail(_ activity: EvidenceLogicalActivity) -> String {
-        var parts = [activity.contribution.rawValue]
+        var parts = [activity.executionStatus == .succeeded
+            ? activity.contribution.rawValue
+            : activity.executionStatus.rawValue]
         if activity.evidenceCount > 0 {
             parts.append("\(activity.evidenceCount) evidence")
         }
@@ -1330,7 +1332,6 @@ final class ChatViewModel: ObservableObject {
 
     private var approvalPollTask: Task<Void, Never>?
     private var healthMonitorTask: Task<Void, Never>?
-    private let tavilyConfigurationSynchronizer = TavilyConfigurationSynchronizer()
 
     // MARK: - Codex (Phase 8)
 
@@ -2314,11 +2315,6 @@ final class ChatViewModel: ObservableObject {
             guard let self else { return }
             while !Task.isCancelled {
                 let health = await client.healthStatus()
-                _ = await tavilyConfigurationSynchronizer.synchronize(
-                    health: health,
-                    loadCredential: KeychainStore.loadTavilyAPIKey,
-                    configure: client.configureTavily
-                )
                 await MainActor.run {
                     self.daemonHealth = health
                 }

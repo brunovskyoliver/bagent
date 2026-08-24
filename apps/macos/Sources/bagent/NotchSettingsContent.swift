@@ -7,6 +7,7 @@ import SwiftUI
 /// compatibility summaries.
 struct NotchSettingsContent: View {
     @ObservedObject var viewModel: ChatViewModel
+    @ObservedObject var browserCoordinator: BrowserCoordinator
     @ObservedObject private var permissions: PermissionsManager
     private let acceptanceState: CompassRailAcceptanceState?
     private let reduceMotionOverride: Bool?
@@ -16,8 +17,16 @@ struct NotchSettingsContent: View {
     @FocusState private var focusedControl: CompassRailFocusedControl?
     @State private var focusMemory = CompassRailFocusMemory()
 
-    init(viewModel: ChatViewModel, acceptanceState: CompassRailAcceptanceState? = nil, reduceMotionOverride: Bool? = nil) {
+    @State private var showingBrowserProfileConfirmation = false
+
+    init(
+        viewModel: ChatViewModel,
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator(),
+        acceptanceState: CompassRailAcceptanceState? = nil,
+        reduceMotionOverride: Bool? = nil
+    ) {
         self.viewModel = viewModel
+        self.browserCoordinator = browserCoordinator
         self.permissions = viewModel.permissions
         self.acceptanceState = acceptanceState
         self.reduceMotionOverride = reduceMotionOverride
@@ -153,7 +162,27 @@ struct NotchSettingsContent: View {
         VStack(alignment: .leading, spacing: 9) {
             ToggleRow(title: "Paste wheel", subtitle: permissions.hasAccessibility ? "Hold the right Command key for recent clips" : "Accessibility permission required", isOn: $pasteWheelEnabled)
             ToggleRow(title: "cmux notifications", subtitle: "Agent notifications in the notch", isOn: $viewModel.cmuxNotificationsEnabled)
+            ToggleRow(
+                title: "browser.settings.title",
+                subtitle: "browser.settings.subtitle",
+                isOn: Binding(
+                    get: { browserCoordinator.isEnabled },
+                    set: { browserCoordinator.setEnabled($0) }
+                )
+            )
+            if browserCoordinator.isEnabled {
+                Text("browser.settings.profile").settingsFont(size: 10).foregroundStyle(NotchWrapMetrics.notchTextFaint).fixedSize(horizontal: false, vertical: true)
+                actionButton("browser.settings.clear") { showingBrowserProfileConfirmation = true }
+            }
             Text("Option-Space opens the notch input.").settingsFont(size: 10).foregroundStyle(NotchWrapMetrics.notchTextFaint).fixedSize(horizontal: false, vertical: true)
+        }
+        .alert("browser.settings.clear.title", isPresented: $showingBrowserProfileConfirmation) {
+            Button("browser.settings.clear.cancel", role: .cancel) {}
+            Button("browser.settings.clear.confirm", role: .destructive) {
+                Task { await browserCoordinator.clearProfileAfterUserConfirmation() }
+            }
+        } message: {
+            Text("browser.settings.clear.message")
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("General settings")

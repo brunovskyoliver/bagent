@@ -29,7 +29,7 @@ team_id=$(codesign -dv --verbose=4 "$candidate" 2>&1 | sed -n 's/^TeamIdentifier
     exit 1
 }
 
-for nested in "$candidate/Contents/MacOS/bagent" "$candidate/Contents/MacOS/bagentd"; do
+for nested in "$candidate/Contents/MacOS/bagent" "$candidate/Contents/MacOS/bagentd" "$candidate/Contents/MacOS/bagent-browser-mcp"; do
     [[ -f "$nested" ]] || { print -u2 "missing nested code: $nested"; exit 1; }
     codesign --verify --strict "$nested"
 done

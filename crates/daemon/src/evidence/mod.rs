@@ -12,6 +12,7 @@ mod synthesis;
 mod types;
 mod validator;
 mod web;
+mod web_execution;
 
 #[cfg(feature = "stage8-acceptance")]
 pub(crate) use acceptance::*;
@@ -25,6 +26,8 @@ pub(crate) use synthesis::*;
 pub(crate) use types::*;
 pub(crate) use validator::*;
 pub(crate) use web::*;
+#[allow(unused_imports)]
+pub(crate) use web_execution::*;
 
 #[cfg(test)]
 pub(crate) mod fixtures;

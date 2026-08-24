@@ -44,7 +44,7 @@ final class TavilyConfigurationSyncTests: XCTestCase {
 
         let waiting = await sync.synchronize(
             health: health(ready: false),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
         XCTAssertEqual(waiting, .pending)
@@ -52,7 +52,7 @@ final class TavilyConfigurationSyncTests: XCTestCase {
 
         let configured = await sync.synchronize(
             health: health(),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
         XCTAssertEqual(configured, .configured)
@@ -67,17 +67,17 @@ final class TavilyConfigurationSyncTests: XCTestCase {
 
         let first = await sync.synchronize(
             health: health(),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
         let second = await sync.synchronize(
             health: health(),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
         let third = await sync.synchronize(
             health: health(tavily: .configured),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
 
@@ -94,17 +94,17 @@ final class TavilyConfigurationSyncTests: XCTestCase {
 
         _ = await sync.synchronize(
             health: health(processID: 101),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
         _ = await sync.synchronize(
             health: health(processID: 101, tavily: .configured),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
         _ = await sync.synchronize(
             health: health(processID: 202),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
 
@@ -118,17 +118,17 @@ final class TavilyConfigurationSyncTests: XCTestCase {
 
         _ = await sync.synchronize(
             health: health(),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
         _ = await sync.synchronize(
             health: health(tavily: .configured),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
         _ = await sync.synchronize(
             health: health(tavily: .pending),
-            loadCredential: { credential },
+            loadCredential: { .present(credential) },
             configure: recorder.configure
         )
 
@@ -141,11 +141,88 @@ final class TavilyConfigurationSyncTests: XCTestCase {
 
         let status = await sync.synchronize(
             health: health(),
-            loadCredential: { nil },
+            loadCredential: { .absent },
             configure: recorder.configure
         )
 
         XCTAssertEqual(status, .absent)
         XCTAssertEqual(recorder.attempts, 1)
+    }
+
+    func testAppRelaunchResendsCredentialToExistingConfiguredDaemonOnce() async {
+        let sync = TavilyConfigurationSynchronizer()
+        let recorder = Recorder()
+        let credential = String(repeating: "k", count: 32)
+
+        let status = await sync.synchronize(
+            health: health(tavily: .configured),
+            loadCredential: { .present(credential) },
+            configure: recorder.configure
+        )
+
+        XCTAssertEqual(status, .configured)
+        XCTAssertEqual(recorder.attempts, 1)
+    }
+
+    func testRepeatedConfigurationFailuresStayBoundedForOneDaemon() async {
+        let sync = TavilyConfigurationSynchronizer(maxAttemptsPerDaemon: 2)
+        let credential = String(repeating: "k", count: 32)
+        var attempts = 0
+
+        for _ in 0..<4 {
+            _ = await sync.synchronize(
+                health: health(),
+                loadCredential: { .present(credential) },
+                configure: { _ in
+                    attempts += 1
+                    throw DaemonError.notReady
+                }
+            )
+        }
+
+        XCTAssertEqual(attempts, 2)
+    }
+
+    func testKeychainReadFailureIsNotTreatedAsCredentialAbsence() async {
+        let sync = TavilyConfigurationSynchronizer(maxAttemptsPerDaemon: 2)
+        let recorder = Recorder()
+
+        let first = await sync.synchronize(
+            health: health(tavily: .configured),
+            loadCredential: { .failed },
+            configure: recorder.configure
+        )
+        let second = await sync.synchronize(
+            health: health(tavily: .configured),
+            loadCredential: { .failed },
+            configure: recorder.configure
+        )
+
+        XCTAssertEqual(first, .configurationFailed)
+        XCTAssertEqual(second, .configurationFailed)
+        XCTAssertEqual(recorder.attempts, 0)
+    }
+
+    func testFailedFirstNormalizedStatusReportHasOneBoundedRetry() {
+        let reporter = TavilyConfigurationFailureReporter(maxAttemptsPerDaemon: 2)
+
+        XCTAssertTrue(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+        reporter.didAttempt(accepted: false)
+        XCTAssertTrue(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+        reporter.didAttempt(accepted: true)
+        XCTAssertFalse(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+
+        XCTAssertTrue(reporter.shouldAttempt(processID: 202, status: .configurationFailed))
+    }
+
+    func testUnavailableHealthDoesNotResetFailureReportBudgetForSamePID() {
+        let reporter = TavilyConfigurationFailureReporter(maxAttemptsPerDaemon: 2)
+
+        XCTAssertTrue(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+        reporter.didAttempt(accepted: false)
+        XCTAssertFalse(reporter.shouldAttempt(processID: nil, status: .pending))
+        XCTAssertTrue(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
+        reporter.didAttempt(accepted: false)
+        XCTAssertFalse(reporter.shouldAttempt(processID: 101, status: .configurationFailed))
     }
 }

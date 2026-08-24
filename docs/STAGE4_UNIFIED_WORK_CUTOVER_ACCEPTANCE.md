@@ -244,7 +244,7 @@ Final artifact hashes:
 | `crates/daemon/src/automations_api.rs` | `2d95b13fec2d82177a62281a796ed21416779d9a1b7c68c11948f351c938473b` |
 | `scripts/acceptance/work-authority.sh` | `2c9c3153b53c971650cb4ef8154759529a2210cff3d1d9f36354f571c7eee255` |
 
-`crates/daemon/migrations/V16__unified_work_cutover.sql` and
+`crates/daemon/migrations/V20__unified_work_cutover.sql` and
 `scripts/acceptance/work-cutover-rollback.sh` are unchanged from the
 original candidate hashes above.
 
@@ -336,7 +336,7 @@ Candidate SHA-256 hashes before independent review:
 
 | Artifact | SHA-256 |
 |---|---|
-| `crates/daemon/migrations/V16__unified_work_cutover.sql` | `792c6710f25c3e254c34c98c1be85e8b6c4450f414e9df366053fb9d50865364` |
+| `crates/daemon/migrations/V20__unified_work_cutover.sql` | `792c6710f25c3e254c34c98c1be85e8b6c4450f414e9df366053fb9d50865364` |
 | `scripts/acceptance/work-authority.sh` | `050b6ad4f644622ba2c7243785e8f052525bee831a2101a80488dc6f7c9333c3` |
 | `scripts/acceptance/work-cutover-rollback.sh` | `2bc4f1d1e814f64aab8c181ddadd42f8272692da85d4bec5861d02b6426273d7` |
 
@@ -408,7 +408,7 @@ Final artifact hashes at that reviewed implementation commit:
 | `crates/daemon/src/unified_work.rs` | `8416257d0c3f88c9c12aa6ecda6b10735fee60411db4dd07bfa11a45a7baf120` |
 | `crates/daemon/src/main.rs` | `80c8f8035131e6d1c1a350d0e1c880fad34677822dbee8bf2b4fc2c1269cc3b0` |
 | `crates/daemon/src/automations_api.rs` | `2d95b13fec2d82177a62281a796ed21416779d9a1b7c68c11948f351c938473b` |
-| `crates/daemon/migrations/V16__unified_work_cutover.sql` | `792c6710f25c3e254c34c98c1be85e8b6c4450f414e9df366053fb9d50865364` |
+| `crates/daemon/migrations/V20__unified_work_cutover.sql` | `792c6710f25c3e254c34c98c1be85e8b6c4450f414e9df366053fb9d50865364` |
 | `scripts/acceptance/work-authority.sh` | `2c9c3153b53c971650cb4ef8154759529a2210cff3d1d9f36354f571c7eee255` |
 | `scripts/acceptance/work-cutover-rollback.sh` | `2bc4f1d1e814f64aab8c181ddadd42f8272692da85d4bec5861d02b6426273d7` |
 

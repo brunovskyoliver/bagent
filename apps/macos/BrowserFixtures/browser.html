@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>bagent browser fixture</title>
+  <style>
+    body { font: 16px system-ui; margin: 24px; }
+    .spacer { height: 1800px; }
+  </style>
+</head>
+<body>
+  <header><h1>Browser fixture</h1></header>
+  <main>
+    <p id="status">Ready</p>
+    <label>Name <input name="name" aria-label="Name"></label>
+    <button id="status-button" type="button" onclick="document.querySelector('#status').textContent='Clicked'">Update status</button>
+    <form id="safe-form" action="/submitted.html" method="get">
+      <label>Note <input name="note" aria-label="Note"></label>
+      <button id="submit-button" type="submit">Submit note</button>
+    </form>
+    <label>Password <input type="password" name="password" aria-label="Password"></label>
+    <label>Upload <input type="file" name="upload" aria-label="Upload"></label>
+    <a href="/submitted.html">Local page</a>
+  </main>
+  <div class="spacer"></div>
+  <script>
+    console.info('fixture loaded');
+    fetch('/fixture-data.json').catch(() => {});
+  </script>
+</body>
+</html>

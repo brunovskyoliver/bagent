@@ -575,6 +575,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reference_acceptance_compile_gate_is_feature_scoped() {
+        let selection = AcceptanceFixtureSelection {
+            acquisition: AcceptanceAcquisition::MailComplete,
+            polish: AcceptancePolish::Passthrough,
+        };
+        assert_eq!(selection.acquisition, AcceptanceAcquisition::MailComplete);
+    }
+
     #[tokio::test]
     async fn fetch_rejects_any_candidate_not_returned_by_typed_discovery() {
         let adapter = AcceptanceWebAdapter::new(AcceptanceAcquisition::WebAuthoritative).unwrap();

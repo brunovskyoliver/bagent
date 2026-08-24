@@ -26,10 +26,35 @@ final class BagentPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
+    override func sendEvent(_ event: NSEvent) {
+        if BrowserCueTrace.isEnabled, event.type == .leftMouseDown {
+            let hit = contentView?.hitTest(event.locationInWindow)
+            BrowserCueTrace.log(
+                "statusPanel leftMouseDown appActive=\(NSApp.isActive) key=\(isKeyWindow) "
+                + "hit=\(hit.map { String(describing: type(of: $0)) } ?? "nil")"
+            )
+        }
+        super.sendEvent(event)
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // Control+1–4 go through keyDown, not performKeyEquivalent — handled by localKeyMonitor.
         return super.performKeyEquivalent(with: event)
     }
+}
+
+// While bagent isn't the frontmost app (the collapsed notch's normal state),
+// AppKit treats the first click on any of its windows as an activation click
+// and swallows it unless the hit view accepts first mouse. NSHostingView
+// returns false by default, so this override is necessary — but it is not
+// sufficient. Measured: with a live cue, the AppKit hit test over the cue
+// resolved to exactly this view, so the cold mouse-down *was* delivered here,
+// and the cue's SwiftUI DragGesture still never ran — the event was dropped
+// inside SwiftUI (gesture routing or arbitration with the ancestor surface
+// gesture; the internal reason was not isolated). That is why the Browser Cue
+// owns a real AppKit hit view of its own — see BrowserCueHitView.
+private final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 @MainActor
@@ -40,6 +65,10 @@ final class NotchWindowController: NSObject {
     /// avoid resize clipping.
     private var statusPanel: BagentPanel!
     private let chatViewModel: ChatViewModel
+    private let browserCoordinator: BrowserCoordinator
+    /// Browser Cue hover preview — a plain subview of the status panel's own
+    /// content view, not a floating window (see BrowserCuePreviewPanel.swift).
+    private var cuePreviewView: BrowserCuePreviewView?
     var isNotchInteractionShowing: Bool { chatViewModel.notchInteractionMode != .collapsed }
     var isTakeoverPresentationActive: Bool { presentationActive && statusPanel.isVisible && statusPanel.isKeyWindow }
     var takeoverPresentationEvidence: [String: Any] {
@@ -70,6 +99,8 @@ final class NotchWindowController: NSObject {
     private var menuBarBottomY: CGFloat = 0
 
     private var visibilityCancellable: AnyCancellable?
+    private var approvalCancellable: AnyCancellable?
+    private var dropTargetCancellable: AnyCancellable?
     private var previousApp: NSRunningApplication?
     private var presentationActive: Bool
     private var auxiliaryMonitoringStarted = false
@@ -78,8 +109,13 @@ final class NotchWindowController: NSObject {
     var statusPanelForTesting: NSPanel { statusPanel }
 #endif
 
-    init(chatViewModel: ChatViewModel, initiallyHidden: Bool = false) {
+    init(
+        chatViewModel: ChatViewModel,
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator(),
+        initiallyHidden: Bool = false
+    ) {
         self.chatViewModel = chatViewModel
+        self.browserCoordinator = browserCoordinator
         self.presentationActive = !initiallyHidden
         super.init()
         computeGeometry()
@@ -90,6 +126,16 @@ final class NotchWindowController: NSObject {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
+
+        browserCoordinator.notchDropZoneProvider = { [weak self] in self?.notchDropZone ?? .zero }
+        // The notch opens up as a drop affordance while a Browser Panel is
+        // dragged over it, and settles back when it leaves.
+        dropTargetCancellable = browserCoordinator.$isNotchDropTargeted
+            .removeDuplicates()
+            .sink { [weak self] targeted in
+                guard let self, self.chatViewModel.notchInteractionMode == .collapsed else { return }
+                self.chatViewModel.pillHovered = targeted
+            }
 
         chatViewModel.onInputOnlySubmitted = { [weak self] in
             self?.collapseInputForThinking()
@@ -363,11 +409,36 @@ final class NotchWindowController: NSObject {
                 self.chatViewModel.cmuxBanner = nil
                 self.isNotchInteractionShowing ? self.collapse() : self.presentInputOnly()
             },
-            onHoverChanged: { [weak self] hovering in self?.hoverChanged(isHovered: hovering) }
+            onHoverChanged: { [weak self] hovering in self?.hoverChanged(isHovered: hovering) },
+            browserCoordinator: browserCoordinator
         )
-        panel.contentView = NSHostingView(rootView: content)
+        panel.contentView = FirstMouseHostingView(rootView: content)
+
+        let preview = BrowserCuePreviewView(hostWindow: panel)
+        panel.contentView?.addSubview(preview)
+        cuePreviewView = preview
+        browserCoordinator.cuePreviewHost = preview
+
         self.statusPanel = panel
         reconcileStatusPanelVisibility()
+    }
+
+    /// Screen rect of the collapsed notch — the drop target that collapses a
+    /// dragged Browser Panel back into its cue.
+    var notchDropZone: CGRect {
+        // Grows with the notch: while it is hover-expanded or an inline surface
+        // is open, the whole visible pill is a valid drop target.
+        let expanded = chatViewModel.notchInteractionMode != .collapsed || chatViewModel.pillHovered
+        let wing = expanded ? NotchWrapMetrics.outputWingWidth : NotchWrapMetrics.hoverWingWidth
+        let width = notchWidth + 2 * wing
+        let height = notchHeight
+            + (expanded ? NotchWrapMetrics.maxBridgeHeight : NotchWrapMetrics.hoverBridgeHeight)
+        return CGRect(
+            x: pillFrame.midX - width / 2,
+            y: menuBarBottomY + notchHeight - height,
+            width: width,
+            height: height
+        )
     }
 
     private func hoverChanged(isHovered _: Bool) {
@@ -385,6 +456,7 @@ final class NotchWindowController: NSObject {
     /// Open the notch input surface (⌥Space when collapsed).
     func presentInputOnly() {
         guard presentationActive else { return }
+        BrowserCueTrace.log("presentInputOnly mode=\(chatViewModel.notchInteractionMode)")
         guard chatViewModel.notchInteractionMode == .collapsed else { return }
         if chatViewModel.notchPresentation.hasActiveForegroundWork {
             presentOutputChat()
@@ -436,6 +508,7 @@ final class NotchWindowController: NSObject {
             viewModel: chatViewModel,
             focusedControl: { [weak self] in self?.focusedCompassRailControl() }
         )
+
 
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             guard let self else { return event }

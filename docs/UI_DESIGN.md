@@ -192,9 +192,15 @@ It is a **1-second surface**: glanceable, tappable, always visible.
 - No long-lived free-form text outside `.input`.
 - No long labels or multi-word status messages.
 - Nothing needing more than a second of attention.
-- No scrollable settings content.
-- **No new windows.** If a feature seems to need one, it belongs in a settings
-  page or it does not belong in bagent.
+- No scrollable settings content. The Compass Rail bounds every settings
+  destination to a fixed height instead of scrolling.
+- **No new windows for ordinary features.** If a feature seems to need one, it
+  belongs in a settings destination or it does not belong in bagent. bagent
+  Browser is the sole accepted exception: each live Browser Session may own one
+  chromeless, resizable, floating Browser Panel because an interactive web page
+  cannot fit the notch. Browser Panels use `.floating`, support all
+  Spaces/full-screen auxiliary placement, and never replace or move the notch
+  panel.
 
 ---
 

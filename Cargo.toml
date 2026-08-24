@@ -14,5 +14,6 @@ members = [
     "crates/connectors/codex",
     "crates/connectors/odoo",
     "crates/connectors/whatsapp",
+    "crates/browser_mcp",
 ]
 resolver = "2"

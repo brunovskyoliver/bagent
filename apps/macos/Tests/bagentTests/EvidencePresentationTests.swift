@@ -205,6 +205,69 @@ final class EvidencePresentationTests: XCTestCase {
         XCTAssertFalse(detail.contains("1 evidence"))
     }
 
+    func testFailedFetchShowsFailureInsteadOfDuplicateContribution() {
+        let event = DaemonClient.LogicalActivityEvent(
+            turnId: "turn-1",
+            activityId: "evidence:failed-fetch",
+            normalizedOperation: "web.fetch",
+            argumentHash: "hash",
+            executionStatus: .failed,
+            contribution: .empty,
+            evidenceCount: 0,
+            sourceDomains: [],
+            durationMs: 10,
+            attemptCount: 1,
+            retries: 0,
+            duplicatesSuppressed: 0,
+            failureReason: "http_4xx"
+        )
+
+        let detail = EvidencePresentation.activityDetail(EvidenceLogicalActivity(event: event))
+        XCTAssertEqual(detail, "failed · http_4xx")
+    }
+
+    func testIrrelevantAndRealDuplicateLabelsStayDistinct() {
+        let irrelevant = DaemonClient.LogicalActivityEvent(
+            turnId: "turn-1",
+            activityId: "evidence:irrelevant",
+            normalizedOperation: "web.fetch",
+            argumentHash: "hash-one",
+            executionStatus: .succeeded,
+            contribution: .irrelevant,
+            evidenceCount: 0,
+            sourceDomains: [],
+            durationMs: 10,
+            attemptCount: 1,
+            retries: 0,
+            duplicatesSuppressed: 0,
+            failureReason: nil
+        )
+        let duplicate = DaemonClient.LogicalActivityEvent(
+            turnId: "turn-1",
+            activityId: "evidence:duplicate",
+            normalizedOperation: "web.fetch",
+            argumentHash: "hash-two",
+            executionStatus: .succeeded,
+            contribution: .duplicate,
+            evidenceCount: 0,
+            sourceDomains: [],
+            durationMs: 0,
+            attemptCount: 0,
+            retries: 0,
+            duplicatesSuppressed: 1,
+            failureReason: nil
+        )
+
+        XCTAssertEqual(
+            EvidencePresentation.activityDetail(EvidenceLogicalActivity(event: irrelevant)),
+            "irrelevant"
+        )
+        XCTAssertEqual(
+            EvidencePresentation.activityDetail(EvidenceLogicalActivity(event: duplicate)),
+            "duplicate · 1 duplicates suppressed"
+        )
+    }
+
     func testAccessibilityLabelIncludesOutcomeAndControlState() {
         let value = outcome(state: .partial, kind: .mail, acquired: 2, requested: 3)
         XCTAssertEqual(

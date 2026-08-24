@@ -116,8 +116,10 @@ require fresh approval; approvals carry automation provenance). Key code:
 
 ### Swift app structure
 
-**The notch is the only UI** — one `NSPanel`, no chat window, no settings window,
-no menu-bar item. Read `docs/UI_DESIGN.md` before any UI change.
+**The notch is the default UI** — one `NSPanel`, no chat window, no settings
+window, and no menu-bar item. The only approved exception is one chromeless,
+floating Browser Panel per live bagent Browser Session. Read `docs/UI_DESIGN.md`
+and the browser ADRs before any UI change.
 
 | File | Role |
 |---|---|
@@ -129,6 +131,46 @@ no menu-bar item. Read `docs/UI_DESIGN.md` before any UI change.
 | `ChatViewModel.swift` | `@MainActor ObservableObject`; all daemon calls; session/attachment/screen state; `notchInteractionMode` |
 | `DaemonClient.swift` | HTTP + SSE client; all REST/SSE types |
 | `ScreenContextProvider.swift` | ScreenCaptureKit capture → local Vision OCR; only text reaches `/chat` |
+
+### bagent Browser
+
+bagent Browser is an optional, explicit setting backed by WebKit and a dedicated
+persistent `WKWebsiteDataStore`. The Swift app owns every `WKWebView`, Browser
+Session, Browser Cue, and Browser Panel on the main actor. The bundled
+`bagent-browser-mcp` executable speaks MCP over stdio and forwards framed RPC
+over the user-only `~/Library/Application Support/bagent/browser.sock` socket;
+it owns no browser state.
+
+```bash
+# Phase 0 signed WebKit proof harness
+scripts/run-agent-browser-phase0.sh
+
+# Release app, daemon, and bundled MCP proxy
+make bundle
+codesign --verify --deep --strict --verbose=2 bagent.app
+```
+
+The proxy launches the packaged app when needed. Enable bagent Browser in the
+notch settings before connecting Codex or Claude. Sessions are implicit per
+stdio connection, capped at four, hidden by default, and share only the
+bagent-owned Browser Profile. Read `docs/AGENT_BROWSER_ROADMAP.md` for the
+complete policy and acceptance matrix.
+
+Claude Code uses the same MCP initialization policy as Codex. For UI layout,
+visual debugging, screenshots, rendered-page validation, interaction bugs,
+forms, dialogs, menus, loading/responsive state, or local web-app debugging,
+route to `bagent-browser`, call `browser_open` first when the URL is known, and
+inspect with hidden `get_page_content` plus `screenshot`. Do not open a browser
+for non-UI coding. Keep the popup hidden unless the user asks to see it or
+direct human input is required. If the setting is off, expect structured
+`browser_disabled` and tell the user to enable bagent Browser in Settings.
+
+Development client registration uses the packaged executable directly:
+
+```bash
+codex mcp add bagent-browser -- "$PWD/apps/macos/bagent.app/Contents/MacOS/bagent-browser-mcp"
+claude mcp add bagent-browser -- "$PWD/apps/macos/bagent.app/Contents/MacOS/bagent-browser-mcp"
+```
 
 ### Agentic tool loop
 
@@ -166,3 +208,20 @@ Tool dispatch helpers live at the bottom of `crates/daemon/src/main.rs` (`tool_m
 Run the app-managed service on port 8082 and verify authenticated `/health`,
 `/v1/models`, Slovak output, streaming, and tool-call round trips. Never reuse
 or stop the unrelated service on port 8080.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as local Markdown under `.scratch/`; external PRs are not a
+request surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the canonical labels `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository using root `CONTEXT.md` and system ADRs at
+`docs/ADR-*.md`. See `docs/agents/domain.md`.

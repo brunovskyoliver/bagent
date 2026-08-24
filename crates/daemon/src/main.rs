@@ -61,6 +61,8 @@ use whatsapp_connector::{
 mod agent_exec;
 mod automations_api;
 mod evidence;
+mod notifications;
+mod reference_resolution;
 mod scheduler;
 
 mod embedded {
@@ -76,6 +78,10 @@ struct AppState {
     /// Small fast model for intent/correction classifiers — never blocks chat TTFT.
     classifier_model: String,
     /// Local opt-in rollback flag for deterministic typed Mail/web evidence routing.
+    /// Optional inert resolver runtime selected at startup; no request path
+    /// consumes it in this slice.
+    #[allow(dead_code)]
+    resolver_runtime: Option<reference_resolution::ResolverRuntime>,
     attachments_dir: PathBuf,
     model_runtime: Arc<ModelRuntime>,
     work_authority: Arc<UnifiedWorkAuthority>,
@@ -100,7 +106,7 @@ struct AppState {
     odoo: Arc<RwLock<Option<OdooConnector>>>,
     /// Tavily key is supplied ephemerally by the signed app from Keychain.
     /// It is never persisted by the daemon or included in diagnostics.
-    tavily_api_key: Arc<TavilyConfiguration>,
+    tavily_configuration: Arc<RwLock<TavilyConfiguration>>,
     /// Compiled and activated only for signed Stage 8 acceptance campaigns.
     #[cfg(feature = "stage8-acceptance")]
     acceptance: Option<evidence::AcceptanceControl>,
@@ -359,6 +365,7 @@ async fn main() -> Result<()> {
     )
     .map_err(|error| anyhow::anyhow!("prepare Stage 4 database backup: {error}"))?;
     let mut conn = Connection::open(&db_path)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     embedded::migrations::runner()
         .run(&mut conn)
         .map_err(|e| anyhow::anyhow!("migration error: {e}"))?;
@@ -375,6 +382,45 @@ async fn main() -> Result<()> {
     bagentd::cutover::finalize_legacy_boundary(&db_path)
         .map_err(|error| anyhow::anyhow!("finalize Stage 8 authority boundary: {error}"))?;
     let db = Arc::new(Mutex::new(conn));
+    let resolver_selection = reference_resolution::select_runtime(
+        || std::env::var(reference_resolution::REFERENCE_RESOLVER_MODE_ENV).ok(),
+        |_mode| {
+            Ok::<
+                Arc<dyn reference_resolution::ConversationalReferenceResolver>,
+                reference_resolution::ResolverFault,
+            >(reference_resolution::production_with_database(Arc::clone(
+                &db,
+            )))
+        },
+    );
+    let resolver_selection_fields = (
+        resolver_selection.selection_label(),
+        resolver_selection.mode_label(),
+        resolver_selection.parse_status_label(),
+    );
+    if resolver_selection_fields.2 == "invalid" {
+        tracing::warn!(
+            selection = resolver_selection_fields.0,
+            mode = resolver_selection_fields.1,
+            parse_status = resolver_selection_fields.2,
+            "invalid resolver mode; using contracts-only off"
+        );
+    } else {
+        tracing::info!(
+            selection = resolver_selection_fields.0,
+            mode = resolver_selection_fields.1,
+            parse_status = resolver_selection_fields.2,
+            "resolver startup selection"
+        );
+    }
+    let resolver_runtime = resolver_selection.into_runtime();
+    if let Some(runtime) = resolver_runtime.as_ref() {
+        runtime
+            .startup()
+            .await
+            .map_err(|_| anyhow::anyhow!("resolver readiness failed"))?;
+        runtime.start_scheduled_prune();
+    }
 
     let token_path = data_dir.join("daemon.token");
     let token = if token_path.exists() {
@@ -656,7 +702,7 @@ async fn main() -> Result<()> {
 
     // Odoo connector — starts unconfigured; Swift configures it lazily via POST /odoo/config.
     let odoo: Arc<RwLock<Option<OdooConnector>>> = Arc::new(RwLock::new(None));
-    let tavily_api_key = Arc::new(TavilyConfiguration::pending());
+    let tavily_configuration = Arc::new(RwLock::new(TavilyConfiguration::pending()));
 
     // WhatsApp connector — always present; autostarts only for prior paired sessions.
     let whatsapp = Arc::new(WhatsappConnector::new(WhatsappConfig::default()));
@@ -693,6 +739,7 @@ async fn main() -> Result<()> {
         token,
         default_model,
         classifier_model,
+        resolver_runtime,
         attachments_dir,
         model_runtime,
         work_authority,
@@ -708,7 +755,7 @@ async fn main() -> Result<()> {
         task_rater,
         codex,
         odoo,
-        tavily_api_key,
+        tavily_configuration,
         #[cfg(feature = "stage8-acceptance")]
         acceptance,
         whatsapp,
@@ -723,6 +770,11 @@ async fn main() -> Result<()> {
     // Daemon-owned automation scheduler: recovery at startup, then sleeps
     // until the next due instant (woken immediately by automations_changed).
     tokio::spawn(scheduler::run_scheduler(state.clone()));
+
+    // Notification mirror. Apple's database holds only what Notification
+    // Center is currently showing, so history exists only because this loop
+    // runs; anything delivered and dismissed between two polls is lost.
+    tokio::spawn(notifications_poll_loop(state.clone()));
 
     let shutdown_state = state.clone();
     #[allow(unused_mut)]
@@ -858,7 +910,15 @@ async fn main() -> Result<()> {
         .route("/odoo/status", get(odoo_status_handler))
         .route("/odoo/open", post(odoo_open_handler))
         .route("/web/tavily/config", post(tavily_config_handler))
+        .route(
+            "/web/tavily/config/failure",
+            post(tavily_config_failure_handler),
+        )
+        .route("/web/tavily/status", get(tavily_status_handler))
         // Phase 11 — WhatsApp connector
+        .route("/notifications/status", get(notifications_status_handler))
+        .route("/notifications/settings", post(notifications_settings_handler))
+        .route("/notifications/forget", post(notifications_forget_handler))
         .route("/whatsapp/status", get(whatsapp_status_handler))
         .route("/whatsapp/start", post(whatsapp_start_handler))
         .route("/whatsapp/stop", post(whatsapp_stop_handler))
@@ -1790,7 +1850,7 @@ async fn stage8_acceptance_not_found_handler() -> StatusCode {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let odoo_configured = state.odoo.read().await.is_some();
-    let tavily_configuration = state.tavily_api_key.status();
+    let tavily_configuration = state.tavily_configuration.read().await.status();
     let wa_status = state
         .whatsapp
         .status()
@@ -4689,68 +4749,55 @@ struct TavilyConfigRequest {
 #[serde(rename_all = "snake_case")]
 enum TavilyConfigurationStatus {
     Pending,
-    Absent,
     Configured,
+    Absent,
+    ConfigurationFailed,
 }
 
 struct TavilyConfiguration {
-    state: std::sync::RwLock<TavilyConfigurationState>,
-}
-
-struct TavilyConfigurationState {
-    credential: Option<String>,
+    api_key: Option<String>,
     status: TavilyConfigurationStatus,
 }
 
 impl TavilyConfiguration {
     fn pending() -> Self {
         Self {
-            state: std::sync::RwLock::new(TavilyConfigurationState {
-                credential: None,
-                status: TavilyConfigurationStatus::Pending,
-            }),
+            api_key: None,
+            status: TavilyConfigurationStatus::Pending,
         }
     }
 
     fn status(&self) -> TavilyConfigurationStatus {
-        self.state
-            .read()
-            .expect("Tavily configuration lock poisoned")
-            .status
+        self.status
     }
 
-    fn credential(&self) -> Option<String> {
-        self.state
-            .read()
-            .expect("Tavily configuration lock poisoned")
-            .credential
-            .clone()
+    fn active_credential(&self) -> Option<String> {
+        matches!(self.status, TavilyConfigurationStatus::Configured)
+            .then(|| self.api_key.clone())
+            .flatten()
     }
 
-    async fn read(&self) -> Option<String> {
-        self.credential()
+    fn mark_failed(&mut self) {
+        self.status = TavilyConfigurationStatus::ConfigurationFailed;
     }
 
-    fn apply(&self, credential: Option<String>) -> Result<TavilyConfigurationStatus, ()> {
-        let credential = credential.and_then(|value| {
+    fn apply(&mut self, api_key: Option<String>) -> Result<(), ()> {
+        let key = api_key.and_then(|value| {
             let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
         });
-        if credential.as_ref().is_some_and(|value| value.len() > 512) {
+        if key.as_ref().is_some_and(|value| value.len() > 512) {
+            self.api_key = None;
+            self.status = TavilyConfigurationStatus::ConfigurationFailed;
             return Err(());
         }
-
-        let status = if credential.is_some() {
+        self.status = if key.is_some() {
             TavilyConfigurationStatus::Configured
         } else {
             TavilyConfigurationStatus::Absent
         };
-        *self
-            .state
-            .write()
-            .expect("Tavily configuration lock poisoned") =
-            TavilyConfigurationState { credential, status };
-        Ok(status)
+        self.api_key = key;
+        Ok(())
     }
 }
 
@@ -4902,21 +4949,126 @@ async fn tavily_config_handler(
     State(state): State<AppState>,
     Json(body): Json<TavilyConfigRequest>,
 ) -> impl IntoResponse {
-    match state.tavily_api_key.apply(body.api_key) {
-        Ok(status) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ok": true, "status": status })),
-        ),
-        Err(()) => (
+    let mut configuration = state.tavily_configuration.write().await;
+    if configuration.apply(body.api_key).is_err() {
+        return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "invalid_api_key" })),
-        ),
+            Json(serde_json::json!({
+                "ok": false,
+                "status": TavilyConfigurationStatus::ConfigurationFailed,
+                "error": "configuration_failed"
+            })),
+        );
     }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "status": configuration.status()
+        })),
+    )
+}
+
+async fn tavily_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let status = state.tavily_configuration.read().await.status();
+    Json(serde_json::json!({ "status": status }))
+}
+
+async fn tavily_config_failure_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mut configuration = state.tavily_configuration.write().await;
+    configuration.mark_failed();
+    Json(serde_json::json!({ "status": configuration.status() }))
 }
 
 // ── WhatsApp handlers (Phase 11) ─────────────────────────────────────────────
 
 /// `GET /whatsapp/status`
+/// Mirror macOS notifications while the feed is enabled.
+///
+// ponytail: fixed 30s tick, no backoff. A failing read logs once per minute at
+// worst; add backoff if that ever becomes noise.
+async fn notifications_poll_loop(state: AppState) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut last_error: Option<String> = None;
+    loop {
+        // Read the cursor, then drop the lock: copying Apple's database and
+        // decoding plists must not sit on the mutex that chat turns need.
+        let cursor = {
+            let conn = state.db.lock().await;
+            notifications::is_enabled(&conn).then(|| notifications::watermark(&conn))
+        };
+
+        if let Some(since) = cursor {
+            let collected =
+                tokio::task::spawn_blocking(move || notifications::collect(since)).await;
+            let outcome = match collected {
+                Ok(Ok(rows)) => {
+                    let conn = state.db.lock().await;
+                    notifications::apply(&conn, &rows, chrono::Utc::now().timestamp())
+                        .map(|n| n.inserted)
+                }
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::anyhow!("collector task panicked: {e}")),
+            };
+            match outcome {
+                Ok(inserted) => {
+                    if inserted > 0 {
+                        tracing::debug!("notifications: mirrored {inserted} new");
+                    }
+                    last_error = None;
+                }
+                Err(e) => {
+                    // Fail closed: last_sync_at stays where it was, so the tool
+                    // reports a stale feed rather than answering from a mirror
+                    // that silently stopped updating.
+                    let msg = e.to_string();
+                    if last_error.as_deref() != Some(msg.as_str()) {
+                        tracing::warn!("notifications: collector failed: {msg}");
+                        last_error = Some(msg);
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct NotificationsSettings {
+    enabled: bool,
+}
+
+async fn notifications_settings_handler(
+    State(state): State<AppState>,
+    Json(body): Json<NotificationsSettings>,
+) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    let _ = notifications::set_enabled(&conn, body.enabled);
+    // Switching off stops collection and makes the feed report unavailable; it
+    // deliberately does not erase. Destroying 30 days of history behind a
+    // toggle would be irreversible and unasked-for — that is what
+    // /notifications/forget is for.
+    Json(serde_json::json!({"enabled": body.enabled}))
+}
+
+async fn notifications_forget_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    let removed = notifications::forget_all(&conn).unwrap_or(0);
+    Json(serde_json::json!({"removed": removed}))
+}
+
+async fn notifications_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.db.lock().await;
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM notifications", [], |r| r.get(0))
+        .unwrap_or(0);
+    Json(serde_json::json!({
+        "enabled": notifications::is_enabled(&conn),
+        "mirrored": count,
+        "unavailable": notifications::unavailable_reason(&conn),
+    }))
+}
+
 async fn whatsapp_status_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.whatsapp.status().await {
         Ok(s) => {
@@ -5732,12 +5884,20 @@ mod tests {
 
     #[test]
     fn tavily_configuration_status_never_exposes_credential_material() {
-        let configuration = TavilyConfiguration::pending();
+        let mut configuration = TavilyConfiguration::pending();
         assert_eq!(configuration.status(), TavilyConfigurationStatus::Pending);
 
         configuration.apply(None).unwrap();
         assert_eq!(configuration.status(), TavilyConfigurationStatus::Absent);
-        assert!(configuration.credential().is_none());
+        assert!(configuration.active_credential().is_none());
+
+        configuration.apply(None).unwrap();
+        configuration.mark_failed();
+        assert_eq!(
+            configuration.status(),
+            TavilyConfigurationStatus::ConfigurationFailed
+        );
+        assert!(configuration.active_credential().is_none());
 
         let credential = String::from_iter(std::iter::repeat_n('k', 32));
         configuration.apply(Some(credential)).unwrap();
@@ -5745,10 +5905,31 @@ mod tests {
             configuration.status(),
             TavilyConfigurationStatus::Configured
         );
-        assert!(configuration.credential().is_some());
+        assert!(configuration.active_credential().is_some());
+
+        configuration.mark_failed();
+        assert_eq!(
+            configuration.status(),
+            TavilyConfigurationStatus::ConfigurationFailed
+        );
+        assert!(configuration.api_key.is_some());
+        assert!(configuration.active_credential().is_none());
+
+        configuration
+            .apply(Some(String::from_iter(std::iter::repeat_n('k', 32))))
+            .unwrap();
 
         let serialized = serde_json::to_string(&configuration.status()).unwrap();
         assert_eq!(serialized, "\"configured\"");
+
+        assert!(configuration
+            .apply(Some(String::from_iter(std::iter::repeat_n('k', 513))))
+            .is_err());
+        assert_eq!(
+            configuration.status(),
+            TavilyConfigurationStatus::ConfigurationFailed
+        );
+        assert!(configuration.active_credential().is_none());
     }
 
     #[cfg(not(feature = "stage8-acceptance"))]

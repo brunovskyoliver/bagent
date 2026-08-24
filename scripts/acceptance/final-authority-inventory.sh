@@ -15,7 +15,7 @@ root = pathlib.Path(sys.argv[1]).resolve()
 src = root / "crates/daemon/src"
 swift_src = root / "apps/macos/Sources/bagent"
 cutover = src / "cutover.rs"
-migration = root / "crates/daemon/migrations/V23__stage8_canonical_cleanup.sql"
+migration = root / "crates/daemon/migrations/V27__stage8_canonical_cleanup.sql"
 
 # Legacy identifiers are allowed only inside the explicit, transactional
 # migration copy. Keep the allowance counted so a new compatibility route

@@ -6,7 +6,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var notchController: NotchWindowController?
     private var daemonLauncher: DaemonLauncher?
+    private var tavilyConfigurationManager: TavilyConfigurationManager?
     private var chatViewModel: ChatViewModel?
+    private var browserCoordinator: BrowserCoordinator?
+    private var browserCommandServer: BrowserCommandServer?
     private let launchMode: AppLaunchMode
     private var preserveDaemonOnTermination = false
     private var hotkeyGeneration = 0
@@ -43,13 +46,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             handoff = nil
         }
 
+        let tavilyConfigurationManager = TavilyConfigurationManager()
+        tavilyConfigurationManager.start()
+        self.tavilyConfigurationManager = tavilyConfigurationManager
+
         let vm = ChatViewModel(
             startMonitoring: launchMode.startsMonitoring,
             consumerFence: handoff?.replacementConsumerFence
         )
         chatViewModel = vm
+        let browserCoordinator = BrowserCoordinator()
+        browserCoordinator.start()
+        self.browserCoordinator = browserCoordinator
         let nc = NotchWindowController(
             chatViewModel: vm,
+            browserCoordinator: browserCoordinator,
             initiallyHidden: handoff != nil || (launchMode != .ordinary && !stage7CAcceptanceOld)
         )
         notchController = nc
@@ -60,6 +71,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.startOldUITakeover(handoff, viewModel: vm, windowController: nc)
             }
         }
+
+        let browserCommandServer = BrowserCommandServer(coordinator: browserCoordinator)
+        browserCoordinator.onEnabledChanged = { [weak browserCommandServer] _ in
+            // Keep the user-only endpoint alive while the feature is disabled
+            // so MCP clients receive browser_disabled instead of an ambiguous
+            // startup timeout. The coordinator still creates no session or cue.
+            browserCommandServer?.start()
+        }
+        browserCommandServer.start()
+        self.browserCommandServer = browserCommandServer
 
         if let handoff {
             Task { @MainActor [weak self, weak vm, weak nc] in
@@ -408,8 +429,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        browserCommandServer?.stop()
+        if let browserCoordinator {
+            for session in browserCoordinator.sessions.values { session.terminate() }
+        }
         unregisterHotkey()
         chatViewModel?.cmuxMonitor.stop()
+        tavilyConfigurationManager?.stop()
+        // A UI-only relaunch hands the daemon to the replacement process, so it
+        // must outlive this one.
         if !preserveDaemonOnTermination {
             daemonLauncher?.stop()
         }

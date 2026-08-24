@@ -45,10 +45,21 @@ tokio-stream = "0.1"
 dirs        = "5"
 chrono      = { version = "0.4", features = ["serde"] }
 sha2        = "0.10"
+unicode-normalization = "0.1"
+hmac        = "0.12"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+rand_core   = { version = "0.6", features = ["getrandom"] }
+secrecy     = "0.8"
+zeroize     = "1"
 base64      = "0.22"
 notify      = { version = "6", features = ["macos_fsevent"] }
 async-trait = "0.1"
 scraper     = "0.27"
+plist       = { version = "1.10", features = ["serde"] }
+tempfile    = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
 
 [dev-dependencies]
 filetime = "0.2"

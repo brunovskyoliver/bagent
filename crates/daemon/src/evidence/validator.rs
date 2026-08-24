@@ -775,7 +775,8 @@ fn mail_bundle_item(
         subject: header.subject,
         received_at: header.received_at,
         body: body.as_ref().map(|body| body.body.clone()),
-        body_state: body.map(|body| body.body_state),
+        body_state: body.as_ref().map(|body| body.body_state),
+        body_origin: body.map(|body| body.body_origin),
     }
 }
 

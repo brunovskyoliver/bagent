@@ -12,7 +12,7 @@ This change is limited to Stage 7A. It does not include the Stage 7B settings re
 
 ## Authority and files
 
-The daemon authority is `crates/daemon/src/current_chat.rs`, reached through the Current Chat routes and Conversation Work admission in `crates/daemon/src/main.rs`. `crates/daemon/src/work_coordinator.rs` owns canonical Work mutations and the atomic user-turn/Work commit. `crates/daemon/src/automation_sessions.rs` preserves the Stage 6 continuation contract while replacing the Current Chat through the daemon authority. The durable schema is `crates/daemon/migrations/V22__durable_current_chat.sql`.
+The daemon authority is `crates/daemon/src/current_chat.rs`, reached through the Current Chat routes and Conversation Work admission in `crates/daemon/src/main.rs`. `crates/daemon/src/work_coordinator.rs` owns canonical Work mutations and the atomic user-turn/Work commit. `crates/daemon/src/automation_sessions.rs` preserves the Stage 6 continuation contract while replacing the Current Chat through the daemon authority. The durable schema is `crates/daemon/migrations/V26__durable_current_chat.sql`.
 
 The Swift transport and restoration seam is `apps/macos/Sources/bagent/DaemonClient.swift` plus `apps/macos/Sources/bagent/ChatViewModel.swift`. `apps/macos/Sources/bagent/SlashCommandRegistry.swift` is the only command registry. `apps/macos/Sources/bagent/NotchWindowController.swift` owns keyboard precedence and marked-text handling; `apps/macos/Sources/bagent/ChatView.swift` owns completion, confirmation, error, focus, and accessibility presentation. New text is localized in `apps/macos/Sources/bagent/Resources/Localizable.xcstrings` with English and Japanese values for all 18 Stage 7A keys.
 

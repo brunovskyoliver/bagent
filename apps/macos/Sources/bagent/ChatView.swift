@@ -45,6 +45,50 @@ enum NotchWrapMetrics {
     static let notchTextPrimaryNS = NSColor(white: 0.80, alpha: 1)  // AppKit output
 }
 
+/// Pure geometry for the notch's left-wing icon row (connector actions,
+/// Browser Cues, cmux, the trace-copied flash). Extracted from `NotchWrapView`
+/// so the collapsed-notch wing width a live Browser Cue requires — and the
+/// row's hit region — are unit-testable without instantiating SwiftUI.
+enum NotchLeftWingLayout {
+    static let iconSize: CGFloat = 18
+    static let iconSpacing: CGFloat = 6
+    /// Gap between the row's right edge and the notch's left edge.
+    static let rowInset: CGFloat = 8
+
+    /// Icons always sit side by side. They used to rest as an overlapping deck
+    /// that fanned on hover, which just made them unreadable — the wing widens
+    /// to fit the row instead.
+    static func rowWidth(count: Int) -> CGFloat {
+        let n = CGFloat(count)
+        guard n > 0 else { return 0 }
+        return n * iconSize + (n - 1) * iconSpacing
+    }
+
+    /// Slot the hover/settings status icon occupies to the left of the row.
+    static let statusIconSlot: CGFloat = iconSize + 6
+
+    /// Wing floor so the whole row (including a live Browser Cue) fits inside
+    /// the black pill even while the notch is fully collapsed. With
+    /// `statusIcon`, the wing also reserves the hover status icon's slot —
+    /// without it the hover-expanded wing (72pt) is too narrow and the status
+    /// icon is drawn straight through the cue row.
+    static func requiredWingWidth(count: Int, statusIcon: Bool = false) -> CGFloat {
+        guard count > 0 else { return 0 }
+        let row = rowWidth(count: count) + 2 * rowInset
+        return statusIcon ? row + statusIconSlot : row
+    }
+
+    /// Centre of the left status icon. It stays centred in the wing while the
+    /// row is empty (unchanged notch behaviour) and steps aside to the row's
+    /// left once any icon — a Browser Cue included — is showing.
+    static func statusIconCenterX(notchOffset: CGFloat, wingWidth: CGFloat,
+                                  count: Int) -> CGFloat {
+        guard count > 0 else { return notchOffset - wingWidth / 2 }
+        let rowLeft = notchOffset - rowInset - rowWidth(count: count)
+        return rowLeft - statusIconSlot / 2
+    }
+}
+
 enum NotchStatusDotGeometry {
     static func outputTopRight(
         notchOffset: CGFloat,
@@ -217,6 +261,23 @@ struct StatusPillView: View {
     @ObservedObject var viewModel: ChatViewModel
     let onTap: () -> Void
     let onHoverChanged: (Bool) -> Void
+    @ObservedObject var browserCoordinator: BrowserCoordinator
+
+    init(
+        notchWidth: CGFloat,
+        notchHeight: CGFloat,
+        viewModel: ChatViewModel,
+        onTap: @escaping () -> Void,
+        onHoverChanged: @escaping (Bool) -> Void,
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator()
+    ) {
+        self.notchWidth = notchWidth
+        self.notchHeight = notchHeight
+        self.viewModel = viewModel
+        self.onTap = onTap
+        self.onHoverChanged = onHoverChanged
+        self.browserCoordinator = browserCoordinator
+    }
 
     var body: some View {
         NotchWrapView(
@@ -224,7 +285,8 @@ struct StatusPillView: View {
             notchHeight: notchHeight,
             viewModel: viewModel,
             onTap: onTap,
-            onHoverChanged: onHoverChanged
+            onHoverChanged: onHoverChanged,
+            browserCoordinator: browserCoordinator
         )
     }
 }
@@ -237,8 +299,29 @@ struct NotchWrapView: View {
     @ObservedObject var viewModel: ChatViewModel
     let onTap: () -> Void
     let onHoverChanged: (Bool) -> Void
+    @ObservedObject var browserCoordinator: BrowserCoordinator
     var acceptanceReduceMotionOverride: Bool? = nil
     var acceptanceSettingsState: CompassRailAcceptanceState? = nil
+
+    init(
+        notchWidth: CGFloat,
+        notchHeight: CGFloat,
+        viewModel: ChatViewModel,
+        onTap: @escaping () -> Void,
+        onHoverChanged: @escaping (Bool) -> Void,
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator(),
+        acceptanceReduceMotionOverride: Bool? = nil,
+        acceptanceSettingsState: CompassRailAcceptanceState? = nil
+    ) {
+        self.notchWidth = notchWidth
+        self.notchHeight = notchHeight
+        self.viewModel = viewModel
+        self.onTap = onTap
+        self.onHoverChanged = onHoverChanged
+        self.browserCoordinator = browserCoordinator
+        self.acceptanceReduceMotionOverride = acceptanceReduceMotionOverride
+        self.acceptanceSettingsState = acceptanceSettingsState
+    }
 
     // Explicit @State so withAnimation directly tweens the shape's animatableData.
     @State private var wingWidth: CGFloat    = NotchWrapMetrics.idleWingWidth
@@ -606,7 +689,14 @@ struct NotchWrapView: View {
     private var targetLeftIconPos: CGPoint {
         let clampedBridge = min(targetBridgeHeight, NotchWrapMetrics.hoverBridgeHeight)
         let y = (notchHeight + clampedBridge) / 2
-        return CGPoint(x: notchOffset - targetWingWidth / 2, y: y)
+        return CGPoint(
+            x: NotchLeftWingLayout.statusIconCenterX(
+                notchOffset: notchOffset,
+                wingWidth: targetWingWidth,
+                count: leftWingIconCount
+            ),
+            y: y
+        )
     }
     private var rightIconPos: CGPoint {
         CGPoint(x: notchOffset + notchWidth + wingWidth / 2, y: iconY)
@@ -686,6 +776,7 @@ struct NotchWrapView: View {
                     viewModel: viewModel,
                     outputGrowthPhase: viewModel.isLatestAssistantStreaming
                         && targetBridgeHeight < NotchWrapMetrics.outputMaxBridgeHeight,
+                    browserCoordinator: browserCoordinator,
                     acceptanceSettingsState: acceptanceSettingsState,
                     acceptanceReduceMotionOverride: acceptanceReduceMotionOverride
                 )
@@ -764,9 +855,7 @@ struct NotchWrapView: View {
     @ViewBuilder
     private var leftWingIconLayer: some View {
         if leftWingIconCount > 0 {
-            HStack(spacing: leftWingStacked
-                ? -(Self.leftWingIconSize - Self.leftWingStackedStep)
-                : Self.leftWingIconSpacing) {
+            HStack(spacing: Self.leftWingIconSpacing) {
                 ForEach(Array(visibleConnectorActions.enumerated()), id: \.element.id) { index, action in
                     Button {
                         viewModel.performConnectorAction(action, slotIndex: index)
@@ -775,61 +864,83 @@ struct NotchWrapView: View {
                                           size: Self.leftWingIconSize)
                     }
                     .buttonStyle(.plain)
-                    .rotationEffect(
-                        .degrees(leftWingStacked
-                            ? Double(visibleConnectorActions.count - index) * -4
-                            : 0),
-                        anchor: .bottom
-                    )
                     .help(action.kind.accessibilityLabel)
                     .accessibilityLabel(action.kind.accessibilityLabel)
+                }
+                ForEach(visibleBrowserCues) { cue in
+                    BrowserCueInteractionView(
+                        cue: cue,
+                        reduceMotion: reduceMotion,
+                        onClick: {
+                            browserCoordinator.toggleCue(cue.id)
+                        },
+                        onOptionClick: {
+                            browserCoordinator.optionClickCue(cue.id)
+                        },
+                        onDragPhase: { phase, location in
+                            browserCoordinator.dragCue(cue.id, phase: phase, location: location)
+                        },
+                        // The cue's AppKit hit view sits on top of the icon, so
+                        // the row's own .onHover never fires over a cue — fan
+                        // the deck from here instead, otherwise the icons stay
+                        // stacked (overlapping) exactly where the pointer is.
+                        onHoverChanged: { hovering, cursor in
+                            if hovering {
+                                browserCoordinator.previewCue(cue.id, at: cursor)
+                            } else {
+                                browserCoordinator.hideCuePreview()
+                            }
+                        },
+                        onGeometryChanged: { rect in
+                            browserCoordinator.updateCueRect(cue.id, rect)
+                        },
+                        shakes: browserCoordinator.cueShakes[cue.id] ?? 0
+                    )
+                    .contextMenu {
+                        if browserCoordinator.isSubmissionPending(for: cue.id) {
+                            Button(String(localized: "browser.cue.approve_submission",
+                                          defaultValue: "Approve form submission")) {
+                                browserCoordinator.approveSubmission(sessionID: cue.id)
+                            }
+                        }
+                        if cue.state == .attention {
+                            Button(String(localized: "browser.cue.resume_agent",
+                                          defaultValue: "Resume agent control")) {
+                                browserCoordinator.resumeAgent(sessionID: cue.id)
+                            }
+                        }
+                        if let label = browserCoordinator.reclaimLabel(for: cue.id) {
+                            Button(String(localized: "browser.cue.reclaim",
+                                          defaultValue: "Reclaim for \(label)")) {
+                                try? browserCoordinator.approvePendingReclaim(sessionID: cue.id)
+                            }
+                            Button(String(localized: "browser.cue.reject_reclaim",
+                                          defaultValue: "Leave detached")) {
+                                browserCoordinator.rejectPendingReclaim(sessionID: cue.id)
+                            }
+                        }
+                        Button(String(localized: "browser.cue.close",
+                                      defaultValue: "Close browser session"),
+                               role: .destructive) {
+                            browserCoordinator.approveClose(sessionID: cue.id)
+                        }
+                    }
                 }
                 if showsCmuxLeftIcon, let notification = displayedCmuxNotification {
                     CmuxIconView(kind: notification.kind, reduceMotion: reduceMotion)
                         .opacity(isCmuxSurfaceActive ? cmuxContentOpacity : 1)
                 }
             }
-            .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.68),
-                       value: leftWingStacked)
             .padding(6)
             .contentShape(Rectangle())
-            .onHover { hovering in setLeftWingFanned(hovering) }
             .position(x: notchOffset - Self.leftWingRowInset - leftWingRowWidth / 2, y: iconY)
         }
     }
 
-    /// Fan on hover-enter immediately; restack after a short debounce so the
-    /// wing resize can't oscillate under the cursor.
-    private func setLeftWingFanned(_ fanned: Bool) {
-        leftWingRestackWork?.cancel()
-        leftWingRestackWork = nil
-        if fanned {
-            guard !leftWingFanned else { return }
-            leftWingFanned = true
-            refreshSurface()
-        } else {
-            guard leftWingFanned else { return }
-            let work = DispatchWorkItem {
-                leftWingFanned = false
-                refreshSurface()
-            }
-            leftWingRestackWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
-        }
-    }
-
-    private static let leftWingIconSize: CGFloat = 18
-    private static let leftWingIconSpacing: CGFloat = 6
-    /// Visible sliver of each icon beneath the next one in the stacked deck.
-    private static let leftWingStackedStep: CGFloat = 5
+    private static let leftWingIconSize: CGFloat = NotchLeftWingLayout.iconSize
+    private static let leftWingIconSpacing: CGFloat = NotchLeftWingLayout.iconSpacing
     /// Gap between the row's right edge and the notch's left edge.
-    private static let leftWingRowInset: CGFloat = 8
-
-    /// Deck rests stacked whenever more than one icon is present and the
-    /// pointer isn't over the row. A single icon renders exactly as before.
-    private var leftWingStacked: Bool {
-        !leftWingFanned && leftWingIconCount > 1
-    }
+    private static let leftWingRowInset: CGFloat = NotchLeftWingLayout.rowInset
 
     /// Connector icons stay through inline
     /// input/output and the expanded chat panel so results are actionable
@@ -838,23 +949,27 @@ struct NotchWrapView: View {
         return viewModel.pendingConnectorActions
     }
 
+    /// Browser Cues step aside while an inline surface is open — ⌥Space is
+    /// meant to leave just the input field.
+    private var visibleBrowserCues: [BrowserCue] {
+        isInlineActive ? [] : browserCoordinator.cues
+    }
+
     private var leftWingIconCount: Int {
         visibleConnectorActions.count
+            + visibleBrowserCues.count
             + (showsCmuxLeftIcon ? 1 : 0)
     }
 
     private var leftWingRowWidth: CGFloat {
-        let n = CGFloat(leftWingIconCount)
-        guard n > 0 else { return 0 }
-        if leftWingStacked {
-            return Self.leftWingIconSize + (n - 1) * Self.leftWingStackedStep
-        }
-        return n * Self.leftWingIconSize + (n - 1) * Self.leftWingIconSpacing
+        NotchLeftWingLayout.rowWidth(count: leftWingIconCount)
     }
 
-    /// Wing floor so the whole row fits inside the black pill.
+    /// Wing floor so the whole row — plus the hover status icon beside it —
+    /// fits inside the black pill.
     private var requiredLeftWingWidth: CGFloat {
-        leftWingIconCount == 0 ? 0 : leftWingRowWidth + 2 * Self.leftWingRowInset
+        NotchLeftWingLayout.requiredWingWidth(count: leftWingIconCount,
+                                              statusIcon: showsLeftStatusIcon || isSettingsActive)
     }
 
     /// Where the connector icon sat at click time — the row still had the
@@ -1160,6 +1275,9 @@ struct NotchWrapView: View {
         .onChange(of: viewModel.pendingConnectorActions) {
             refreshSurface()
         }
+        .onChange(of: browserCoordinator.cues) {
+            refreshSurface()
+        }
         .onChange(of: viewModel.isActivityTranscriptExpanded) {
             deferOutputSurfaceRefresh(force: true)
         }
@@ -1298,6 +1416,7 @@ private struct DrawInSymbol: View {
 
 struct InlineNotchContent: View {
     @ObservedObject var viewModel: ChatViewModel
+    @ObservedObject var browserCoordinator: BrowserCoordinator
     let showsInputLeadingIcon: Bool
     let outputGrowthPhase: Bool
     let acceptanceSettingsState: CompassRailAcceptanceState?
@@ -1307,10 +1426,18 @@ struct InlineNotchContent: View {
     @State private var placeholderRevealID = UUID()
     @State private var inlineFocusRetryID = UUID()
 
-    init(viewModel: ChatViewModel, showsInputLeadingIcon: Bool = true, outputGrowthPhase: Bool = false, acceptanceSettingsState: CompassRailAcceptanceState? = nil, acceptanceReduceMotionOverride: Bool? = nil) {
+    init(
+        viewModel: ChatViewModel,
+        showsInputLeadingIcon: Bool = true,
+        outputGrowthPhase: Bool = false,
+        browserCoordinator: BrowserCoordinator = BrowserCoordinator(),
+        acceptanceSettingsState: CompassRailAcceptanceState? = nil,
+        acceptanceReduceMotionOverride: Bool? = nil
+    ) {
         self.viewModel = viewModel
         self.showsInputLeadingIcon = showsInputLeadingIcon
         self.outputGrowthPhase = outputGrowthPhase
+        self.browserCoordinator = browserCoordinator
         self.acceptanceSettingsState = acceptanceSettingsState
         self.acceptanceReduceMotionOverride = acceptanceReduceMotionOverride
     }
@@ -1350,7 +1477,7 @@ struct InlineNotchContent: View {
                 case .output:
                     outputView
                 case .settings:
-                    NotchSettingsContent(viewModel: viewModel, acceptanceState: acceptanceSettingsState, reduceMotionOverride: acceptanceReduceMotionOverride)
+                    NotchSettingsContent(viewModel: viewModel, browserCoordinator: browserCoordinator, acceptanceState: acceptanceSettingsState, reduceMotionOverride: acceptanceReduceMotionOverride)
                 case .automations:
                     AutomationsNotchContent(viewModel: viewModel)
                 case .collapsed:

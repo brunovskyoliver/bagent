@@ -10,9 +10,9 @@ use std::{collections::HashMap, fs, path::Path};
 #[cfg(feature = "stage8-acceptance")]
 use std::{path::PathBuf, thread, time::Duration};
 
-const WORK_SCHEMA: &str = include_str!("../migrations/V15__work_coordinator_foundations.sql");
-const CUTOVER_SCHEMA: &str = include_str!("../migrations/V16__unified_work_cutover.sql");
-const STAGE8_SCHEMA: &str = include_str!("../migrations/V23__stage8_canonical_cleanup.sql");
+const WORK_SCHEMA: &str = include_str!("../migrations/V19__work_coordinator_foundations.sql");
+const CUTOVER_SCHEMA: &str = include_str!("../migrations/V20__unified_work_cutover.sql");
+const STAGE8_SCHEMA: &str = include_str!("../migrations/V27__stage8_canonical_cleanup.sql");
 pub const LEGACY_UNAVAILABLE: &str =
     "Legacy result content is unavailable because its privacy provenance cannot be verified.";
 
@@ -90,7 +90,10 @@ pub fn prepare_pre_cutover_backup(source: &Path, backup: &Path) -> Result<Option
         .map_err(storage)?
         .flatten()
         .unwrap_or(0);
-    if version >= 16 {
+    // The Unified Work cutover is V20 after the roadmap migrations were
+    // renumbered above main's already-shipped V15-V18 sequence. A database
+    // below that is still pre-cutover and must be backed up first.
+    if version >= 20 {
         return Ok(None);
     }
     if backup.exists() {
