@@ -3,7 +3,12 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 candidate="${1:-$root/apps/macos/bagent.app}"
-base="${STAGE8_FIXED_BASE:-45c26b1c1d3bd482b144525723a9c71a1fe57ced}"
+# The old candidate must be a build a user could actually be running. Since the
+# roadmap migrations were renumbered above main's already-shipped V15-V18, a
+# pre-merge roadmap build is no longer a valid predecessor: its V15 collides.
+# main is the released predecessor and the sequence every real database carries,
+# so it is the default. Set STAGE8_FIXED_BASE to compare against another commit.
+base="${STAGE8_FIXED_BASE:-342be4866da9ed8614139eba5459a0fa69edeb62}"
 product_version="$(sw_vers -productVersion)"
 protected_8080_before="$(lsof -nP -tiTCP:8080 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)"
 protected_8082_before="$(lsof -nP -tiTCP:8082 -sTCP:LISTEN 2>/dev/null | sort | tr '\n' ',' || true)"
@@ -111,8 +116,23 @@ sign_id="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\
     echo "A54 FAIL: Apple Development signing identity unavailable" >&2
     exit 1
 }
-cargo build --release --manifest-path "$old_checkout/Cargo.toml" -p bagentd \
-    --features stage7a-acceptance,stage8-acceptance >/dev/null
+# Older bases declare fewer acceptance features. Compile exactly the ones the
+# base offers so a genuine predecessor is still buildable; a base that supports
+# none is still a valid rollback subject because the seed and refusal paths use
+# the ordinary daemon startup and schema reader.
+old_features=""
+for feature in stage7a-acceptance stage8-acceptance; do
+    if rg -q "^$feature = \[" "$old_checkout/crates/daemon/Cargo.toml"; then
+        old_features="${old_features:+$old_features,}$feature"
+    fi
+done
+if [[ -n "$old_features" ]]; then
+    cargo build --release --manifest-path "$old_checkout/Cargo.toml" -p bagentd \
+        --features "$old_features" >/dev/null
+else
+    cargo build --release --manifest-path "$old_checkout/Cargo.toml" -p bagentd >/dev/null
+fi
+echo "A54 old candidate: $base with features [${old_features:-none}]"
 cp "$old_checkout/target/release/bagentd" "$old_app/Contents/MacOS/bagentd"
 codesign --force --sign "$sign_id" --identifier sk.bagent.app.daemon \
     "$old_app/Contents/MacOS/bagentd" >/dev/null

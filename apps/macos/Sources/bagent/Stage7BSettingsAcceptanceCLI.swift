@@ -393,7 +393,12 @@ enum Stage7BSettingsAcceptanceCLI {
     ) -> [String: String] {
         switch route {
         case .area(.general):
-            return ["Paste wheel": "On", "cmux notifications": "On"]
+            // bagent Browser defaults to off; the fixture never enables it.
+            return [
+                "Paste wheel": "On",
+                "cmux notifications": "On",
+                "bagent Browser": "Off",
+            ]
         case .area(.modelRuntime):
             return [
                 "Local chat model": state.selectedModel,
