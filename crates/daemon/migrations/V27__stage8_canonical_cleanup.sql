@@ -14,7 +14,23 @@ CREATE TABLE IF NOT EXISTS automation_run_records (
     result_summary TEXT,
     is_catch_up    INTEGER NOT NULL DEFAULT 0 CHECK (is_catch_up IN (0, 1)),
     is_manual      INTEGER NOT NULL DEFAULT 0 CHECK (is_manual IN (0, 1)),
-    created_at     TEXT NOT NULL
+    created_at     TEXT NOT NULL,
+    -- Carried from main's V15 so a blocked run keeps its typed reference
+    -- outcome on the canonical run record.
+    reference_outcome_code TEXT
+        CHECK (
+            reference_outcome_code IS NULL
+            OR reference_outcome_code IN (
+                'missing_referent',
+                'ambiguous',
+                'confirmation_required',
+                'private_source_denied',
+                'expired',
+                'unsupported',
+                'resolver_unavailable'
+            )
+        )
+        CHECK ((status = 'blocked') = (reference_outcome_code IS NOT NULL))
 );
 
 CREATE INDEX IF NOT EXISTS idx_automation_run_records_recent

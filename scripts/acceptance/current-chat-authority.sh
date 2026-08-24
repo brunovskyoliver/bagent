@@ -15,7 +15,9 @@ scan_tree() {
         echo "FAIL: UserDefaults retains chat or session identity authority"
         failures=$((failures + 1))
     fi
-    if rg -n --glob '*.swift' 'func clear\(\)' "$root/apps/macos/Sources" >/dev/null 2>&1; then
+    # Scoped away from the browser sources: BrowserProfile.clear() erases WebKit
+    # website data for bagent Browser and is not a Current Chat entry point.
+    if rg -n --glob '*.swift' --glob '!Browser*.swift' 'func clear\(\)' "$root/apps/macos/Sources" >/dev/null 2>&1; then
         echo "FAIL: a local-only clear entry point remains"
         failures=$((failures + 1))
     fi

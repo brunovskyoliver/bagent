@@ -74,3 +74,14 @@ single_match = "allow"
 needless_question_mark = "allow"
 items_after_test_module = "allow"
 too_many_arguments = "allow"
+
+# Inherited from main's conversational reference resolution when it merged
+# into this crate's stricter lint config — owner: GitHub #15; reason:
+# style-only debt in reference_resolution, out of scope for the integration;
+# expires: 2026-11-24.
+enum_variant_names = "allow"
+comparison_to_empty = "allow"
+needless_borrows_for_generic_args = "allow"
+large_enum_variant = "allow"
+collapsible_match = "allow"
+single_range_in_vec_init = "allow"

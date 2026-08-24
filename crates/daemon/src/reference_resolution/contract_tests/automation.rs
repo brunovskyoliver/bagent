@@ -197,7 +197,7 @@ fn red_finish_failure_cannot_expose_a_partial_terminal_update() {
 
     let stored_status: String = conn
         .query_row(
-            "SELECT status FROM automation_runs WHERE id=?1",
+            "SELECT status FROM automation_run_records WHERE id=?1",
             params![run.id.to_string()],
             |row| row.get(0),
         )
@@ -322,7 +322,7 @@ fn identical_retry_is_idempotent_and_conflicting_retry_fails_closed() {
     .is_err());
     let status: String = conn
         .query_row(
-            "SELECT status FROM automation_runs WHERE id=?1",
+            "SELECT status FROM automation_run_records WHERE id=?1",
             params![run.id.to_string()],
             |row| row.get(0),
         )
@@ -610,7 +610,7 @@ fn terminal_event_order_and_persistence_failure_are_structural() {
     assert_eq!(failed_events[0].as_object().unwrap().len(), 3);
     let status: String = conn
         .query_row(
-            "SELECT status FROM automation_runs WHERE id=?1",
+            "SELECT status FROM automation_run_records WHERE id=?1",
             params![run.id.to_string()],
             |row| row.get(0),
         )
@@ -701,7 +701,7 @@ fn sqlite_rejects_invalid_status_and_reference_code_tuples() {
     .unwrap();
 
     let invalid_code = conn.execute(
-        "INSERT INTO automation_runs
+        "INSERT INTO automation_run_records
          (id, automation_id, scheduled_for, status, created_at, reference_outcome_code)
          VALUES ('synthetic-invalid-code', ?1, ?2, 'blocked', ?2, 'not_allowed')",
         params![automation.id.to_string(), now().to_rfc3339()],
@@ -709,7 +709,7 @@ fn sqlite_rejects_invalid_status_and_reference_code_tuples() {
     assert!(invalid_code.is_err());
 
     let non_blocked_with_code = conn.execute(
-        "INSERT INTO automation_runs
+        "INSERT INTO automation_run_records
          (id, automation_id, scheduled_for, status, created_at, reference_outcome_code)
          VALUES ('synthetic-invalid-status', ?1, ?2, 'completed', ?2, 'ambiguous')",
         params![automation.id.to_string(), now().to_rfc3339()],
@@ -717,7 +717,7 @@ fn sqlite_rejects_invalid_status_and_reference_code_tuples() {
     assert!(non_blocked_with_code.is_err());
 
     let blocked_without_code = conn.execute(
-        "INSERT INTO automation_runs
+        "INSERT INTO automation_run_records
          (id, automation_id, scheduled_for, status, created_at)
          VALUES ('synthetic-missing-code', ?1, ?2, 'blocked', ?2)",
         params![automation.id.to_string(), now().to_rfc3339()],

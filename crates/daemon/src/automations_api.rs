@@ -1974,7 +1974,12 @@ mod tests {
         });
         let outcome = outcome_to_status(&denied);
         assert_eq!(outcome.status, AutomationRunStatus::Partial);
-        assert_eq!(outcome.result_summary, "Čiastočne.");
+        // Status comes from the typed completion; the denial count is only
+        // annotated onto the user-visible summary.
+        assert_eq!(
+            outcome.result_summary,
+            "Čiastočne.\n(1 akcií nebolo schválených)"
+        );
 
         let failed: Result<ExecOutcome, ExecError> =
             Err(ExecError::Model("connection refused".into()));

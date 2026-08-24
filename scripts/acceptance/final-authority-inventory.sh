@@ -61,8 +61,25 @@ def strip_cfg_test_items(text: str) -> str:
         text = text[:start] + text[end:]
 
 
+# `reference_resolution/contract_tests/` is a whole-tree test module: it is
+# declared `#[cfg(test)] #[path = "contract_tests/mod.rs"] mod contract;`, so the
+# compiler never builds it into the daemon. The inline `#[cfg(test)]` stripper
+# cannot see that from inside the files themselves, so exclude the tree here and
+# assert the gating declaration still exists, or the exclusion is not earned.
+CONTRACT_TESTS_DIR = src / "reference_resolution" / "contract_tests"
+_reference_mod = (src / "reference_resolution" / "mod.rs").read_text()
+if '#[cfg(test)]\n#[path = "contract_tests/mod.rs"]' not in _reference_mod:
+    print("contract_tests is no longer cfg(test)-gated; refusing to skip it", file=sys.stderr)
+    raise SystemExit(2)
+
+
 def production_files() -> list[pathlib.Path]:
-    return sorted(src.rglob("*.rs")) + sorted(swift_src.rglob("*.swift"))
+    rust = [
+        path
+        for path in sorted(src.rglob("*.rs"))
+        if CONTRACT_TESTS_DIR not in path.parents
+    ]
+    return rust + sorted(swift_src.rglob("*.swift"))
 
 
 def source_text(path: pathlib.Path) -> str:

@@ -529,7 +529,10 @@ fn pre_cutover_backup_boundary_follows_the_renumbered_cutover_migration() {
         "a database at main's V18 ceiling predates the V20 Unified Work cutover \
          and must be backed up before migration"
     );
-    assert!(pre_backup.exists(), "the pre-cutover backup must be written");
+    assert!(
+        pre_backup.exists(),
+        "the pre-cutover backup must be written"
+    );
     assert_eq!(
         prepared.as_deref(),
         Some(sha256(&pre_backup).unwrap().as_str()),

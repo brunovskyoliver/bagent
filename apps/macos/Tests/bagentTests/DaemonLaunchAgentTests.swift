@@ -11,83 +11,35 @@ final class DaemonLaunchAgentTests: XCTestCase {
         XCTAssertNotNil(environment["BAGENT_CHAT_MODEL_PATH"])
     }
 
-    func testRuntimeEnvironmentPreservesExplicitEvidenceRollbackOnly() {
-        let rollback = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "0",
-            "BAGENT_STAGE8_ACCEPTANCE_FIXTURES": "0",
-        ])
-        XCTAssertEqual(rollback["BAGENT_EVIDENCE_ORCHESTRATOR"], "0")
-        XCTAssertNil(rollback["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+    func testResolverModeIsForwardedVerbatimWithoutATopLevelSwitch() {
+        // Typed evidence routing is unconditional after Stage 8, so the resolver
+        // mode is an independent setting with no higher-precedence flag above it.
+        for value in ["enforce", " observe ", "persistence", "Enforce & keep"] {
+            let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
+                "BAGENT_REFERENCE_RESOLVER_MODE": value,
+            ])
+            XCTAssertEqual(environment["BAGENT_REFERENCE_RESOLVER_MODE"], value)
+            XCTAssertNil(environment["BAGENT_EVIDENCE_ORCHESTRATOR"])
+        }
+    }
 
-        let invalid = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "unexpected",
-        ])
-        XCTAssertEqual(invalid["BAGENT_EVIDENCE_ORCHESTRATOR"], "unexpected")
+    func testAbsentSubordinateResolverModeAddsNothing() {
+        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [:])
 
-        let ordinary = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [:])
-        XCTAssertNil(ordinary["BAGENT_EVIDENCE_ORCHESTRATOR"])
-        XCTAssertNil(ordinary["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+        XCTAssertNil(environment["BAGENT_REFERENCE_RESOLVER_MODE"])
+        XCTAssertNil(environment["BAGENT_EVIDENCE_ORCHESTRATOR"])
+        XCTAssertNil(environment["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"])
+    }
 
+    func testAcceptanceFixtureSwitchStillForwards() {
         let acceptance = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
             "BAGENT_STAGE8_ACCEPTANCE_FIXTURES": "1",
         ])
         XCTAssertEqual(acceptance["BAGENT_STAGE8_ACCEPTANCE_FIXTURES"], "1")
-
-        var rollbackWithoutRouting = rollback
-        rollbackWithoutRouting.removeValue(forKey: "BAGENT_EVIDENCE_ORCHESTRATOR")
-        XCTAssertEqual(rollbackWithoutRouting, ordinary)
-    }
-
-    func testRollbackOmitsSubordinateResolverMode() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "0",
-            "BAGENT_REFERENCE_RESOLVER_MODE": "enforce",
-        ])
-
-        XCTAssertEqual(environment["BAGENT_EVIDENCE_ORCHESTRATOR"], "0")
-        XCTAssertNil(environment["BAGENT_REFERENCE_RESOLVER_MODE"])
-    }
-
-    func testEnabledTopLevelForwardsSubordinateResolverModeUnchanged() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "1",
-            "BAGENT_REFERENCE_RESOLVER_MODE": " observe ",
-        ])
-
-        XCTAssertEqual(environment["BAGENT_EVIDENCE_ORCHESTRATOR"], "1")
-        XCTAssertEqual(environment["BAGENT_REFERENCE_RESOLVER_MODE"], " observe ")
-    }
-
-    func testAbsentTopLevelStillForwardsSubordinateResolverMode() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_REFERENCE_RESOLVER_MODE": "persistence",
-        ])
-
-        XCTAssertNil(environment["BAGENT_EVIDENCE_ORCHESTRATOR"])
-        XCTAssertEqual(environment["BAGENT_REFERENCE_RESOLVER_MODE"], "persistence")
-    }
-
-    func testInvalidTopLevelPreservesBothValuesForDaemonHandling() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "unexpected",
-            "BAGENT_REFERENCE_RESOLVER_MODE": "enforce",
-        ])
-
-        XCTAssertEqual(environment["BAGENT_EVIDENCE_ORCHESTRATOR"], "unexpected")
-        XCTAssertEqual(environment["BAGENT_REFERENCE_RESOLVER_MODE"], "enforce")
-    }
-
-    func testAbsentSubordinateResolverModeAddsNothing() {
-        let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "1",
-        ])
-
-        XCTAssertNil(environment["BAGENT_REFERENCE_RESOLVER_MODE"])
     }
 
     func testPlistPreservesSelectedResolverEnvironmentExactly() throws {
         let environment = DaemonLaunchAgent.runtimeEnvironment(processEnvironment: [
-            "BAGENT_EVIDENCE_ORCHESTRATOR": "1",
             "BAGENT_REFERENCE_RESOLVER_MODE": "Enforce & keep",
         ])
         let plist = DaemonLaunchAgent.plistContent(
@@ -99,8 +51,8 @@ final class DaemonLaunchAgentTests: XCTestCase {
         ) as? [String: Any]
         let serialized = parsed?["EnvironmentVariables"] as? [String: String]
 
-        XCTAssertEqual(serialized?["BAGENT_EVIDENCE_ORCHESTRATOR"], "1")
         XCTAssertEqual(serialized?["BAGENT_REFERENCE_RESOLVER_MODE"], "Enforce & keep")
+        XCTAssertNil(serialized?["BAGENT_EVIDENCE_ORCHESTRATOR"])
     }
 
     func testPlistContainsBinaryLabelAndSortedEnv() throws {

@@ -370,12 +370,24 @@ fn finalize_stage8_cleanup_with_optional_failpoint(
 
     let has_legacy_runs = table_exists_in_transaction(&transaction, "automation_runs")?;
     if has_legacy_runs {
+        // A database that predates main's V15 has no typed reference outcome to
+        // carry; read NULL for it rather than failing the forward transaction.
+        let has_reference_outcome = transaction
+            .prepare("SELECT 1 FROM pragma_table_info('automation_runs') WHERE name='reference_outcome_code'")
+            .and_then(|mut statement| statement.exists([]))
+            .map_err(storage)?;
+        let reference_outcome_column = if has_reference_outcome {
+            "reference_outcome_code"
+        } else {
+            "NULL"
+        };
         let mut statement = transaction
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, automation_id, scheduled_for, started_at, finished_at,
-                        status, result_summary, is_catch_up, is_manual, created_at
-                 FROM automation_runs ORDER BY created_at ASC, id ASC",
-            )
+                        status, result_summary, is_catch_up, is_manual, created_at,
+                        {reference_outcome_column}
+                 FROM automation_runs ORDER BY created_at ASC, id ASC"
+            ))
             .map_err(storage)?;
         let rows = statement
             .query_map([], |row| {
@@ -390,6 +402,7 @@ fn finalize_stage8_cleanup_with_optional_failpoint(
                     row.get::<_, i64>(7)?,
                     row.get::<_, i64>(8)?,
                     row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })
             .map_err(storage)?
@@ -407,6 +420,7 @@ fn finalize_stage8_cleanup_with_optional_failpoint(
             is_catch_up,
             is_manual,
             created_at,
+            reference_outcome_code,
         ) in rows
         {
             let (safe_summary, available) = safe_legacy_summary(summary);
@@ -414,8 +428,9 @@ fn finalize_stage8_cleanup_with_optional_failpoint(
                 .execute(
                     "INSERT OR IGNORE INTO automation_run_records
                      (id, automation_id, scheduled_for, started_at, finished_at, status,
-                      result_summary, is_catch_up, is_manual, created_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                      result_summary, is_catch_up, is_manual, created_at,
+                      reference_outcome_code)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
                         id,
                         automation_id,
@@ -427,6 +442,7 @@ fn finalize_stage8_cleanup_with_optional_failpoint(
                         is_catch_up,
                         is_manual,
                         created_at,
+                        reference_outcome_code,
                     ],
                 )
                 .map_err(storage)?;

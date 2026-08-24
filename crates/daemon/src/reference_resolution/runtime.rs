@@ -1,6 +1,6 @@
 use super::{
-    parse_resolver_mode_with_status, ConversationalReferenceResolver,
-    ResolverMode, ResolverModeParseStatus,
+    parse_resolver_mode_with_status, ConversationalReferenceResolver, ResolverMode,
+    ResolverModeParseStatus,
 };
 use std::{
     fmt,

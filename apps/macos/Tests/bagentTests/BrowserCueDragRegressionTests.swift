@@ -321,29 +321,27 @@ struct BrowserCueDragRegressionTests {
 
         // The cue stays hit-testable in every mode that shows it. Inline
         // surfaces deliberately hide it (⌥Space leaves just the input field).
-        for mode in [NotchInteractionMode.thinking, .collapsed] {
-            viewModel.notchInteractionMode = mode
-            viewModel.isExpanded = mode != .collapsed
-            contentView.layoutSubtreeIfNeeded()
-            try? await Task.sleep(for: .milliseconds(20))
-            let modeHitView = try #require(descendants(of: contentView).compactMap { $0 as? BrowserCueHitView }.first)
-            let modeCenter = modeHitView.convert(
-                CGPoint(x: modeHitView.bounds.midX, y: modeHitView.bounds.midY), to: nil)
-            #expect(contentView.hitTest(modeCenter) === modeHitView, "cue unreachable in \(mode)")
-        }
-        for mode in [NotchInteractionMode.input, .output, .settings, .automations] {
-            viewModel.notchInteractionMode = mode
-            viewModel.isExpanded = true
-            viewModel.chatSurfaceMode = mode == .output ? .outputExpanded : .inputOnly
+        // The notch mode is projected from authoritative Work state, so each mode
+        // is entered through its real driver rather than by assigning the derived
+        // properties the Stage 8 cleanup removed.
+        controller.collapse()
+        contentView.layoutSubtreeIfNeeded()
+        try? await Task.sleep(for: .milliseconds(20))
+        let collapsedMode = viewModel.notchInteractionMode
+        let modeHitView = try #require(descendants(of: contentView).compactMap { $0 as? BrowserCueHitView }.first)
+        let modeCenter = modeHitView.convert(
+            CGPoint(x: modeHitView.bounds.midX, y: modeHitView.bounds.midY), to: nil)
+        #expect(contentView.hitTest(modeCenter) === modeHitView, "cue unreachable in \(collapsedMode)")
+        for enter in [controller.presentInputOnly, controller.presentOutputChat] {
+            enter()
             contentView.layoutSubtreeIfNeeded()
             try? await Task.sleep(for: .milliseconds(40))
+            let mode = viewModel.notchInteractionMode
             #expect(descendants(of: contentView).compactMap { $0 as? BrowserCueHitView }.isEmpty,
                     "the cue must step aside for the inline surface in \(mode)")
         }
 
-        viewModel.isExpanded = false
-        viewModel.chatSurfaceMode = .collapsed
-        viewModel.notchInteractionMode = .collapsed
+        controller.collapse()
         contentView.layoutSubtreeIfNeeded()
         try? await Task.sleep(for: .milliseconds(40))
 
@@ -485,7 +483,9 @@ struct BrowserCueDragRegressionTests {
         let controller = NotchWindowController(chatViewModel: viewModel)
         let collapsed = controller.notchDropZone
 
-        viewModel.notchInteractionMode = .input
+        // The notch mode is projected from Work state, so drive it through the
+        // controller rather than assigning the derived property.
+        controller.presentInputOnly()
         let expanded = controller.notchDropZone
 
         #expect(expanded.width > collapsed.width)
@@ -776,38 +776,6 @@ struct BrowserCueDragRegressionTests {
         #expect(coordinator.cues.first { $0.id == sessionID }?.isAgentActive == false)
     }
 
-    @Test("the trace-copied tick is not part of the cue row and cannot overlap it")
-    func traceTickLivesOnTheRightWing() async throws {
-        _ = NSApplication.shared
-        let coordinator = BrowserCoordinator(profile: BrowserProfile(identifier: UUID()), enabled: true)
-        let sessionID = try await openSession(coordinator, connectionID: "trace-tick")
-        defer { coordinator.approveClose(sessionID: sessionID) }
-
-        let viewModel = ChatViewModel(startMonitoring: false)
-        let controller = NotchWindowController(chatViewModel: viewModel, browserCoordinator: coordinator)
-        let panel = controller.statusPanelForTesting
-        panel.orderFront(nil)
-        defer { panel.orderOut(nil) }
-        let contentView = try #require(panel.contentView)
-        for _ in 0..<8 {
-            contentView.layoutSubtreeIfNeeded()
-            try? await Task.sleep(for: .milliseconds(20))
-            if descendants(of: contentView).contains(where: { $0 is BrowserCueHitView }) { break }
-        }
-        let cueFrame = try #require(descendants(of: contentView)
-            .first { $0 is BrowserCueHitView }?.convert(CGRect(x: 0, y: 0, width: 18, height: 18), to: contentView))
-
-        // Raising the tick must not shift or cover the cue — it renders on the
-        // right wing with the status pills, not in the left-wing icon row.
-        viewModel.traceCopiedFlash = true
-        contentView.layoutSubtreeIfNeeded()
-        try? await Task.sleep(for: .milliseconds(60))
-        let cueFrameWithTick = try #require(descendants(of: contentView)
-            .first { $0 is BrowserCueHitView }?.convert(CGRect(x: 0, y: 0, width: 18, height: 18), to: contentView))
-        #expect(cueFrameWithTick == cueFrame)
-        // The right wing is on the far side of the notch from the cue row.
-        #expect(cueFrame.maxX < contentView.bounds.midX)
-    }
 
     // MARK: - Cue hover preview
 

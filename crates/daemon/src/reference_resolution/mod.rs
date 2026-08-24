@@ -26,9 +26,8 @@ pub(crate) use extraction::{
     MAX_SPAN_BYTES,
 };
 pub(crate) use mode::{
-    parse_resolver_mode, parse_resolver_mode_with_status, select_resolver_mode,
-    ParsedResolverMode, ResolverMode, ResolverModeParseStatus,
-    DEFAULT_RESOLVER_MODE, REFERENCE_RESOLVER_MODE_ENV,
+    parse_resolver_mode, parse_resolver_mode_with_status, select_resolver_mode, ParsedResolverMode,
+    ResolverMode, ResolverModeParseStatus, DEFAULT_RESOLVER_MODE, REFERENCE_RESOLVER_MODE_ENV,
 };
 pub(crate) use query::admit_provider_query;
 pub(crate) use query::normalize_public_url_for_adapter;

@@ -917,7 +917,10 @@ async fn main() -> Result<()> {
         .route("/web/tavily/status", get(tavily_status_handler))
         // Phase 11 — WhatsApp connector
         .route("/notifications/status", get(notifications_status_handler))
-        .route("/notifications/settings", post(notifications_settings_handler))
+        .route(
+            "/notifications/settings",
+            post(notifications_settings_handler),
+        )
         .route("/notifications/forget", post(notifications_forget_handler))
         .route("/whatsapp/status", get(whatsapp_status_handler))
         .route("/whatsapp/start", post(whatsapp_start_handler))

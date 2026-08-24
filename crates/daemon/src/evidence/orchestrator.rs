@@ -644,10 +644,8 @@ where
                                             result.contribution,
                                             EvidenceContribution::Satisfied
                                                 | EvidenceContribution::Partial
-                                        ) && evidence_has_same_nonempty_content(
-                                            prior_evidence,
-                                            evidence,
-                                        ))
+                                        ) && evidence_content_fingerprint(prior_evidence)
+                                            == evidence_content_fingerprint(evidence))
                                 })
                         });
                         if duplicate_source {
@@ -808,11 +806,6 @@ fn evidence_content_fingerprint(evidence: &WebFetchEvidence) -> String {
         .take(240)
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn evidence_has_same_nonempty_content(left: &WebFetchEvidence, right: &WebFetchEvidence) -> bool {
-    let left_fingerprint = evidence_content_fingerprint(left);
-    !left_fingerprint.is_empty() && left_fingerprint == evidence_content_fingerprint(right)
 }
 
 fn search_has_terminal_tavily_failure(search: Option<&OperationResult<WebSearchResult>>) -> bool {
@@ -3724,11 +3717,10 @@ mod tests {
             ],
         );
         let mut gate = EventRecordingGate::new();
-        let mut plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
+        let plan = EvidencePlanner::plan(EvidenceIntent::WebFact {
             query: "What is the current population of Bratislava?".into(),
             verification: VerificationLevel::Corroborated,
         });
-        plan.budget.web_search_attempts = 1;
 
         let _ = execute_web_plan(adapter, &mut gate, "turn-irrelevant", &plan, "en").await;
 

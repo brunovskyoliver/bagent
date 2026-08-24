@@ -1620,11 +1620,27 @@ fn session_and_automation_parent_deletes_cascade_resolver_rows() {
             [],
         )
         .unwrap();
+    // Stage 6 detached Automation Run history from the live Definition: deleting
+    // the Definition must leave the run, and therefore the resolver rows that
+    // belong to that retained history, intact.
     connection
         .execute(
             "DELETE FROM automations WHERE id='synthetic-automation'",
             [],
         )
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM reference_turns", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "resolver rows follow the retained Automation Run, not the deleted Definition"
+    );
+
+    // The run record is the actual parent: removing it cascades the resolver rows.
+    connection
+        .execute("DELETE FROM automation_runs WHERE id='synthetic-run'", [])
         .unwrap();
     assert_eq!(
         connection

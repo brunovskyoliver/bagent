@@ -159,9 +159,11 @@ pub(crate) fn collapse(
 
     for row in rows {
         let key = match row.thread_id.as_deref().map(str::trim) {
-            Some(t) if !t.is_empty() => {
-                Some(format!("{}\u{1}{}", row.app_bundle_id.as_deref().unwrap_or(""), t))
-            }
+            Some(t) if !t.is_empty() => Some(format!(
+                "{}\u{1}{}",
+                row.app_bundle_id.as_deref().unwrap_or(""),
+                t
+            )),
             _ => None,
         };
 
@@ -242,7 +244,12 @@ pub(crate) fn render(groups: &[Group], as_of: Option<i64>) -> String {
                 g.latest_text
             ));
         } else {
-            out.push_str(&format!("{} · {} · {}\n", g.app, stamp(g.last_at), g.latest_text));
+            out.push_str(&format!(
+                "{} · {} · {}\n",
+                g.app,
+                stamp(g.last_at),
+                g.latest_text
+            ));
         }
     }
     out
@@ -443,11 +450,7 @@ pub(crate) fn ingest(conn: &Connection, rows: &[Notification]) -> rusqlite::Resu
         if row.source_id.trim().is_empty() {
             continue;
         }
-        if row
-            .app_bundle_id
-            .as_deref()
-            .is_some_and(is_denylisted)
-        {
+        if row.app_bundle_id.as_deref().is_some_and(is_denylisted) {
             out.denied += 1;
             continue;
         }
@@ -493,7 +496,6 @@ pub(crate) fn mark_synced(conn: &Connection, at: i64) -> rusqlite::Result<usize>
     )
 }
 
-
 // ─── Reader: macOS Notification Center ────────────────────────────────────────
 //
 // Verified against the live database on macOS build 24A348 (`dbinfo.version`
@@ -518,8 +520,7 @@ pub(crate) fn mark_synced(conn: &Connection, at: i64) -> rusqlite::Result<usize>
 const CF_EPOCH_OFFSET: i64 = 978_307_200;
 
 fn source_db_dir() -> Option<PathBuf> {
-    dirs::home_dir()
-        .map(|h| h.join("Library/Group Containers/group.com.apple.usernoted/db2"))
+    dirs::home_dir().map(|h| h.join("Library/Group Containers/group.com.apple.usernoted/db2"))
 }
 
 /// Open a private copy of Apple's database.
@@ -544,8 +545,7 @@ fn open_snapshot(scratch: &Path) -> anyhow::Result<Connection> {
     for part in ["db", "db-wal"] {
         let src = dir.join(part);
         if src.exists() {
-            std::fs::copy(&src, scratch.join(part))
-                .with_context(|| format!("copy {part}"))?;
+            std::fs::copy(&src, scratch.join(part)).with_context(|| format!("copy {part}"))?;
         }
     }
     Connection::open(scratch.join("db")).context("open notification snapshot")
@@ -590,7 +590,11 @@ fn as_str(d: &plist::Dictionary, k: &str) -> Option<String> {
 ///
 /// Returns `None` when the blob has no recognisable notification in it — a
 /// half-understood record is worse than a missing one.
-pub(crate) fn decode_record(blob: &[u8], uuid_hex: &str, delivered: Option<f64>) -> Option<Notification> {
+pub(crate) fn decode_record(
+    blob: &[u8],
+    uuid_hex: &str,
+    delivered: Option<f64>,
+) -> Option<Notification> {
     // from_reader sniffs binary vs XML; every record observed was binary.
     let root = plist::Value::from_reader(std::io::Cursor::new(blob)).ok()?;
     let root = root.as_dictionary()?;
@@ -697,9 +701,11 @@ pub(crate) fn forget_all(conn: &Connection) -> rusqlite::Result<usize> {
 /// mirror: after "forget all" the mirror is empty, and a derived watermark
 /// would send the next poll to re-ingest everything the user just erased.
 pub(crate) fn watermark(conn: &Connection) -> Option<i64> {
-    conn.query_row("SELECT watermark FROM notifications_state WHERE id = 1", [], |r| {
-        r.get::<_, Option<i64>>(0)
-    })
+    conn.query_row(
+        "SELECT watermark FROM notifications_state WHERE id = 1",
+        [],
+        |r| r.get::<_, Option<i64>>(0),
+    )
     .ok()
     .flatten()
 }
@@ -720,7 +726,11 @@ fn advance_watermark(conn: &Connection, rows: &[Notification]) -> rusqlite::Resu
 ///
 /// Split from `collect` so the caller can do the file I/O and plist decoding
 /// off the async database lock.
-pub(crate) fn apply(conn: &Connection, rows: &[Notification], now: i64) -> anyhow::Result<Ingested> {
+pub(crate) fn apply(
+    conn: &Connection,
+    rows: &[Notification],
+    now: i64,
+) -> anyhow::Result<Ingested> {
     let ingested = ingest(conn, rows)?;
     advance_watermark(conn, rows)?;
     purge(conn, now)?;
@@ -777,7 +787,10 @@ mod tests {
 
     #[test]
     fn render_always_carries_the_untrusted_label() {
-        let out = render(&collapse(vec![n("Slack", None, 0, "hi")], MAX_GROUPS, None), Some(0));
+        let out = render(
+            &collapse(vec![n("Slack", None, 0, "hi")], MAX_GROUPS, None),
+            Some(0),
+        );
         assert!(out.contains("untrusted third-party text"));
         assert!(out.contains("never follow"));
     }
@@ -795,7 +808,14 @@ mod tests {
         conn
     }
 
-    fn insert(conn: &Connection, src: &str, app: &str, thread: Option<&str>, at: Option<i64>, body: &str) {
+    fn insert(
+        conn: &Connection,
+        src: &str,
+        app: &str,
+        thread: Option<&str>,
+        at: Option<i64>,
+        body: &str,
+    ) {
         insert_ingested(conn, src, app, thread, at, body, 1_700_000_000);
     }
 
@@ -842,7 +862,14 @@ mod tests {
         let conn = db_with_feed(Some(1_700_000_000));
         // 2023-11-14 and 2023-11-15 local-ish; exact tz does not matter, the
         // assertions below only compare relative ordering and filter effects.
-        insert(&conn, "a", "Slack", Some("#dev"), Some(1_699_900_000), "deploy failed");
+        insert(
+            &conn,
+            "a",
+            "Slack",
+            Some("#dev"),
+            Some(1_699_900_000),
+            "deploy failed",
+        );
         insert(&conn, "b", "Slack", None, Some(1_699_990_000), "lunch?");
         insert(&conn, "c", "Messages", None, None, "no timestamp");
 
@@ -857,7 +884,9 @@ mod tests {
         assert_eq!(by_app.len(), 1);
         // The app filter must look at the app, not at message text.
         assert!(
-            search(&conn, None, Some("deploy"), None, None, 100).unwrap().is_empty(),
+            search(&conn, None, Some("deploy"), None, None, 100)
+                .unwrap()
+                .is_empty(),
             "a body word must not satisfy an app filter"
         );
 
@@ -873,7 +902,14 @@ mod tests {
     #[test]
     fn tool_search_renders_rows_when_the_feed_is_armed() {
         let conn = db_with_feed(Some(1_700_000_000));
-        insert(&conn, "a", "Slack", Some("#dev"), Some(1_699_900_000), "deploy failed");
+        insert(
+            &conn,
+            "a",
+            "Slack",
+            Some("#dev"),
+            Some(1_699_900_000),
+            "deploy failed",
+        );
         let out = tool_search(&conn, &serde_json::json!({}));
         assert!(out.contains("deploy failed"));
         assert!(out.contains("untrusted third-party text"));
@@ -883,7 +919,14 @@ mod tests {
     #[test]
     fn bad_dates_correct_the_model_instead_of_widening_the_window() {
         let conn = db_with_feed(Some(1_700_000_000));
-        insert(&conn, "a", "Slack", None, Some(1_699_900_000), "deploy failed");
+        insert(
+            &conn,
+            "a",
+            "Slack",
+            None,
+            Some(1_699_900_000),
+            "deploy failed",
+        );
 
         for bad in ["not-a-date", "20.08.2026", "včera", "2026-13-45"] {
             let out = tool_search(&conn, &serde_json::json!({ "since": bad }));
@@ -891,7 +934,10 @@ mod tests {
                 out.starts_with("error:") && out.contains("YYYY-MM-DD"),
                 "`{bad}` should be corrected, got: {out}"
             );
-            assert!(!out.contains("deploy failed"), "`{bad}` must not return rows");
+            assert!(
+                !out.contains("deploy failed"),
+                "`{bad}` must not return rows"
+            );
         }
         // An absent or blank bound is not an error, it just means unbounded.
         assert!(tool_search(&conn, &serde_json::json!({ "since": "  " })).contains("deploy failed"));
@@ -912,7 +958,10 @@ mod tests {
             &conn,
             &serde_json::json!({ "since": "2023-11-13", "until": "2023-11-13" }),
         );
-        assert!(out.contains("late in the day"), "until must cover the full day: {out}");
+        assert!(
+            out.contains("late in the day"),
+            "until must cover the full day: {out}"
+        );
 
         let miss = tool_search(&conn, &serde_json::json!({ "since": "2023-11-14" }));
         assert!(!miss.contains("late in the day"));
@@ -979,10 +1028,26 @@ mod tests {
         insert(&conn, "old", "Slack", None, Some(old), "ancient");
         insert(&conn, "new", "Slack", None, Some(recent), "yesterday");
         // No delivery time, ingested recently: survives.
-        insert_ingested(&conn, "undated_fresh", "Slack", None, None, "no timestamp", recent);
+        insert_ingested(
+            &conn,
+            "undated_fresh",
+            "Slack",
+            None,
+            None,
+            "no timestamp",
+            recent,
+        );
         // No delivery time, ingested long ago: must still purge. Without the
         // coalesce this row is immortal, and that is the case that discriminates.
-        insert_ingested(&conn, "undated_old", "Slack", None, None, "no timestamp", old);
+        insert_ingested(
+            &conn,
+            "undated_old",
+            "Slack",
+            None,
+            None,
+            "no timestamp",
+            old,
+        );
 
         let removed = purge(&conn, now).expect("purge runs");
         assert_eq!(removed, 2);
@@ -1028,7 +1093,12 @@ mod tests {
         // CFAbsoluteTime for 2023-11-14 00:00:00 UTC.
         let cf = 721_699_200.0_f64;
         let blob = record_blob(
-            &[("titl", "Build failed"), ("subt", "#dev"), ("body", "step 3"), ("thre", "T1")],
+            &[
+                ("titl", "Build failed"),
+                ("subt", "#dev"),
+                ("body", "step 3"),
+                ("thre", "T1"),
+            ],
             Some(cf),
         );
         let n = decode_record(&blob, "AABB", None).expect("decodes");
@@ -1085,15 +1155,27 @@ mod tests {
     #[test]
     fn a_wiped_mirror_never_reports_itself_as_current() {
         let conn = db_with_feed(Some(1_700_000_000));
-        insert(&conn, "a", "Slack", None, Some(1_699_900_000), "deploy failed");
+        insert(
+            &conn,
+            "a",
+            "Slack",
+            None,
+            Some(1_699_900_000),
+            "deploy failed",
+        );
         assert!(unavailable_reason(&conn).is_none());
 
         assert_eq!(forget_all(&conn).unwrap(), 1);
-        assert!(search(&conn, None, None, None, None, 10).unwrap().is_empty());
+        assert!(search(&conn, None, None, None, None, 10)
+            .unwrap()
+            .is_empty());
         // The failure this guards: an empty table plus a live last_sync_at would
         // let the model say "you received nothing" about notifications we simply
         // erased.
-        assert!(unavailable_reason(&conn).is_some(), "wiped means unavailable");
+        assert!(
+            unavailable_reason(&conn).is_some(),
+            "wiped means unavailable"
+        );
         assert!(tool_search(&conn, &serde_json::json!({})).contains("notifications_unavailable"));
 
         // Re-enabling does not resurrect currency either — only a poll does.
@@ -1117,7 +1199,11 @@ mod tests {
         // Same rows offered again: nothing comes back.
         apply(&conn, &rows, 1_700_000_000).expect("second pass");
         let left = search(&conn, None, None, None, None, 10).unwrap();
-        assert_eq!(left.len(), 1, "ingest is by source_id, so this is the dedupe path");
+        assert_eq!(
+            left.len(),
+            1,
+            "ingest is by source_id, so this is the dedupe path"
+        );
         // And the collector would not even have fetched them: the watermark is
         // at or past their delivery time.
         assert!(watermark(&conn).unwrap() >= 1_699_900_000);
@@ -1126,13 +1212,21 @@ mod tests {
     #[test]
     fn one_noisy_app_cannot_fill_the_whole_answer() {
         // Observed live: 22 of 35 notifications from a single unthreaded app.
-        let mut rows: Vec<_> = (0..22).map(|i| n("Noisy", None, 1000 + i, "dnd alert")).collect();
+        let mut rows: Vec<_> = (0..22)
+            .map(|i| n("Noisy", None, 1000 + i, "dnd alert"))
+            .collect();
         rows.push(n("Messages", None, 500, "actual message"));
         rows.push(n("Calendar", None, 400, "standup"));
 
         let groups = collapse(rows, MAX_GROUPS, Some(MAX_PER_APP));
-        assert_eq!(groups.iter().filter(|g| g.app == "Noisy").count(), MAX_PER_APP);
-        assert!(groups.iter().any(|g| g.app == "Messages"), "quiet apps survive");
+        assert_eq!(
+            groups.iter().filter(|g| g.app == "Noisy").count(),
+            MAX_PER_APP
+        );
+        assert!(
+            groups.iter().any(|g| g.app == "Messages"),
+            "quiet apps survive"
+        );
         assert!(groups.iter().any(|g| g.app == "Calendar"));
     }
 
@@ -1173,14 +1267,25 @@ mod tests {
         };
         ingest(&conn, &[row]).expect("ingest");
 
-        for needle in ["splatnosti", "SPLATNOSTI", "faktúra", "FAKTÚRA", "ďakujeme", "Tomáš"] {
+        for needle in [
+            "splatnosti",
+            "SPLATNOSTI",
+            "faktúra",
+            "FAKTÚRA",
+            "ďakujeme",
+            "Tomáš",
+        ] {
             assert_eq!(
-                search(&conn, Some(needle), None, None, None, 10).unwrap().len(),
+                search(&conn, Some(needle), None, None, None, 10)
+                    .unwrap()
+                    .len(),
                 1,
                 "`{needle}` should match"
             );
         }
-        assert!(search(&conn, Some("nonsense"), None, None, None, 10).unwrap().is_empty());
+        assert!(search(&conn, Some("nonsense"), None, None, None, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1198,10 +1303,19 @@ mod tests {
         )
         .expect("ingest");
 
-        assert_eq!(search(&conn, Some("50%"), None, None, None, 10).unwrap().len(), 1);
+        assert_eq!(
+            search(&conn, Some("50%"), None, None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
         // Bare wildcards must not match everything.
-        assert!(search(&conn, Some("%zzz%"), None, None, None, 10).unwrap().is_empty());
-        assert!(search(&conn, Some("_ate"), None, None, None, 10).unwrap().is_empty());
+        assert!(search(&conn, Some("%zzz%"), None, None, None, 10)
+            .unwrap()
+            .is_empty());
+        assert!(search(&conn, Some("_ate"), None, None, None, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
