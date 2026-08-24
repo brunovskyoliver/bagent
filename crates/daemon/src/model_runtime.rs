@@ -754,7 +754,35 @@ impl ModelRuntimeAdapter for ProductionBaseRtAdapter {
                     }
                 }
             }
+            // An externally managed BaseRT is not ours to restart: the endpoint is
+            // supplied by the caller and is not the managed port-8082 service.
+            // Unloading every weight is the equivalent clean boundary here, and
+            // refusing outright would poison the runtime for later demands.
+            RuntimeAction::Restart if self.externally_managed => {
+                if !self.client.is_up().await {
+                    return Err(anyhow!("external BaseRT fixture is unavailable"));
+                }
+                for class in [ModelClass::Chat4B, ModelClass::Synthesis35B] {
+                    let (id, _) = self.config.model(class);
+                    if self
+                        .client
+                        .model_readiness(id)
+                        .await
+                        .map(|readiness| readiness.loaded)
+                        .unwrap_or(false)
+                    {
+                        self.client.unload_model(id).await?;
+                    }
+                }
+            }
             RuntimeAction::Restart => self.restart_managed().await?,
+            // The external fixture has no PID of ours to change; readiness of the
+            // caller-supplied endpoint is the whole contract.
+            RuntimeAction::VerifyHealthyChangedPid if self.externally_managed => {
+                if !self.client.is_up().await {
+                    return Err(anyhow!("external BaseRT fixture is unavailable"));
+                }
+            }
             RuntimeAction::VerifyHealthyChangedPid => {
                 let proof = *self.restart_pids.lock().await;
                 let (previous, current) =
@@ -1926,5 +1954,32 @@ impl Drop for DispatchedDemand {
         if !self.settled {
             self.mark_indeterminate(RuntimeFault::IndeterminateTimeout);
         }
+    }
+}
+
+#[cfg(test)]
+mod external_restart_tests {
+    /// An externally managed BaseRT is supplied by the caller and is not the
+    /// managed port-8082 service, so a clean-boundary restart must not be
+    /// attempted against it. Refusing outright left the runtime poisoned and
+    /// failed every later demand with the port restriction, which took down
+    /// automations that only needed the 4B chat model.
+    #[test]
+    fn external_runtime_restart_is_not_refused_by_the_managed_port_guard() {
+        let source = include_str!("model_runtime.rs");
+        let guard = source
+            .find("RuntimeAction::Restart if self.externally_managed =>")
+            .expect("external runtimes must handle Restart before the managed path");
+        let managed = source
+            .find("RuntimeAction::Restart => self.restart_managed().await?,")
+            .expect("managed restart arm must still exist");
+        assert!(
+            guard < managed,
+            "the externally-managed arm must precede the managed restart arm"
+        );
+        let verify = source
+            .find("RuntimeAction::VerifyHealthyChangedPid if self.externally_managed =>")
+            .expect("external runtimes must not require a changed managed PID");
+        assert!(verify > guard);
     }
 }
