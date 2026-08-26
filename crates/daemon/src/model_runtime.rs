@@ -622,7 +622,12 @@ impl ProductionBaseRtAdapter {
             "--idle-timeout".into(),
             "0".into(),
             "--max-context".into(),
-            "4096".into(),
+            // Stage 8 acceptance config (docs/STAGE8_EVIDENCE_ACCEPTANCE.md).
+            // 4096 is too small for the tool-schema-heavy chat prompt
+            // (~3k tokens) plus max_tokens=2048 — BaseRT degrades under the
+            // pressure and serves prompts with the tool section stripped,
+            // which makes the model narrate tool use instead of calling it.
+            "16384".into(),
             "--kv-bits".into(),
             "4".into(),
             "--max-tokens".into(),

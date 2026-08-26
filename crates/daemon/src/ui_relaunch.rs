@@ -8,6 +8,13 @@ use uuid::Uuid;
 
 pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the recorded active consumer may stay silent before another UI
+/// process may adopt the authority. The notch event monitor polls at ~1 Hz,
+/// so silence beyond this window means the consumer died without a relaunch
+/// handoff (force quit, crash, kill) — without adoption the replacement UI
+/// would be locked out of /work/snapshot and /work/events forever.
+const CONSUMER_ADOPTION_TIMEOUT: Duration = Duration::from_secs(20);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TransferPhase {
     Reserved,
@@ -84,6 +91,9 @@ struct PersistedUiConsumerAuthority {
 pub struct UiConsumerAuthority {
     active_fence: Option<String>,
     pending: Option<PendingTransfer>,
+    /// Last time the active fence presented itself to the daemon. In-memory
+    /// only: a daemon restart re-arms the grace window.
+    active_last_seen: Option<Instant>,
 }
 
 impl UiConsumerAuthority {
@@ -98,8 +108,12 @@ impl UiConsumerAuthority {
         let saved = serde_json::from_slice::<PersistedUiConsumerAuthority>(&data)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let now_unix_ms = unix_millis(SystemTime::now());
+        let restored_active = saved.active_fence;
         Ok(Self {
-            active_fence: saved.active_fence,
+            active_fence: restored_active.clone(),
+            // Assume the persisted consumer was alive at daemon start; the
+            // grace window re-arms from now.
+            active_last_seen: restored_active.map(|_| now),
             pending: saved.pending.map(|pending| PendingTransfer {
                 identity: pending.identity,
                 old_fence: pending.old_fence,
@@ -165,6 +179,7 @@ impl UiConsumerAuthority {
                     TransferPhase::Reserved | TransferPhase::Ready
                 )
             {
+                self.active_last_seen = Some(now);
                 return Ok(());
             }
             if fence == pending.replacement_fence
@@ -178,11 +193,48 @@ impl UiConsumerAuthority {
             return Err(UiConsumerTransferError::StaleConsumer);
         }
         match self.active_fence.as_deref() {
-            None => self.active_fence = Some(fence.to_owned()),
-            Some(active) if active == fence => {}
+            None => {
+                self.active_fence = Some(fence.to_owned());
+                self.active_last_seen = Some(now);
+            }
+            Some(active) if active == fence => self.active_last_seen = Some(now),
+            Some(_) if self.can_adopt(fence, now) => self.adopt(fence, now),
             Some(_) => return Err(UiConsumerTransferError::StaleConsumer),
         }
         Ok(())
+    }
+
+    /// Authorizes a live-consumer request (`/work/events`, attention acks).
+    /// A matching fence has its liveness refreshed; a silent active consumer
+    /// past the adoption window is replaced by the requester, so a UI that
+    /// was killed without a relaunch handoff cannot lock out its successor.
+    pub fn authorize_consumer(&mut self, fence: &str, now: Instant) -> bool {
+        self.expire(now);
+        match self.active_fence.as_deref() {
+            Some(active) if active == fence => {
+                self.active_last_seen = Some(now);
+                true
+            }
+            Some(_) if self.pending.is_none() && self.can_adopt(fence, now) => {
+                self.adopt(fence, now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn can_adopt(&self, fence: &str, now: Instant) -> bool {
+        self.active_fence
+            .as_deref()
+            .is_some_and(|active| active != fence)
+            && self
+                .active_last_seen
+                .is_some_and(|seen| now.duration_since(seen) >= CONSUMER_ADOPTION_TIMEOUT)
+    }
+
+    fn adopt(&mut self, fence: &str, now: Instant) {
+        self.active_fence = Some(fence.to_owned());
+        self.active_last_seen = Some(now);
     }
 
     pub fn reserve(
@@ -288,6 +340,9 @@ impl UiConsumerAuthority {
             pending.replacement_fence.clone()
         };
         self.active_fence = Some(replacement_fence);
+        // The replacement has not polled yet; re-arm its grace window so a
+        // bystander fence cannot adopt the just-activated authority.
+        self.active_last_seen = Some(now);
         Ok(())
     }
 
@@ -643,6 +698,59 @@ mod tests {
         assert_eq!(
             authority.fence_old("handoff", "old", start),
             Err(UiConsumerTransferError::NotReady)
+        );
+    }
+
+    #[test]
+    fn silent_active_consumer_is_adopted_by_new_ui() {
+        let start = Instant::now();
+        let mut authority = UiConsumerAuthority::default();
+        authority.claim_snapshot("dead", start).unwrap();
+
+        // Within the grace window a successor is still locked out.
+        assert!(!authority.authorize_consumer("successor", start + Duration::from_secs(5)));
+        assert_eq!(
+            authority.claim_snapshot("successor", start + Duration::from_secs(5)),
+            Err(UiConsumerTransferError::StaleConsumer)
+        );
+
+        // Once the dead consumer's silence exceeds the window, the
+        // successor takes over and live requests are authorized.
+        let later = start + CONSUMER_ADOPTION_TIMEOUT;
+        assert!(authority.authorize_consumer("successor", later));
+        assert_eq!(authority.active_fence(later), Some("successor".into()));
+        assert!(authority.claim_snapshot("successor", later).is_ok());
+    }
+
+    #[test]
+    fn polling_keeps_the_authority_with_its_owner() {
+        let start = Instant::now();
+        let mut authority = UiConsumerAuthority::default();
+        authority.claim_snapshot("live", start).unwrap();
+        // The owner keeps polling; each poll refreshes the lease.
+        for seconds in [1, 5, 10, 15, 19] {
+            assert!(authority.authorize_consumer("live", start + Duration::from_secs(seconds)));
+        }
+        // A bystander never adopts while the owner stays fresh.
+        let late = start + Duration::from_secs(40);
+        assert!(authority.authorize_consumer("live", late));
+        let very_late = late + CONSUMER_ADOPTION_TIMEOUT - Duration::from_secs(5);
+        assert!(!authority.authorize_consumer("bystander", very_late));
+        assert_eq!(authority.active_fence(very_late), Some("live".into()));
+    }
+
+    #[test]
+    fn adoption_never_interrupts_a_pending_transfer() {
+        let start = Instant::now();
+        let mut authority = UiConsumerAuthority::default();
+        authority.claim_snapshot("old", start).unwrap();
+        authority.reserve("handoff", "old", "new", start).unwrap();
+        // Old consumer goes silent mid-transfer; a third fence must wait.
+        let late = start + CONSUMER_ADOPTION_TIMEOUT;
+        assert!(!authority.authorize_consumer("bystander", late));
+        assert_eq!(
+            authority.claim_snapshot("bystander", late),
+            Err(UiConsumerTransferError::StaleConsumer)
         );
     }
 }

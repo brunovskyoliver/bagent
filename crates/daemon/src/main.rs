@@ -2172,9 +2172,8 @@ async fn acknowledge_work_attention(
     Json(request): Json<AcknowledgeWorkAttentionRequest>,
 ) -> impl IntoResponse {
     let mut authority = state.ui_consumer_authority.lock().await;
-    let fence_matches = authority
-        .active_fence(std::time::Instant::now())
-        .is_some_and(|active| active == request.consumer_fence);
+    let fence_matches =
+        authority.authorize_consumer(&request.consumer_fence, std::time::Instant::now());
     persist_ui_consumer_authority(&state, &authority);
     if !fence_matches {
         return (
@@ -2277,9 +2276,8 @@ async fn work_events(
     Query(query): Query<WorkEventsQuery>,
 ) -> impl IntoResponse {
     let mut authority = state.ui_consumer_authority.lock().await;
-    let fence_matches = authority
-        .active_fence(std::time::Instant::now())
-        .is_some_and(|active| active == query.consumer_fence);
+    let fence_matches =
+        authority.authorize_consumer(&query.consumer_fence, std::time::Instant::now());
     persist_ui_consumer_authority(&state, &authority);
     if !fence_matches {
         return (

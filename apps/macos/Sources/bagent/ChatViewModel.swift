@@ -191,12 +191,17 @@ struct TurnActivity: Identifiable, Equatable {
 
 enum AgentStatus {
     case ready, thinking, awaitingApproval
+    case loading, failed, partial, unread
 
     var color: Color {
         switch self {
         case .ready:            return Color(red: 0.18, green: 0.80, blue: 0.44)
         case .thinking:         return Color(red: 0.20, green: 0.60, blue: 1.00)
         case .awaitingApproval: return Color(red: 1.00, green: 0.78, blue: 0.15)
+        case .loading:          return .cyan
+        case .failed:           return .red
+        case .partial:          return .orange
+        case .unread:           return .blue
         }
     }
 
@@ -205,6 +210,10 @@ enum AgentStatus {
         case .ready:            return "Pripravený"
         case .thinking:         return "Spracováva"
         case .awaitingApproval: return "Čaká na schválenie"
+        case .loading:          return "Načítava model"
+        case .failed:           return "Zlyhalo"
+        case .partial:          return "Čiastočný výsledok"
+        case .unread:           return "Neprečítaný výsledok"
         }
     }
 }
@@ -423,6 +432,25 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var restoredValidatedSources: [DaemonClient.CurrentChatAvailability] = []
     @Published private(set) var restoredConnectorReferences: [DaemonClient.CurrentChatAvailability] = []
     @Published private(set) var restoredApprovalPresentations: [DaemonClient.CompletedApprovalPresentation] = []
+
+    /// Connector references survive a daemon restart for provenance, but an
+    /// unavailable reference is historical state rather than pending input.
+    /// Keep it in `restoredConnectorReferences` for callers that need the full
+    /// snapshot, while keeping stale warnings out of the composer.
+    var restoredDisplayableConnectorReferences: [DaemonClient.CurrentChatAvailability] {
+        var displayedKinds = Set<String>()
+        var references: [DaemonClient.CurrentChatAvailability] = []
+        for reference in restoredConnectorReferences
+            where reference.availability == "available"
+        {
+            // The composer represents a connector kind, not every individual
+            // message read from that connector. Search plus read can otherwise
+            // leave several identical `mail` icons at the bottom of the view.
+            guard displayedKinds.insert(reference.label).inserted else { continue }
+            references.append(reference)
+        }
+        return references
+    }
     /// True while uploading a file to the daemon.
     @Published var isUploadingAttachment = false
     @Published var streamingAssistantMessageId: UUID? = nil
@@ -1227,6 +1255,11 @@ final class ChatViewModel: ObservableObject {
     var agentStatus: AgentStatus {
         if notchPresentation.pendingApprovalIdentity != nil { return .awaitingApproval }
         if notchPresentation.hasActiveForegroundWork { return .thinking }
+        let works = notchPresentation.snapshot.works
+        if works.contains(where: { $0.terminalAttention == .failed }) { return .failed }
+        if works.contains(where: { $0.terminalAttention == .partial }) { return .partial }
+        if works.contains(where: { $0.terminalAttention == .unread }) { return .unread }
+        if notchPresentation.snapshot.model.isTransitioning { return .loading }
         return .ready
     }
 
@@ -1988,6 +2021,28 @@ final class ChatViewModel: ObservableObject {
     }
 
     func restoreCurrentChat(preservingActivePresentation: Bool = false) async {
+        // On a fresh launch the daemon may still be binding its listener
+        // (stale port file, restart race). A single failed attempt must not
+        // leave Current Chat permanently unloaded — without a snapshot every
+        // submission is rejected with "Current Chat is still loading" and
+        // nothing else re-triggers the restore.
+        let attempts = currentChatSnapshot == nil ? 6 : 1
+        for attempt in 0..<attempts {
+            do {
+                try await restoreCurrentChatOnce(
+                    preservingActivePresentation: preservingActivePresentation)
+                return
+            } catch {
+                guard currentChatSnapshot == nil, attempt + 1 < attempts else { break }
+                try? await Task.sleep(for: .milliseconds(400 * (attempt + 1)))
+            }
+        }
+        if currentChatSnapshot == nil {
+            slashCommandError = String(localized: "currentChat.restore.failure", defaultValue: "Current Chat could not be restored")
+        }
+    }
+
+    private func restoreCurrentChatOnce(preservingActivePresentation: Bool) async throws {
         do {
             let snapshot = try await client.currentChat()
             var restoredPending: [ChatAttachment] = []
@@ -2004,10 +2059,6 @@ final class ChatViewModel: ObservableObject {
                 restoreCaretAtEnd: !preservingActivePresentation)
             pendingAttachments = restoredPending
             restoredPendingAttachmentReferences = restoredPending.map(\.id)
-        } catch {
-            if currentChatSnapshot == nil {
-                slashCommandError = String(localized: "currentChat.restore.failure", defaultValue: "Current Chat could not be restored")
-            }
         }
     }
 
@@ -2182,6 +2233,7 @@ final class ChatViewModel: ObservableObject {
     func requestCurrentChatClear() {
         guard currentChatSnapshot != nil else {
             slashCommandError = String(localized: "currentChat.loading", defaultValue: "Current Chat is still loading")
+            Task { await restoreCurrentChat() }
             return
         }
         guard !notchPresentation.hasActiveForegroundWork, authoritativePendingApproval == nil else {
@@ -2344,6 +2396,7 @@ final class ChatViewModel: ObservableObject {
         let wasInputOnly = notchInteractionMode == .input
         guard let currentChatSnapshot else {
             slashCommandError = String(localized: "currentChat.loading", defaultValue: "Current Chat is still loading")
+            Task { await restoreCurrentChat() }
             return
         }
         let submissionSnapshot = currentChatSnapshot
@@ -2594,7 +2647,13 @@ final class ChatViewModel: ObservableObject {
                         }
                     }
                 } catch NotchEventTransportError.consumerFenced {
-                    return
+                    // The daemon rejects consumers it does not (yet) trust:
+                    // while its adoption grace window elapses after a dead
+                    // owner, or during a relaunch transfer. Retrying lets
+                    // this consumer adopt once the window passes; during a
+                    // genuine takeover the takeover flow terminates this
+                    // process, so spinning here is safe.
+                    try? await Task.sleep(for: .seconds(2))
                 } catch {
                     notchEventConsumer.invalidateConsumerFence()
                 }

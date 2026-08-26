@@ -107,6 +107,8 @@ impl EvidenceIntentClassifier {
                 "read",
                 "what is in",
                 "what's in",
+                "what was",
+                "what did",
                 "summar",
                 "precitaj",
                 "zhrn",
@@ -272,6 +274,36 @@ fn is_singular_mail(normalized: &str) -> bool {
 }
 
 fn targeted_query(original: &str, normalized: &str) -> Option<String> {
+    // Natural-language requests often put the sender/topic before the noun:
+    // “what was the Flixbus email about?” The older marker-only extraction
+    // handled “email from Flixbus” but left this common form in the legacy
+    // model loop, where the small model could repeatedly list the inbox.
+    for (prefix, suffix) in [
+        ("what was the ", " email about"),
+        ("what was ", " email about"),
+        ("what did the ", " email say"),
+        ("what did ", " email say"),
+        ("what was the ", " mail about"),
+        ("what was ", " mail about"),
+        ("what did the ", " mail say"),
+        ("what did ", " mail say"),
+    ] {
+        let Some(start) = normalized.find(prefix) else {
+            continue;
+        };
+        let query_start = start + prefix.len();
+        let Some(relative_end) = normalized[query_start..].find(suffix) else {
+            continue;
+        };
+        let query = normalized[query_start..query_start + relative_end]
+            .trim()
+            .trim_start_matches("the ")
+            .trim();
+        if !query.is_empty() {
+            return Some(query.to_string());
+        }
+    }
+
     let markers = [
         " from ",
         " od ",

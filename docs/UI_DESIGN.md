@@ -65,11 +65,19 @@ Two animatable inputs drive `NotchWrapShape`: `wingWidth` and `bridgeHeight`
 the notch is doing. There are no parallel `isExpanded` / `isInputShowing` flags —
 they were removed; do not reintroduce them.
 
+While a turn runs (`.thinking`) the notch does **not** expand: it keeps its idle
+geometry and the pulsing blue status dot on the right wing signals the work.
+The expanded stage-rail surface returns with the first streamed token
+(`.output`). Collapsed state is carried **only** by compact right-wing dots
+(blue thinking, cyan model loading, red/orange/blue failed/partial/unread,
+amber approval) — no expanded text capsules; steady state (`RESIDENT`, ready)
+is a pure black notch.
+
 | Mode | Entered by | Shows |
 |---|---|---|
 | `.collapsed` | `collapse()`, Esc, click-away | nothing (black notch) |
 | `.input` | `⌥Space` / pill tap → `presentInputOnly()` | text field + source bubbles |
-| `.thinking` | submit → `collapseInputForThinking()` | thinking indicator |
+| `.thinking` | submit → `collapseInputForThinking()` | collapsed notch + pulsing blue status dot on the right wing |
 | `.output` | first assistant token → `presentOutputChat()` | streamed response |
 | `.settings` | `/settings` → `openNotchSettings()` | settings pages |
 | `.automations` | `/automations` → `openAutomations()` | automation list / detail / step editor |

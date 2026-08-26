@@ -649,6 +649,10 @@ fn route_tools_for_turn(
     let normalized = user_message.to_lowercase();
     let tokens = routing_tokens(&normalized);
     let mentions_mail = routing_tokens_mention_mail(&tokens);
+    let targeted_query = match EvidenceIntentClassifier.classify(user_message) {
+        Classification::Recognized(EvidenceIntent::MailTargeted { query, .. }) => Some(query),
+        _ => None,
+    };
     let asks_to_access_mail = tokens.iter().any(|token| {
         matches!(
             *token,
@@ -675,25 +679,46 @@ fn route_tools_for_turn(
             "note" | "notes" | "file" | "files" | "document" | "documents" | "odoo" | "whatsapp"
         )
     });
-    if !mentions_mail || !asks_to_access_mail || composition_intent || mixed_source_intent {
+    if !mentions_mail
+        || (!asks_to_access_mail && targeted_query.is_none())
+        || composition_intent
+        || mixed_source_intent
+    {
         return (tools, None);
     }
 
     let mail_tools: Vec<ToolDef> = tools
         .into_iter()
-        .filter(|tool| tool.function.name.starts_with("mail_"))
+        .filter(|tool| {
+            if targeted_query.is_some() {
+                matches!(tool.function.name.as_str(), "mail_search" | "mail_read")
+            } else {
+                tool.function.name.starts_with("mail_")
+            }
+        })
         .collect();
     if mail_tools.is_empty() {
         return (mail_tools, None);
     }
 
-    let guidance = Message::system(
-        "You can access the user's local Mail.app through the provided mail tools. \
-         For requests about recent or last emails, call mail_list_inbox first, then \
-         call mail_read for the returned messages needed for an accurate summary. \
-         Use the tool results to answer. Do not claim that you lack email access \
-         while these tools are available.",
-    );
+    let guidance = if let Some(query) = targeted_query {
+        let encoded_query = serde_json::to_string(&query).unwrap_or_else(|_| "\"\"".into());
+        Message::system(format!(
+            "You can access the user's local Mail.app through the provided mail tools. \
+             This is a targeted request. Do not list the whole inbox or guess. Immediately \
+             call mail_search with the exact user-provided search term {encoded_query}, then \
+             call mail_read for the matching rowid before answering. Use only the tool results \
+             to answer and do not claim that you lack email access while these tools are available."
+        ))
+    } else {
+        Message::system(
+            "You can access the user's local Mail.app through the provided mail tools. \
+             For requests about recent or last emails, call mail_list_inbox first, then \
+             call mail_read for the returned messages needed for an accurate summary. \
+             Use the tool results to answer. Do not claim that you lack email access \
+             while these tools are available.",
+        )
+    };
     (mail_tools, Some(guidance))
 }
 
@@ -794,6 +819,15 @@ fn routed_evidence_intent(enabled: bool, user_message: &str) -> Option<EvidenceI
 }
 
 fn request_requires_legacy_routing(intent: &EvidenceIntent, user_message: &str) -> bool {
+    if matches!(intent, EvidenceIntent::MailTargeted { .. }) {
+        let normalized = user_message.to_lowercase();
+        // A targeted phrase is safe to execute deterministically only when it
+        // contains one mail request. Conjunctions can hide a second source or
+        // an ambiguity that needs the legacy clarification path.
+        return normalized.contains(" or ")
+            || normalized.contains(" and ")
+            || normalized.contains(" online");
+    }
     let base_intent = production_evidence_intent(intent);
     if matches!(intent, EvidenceIntent::AnalyzeQuotedEvidence { .. }) {
         return match base_intent {
@@ -817,10 +851,8 @@ fn request_requires_legacy_routing(intent: &EvidenceIntent, user_message: &str) 
             !is_supported_direct_page_request(user_message, url.as_str(), false)
         }
         Some(EvidenceIntent::WebFact { .. }) => !is_supported_web_fact_request(user_message, false),
-        Some(
-            EvidenceIntent::AnalyzeQuotedEvidence { .. } | EvidenceIntent::MailTargeted { .. },
-        )
-        | None => true,
+        Some(EvidenceIntent::MailTargeted { .. }) => false,
+        Some(EvidenceIntent::AnalyzeQuotedEvidence { .. }) | None => true,
     }
 }
 
@@ -1606,10 +1638,10 @@ fn production_evidence_intent(intent: &EvidenceIntent) -> Option<&EvidenceIntent
     match intent {
         supported @ (EvidenceIntent::MailLatestHeaders { .. }
         | EvidenceIntent::MailLatestContent { .. }
+        | EvidenceIntent::MailTargeted { .. }
         | EvidenceIntent::WebDirectPage { .. }
         | EvidenceIntent::WebFact { .. }) => Some(supported),
         EvidenceIntent::AnalyzeQuotedEvidence { intent } => production_evidence_intent(intent),
-        EvidenceIntent::MailTargeted { .. } => None,
     }
 }
 
@@ -3777,6 +3809,10 @@ pub(crate) async fn run_agent_loop(
     let mut full_response = String::new();
     let mut approvals_denied: usize = 0;
     let mut tool_calls_used: usize = 0;
+    let mut narration_nudged: u8 = 0;
+    // Last tool-round text that actually said something — used as a fallback
+    // when the final round answers empty (model emitted no tokens at all).
+    let mut last_nonempty_round = String::new();
     let mut transcript_sources: Vec<TranscriptSource> = Vec::new();
 
     let user_message = messages
@@ -4158,6 +4194,7 @@ pub(crate) async fn run_agent_loop(
         } else {
             tools.clone()
         };
+        let round_has_tools = !round_tools.is_empty();
         let stream = inference
             .stream(messages.clone(), round_tools)
             .await
@@ -4175,6 +4212,13 @@ pub(crate) async fn run_agent_loop(
                     if publish_live && !sink.emit(json!({"type":"token","content":token})).await {
                         return Err(ExecError::SinkClosed);
                     }
+                    // Anti-degeneration cutoff: a tool-capable round that keeps
+                    // producing prose past this budget without emitting a call
+                    // is stuck narrating ("I will search ..." loops). Cut the
+                    // stream and let the nudge below redirect the next round.
+                    if round_has_tools && round_text.len() > 700 {
+                        break;
+                    }
                 }
                 Ok(ChatStreamEvent::ToolCalls(calls)) => round_calls.extend(calls),
                 Err(e) => {
@@ -4184,6 +4228,43 @@ pub(crate) async fn run_agent_loop(
                     return Err(ExecError::Model(e.to_string()));
                 }
             }
+        }
+
+        // Anti-narration guard: a small chat model sometimes *describes*
+        // calling a tool ("I will search for ...") instead of emitting the
+        // call, then loops on that sentence. When a buffered tool-capable
+        // round ends without calls but its text announces an action, push a
+        // corrective system nudge and retry once with tools still available.
+        const NARRATION_INTENTS: &[&str] = &[
+            "i'll search",
+            "i will search",
+            "let me search",
+            "i'll look up",
+            "i will look up",
+            "let me look up",
+            "i'll check",
+            "i will check",
+            "let me check",
+            "i'll find",
+            "i will find",
+            "let me find",
+            "i'll use the web_search",
+            "i will use the web_search",
+        ];
+        let announces_action = round_has_tools
+            && NARRATION_INTENTS
+                .iter()
+                .any(|intent| round_text.to_ascii_lowercase().contains(intent));
+        if round_calls.is_empty() && announces_action && narration_nudged < 2 && round < MAX_ROUNDS
+        {
+            narration_nudged += 1;
+            messages.push(Message::assistant(round_text));
+            messages.push(Message::system(
+                "Do not describe or announce actions. Call one of the available \
+                 tools now with concrete arguments, or answer directly if no tool \
+                 applies.",
+            ));
+            continue 'agent;
         }
 
         if round_calls.is_empty()
@@ -4201,6 +4282,9 @@ pub(crate) async fn run_agent_loop(
         }
 
         if round_calls.is_empty() {
+            if !round_text.trim().is_empty() {
+                last_nonempty_round = round_text.clone();
+            }
             if !publish_live
                 && !sink
                     .emit(json!({"type":"token","content":round_text}))
@@ -4911,6 +4995,22 @@ pub(crate) async fn run_agent_loop(
         }
     } // end 'agent loop
 
+    // The final round may legitimately emit zero tokens (model answered with
+    // an empty message after tool rounds). Never publish an empty answer —
+    // fall back to the last round that said something, then a standard line.
+    if full_response.trim().is_empty() {
+        if !last_nonempty_round.trim().is_empty() {
+            let _ = sink
+                .emit(json!({"type":"token","content":&last_nonempty_round}))
+                .await;
+            full_response = last_nonempty_round;
+        } else {
+            let fallback = "Prepáč, odpoveď sa nepodarilo vygenerovať. Skús prosím otázku zopakovať alebo formuluj trochu inak.".to_string();
+            let _ = sink.emit(json!({"type":"token","content":&fallback})).await;
+            full_response = fallback;
+        }
+    }
+
     if let Some(ref fref) = found_file_ref {
         save_last_file_ref(
             db,
@@ -5461,6 +5561,28 @@ mod tests {
     }
 
     #[test]
+    fn targeted_mail_intent_forces_search_then_read() {
+        let tools = vec![
+            test_tool("web_search"),
+            test_tool("mail_search"),
+            test_tool("mail_list_inbox"),
+            test_tool("mail_read"),
+            test_tool("mail_open"),
+        ];
+        let (routed, guidance) = route_tools_for_turn("what was the flixbus email about?", tools);
+        let names: Vec<&str> = routed
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["mail_search", "mail_read"]);
+        let guidance = guidance.expect("targeted mail should add system guidance");
+        assert!(guidance.content.contains("flixbus"));
+        assert!(guidance.content.contains("mail_search"));
+        assert!(guidance.content.contains("mail_read"));
+        assert!(!guidance.content.contains("mail_list_inbox"));
+    }
+
+    #[test]
     fn ordinary_turn_preserves_full_tool_set_without_extra_guidance() {
         let tools = vec![test_tool("web_search"), test_tool("mail_search")];
         let (routed, guidance) = route_tools_for_turn("What is the weather?", tools);
@@ -5597,9 +5719,29 @@ mod tests {
     }
 
     #[test]
-    fn flagged_routing_keeps_targeted_ambiguous_mixed_and_unrelated_turns_legacy() {
+    fn targeted_mail_is_typed_and_does_not_read_ambiguous_matches() {
+        let routing = prepare_turn_routing(
+            true,
+            &ExecOrigin::Chat,
+            "targeted-mail-session",
+            "what was the flixbus email about?",
+            vec![test_tool("mail_search"), test_tool("mail_read")],
+        );
+
+        assert!(matches!(
+            routing.evidence.map(|routed| routed.intent),
+            Some(EvidenceIntent::MailTargeted {
+                query,
+                needs_content: true
+            }) if query == "flixbus"
+        ));
+        assert!(routing.tools.is_empty());
+        assert!(routing.guidance.is_none());
+    }
+
+    #[test]
+    fn flagged_routing_keeps_mixed_and_unrelated_turns_legacy() {
         for prompt in [
-            "read the latest email from Alice",
             "read my latest email or the latest one from Alice",
             "read my latest email and check the current price online",
             "what is in my project notes?",
@@ -5621,6 +5763,8 @@ mod tests {
         let supported = [
             "show my latest 3 emails",
             "can you read me the 3 latest emails?",
+            "read the latest email from Alice",
+            "what was the flixbus email about?",
             "read https://example.com/report",
             "can you read https://example.com/report?",
             "summarize https://example.com/report",
@@ -5689,7 +5833,6 @@ mod tests {
         }
 
         let legacy = [
-            "read the latest email from Alice",
             "read my latest email or the latest one from Alice",
             "read my latest email and check the current price online",
             "read my latest email and search Google for Acme",

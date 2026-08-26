@@ -511,7 +511,11 @@ impl BaseRtClient {
                     "messages": messages,
                     "tools": tools,
                     "stream": true,
-                    "temperature": 0.7,
+                    // 0.7 made the 4B chat model narrate tool use ("I will
+                    // search ...") instead of emitting the call, sometimes
+                    // degenerating into repetition loops. Lower temperature
+                    // keeps agentic rounds deterministic enough to act.
+                    "temperature": 0.4,
                     "max_tokens": 2048,
                 }))
                 .send()

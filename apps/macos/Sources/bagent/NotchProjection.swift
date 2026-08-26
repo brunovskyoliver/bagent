@@ -626,7 +626,9 @@ enum NotchProjection {
                 accessibilityLabel: "Status",
                 accessibilityValue: statusAccessibilityValue(pillLabel, automationCount: activeAutomations.count)
             ),
-            geometry: .init(wingWidth: pillLabel == nil ? 32 : 248, bridgeHeight: bridgeHeight),
+            // Status lives on the compact right-wing dot; no text pill ever
+            // widens the collapsed notch.
+            geometry: .init(wingWidth: 32, bridgeHeight: bridgeHeight),
             motion: .accepted(reduceMotion: reduceMotion),
             focusedWorkIdentity: focused?.identity,
             activeAutomationCount: activeAutomations.count,

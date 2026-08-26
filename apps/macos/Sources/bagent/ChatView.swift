@@ -334,6 +334,10 @@ struct NotchWrapView: View {
     @State private var isHovered = false
     @State private var pulsing = false
     @State private var copyFlashed = false
+    /// True while the input→thinking collapse morph is still running; the
+    /// thinking dot waits for it so it never rides the shrinking edge and
+    /// read as detached from the shape.
+    @State private var thinkingDotDeferred = false
     @State private var isDragTargeted = false
     @State private var inlineContentOpacity: CGFloat = 0
     @State private var cmuxContentOpacity: CGFloat = 0
@@ -375,10 +379,11 @@ struct NotchWrapView: View {
             || isProjectionSurfaceActive
     }
     private var isProjectionSurfaceActive: Bool {
-        (viewModel.notchPresentation.geometry.bridgeHeight > 0
-            || viewModel.notchPresentation.statusPill.label != nil)
-            && (viewModel.notchInteractionMode == .collapsed
-                || viewModel.notchInteractionMode == .thinking)
+        // Only content-bearing surfaces (activity rails, automations,
+        // approvals) hold the collapsed projection open. Status is carried
+        // by the right-wing dot — never by expanded geometry or text pills.
+        viewModel.notchInteractionMode == .collapsed
+            && viewModel.notchPresentation.geometry.bridgeHeight > 0
     }
     private var isSettingsActive: Bool { viewModel.notchInteractionMode == .settings }
 
@@ -797,37 +802,20 @@ struct NotchWrapView: View {
 
     @ViewBuilder
     private var statusDotLayer: some View {
-        if viewModel.notchPresentation.statusPill.label == nil,
+        // The compact right-wing dot is the only collapsed-state indicator:
+        // blue pulsing while a turn runs, cyan while the model loads, red /
+        // orange / blue for failed / partial / unread results. Idle + ready
+        // stays a pure black notch. During the input→thinking collapse the
+        // dot waits for the morph to finish (thinkingDotDeferred) so it never
+        // appears detached from the still-shrinking shape.
+        let collapseDeferred = thinkingDotDeferred && viewModel.notchInteractionMode == .thinking
+        if !collapseDeferred,
            status != .ready || ((viewModel.notchPresentation.interactionMode != .collapsed
                 && viewModel.notchPresentation.interactionMode != .thinking) && !isInlineActive) {
             StatusDotView(status: status, pulsing: $pulsing, reduceMotion: reduceMotion, copyFlashed: copyFlashed, isDragTargeted: isDragTargeted)
                 .position(statusDotPos)
                 .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
                 .clipShape(animatedNotchClipShape)
-        }
-    }
-
-    @ViewBuilder
-    private var invariantStatusPillLayer: some View {
-        if viewModel.notchPresentation.statusPill.label != nil {
-            InvariantNotchStatusPill(
-                presentation: viewModel.notchPresentation.statusPill,
-                activeAutomationCount: viewModel.notchPresentation.activeAutomationCount,
-                action: viewModel.openActiveAutomations
-            )
-            .position(
-                x: (isSettingsActive
-                    ? NotchPillLayout.settingsOrigin(maxPanelWidth: maxSize.width)
-                    : NotchPillLayout.origin(maxPanelWidth: maxSize.width)).x
-                    + NotchPillLayout.size.width / 2,
-                y: (isSettingsActive
-                    ? NotchPillLayout.settingsOrigin(maxPanelWidth: maxSize.width)
-                    : NotchPillLayout.origin(maxPanelWidth: maxSize.width)).y
-                    + NotchPillLayout.size.height / 2
-            )
-            .frame(width: maxSize.width, height: maxSize.height, alignment: .topLeading)
-            .opacity(inlineContentOpacity)
-            .clipShape(animatedNotchClipShape)
         }
     }
 
@@ -1169,7 +1157,6 @@ struct NotchWrapView: View {
             // bg); shown when chat open, task running, approval pending, or error
             // (so a down daemon always surfaces).
             inlineSurfaceLayer
-            invariantStatusPillLayer
             cmuxBannerLayer
             statusDotLayer
             cmuxDotLayer
@@ -1254,6 +1241,14 @@ struct NotchWrapView: View {
         .onChange(of: viewModel.notchInteractionMode) { previousMode, mode in
             updateStatusDotTravelState(previousMode: previousMode, currentMode: mode)
             if mode != .output { outputWingRatchet = NotchWrapMetrics.outputMinWingWidth }
+            if mode == .thinking, previousMode != .thinking {
+                thinkingDotDeferred = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + NotchWrapMetrics.surfaceDuration) {
+                    thinkingDotDeferred = false
+                }
+            } else if mode != .thinking {
+                thinkingDotDeferred = false
+            }
             refreshSurface()
         }
         .onChange(of: viewModel.notchPresentation.revision) {
@@ -1724,7 +1719,7 @@ struct InlineNotchContent: View {
     private var restoredCurrentChatRecords: some View {
         let attachments = viewModel.restoredSubmittedAttachments
         let sources = viewModel.restoredValidatedSources
-        let connectors = viewModel.restoredConnectorReferences
+        let connectors = viewModel.restoredDisplayableConnectorReferences
         let approvals = viewModel.restoredApprovalPresentations
         if !attachments.isEmpty || !sources.isEmpty || !connectors.isEmpty || !approvals.isEmpty {
             VStack(alignment: .leading, spacing: 3) {

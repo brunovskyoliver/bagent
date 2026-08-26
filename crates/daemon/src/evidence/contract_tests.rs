@@ -85,6 +85,13 @@ fn classifies_targeted_mail_urls_and_web_verification_level() {
             needs_content: true,
         })
     );
+    assert_eq!(
+        classifier.classify("can you find me what was the flixbus email about"),
+        Classification::Recognized(EvidenceIntent::MailTargeted {
+            query: "flixbus".into(),
+            needs_content: true,
+        })
+    );
     assert!(matches!(
         classifier.classify("read https://example.com/report"),
         Classification::Recognized(EvidenceIntent::WebDirectPage { .. })

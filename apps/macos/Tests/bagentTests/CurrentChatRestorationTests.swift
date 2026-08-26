@@ -42,6 +42,7 @@ final class CurrentChatRestorationTests: XCTestCase {
         XCTAssertEqual(viewModel.restoredSubmittedAttachments.first?.availability, .unavailable)
         XCTAssertEqual(viewModel.restoredValidatedSources, snapshot.validatedSources)
         XCTAssertEqual(viewModel.restoredConnectorReferences, snapshot.connectorReferences)
+        XCTAssertTrue(viewModel.restoredDisplayableConnectorReferences.isEmpty)
         XCTAssertEqual(viewModel.restoredApprovalPresentations, snapshot.completedApprovalPresentations)
     }
 
@@ -51,6 +52,35 @@ final class CurrentChatRestorationTests: XCTestCase {
         XCTAssertEqual(missing.id, "missing-a")
         XCTAssertEqual(missing.availability, .unavailable)
         XCTAssertNil(missing.localURL)
+    }
+
+    func testComposerCollapsesRepeatedConnectorKinds() {
+        let snapshot = DaemonClient.CurrentChatSnapshot(
+            identity: "chat-a",
+            revision: 7,
+            turnCount: 1,
+            contentBytes: 128,
+            turns: [],
+            draft: nil,
+            continuation: nil,
+            submittedAttachments: [],
+            validatedSources: [],
+            connectorReferences: [
+                DaemonClient.CurrentChatAvailability(
+                    identity: "mail:one", label: "mail", availability: "available"),
+                DaemonClient.CurrentChatAvailability(
+                    identity: "mail:two", label: "mail", availability: "available"),
+                DaemonClient.CurrentChatAvailability(
+                    identity: "notes:one", label: "notes", availability: "available")
+            ],
+            completedApprovalPresentations: [])
+        let viewModel = ChatViewModel(startMonitoring: false)
+
+        viewModel.applyCurrentChatSnapshot(snapshot, rebuildMessages: true)
+
+        XCTAssertEqual(
+            viewModel.restoredDisplayableConnectorReferences.map(\.label),
+            ["mail", "notes"])
     }
 
     func testRejectedAdmissionsRestoreExactDraftAndPendingReferences() {
